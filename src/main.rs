@@ -1,4 +1,5 @@
 mod cli;
+mod orchestrator;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -6,8 +7,9 @@ use std::path::Path;
 
 use cli::{Cli, Command};
 use semver_analyzer_core::{
-    AnalysisMetadata, AnalysisReport, ApiSurface, Comparison, FileChanges, FileStatus,
-    ManifestChange, StructuralChange, StructuralChangeType, Summary,
+    AnalysisMetadata, AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, ApiSurface,
+    BehavioralChange, Comparison, FileChanges, FileStatus, ManifestChange, StructuralChange,
+    Summary,
 };
 use semver_analyzer_ts::OxcExtractor;
 
@@ -38,6 +40,7 @@ async fn main() -> Result<()> {
             llm_command,
             max_llm_cost,
             build_command,
+            llm_all_files,
         } => {
             cmd_analyze(
                 &repo,
@@ -48,7 +51,9 @@ async fn main() -> Result<()> {
                 llm_command.as_deref(),
                 max_llm_cost,
                 build_command.as_deref(),
-            )?;
+                llm_all_files,
+            )
+            .await?;
         }
 
         Command::Serve => {
@@ -122,17 +127,18 @@ fn cmd_diff(from_path: &Path, to_path: &Path, output: Option<&Path>) -> Result<(
     Ok(())
 }
 
-// ─── Analyze command (full TD pipeline) ──────────────────────────────────
+// ─── Analyze command (concurrent TD+BU pipeline) ────────────────────────
 
-fn cmd_analyze(
+async fn cmd_analyze(
     repo: &Path,
     from_ref: &str,
     to_ref: &str,
     output: Option<&Path>,
-    _no_llm: bool,
-    _llm_command: Option<&str>,
+    no_llm: bool,
+    llm_command: Option<&str>,
     _max_llm_cost: f64,
     build_command: Option<&str>,
+    llm_all_files: bool,
 ) -> Result<()> {
     eprintln!(
         "Analyzing {} from {} to {}",
@@ -140,51 +146,41 @@ fn cmd_analyze(
         from_ref,
         to_ref
     );
+    if no_llm {
+        eprintln!("Mode: static analysis only (--no-llm)");
+    }
 
-    // Step 1: Extract API surfaces for both refs
-    let extractor = OxcExtractor::new();
+    // Run concurrent TD+BU pipeline
+    let result = orchestrator::run_concurrent_analysis(
+        repo,
+        from_ref,
+        to_ref,
+        no_llm,
+        llm_command,
+        build_command,
+        llm_all_files,
+    )
+    .await?;
 
-    eprintln!("Extracting API surface at {} ...", from_ref);
-    let old_surface = extractor
-        .extract_at_ref(repo, from_ref, build_command)
-        .with_context(|| format!("Failed to extract API surface at ref {}", from_ref))?;
-    eprintln!("  {} symbols extracted", old_surface.symbols.len());
-
-    eprintln!("Extracting API surface at {} ...", to_ref);
-    let new_surface = extractor
-        .extract_at_ref(repo, to_ref, build_command)
-        .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?;
-    eprintln!("  {} symbols extracted", new_surface.symbols.len());
-
-    // Step 2: Structural diff
-    eprintln!("Computing structural diff ...");
-    let structural_changes = semver_analyzer_core::diff::diff_surfaces(&old_surface, &new_surface);
-    let structural_breaking = structural_changes.iter().filter(|c| c.is_breaking).count();
-    eprintln!(
-        "  {} structural changes ({} breaking)",
-        structural_changes.len(),
-        structural_breaking
-    );
-
-    // Step 3: Package.json diff
-    eprintln!("Comparing package.json ...");
-    let manifest_changes = diff_package_json(repo, from_ref, to_ref);
-    let manifest_breaking = manifest_changes.iter().filter(|c| c.is_breaking).count();
-    if !manifest_changes.is_empty() {
+    // Print summary stats
+    let manifest_breaking = result.manifest_changes.iter().filter(|c| c.is_breaking).count();
+    if !result.manifest_changes.is_empty() {
         eprintln!(
-            "  {} manifest changes ({} breaking)",
-            manifest_changes.len(),
+            "[TD]   {} manifest changes ({} breaking)",
+            result.manifest_changes.len(),
             manifest_breaking
         );
     }
 
-    // Step 4: Build report
+    // Build report
     let report = build_report(
         repo,
         from_ref,
         to_ref,
-        structural_changes,
-        manifest_changes,
+        result.structural_changes,
+        result.behavioral_changes,
+        result.manifest_changes,
+        result.llm_api_changes,
     );
 
     let total_breaking = report.summary.total_breaking_changes;
@@ -196,62 +192,15 @@ fn cmd_analyze(
             "BREAKING: {} total breaking change(s) detected.",
             total_breaking
         );
+        eprintln!(
+            "  {} API changes, {} behavioral changes",
+            report.summary.breaking_api_changes,
+            report.summary.breaking_behavioral_changes
+        );
     }
 
     write_json_output(&report, output)?;
     Ok(())
-}
-
-// ─── Package.json diff helper ────────────────────────────────────────────
-
-/// Try to diff package.json between two refs.
-/// Falls back to empty if package.json doesn't exist at either ref.
-fn diff_package_json(
-    repo: &Path,
-    from_ref: &str,
-    to_ref: &str,
-) -> Vec<ManifestChange> {
-    let old_json = read_git_file(repo, from_ref, "package.json");
-    let new_json = read_git_file(repo, to_ref, "package.json");
-
-    match (old_json, new_json) {
-        (Some(old_str), Some(new_str)) => {
-            let old: serde_json::Value = match serde_json::from_str(&old_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("  Warning: could not parse package.json at {}: {}", from_ref, e);
-                    return Vec::new();
-                }
-            };
-            let new: serde_json::Value = match serde_json::from_str(&new_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("  Warning: could not parse package.json at {}: {}", to_ref, e);
-                    return Vec::new();
-                }
-            };
-            semver_analyzer_ts::manifest::diff_manifests(&old, &new)
-        }
-        _ => {
-            eprintln!("  package.json not found at one or both refs, skipping manifest diff");
-            Vec::new()
-        }
-    }
-}
-
-/// Read a file at a specific git ref via `git show`.
-fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{}:{}", git_ref, file_path)])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        None
-    }
 }
 
 // ─── Report building ─────────────────────────────────────────────────────
@@ -261,43 +210,122 @@ fn build_report(
     from_ref: &str,
     to_ref: &str,
     structural_changes: Vec<StructuralChange>,
+    behavioral_changes: Vec<BehavioralChange>,
     manifest_changes: Vec<ManifestChange>,
+    llm_api_changes: Vec<orchestrator::LlmApiChangeEntry>,
 ) -> AnalysisReport {
-    // Group structural changes by file
-    let mut file_map: std::collections::BTreeMap<std::path::PathBuf, Vec<StructuralChange>> =
+    // Group breaking structural changes by file, converting to v2 ApiChange format.
+    // Non-breaking changes (symbol_added, etc.) are excluded from the report.
+    let mut file_api_map: std::collections::BTreeMap<std::path::PathBuf, Vec<ApiChange>> =
         std::collections::BTreeMap::new();
-    for change in structural_changes {
-        // Try to determine the file from the qualified name
+
+    for change in &structural_changes {
+        if !change.is_breaking {
+            continue;
+        }
         let file = qualified_name_to_file(&change.qualified_name);
-        file_map.entry(file).or_default().push(change);
+        let api_change = structural_to_api_change(change);
+        file_api_map.entry(file).or_default().push(api_change);
     }
 
-    let structural_breaking: usize = file_map
-        .values()
-        .flat_map(|v| v.iter())
-        .filter(|c| c.is_breaking)
-        .count();
-    let manifest_breaking = manifest_changes.iter().filter(|c| c.is_breaking).count();
-    let total_breaking = structural_breaking + manifest_breaking;
-    let files_with_breaking = file_map
-        .values()
-        .filter(|changes| changes.iter().any(|c| c.is_breaking))
-        .count();
+    // Merge LLM-detected API changes into the file map.
+    // These catch type-level changes that static .d.ts analysis misses
+    // (interface extends, optionality, enum member changes, etc.)
+    for entry in &llm_api_changes {
+        let file = std::path::PathBuf::from(&entry.file_path);
+        let change_type = match entry.change.as_str() {
+            "type_changed" => ApiChangeType::TypeChanged,
+            "removed" => ApiChangeType::Removed,
+            "default_changed" => ApiChangeType::SignatureChanged,
+            _ => ApiChangeType::SignatureChanged,
+        };
+        let kind = if entry.symbol.contains('.') {
+            ApiChangeKind::Property
+        } else {
+            ApiChangeKind::Interface
+        };
+        let api_change = ApiChange {
+            symbol: entry.symbol.clone(),
+            kind,
+            change: change_type,
+            before: None,
+            after: None,
+            description: entry.description.clone(),
+        };
+        // Only add if not already present (avoid duplicating TD findings)
+        let existing = file_api_map.entry(file).or_default();
+        let already_exists = existing.iter().any(|c| c.symbol == entry.symbol);
+        if !already_exists {
+            existing.push(api_change);
+        }
+    }
 
-    let changes: Vec<FileChanges> = file_map
+    // Sort changes within each file by symbol name
+    for changes in file_api_map.values_mut() {
+        changes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    }
+
+    let api_breaking: usize = file_api_map.values().map(|v| v.len()).sum();
+    let behavioral_breaking = behavioral_changes.len();
+
+    // Merge behavioral changes into file map using the source_file
+    // extracted from the BU pipeline's qualified names.
+    let mut file_behavioral_map: std::collections::BTreeMap<
+        std::path::PathBuf,
+        Vec<BehavioralChange>,
+    > = std::collections::BTreeMap::new();
+    for bc in behavioral_changes {
+        let file = if let Some(ref src) = bc.source_file {
+            std::path::PathBuf::from(src)
+        } else {
+            std::path::PathBuf::from("(behavioral)")
+        };
+        file_behavioral_map.entry(file).or_default().push(bc);
+    }
+
+    // Build the combined file changes list
+    let mut all_files: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    all_files.extend(file_api_map.keys().cloned());
+    all_files.extend(file_behavioral_map.keys().cloned());
+
+    let changes: Vec<FileChanges> = all_files
         .into_iter()
-        .map(|(file, changes)| FileChanges {
-            file,
-            status: FileStatus::Modified,
-            structural_changes: changes,
-            behavioral_changes: Vec::new(),
+        .map(|file| {
+            let api_changes = file_api_map.remove(&file).unwrap_or_default();
+            let behavioral = file_behavioral_map.remove(&file).unwrap_or_default();
+
+            let status = if api_changes
+                .iter()
+                .all(|c| c.change == semver_analyzer_core::ApiChangeType::Removed)
+                && behavioral.is_empty()
+            {
+                FileStatus::Deleted
+            } else {
+                FileStatus::Modified
+            };
+            FileChanges {
+                file,
+                status,
+                renamed_from: None,
+                breaking_api_changes: api_changes,
+                breaking_behavioral_changes: behavioral,
+            }
         })
         .collect();
+
+    let files_with_breaking = changes.len();
 
     // Get SHAs
     let from_sha = resolve_sha(repo, from_ref).unwrap_or_else(|| from_ref.to_string());
     let to_sha = resolve_sha(repo, to_ref).unwrap_or_else(|| to_ref.to_string());
     let commit_count = count_commits(repo, from_ref, to_ref).unwrap_or(0);
+
+    let call_graph_info = if behavioral_breaking > 0 {
+        "static_with_hof_heuristics"
+    } else {
+        "none (no behavioral analysis)"
+    };
 
     AnalysisReport {
         repository: repo.to_path_buf(),
@@ -310,20 +338,104 @@ fn build_report(
             analysis_timestamp: chrono::Utc::now().to_rfc3339(),
         },
         summary: Summary {
-            total_breaking_changes: total_breaking,
-            structural_breaking_changes: structural_breaking,
-            behavioral_breaking_changes: 0, // BU not yet implemented
-            manifest_breaking_changes: manifest_breaking,
+            total_breaking_changes: api_breaking + behavioral_breaking,
+            breaking_api_changes: api_breaking,
+            breaking_behavioral_changes: behavioral_breaking,
             files_with_breaking_changes: files_with_breaking,
         },
         changes,
         manifest_changes,
         metadata: AnalysisMetadata {
-            call_graph_analysis: "none (TD-only mode)".to_string(),
+            call_graph_analysis: call_graph_info.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
             llm_usage: None,
         },
     }
+}
+
+/// Convert an internal StructuralChange to a v2-format ApiChange.
+fn structural_to_api_change(sc: &StructuralChange) -> ApiChange {
+    let kind = symbol_kind_to_api_kind(&sc.kind);
+    let change = sc.change_type.to_api_change_type();
+
+    // Build the v2 symbol name: `ComponentName.propName` format.
+    // The qualified_name is like "packages/react-core/dist/esm/components/Card/Card.CardProps.isFlat"
+    // We want: "Card.isFlat" or just "Card" for top-level symbols.
+    let symbol = qualified_name_to_display_symbol(&sc.qualified_name, &sc.symbol);
+
+    ApiChange {
+        symbol,
+        kind,
+        change,
+        before: sc.before.clone(),
+        after: sc.after.clone(),
+        description: sc.description.clone(),
+    }
+}
+
+/// Map internal symbol kind string to v2 ApiChangeKind.
+fn symbol_kind_to_api_kind(kind: &str) -> ApiChangeKind {
+    match kind {
+        "Function" => ApiChangeKind::Function,
+        "Method" => ApiChangeKind::Method,
+        "Class" => ApiChangeKind::Class,
+        "Interface" => ApiChangeKind::Interface,
+        "TypeAlias" => ApiChangeKind::TypeAlias,
+        "Constant" | "Variable" => ApiChangeKind::Constant,
+        "Enum" => ApiChangeKind::TypeAlias, // v2 uses type_alias for enums
+        "Property" => ApiChangeKind::Property,
+        "Namespace" => ApiChangeKind::ModuleExport,
+        _ => ApiChangeKind::Property,
+    }
+}
+
+/// Convert a qualified name to a human-readable display symbol.
+///
+/// Input: `packages/react-core/dist/esm/components/Card/Card.CardProps.isFlat`
+/// Output: `CardProps.isFlat`
+///
+/// Input: `packages/react-core/dist/esm/components/Card/Card.Card`
+/// Output: `Card`
+///
+/// Strategy: take the parts after the last path separator (the `.`-separated
+/// symbol chain from the file stem), then drop the file stem if it matches
+/// the first symbol part.
+fn qualified_name_to_display_symbol(qualified_name: &str, symbol_name: &str) -> String {
+    // Split by '/' to get path components, then take the last one which
+    // contains the file stem + symbol chain
+    let last_path = qualified_name.rsplit('/').next().unwrap_or(qualified_name);
+
+    // Split by '.' to get [file_stem, symbol_parts...]
+    let parts: Vec<&str> = last_path.split('.').collect();
+
+    if parts.len() <= 1 {
+        return symbol_name.to_string();
+    }
+
+    // parts[0] is the file stem (e.g., "Card"), parts[1..] are symbol parts
+    let symbol_parts = &parts[1..];
+
+    if symbol_parts.is_empty() {
+        return symbol_name.to_string();
+    }
+
+    // If there's only one symbol part, it's the top-level symbol
+    if symbol_parts.len() == 1 {
+        return symbol_parts[0].to_string();
+    }
+
+    // Multiple parts: join with '.' (e.g., "CardProps.isFlat")
+    // But use Component name instead of Props interface name where possible:
+    // "CardProps.isFlat" → "Card.isFlat" if the first part ends with "Props"
+    let mut display_parts = symbol_parts.to_vec();
+    if display_parts[0].ends_with("Props") {
+        let component = display_parts[0].strip_suffix("Props").unwrap();
+        if !component.is_empty() {
+            display_parts[0] = component;
+        }
+    }
+
+    display_parts.join(".")
 }
 
 // ─── Git helpers ─────────────────────────────────────────────────────────
@@ -392,6 +504,7 @@ fn qualified_name_to_file(qualified_name: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use semver_analyzer_core::StructuralChangeType;
 
     #[test]
     fn qualified_name_to_file_simple() {
@@ -424,6 +537,8 @@ mod tests {
             Path::new("/tmp/repo"),
             "v1.0.0",
             "v2.0.0",
+            vec![],
+            vec![],
             vec![],
             vec![],
         );
@@ -472,11 +587,97 @@ mod tests {
             "v1",
             "v2",
             changes,
+            vec![], // no behavioral changes
             manifest,
+            vec![],
         );
-        assert_eq!(report.summary.structural_breaking_changes, 1);
-        assert_eq!(report.summary.manifest_breaking_changes, 1);
-        assert_eq!(report.summary.total_breaking_changes, 2);
+        // Only the breaking structural change counts (non-breaking excluded)
+        assert_eq!(report.summary.breaking_api_changes, 1);
+        assert_eq!(report.summary.breaking_behavioral_changes, 0);
+        assert_eq!(report.summary.total_breaking_changes, 1);
         assert_eq!(report.summary.files_with_breaking_changes, 1);
+        // Non-breaking changes excluded from output
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].breaking_api_changes.len(), 1);
+    }
+
+    #[test]
+    fn build_report_with_behavioral_changes() {
+        use semver_analyzer_core::BehavioralChangeKind;
+
+        let behavioral = vec![BehavioralChange {
+            symbol: "createUser".into(),
+            kind: BehavioralChangeKind::Function,
+            description: "Email normalization now strips + aliases".into(),
+            source_file: Some("src/api/users.ts".into()),
+        }];
+
+        let report = build_report(
+            Path::new("/tmp/repo"),
+            "v1",
+            "v2",
+            vec![],
+            behavioral,
+            vec![],
+            vec![],
+        );
+        assert_eq!(report.summary.breaking_api_changes, 0);
+        assert_eq!(report.summary.breaking_behavioral_changes, 1);
+        assert_eq!(report.summary.total_breaking_changes, 1);
+        assert_eq!(report.summary.files_with_breaking_changes, 1);
+    }
+
+    #[test]
+    fn display_symbol_simple() {
+        assert_eq!(
+            qualified_name_to_display_symbol("test.greet", "greet"),
+            "greet"
+        );
+    }
+
+    #[test]
+    fn display_symbol_component_prop() {
+        // CardProps.isFlat → Card.isFlat
+        assert_eq!(
+            qualified_name_to_display_symbol(
+                "packages/react-core/dist/esm/components/Card/Card.CardProps.isFlat",
+                "isFlat"
+            ),
+            "Card.isFlat"
+        );
+    }
+
+    #[test]
+    fn display_symbol_top_level() {
+        assert_eq!(
+            qualified_name_to_display_symbol(
+                "packages/react-core/dist/esm/components/Card/Card.Card",
+                "Card"
+            ),
+            "Card"
+        );
+    }
+
+    #[test]
+    fn display_symbol_non_props_interface() {
+        // AccordionContent.isHidden (not a Props interface)
+        assert_eq!(
+            qualified_name_to_display_symbol(
+                "packages/react-core/dist/esm/components/Accordion/AccordionContent.AccordionContent.isHidden",
+                "isHidden"
+            ),
+            "AccordionContent.isHidden"
+        );
+    }
+
+    #[test]
+    fn display_symbol_interface_member() {
+        assert_eq!(
+            qualified_name_to_display_symbol(
+                "packages/react-core/dist/esm/components/Button/Button.ButtonProps.variant",
+                "variant"
+            ),
+            "Button.variant"
+        );
     }
 }

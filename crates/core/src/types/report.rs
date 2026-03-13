@@ -1,0 +1,413 @@
+//! Output data structures for the analysis report.
+//!
+//! These define the JSON schema of the tool's output, matching the v2 harness
+//! format. The format is designed to be consumed by both humans (via agents/CI)
+//! and machines (via MCP).
+//!
+//! Key design: changes are grouped **per-file**, with only files containing
+//! breaking changes included in the output. Each file entry has separate
+//! arrays for API and behavioral breaking changes.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Top-level analysis report (v2 harness format).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisReport {
+    /// Path to the analyzed repository.
+    pub repository: PathBuf,
+
+    /// Git comparison metadata.
+    pub comparison: Comparison,
+
+    /// Summary counts.
+    pub summary: Summary,
+
+    /// Per-file changes, sorted alphabetically by file path.
+    /// Only files with at least one breaking change are included.
+    pub changes: Vec<FileChanges>,
+
+    /// Package manifest changes (package.json).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub manifest_changes: Vec<ManifestChange>,
+
+    /// Metadata about the analysis run.
+    pub metadata: AnalysisMetadata,
+}
+
+/// Git comparison metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comparison {
+    pub from_ref: String,
+    pub to_ref: String,
+    pub from_sha: String,
+    pub to_sha: String,
+    pub commit_count: usize,
+    pub analysis_timestamp: String,
+}
+
+/// Summary counts for the report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub total_breaking_changes: usize,
+    pub breaking_api_changes: usize,
+    pub breaking_behavioral_changes: usize,
+    pub files_with_breaking_changes: usize,
+}
+
+/// All breaking changes within a single file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChanges {
+    /// Path to the file relative to repository root.
+    pub file: PathBuf,
+
+    /// Git status of the file.
+    pub status: FileStatus,
+
+    /// Original file path if status is renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<PathBuf>,
+
+    /// Breaking changes to public/exported symbols.
+    pub breaking_api_changes: Vec<ApiChange>,
+
+    /// Breaking behavioral changes (DOM structure, CSS, defaults, rendering).
+    pub breaking_behavioral_changes: Vec<BehavioralChange>,
+}
+
+/// Git file status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+/// A breaking API change detected by structural analysis (TD pipeline).
+///
+/// Follows the v2 harness schema: symbol uses `Component.propName` format,
+/// kind maps to a fixed set of categories, and change classifies the type
+/// of breaking change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiChange {
+    /// Symbol name: `ComponentName` for component-level, `ComponentName.propName`
+    /// for prop-level changes.
+    pub symbol: String,
+
+    /// The kind of symbol.
+    pub kind: ApiChangeKind,
+
+    /// What kind of breaking change occurred.
+    pub change: ApiChangeType,
+
+    /// The symbol's signature/definition before the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+
+    /// The symbol's signature/definition after the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+
+    /// Human-readable description of what broke and how it affects consumers.
+    pub description: String,
+}
+
+/// Kind of symbol affected by an API change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiChangeKind {
+    Function,
+    Method,
+    Class,
+    #[serde(rename = "struct")]
+    Struct,
+    Interface,
+    #[serde(rename = "trait")]
+    Trait,
+    TypeAlias,
+    Constant,
+    Field,
+    Property,
+    ModuleExport,
+}
+
+/// Type of breaking API change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiChangeType {
+    Removed,
+    SignatureChanged,
+    TypeChanged,
+    VisibilityChanged,
+    Renamed,
+}
+
+/// A behavioral change detected by BU analysis (possibly LLM-assisted).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehavioralChange {
+    /// The function/method/class where the behavioral change occurs.
+    pub symbol: String,
+
+    /// The kind of symbol.
+    pub kind: BehavioralChangeKind,
+
+    /// What was happening before and what happens now.
+    pub description: String,
+
+    /// Source file path (used internally for grouping, not in v2 output).
+    #[serde(skip)]
+    pub source_file: Option<String>,
+}
+
+/// Kind of symbol for behavioral changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BehavioralChangeKind {
+    Function,
+    Method,
+    Class,
+    Module,
+}
+
+// ── Internal types used during diff computation ─────────────────────────
+// These are NOT part of the v2 output schema but are used internally
+// by the diff engine to compute changes before they are mapped to
+// ApiChange entries.
+
+/// A structural change detected by the diff engine.
+///
+/// This is the internal representation. The `build_report` function in
+/// the binary crate converts these to `ApiChange` entries for the output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralChange {
+    /// The affected symbol name.
+    pub symbol: String,
+
+    /// Fully qualified symbol name.
+    pub qualified_name: String,
+
+    /// Symbol kind (function, class, interface, etc.).
+    pub kind: String,
+
+    /// What type of structural change this is.
+    pub change_type: StructuralChangeType,
+
+    /// The symbol's signature/definition before the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+
+    /// The symbol's signature/definition after the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+
+    /// Human-readable description of the change.
+    pub description: String,
+
+    /// Whether this change is breaking.
+    pub is_breaking: bool,
+
+    /// Impact analysis: what code depends on this symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<ImpactAnalysis>,
+}
+
+/// Categories of structural changes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuralChangeType {
+    // Symbol-level
+    SymbolRemoved,
+    SymbolAdded,
+    SymbolRenamed,
+    SymbolMovedToDeprecated,
+
+    // Parameter changes
+    ParameterAdded,
+    ParameterRemoved,
+    ParameterTypeChanged,
+    ParameterMadeRequired,
+    ParameterMadeOptional,
+    ParameterDefaultValueChanged,
+    RestParameterAdded,
+    RestParameterRemoved,
+
+    // Return type changes
+    ReturnTypeChanged,
+    MadeAsync,
+    MadeSync,
+
+    // Visibility changes
+    VisibilityReduced,
+    VisibilityIncreased,
+
+    // Generic type parameter changes
+    TypeParameterAdded,
+    TypeParameterRemoved,
+    TypeParameterReordered,
+    TypeParameterConstraintChanged,
+    TypeParameterDefaultChanged,
+
+    // Property modifier changes
+    ReadonlyAdded,
+    ReadonlyRemoved,
+    AbstractAdded,
+    AbstractRemoved,
+    StaticInstanceChanged,
+    AccessorKindChanged,
+
+    // Class hierarchy changes
+    BaseClassChanged,
+    InterfaceImplementationAdded,
+    InterfaceImplementationRemoved,
+
+    // Enum changes
+    EnumMemberAdded,
+    EnumMemberRemoved,
+    EnumMemberValueChanged,
+
+    // Interface/type changes
+    PropertyAdded,
+    PropertyRemoved,
+    PropertyRenamed,
+
+    // Special
+    ThisParameterTypeChanged,
+}
+
+impl StructuralChangeType {
+    /// Map internal change type to v2 harness API change type.
+    pub fn to_api_change_type(&self) -> ApiChangeType {
+        match self {
+            Self::SymbolRemoved
+            | Self::ParameterRemoved
+            | Self::RestParameterRemoved
+            | Self::PropertyRemoved
+            | Self::EnumMemberRemoved
+            | Self::InterfaceImplementationRemoved => ApiChangeType::Removed,
+
+            Self::SymbolRenamed | Self::SymbolMovedToDeprecated | Self::PropertyRenamed => {
+                ApiChangeType::Renamed
+            }
+
+            Self::ParameterAdded
+            | Self::ParameterMadeRequired
+            | Self::ParameterMadeOptional
+            | Self::ParameterDefaultValueChanged
+            | Self::RestParameterAdded
+            | Self::MadeAsync
+            | Self::MadeSync
+            | Self::TypeParameterAdded
+            | Self::TypeParameterRemoved
+            | Self::TypeParameterReordered
+            | Self::TypeParameterConstraintChanged
+            | Self::TypeParameterDefaultChanged
+            | Self::BaseClassChanged
+            | Self::InterfaceImplementationAdded
+            | Self::AbstractAdded
+            | Self::AbstractRemoved
+            | Self::StaticInstanceChanged
+            | Self::AccessorKindChanged
+            | Self::ReadonlyAdded
+            | Self::ReadonlyRemoved
+            | Self::ThisParameterTypeChanged
+            | Self::PropertyAdded
+            | Self::EnumMemberAdded
+            | Self::EnumMemberValueChanged => ApiChangeType::SignatureChanged,
+
+            Self::ParameterTypeChanged | Self::ReturnTypeChanged => ApiChangeType::TypeChanged,
+
+            Self::VisibilityReduced | Self::VisibilityIncreased => ApiChangeType::VisibilityChanged,
+
+            Self::SymbolAdded => ApiChangeType::SignatureChanged,
+        }
+    }
+}
+
+/// Impact analysis: what code depends on a broken symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactAnalysis {
+    /// Direct dependents within the repository.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub internal_dependents: Vec<Dependent>,
+
+    /// Transitive dependents (reached through call chains).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transitive_dependents: Vec<Dependent>,
+}
+
+/// A code location that depends on a broken symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dependent {
+    pub file: PathBuf,
+    pub line: usize,
+    pub symbol: String,
+}
+
+/// A breaking change in package.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestChange {
+    /// What field changed.
+    pub field: String,
+
+    /// Change type.
+    pub change_type: ManifestChangeType,
+
+    /// Value before the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+
+    /// Value after the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+
+    /// Human-readable description.
+    pub description: String,
+
+    /// Whether this change is breaking.
+    pub is_breaking: bool,
+}
+
+/// Categories of package.json changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestChangeType {
+    EntryPointChanged,
+    ExportsEntryRemoved,
+    ExportsEntryAdded,
+    ExportsConditionRemoved,
+    ModuleSystemChanged,
+    PeerDependencyAdded,
+    PeerDependencyRemoved,
+    PeerDependencyRangeChanged,
+    EngineConstraintChanged,
+    BinEntryRemoved,
+}
+
+/// Metadata about the analysis run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisMetadata {
+    /// How the call graph was analyzed.
+    pub call_graph_analysis: String,
+
+    /// Tool version.
+    pub tool_version: String,
+
+    /// LLM usage statistics (None if --no-llm).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_usage: Option<LlmUsage>,
+}
+
+/// LLM usage statistics for cost tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmUsage {
+    pub total_calls: usize,
+    pub spec_inference_calls: usize,
+    pub comparison_calls: usize,
+    pub propagation_calls: usize,
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub estimated_cost_usd: f64,
+    pub circuit_breaker_triggered: bool,
+}

@@ -91,6 +91,13 @@ pub enum Command {
         /// Example: --build-command "yarn build"
         #[arg(long)]
         build_command: Option<String>,
+
+        /// Send ALL files with changed exported functions to the LLM,
+        /// not just files that have associated test changes. By default,
+        /// only files whose tests also changed are sent to the LLM
+        /// (much faster and cheaper).
+        #[arg(long)]
+        llm_all_files: bool,
     },
 
     /// Start as an MCP server (stdio transport).

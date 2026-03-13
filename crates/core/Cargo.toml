@@ -1,0 +1,15 @@
+[package]
+name = "semver-analyzer-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core types, traits, and diff engine for the semver-analyzer"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dashmap = "6"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros"] }

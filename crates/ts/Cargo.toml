@@ -1,0 +1,27 @@
+[package]
+name = "semver-analyzer-ts"
+version = "0.1.0"
+edition = "2021"
+description = "TypeScript/JavaScript support for the semver-analyzer"
+
+[dependencies]
+semver-analyzer-core = { path = "../core" }
+
+# OXC - JavaScript/TypeScript toolchain
+oxc_parser = "0.116"
+oxc_ast = "0.116"
+oxc_allocator = "0.116"
+oxc_span = "0.116"
+
+# Serialization
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Regex for test assertion detection
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"

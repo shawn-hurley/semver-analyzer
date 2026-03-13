@@ -1,0 +1,140 @@
+//! LLM-based behavioral analysis for the semver-analyzer.
+//!
+//! This crate implements the `BehaviorAnalyzer` trait from `semver-analyzer-core`.
+//! It provides:
+//!
+//! 1. **Agent-agnostic LLM invocation** via `--llm-command` (goose, opencode, etc.)
+//! 2. **Template-constrained spec inference** — prompts that produce `FunctionSpec` JSON
+//! 3. **Tier 1 structural spec comparison** — mechanical comparison without LLM
+//! 4. **Tier 2 LLM fallback** — for ambiguous `notes` diffs and fuzzy matches
+//!
+//! ## Usage
+//!
+//! ```rust,ignore
+//! use semver_analyzer_llm::LlmBehaviorAnalyzer;
+//!
+//! let analyzer = LlmBehaviorAnalyzer::new("goose run --no-session -q -t");
+//! let spec = analyzer.infer_spec(&function_body, &signature)?;
+//! ```
+
+mod invoke;
+mod prompts;
+mod spec_compare;
+
+use anyhow::Result;
+pub use invoke::{FileApiChange, FileBehavioralChange};
+use semver_analyzer_core::{
+    BehaviorAnalyzer, BreakingVerdict, ChangedFunction, EvidenceSource, FunctionSpec, TestDiff,
+};
+
+/// LLM-based implementation of `BehaviorAnalyzer`.
+///
+/// Uses an external command (e.g., `goose run`, `opencode run`) to invoke
+/// an LLM for spec inference. The command receives a prompt as its final
+/// argument and is expected to return a response on stdout.
+pub struct LlmBehaviorAnalyzer {
+    /// The command template for invoking the LLM.
+    /// The prompt is appended as the final argument.
+    /// e.g., "goose run --no-session -q -t" or "opencode run"
+    llm_command: String,
+
+    /// Timeout in seconds for each LLM invocation.
+    timeout_secs: u64,
+}
+
+impl LlmBehaviorAnalyzer {
+    /// Create a new LLM analyzer with the given command.
+    pub fn new(llm_command: &str) -> Self {
+        Self {
+            llm_command: llm_command.to_string(),
+            timeout_secs: 120,
+        }
+    }
+
+    /// Set the timeout for LLM invocations.
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+}
+
+impl LlmBehaviorAnalyzer {
+    /// Analyze a single file's diff for breaking changes (behavioral + API type-level).
+    ///
+    /// This is the file-level approach: one LLM call per file instead of
+    /// 2+ calls per function. The prompt includes the git diff and the
+    /// list of changed function signatures.
+    ///
+    /// Returns (behavioral_changes, api_changes).
+    pub fn analyze_file_diff(
+        &self,
+        file_path: &str,
+        diff_content: &str,
+        changed_functions: &[ChangedFunction],
+    ) -> Result<(Vec<FileBehavioralChange>, Vec<FileApiChange>)> {
+        let prompt =
+            prompts::build_file_behavioral_prompt(file_path, diff_content, changed_functions);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_file_behavioral_response(&response)
+    }
+}
+
+impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
+    fn infer_spec(&self, function_body: &str, signature: &str) -> Result<FunctionSpec> {
+        let prompt = prompts::build_spec_inference_prompt(function_body, signature);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_function_spec(&response)
+    }
+
+    fn infer_spec_with_test_context(
+        &self,
+        function_body: &str,
+        signature: &str,
+        test_context: &TestDiff,
+    ) -> Result<FunctionSpec> {
+        let prompt =
+            prompts::build_spec_inference_with_test_prompt(function_body, signature, test_context);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_function_spec(&response)
+    }
+
+    fn specs_are_breaking(
+        &self,
+        old: &FunctionSpec,
+        new: &FunctionSpec,
+    ) -> Result<BreakingVerdict> {
+        // Tier 1: Structural comparison (no LLM)
+        let tier1 = spec_compare::structural_compare(old, new);
+
+        if tier1.is_breaking || tier1.confidence >= 0.80 {
+            return Ok(tier1);
+        }
+
+        // Tier 2: LLM fallback for notes diffs and ambiguous cases
+        if !old.notes.is_empty() || !new.notes.is_empty() {
+            let prompt = prompts::build_spec_comparison_prompt(old, new);
+            let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+            return invoke::parse_breaking_verdict(&response);
+        }
+
+        // No breaking changes detected
+        Ok(tier1)
+    }
+
+    fn check_propagation(
+        &self,
+        caller_body: &str,
+        caller_signature: &str,
+        callee_name: &str,
+        evidence: &EvidenceSource,
+    ) -> Result<bool> {
+        let prompt = prompts::build_propagation_check_prompt(
+            caller_body,
+            caller_signature,
+            callee_name,
+            evidence,
+        );
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_propagation_result(&response)
+    }
+}
