@@ -339,6 +339,7 @@ fn run_bu_phase1(
                 evidence: EvidenceSource::TestDelta { test_diff: td },
                 confidence: 0.95,
                 description,
+                category: None, // Test-delta: category inferred later or by JSX differ
             };
             stats.test_behavioral_breaks += 1;
 
@@ -359,6 +360,102 @@ fn run_bu_phase1(
                 }
             }
         }
+    }
+
+    // ── JSX diff analysis (per-function, deterministic, no LLM) ─────
+    let mut jsx_change_count = 0;
+    for func in &changed_fns {
+        // Skip functions without JSX or without both bodies
+        if func.old_body.is_empty()
+            || func.new_body.is_empty()
+            || !semver_analyzer_ts::jsx_diff::body_contains_jsx(&func.old_body)
+            || !semver_analyzer_ts::jsx_diff::body_contains_jsx(&func.new_body)
+        {
+            continue;
+        }
+
+        // Only analyze exported functions (these are the component render outputs consumers see)
+        if func.visibility != Visibility::Exported && func.visibility != Visibility::Public {
+            continue;
+        }
+
+        let jsx_changes = semver_analyzer_ts::jsx_diff::diff_jsx_bodies(
+            &func.old_body,
+            &func.new_body,
+            &func.name,
+            &func.file,
+        );
+
+        for jsx_change in jsx_changes {
+            // Check if TD already found this symbol (avoid duplicates)
+            if semver_analyzer_core::shared::should_skip_for_bu(
+                shared,
+                &mut receiver,
+                &func.qualified_name,
+            ) {
+                continue;
+            }
+
+            let brk = BehavioralBreak {
+                symbol: func.qualified_name.clone(),
+                caused_by: func.qualified_name.clone(),
+                call_path: vec![func.name.clone()],
+                evidence: EvidenceSource::JsxDiff {
+                    change_description: jsx_change.description.clone(),
+                },
+                confidence: 0.90,
+                description: jsx_change.description,
+                category: Some(jsx_change.category),
+            };
+            shared.insert_behavioral_break(brk);
+            jsx_change_count += 1;
+        }
+    }
+
+    // ── CSS variable/class scanning (per-function, deterministic) ────
+    let mut css_change_count = 0;
+    for func in &changed_fns {
+        if func.old_body.is_empty() || func.new_body.is_empty() {
+            continue;
+        }
+        if func.visibility != Visibility::Exported && func.visibility != Visibility::Public {
+            continue;
+        }
+        if !semver_analyzer_ts::css_scan::body_contains_css_refs(&func.old_body)
+            && !semver_analyzer_ts::css_scan::body_contains_css_refs(&func.new_body)
+        {
+            continue;
+        }
+
+        let css_changes = semver_analyzer_ts::css_scan::diff_css_references(
+            &func.old_body,
+            &func.new_body,
+            &func.name,
+            &func.file,
+        );
+
+        for css_change in css_changes {
+            let brk = BehavioralBreak {
+                symbol: func.qualified_name.clone(),
+                caused_by: func.qualified_name.clone(),
+                call_path: vec![func.name.clone()],
+                evidence: EvidenceSource::JsxDiff {
+                    change_description: css_change.description.clone(),
+                },
+                confidence: 0.90,
+                description: css_change.description,
+                category: Some(css_change.category),
+            };
+            shared.insert_behavioral_break(brk);
+            css_change_count += 1;
+        }
+    }
+
+    if jsx_change_count > 0 || css_change_count > 0 {
+        eprintln!(
+            "  BU Phase 1: {} JSX + {} CSS changes detected deterministically",
+            jsx_change_count, css_change_count,
+        );
     }
 
     // ── Prepare file list for LLM Phase 2 ───────────────────────────
@@ -658,6 +755,7 @@ async fn run_bu_phase2_llm(
 
                     for change in beh_changes {
                         breaks.fetch_add(1, Ordering::Relaxed);
+                        let category = change.category.as_deref().and_then(parse_behavioral_category);
                         let brk = BehavioralBreak {
                             symbol: format!("{}::{}", file_path, change.symbol),
                             caused_by: format!("{}::{}", file_path, change.symbol),
@@ -680,6 +778,7 @@ async fn run_bu_phase2_llm(
                             },
                             confidence: 0.70,
                             description: change.description,
+                            category,
                         };
                         shared_ref.insert_behavioral_break(brk);
                     }
@@ -786,6 +885,7 @@ fn walk_up_call_graph(
                         "Behavioral change in {} propagated through call chain",
                         original_break.caused_by
                     ),
+                    category: original_break.category.clone(), // Propagate parent's category
                 });
                 propagated += 1;
             } else {
@@ -829,11 +929,13 @@ fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange> {
                     BehavioralChangeKind::Class // LLM file-level analysis = component-level
                 }
                 EvidenceSource::TestDelta { .. } => BehavioralChangeKind::Function,
+                EvidenceSource::JsxDiff { .. } => BehavioralChangeKind::Class, // JSX diff = component-level
             };
 
             BehavioralChange {
                 symbol: extract_display_name(&brk.symbol),
                 kind,
+                category: brk.category.clone(),
                 description: brk.description.clone(),
                 source_file,
             }
@@ -893,6 +995,22 @@ fn diff_package_json(
             semver_analyzer_ts::manifest::diff_manifests(&old, &new)
         }
         _ => Vec::new(),
+    }
+}
+
+/// Parse a behavioral category string from an LLM response into the enum.
+fn parse_behavioral_category(s: &str) -> Option<semver_analyzer_core::BehavioralCategory> {
+    use semver_analyzer_core::BehavioralCategory;
+    match s.trim().to_lowercase().replace('-', "_").as_str() {
+        "dom_structure" | "dom" | "render" => Some(BehavioralCategory::DomStructure),
+        "css_class" | "css" => Some(BehavioralCategory::CssClass),
+        "css_variable" | "css_var" => Some(BehavioralCategory::CssVariable),
+        "accessibility" | "a11y" => Some(BehavioralCategory::Accessibility),
+        "default_value" | "default" => Some(BehavioralCategory::DefaultValue),
+        "logic_change" | "logic" | "side_effect" => Some(BehavioralCategory::LogicChange),
+        "data_attribute" | "data" | "ouia" => Some(BehavioralCategory::DataAttribute),
+        "render_output" | "visual" => Some(BehavioralCategory::RenderOutput),
+        _ => None,
     }
 }
 

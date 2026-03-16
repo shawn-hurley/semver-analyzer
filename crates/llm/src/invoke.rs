@@ -154,6 +154,10 @@ pub struct FileBehavioralChange {
     pub symbol: String,
     #[serde(default = "default_kind")]
     pub kind: String,
+    /// Sub-category: dom_structure, css_class, css_variable, accessibility,
+    /// default_value, logic_change, data_attribute, render_output.
+    #[serde(default)]
+    pub category: Option<String>,
     pub description: String,
 }
 

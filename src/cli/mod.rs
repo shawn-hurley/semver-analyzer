@@ -100,6 +100,70 @@ pub enum Command {
         llm_all_files: bool,
     },
 
+    /// Generate Konveyor analyzer rules from breaking change analysis.
+    ///
+    /// Can either run the full analysis pipeline internally or accept
+    /// a pre-existing AnalysisReport JSON file.
+    Konveyor {
+        /// Path to a pre-existing AnalysisReport JSON file.
+        /// Mutually exclusive with --repo/--from/--to.
+        #[arg(long, conflicts_with_all = ["repo", "from", "to"])]
+        from_report: Option<PathBuf>,
+
+        /// Path to the git repository (runs full analysis pipeline).
+        #[arg(long, required_unless_present = "from_report")]
+        repo: Option<PathBuf>,
+
+        /// Git ref to compare from (the "old" version).
+        #[arg(long, required_unless_present = "from_report")]
+        from: Option<String>,
+
+        /// Git ref to compare to (the "new" version).
+        #[arg(long, required_unless_present = "from_report")]
+        to: Option<String>,
+
+        /// Output directory for the generated ruleset.
+        #[arg(long)]
+        output_dir: PathBuf,
+
+        /// File glob pattern for filecontent rules.
+        /// Determines which files Konveyor will scan for violations.
+        #[arg(long, default_value = "*.{ts,tsx,js,jsx,mjs,cjs}")]
+        file_pattern: String,
+
+        /// Konveyor provider to target for rule conditions.
+        /// "builtin" uses builtin.filecontent (regex) — works with vanilla Konveyor.
+        /// "frontend" uses frontend.referenced (AST-level) — requires the
+        /// frontend-analyzer-provider gRPC server.
+        #[arg(long, default_value = "builtin")]
+        provider: String,
+
+        /// Name for the generated ruleset.
+        #[arg(long, default_value = "semver-breaking-changes")]
+        ruleset_name: String,
+
+        /// Skip LLM-based behavioral analysis (static analysis only).
+        /// Only used when running analysis internally (--repo mode).
+        #[arg(long)]
+        no_llm: bool,
+
+        /// Command to invoke for LLM analysis.
+        #[arg(long)]
+        llm_command: Option<String>,
+
+        /// Maximum LLM cost in USD before circuit breaker triggers.
+        #[arg(long, default_value = "5.0")]
+        max_llm_cost: f64,
+
+        /// Custom build command to run instead of `tsc --declaration`.
+        #[arg(long)]
+        build_command: Option<String>,
+
+        /// Send ALL files with changed exported functions to the LLM.
+        #[arg(long)]
+        llm_all_files: bool,
+    },
+
     /// Start as an MCP server (stdio transport).
     Serve,
 }

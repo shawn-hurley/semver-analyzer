@@ -8,8 +8,10 @@
 
 pub mod call_graph;
 pub mod canon;
+pub mod css_scan;
 pub mod diff_parser;
 pub mod extract;
+pub mod jsx_diff;
 pub mod manifest;
 pub mod test_analyzer;
 pub mod worktree;

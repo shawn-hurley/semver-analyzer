@@ -201,6 +201,11 @@ pub struct BehavioralBreak {
 
     /// Human-readable description of the behavioral change.
     pub description: String,
+
+    /// Sub-category of the behavioral change (DOM, CSS, a11y, etc.).
+    /// Populated from LLM response or JSX diff analysis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<super::BehavioralCategory>,
 }
 
 /// How the behavioral change was detected.
@@ -224,6 +229,43 @@ pub enum EvidenceSource {
         spec_old: FunctionSpec,
         spec_new: FunctionSpec,
     },
+
+    /// Deterministic JSX AST diff — no LLM needed.
+    /// High confidence (0.90) since it's based on structural comparison.
+    JsxDiff {
+        /// What kind of JSX change was detected.
+        change_description: String,
+    },
+}
+
+// ── JSX Diff Types ─────────────────────────────────────────────────────
+
+/// A change detected by comparing JSX render output between two versions.
+///
+/// Produced by the JSX differ (deterministic, no LLM). Each change
+/// maps to a `BehavioralCategory` and can be converted to a
+/// `BehavioralBreak` with high confidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsxChange {
+    /// The component function/class that produces this JSX.
+    pub symbol: String,
+
+    /// Source file containing the component.
+    pub file: std::path::PathBuf,
+
+    /// What kind of JSX change this is.
+    pub category: super::BehavioralCategory,
+
+    /// Human-readable description of the change.
+    pub description: String,
+
+    /// The old value (element name, class name, ARIA attribute value, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+
+    /// The new value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 // ── Call Graph Types ────────────────────────────────────────────────────
@@ -437,6 +479,7 @@ mod tests {
             },
             confidence: 0.55,
             description: "Email normalization now strips + aliases".into(),
+            category: None,
         };
 
         assert_eq!(brk.call_path.len(), 3);

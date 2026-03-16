@@ -300,6 +300,7 @@ mod tests {
             },
             confidence: 0.95,
             description: format!("{} behavior changed", name),
+            category: None,
         }
     }
 

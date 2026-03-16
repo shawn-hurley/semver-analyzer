@@ -1,4 +1,5 @@
 mod cli;
+mod konveyor;
 mod orchestrator;
 
 use anyhow::{Context, Result};
@@ -47,6 +48,39 @@ async fn main() -> Result<()> {
                 &from,
                 &to,
                 output.as_deref(),
+                no_llm,
+                llm_command.as_deref(),
+                max_llm_cost,
+                build_command.as_deref(),
+                llm_all_files,
+            )
+            .await?;
+        }
+
+        Command::Konveyor {
+            from_report,
+            repo,
+            from,
+            to,
+            output_dir,
+            file_pattern,
+            provider,
+            ruleset_name,
+            no_llm,
+            llm_command,
+            max_llm_cost,
+            build_command,
+            llm_all_files,
+        } => {
+            cmd_konveyor(
+                from_report.as_deref(),
+                repo.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                &output_dir,
+                &file_pattern,
+                &provider,
+                &ruleset_name,
                 no_llm,
                 llm_command.as_deref(),
                 max_llm_cost,
@@ -200,6 +234,112 @@ async fn cmd_analyze(
     }
 
     write_json_output(&report, output)?;
+    Ok(())
+}
+
+// ─── Konveyor command ────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_konveyor(
+    from_report: Option<&Path>,
+    repo: Option<&Path>,
+    from_ref: Option<&str>,
+    to_ref: Option<&str>,
+    output_dir: &Path,
+    file_pattern: &str,
+    provider_str: &str,
+    ruleset_name: &str,
+    no_llm: bool,
+    llm_command: Option<&str>,
+    _max_llm_cost: f64,
+    build_command: Option<&str>,
+    llm_all_files: bool,
+) -> Result<()> {
+    let provider = match provider_str {
+        "frontend" => konveyor::RuleProvider::Frontend,
+        "builtin" => konveyor::RuleProvider::Builtin,
+        other => {
+            eprintln!(
+                "Warning: unknown provider '{}', falling back to 'builtin'",
+                other
+            );
+            konveyor::RuleProvider::Builtin
+        }
+    };
+    let report = if let Some(report_path) = from_report {
+        // Mode 1: Load pre-existing report
+        eprintln!("Loading report from {}", report_path.display());
+        let json = std::fs::read_to_string(report_path)
+            .with_context(|| format!("Failed to read {}", report_path.display()))?;
+        let report: semver_analyzer_core::AnalysisReport = serde_json::from_str(&json)
+            .with_context(|| format!("Failed to parse {} as AnalysisReport", report_path.display()))?;
+        report
+    } else {
+        // Mode 2: Run analysis internally
+        let repo = repo.context("--repo is required when --from-report is not provided")?;
+        let from = from_ref.context("--from is required when --from-report is not provided")?;
+        let to = to_ref.context("--to is required when --from-report is not provided")?;
+
+        eprintln!(
+            "Analyzing {} from {} to {}",
+            repo.display(),
+            from,
+            to
+        );
+        if no_llm {
+            eprintln!("Mode: static analysis only (--no-llm)");
+        }
+
+        let result = orchestrator::run_concurrent_analysis(
+            repo, from, to, no_llm, llm_command, build_command, llm_all_files,
+        )
+        .await?;
+
+        build_report(
+            repo,
+            from,
+            to,
+            result.structural_changes,
+            result.behavioral_changes,
+            result.manifest_changes,
+            result.llm_api_changes,
+        )
+    };
+
+    // Generate rules and fix guidance
+    let rules = konveyor::generate_rules(&report, file_pattern, provider);
+    let fix_guidance = konveyor::generate_fix_guidance(&report, &rules, file_pattern);
+    let rule_count = rules.len();
+
+    // Write ruleset directory
+    konveyor::write_ruleset_dir(output_dir, ruleset_name, &report, &rules)?;
+
+    // Write fix guidance to sibling directory
+    let fix_dir = konveyor::write_fix_guidance_dir(output_dir, &fix_guidance)?;
+
+    eprintln!(
+        "Generated {} Konveyor rules in {}",
+        rule_count,
+        output_dir.display()
+    );
+    eprintln!("  Ruleset:  {}/ruleset.yaml", output_dir.display());
+    eprintln!("  Rules:    {}/breaking-changes.yaml", output_dir.display());
+    eprintln!(
+        "  Fixes:    {}/fix-guidance.yaml",
+        fix_dir.display()
+    );
+    eprintln!(
+        "  Summary:  {} auto-fixable, {} need review, {} manual only",
+        fix_guidance.summary.auto_fixable,
+        fix_guidance.summary.needs_review,
+        fix_guidance.summary.manual_only,
+    );
+    eprintln!();
+    eprintln!(
+        "Use with: konveyor-analyzer --rules {}",
+        output_dir.display()
+    );
+
     Ok(())
 }
 
@@ -608,6 +748,7 @@ mod tests {
         let behavioral = vec![BehavioralChange {
             symbol: "createUser".into(),
             kind: BehavioralChangeKind::Function,
+            category: None,
             description: "Email normalization now strips + aliases".into(),
             source_file: Some("src/api/users.ts".into()),
         }];

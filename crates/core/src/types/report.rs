@@ -153,6 +153,11 @@ pub struct BehavioralChange {
     /// The kind of symbol.
     pub kind: BehavioralChangeKind,
 
+    /// Sub-category of the behavioral change (DOM, CSS, a11y, etc.).
+    /// When present, enables more precise Konveyor rule generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<BehavioralCategory>,
+
     /// What was happening before and what happens now.
     pub description: String,
 
@@ -169,6 +174,35 @@ pub enum BehavioralChangeKind {
     Method,
     Class,
     Module,
+}
+
+/// Sub-category of a behavioral breaking change.
+///
+/// Enables downstream tools (Konveyor rule generation, fix guidance)
+/// to produce targeted rules and labels like `change-type=dom-structure`
+/// or `impact=frontend-testing`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BehavioralCategory {
+    /// Changed element types, added/removed wrapper elements, altered
+    /// component nesting structure.
+    DomStructure,
+    /// CSS class name renames, removals, or changed class application logic.
+    CssClass,
+    /// CSS custom property (variable) renames or removals.
+    CssVariable,
+    /// ARIA attribute changes, role changes, keyboard navigation, focus
+    /// management, tab order changes.
+    Accessibility,
+    /// Changed default prop values, altered conditional logic, changed
+    /// return values for same inputs.
+    DefaultValue,
+    /// Changed event handling, state management, side effects.
+    LogicChange,
+    /// Changed data-ouia-*, data-testid, or other data attributes.
+    DataAttribute,
+    /// General render output change not covered by other categories.
+    RenderOutput,
 }
 
 // ── Internal types used during diff computation ─────────────────────────

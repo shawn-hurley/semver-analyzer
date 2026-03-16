@@ -319,17 +319,31 @@ pub fn build_file_behavioral_prompt(
 Identify TWO categories of breaking changes:
 
 ### A. Behavioral breaking changes
-Changes that alter the OBSERVABLE BEHAVIOR of exported functions/components:
-1. **DOM/render changes**: Changed element types, added/removed wrapper
-   elements, altered component structure
-2. **CSS changes**: Class name renames (e.g., pf-v5-* → pf-v6-*), removed
-   CSS classes, changed CSS custom properties
-3. **Default value changes**: Changed default prop values that alter behavior
-4. **Logic changes**: Changed conditional logic, removed code paths,
-   altered return values for same inputs
-5. **Side effect changes**: Removed or changed event emissions, changed
-   state management patterns
-6. **OUIA/data attribute changes**: Changed data-ouia-component-type values
+Changes that alter the OBSERVABLE BEHAVIOR of exported functions/components.
+For each, assign a `category` from: `dom_structure`, `css_class`, `css_variable`,
+`accessibility`, `default_value`, `logic_change`, `data_attribute`, `render_output`.
+
+1. **DOM/render changes** (category: `dom_structure`): Changed element types
+   (e.g., `<header>` → `<div>`), added/removed wrapper elements, altered
+   component nesting structure, children wrapping changes
+2. **CSS changes** (category: `css_class`): Class name renames
+   (e.g., pf-v5-* → pf-v6-*), removed CSS classes, changed class
+   application logic, modifier classes no longer applied
+3. **CSS variable changes** (category: `css_variable`): Renamed or removed
+   CSS custom properties (e.g., --pf-v5-* → --pf-v6-*)
+4. **Accessibility changes** (category: `accessibility`): Added/removed/changed
+   ARIA attributes (aria-label, aria-labelledby, aria-describedby, aria-hidden),
+   changed `role` attributes, keyboard navigation changes, focus management
+   changes, tab order changes (tabIndex additions/removals)
+5. **Default value changes** (category: `default_value`): Changed default
+   prop values that alter behavior
+6. **Logic changes** (category: `logic_change`): Changed conditional logic,
+   removed code paths, altered return values for same inputs, changed event
+   handler types, removed or changed event emissions
+7. **Data attribute changes** (category: `data_attribute`): Changed
+   data-ouia-component-type, data-testid, or other data-* attributes
+8. **Other render output** (category: `render_output`): Any other change
+   to what is visually rendered that doesn't fit above
 
 ### B. API type-level breaking changes
 Changes to type signatures that static .d.ts analysis may miss:
@@ -359,6 +373,7 @@ Return ONLY a JSON object:
     {{
       "symbol": "<ComponentName or functionName>",
       "kind": "class",
+      "category": "<dom_structure|css_class|css_variable|accessibility|default_value|logic_change|data_attribute|render_output>",
       "description": "<what changed and why it breaks consumers>"
     }}
   ],
@@ -374,6 +389,7 @@ Return ONLY a JSON object:
 
 Rules:
 - For behavioral: use "class" for React components, "function" for others
+- For behavioral: ALWAYS include a "category" from the list above
 - For API: use "InterfaceName.propName" format for property changes
 - Keep descriptions specific and actionable
 - Only include changes that would break existing consumers
@@ -435,6 +451,9 @@ fn format_evidence(evidence: &EvidenceSource) -> String {
                 serde_json::to_string(spec_old).unwrap_or_default(),
                 serde_json::to_string(spec_new).unwrap_or_default()
             )
+        }
+        EvidenceSource::JsxDiff { change_description } => {
+            format!("JSX render output change: {}", change_description)
         }
     }
 }

@@ -26,5 +26,8 @@ serde_json = "1"
 # Error handling
 anyhow = "1"
 
+# YAML output (for Konveyor rules)
+serde_yaml = "0.9"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }

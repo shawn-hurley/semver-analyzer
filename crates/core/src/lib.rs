@@ -28,6 +28,7 @@ pub use types::{
     ApiSurface,
     // BU pipeline types
     BehavioralBreak,
+    BehavioralCategory,
     BehavioralChange,
     BehavioralChangeKind,
     BreakingVerdict,
@@ -41,6 +42,7 @@ pub use types::{
     FileStatus,
     FunctionSpec,
     ImpactAnalysis,
+    JsxChange,
     LlmUsage,
     ManifestChange,
     ManifestChangeType,
