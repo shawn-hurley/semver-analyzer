@@ -3971,12 +3971,6 @@ pub fn write_ruleset_dir(
     report: &AnalysisReport,
     rules: &[KonveyorRule],
 ) -> Result<()> {
-    // Clean the output directory to remove stale rules from previous runs
-    if output_dir.exists() {
-        std::fs::remove_dir_all(output_dir).with_context(|| {
-            format!("Failed to clean output directory {}", output_dir.display())
-        })?;
-    }
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
 
