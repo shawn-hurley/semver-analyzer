@@ -104,9 +104,10 @@ pub async fn run_concurrent_analysis(
 
     // BU Phase 2: Concurrent LLM file analysis (async, 5 at a time)
     let mut llm_stats = LlmPhaseStats::default();
+    let mut composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)> = vec![];
     let llm_api_entries = Arc::new(std::sync::Mutex::new(Vec::<LlmApiChangeEntry>::new()));
     if !no_llm && !phase1.files_for_llm.is_empty() {
-        llm_stats = run_bu_phase2_llm(
+        let (stats, comp) = run_bu_phase2_llm(
             repo,
             from_ref,
             to_ref,
@@ -116,19 +117,9 @@ pub async fn run_concurrent_analysis(
             &llm_api_entries,
         )
         .await;
+        llm_stats = stats;
+        composition_changes = comp;
     }
-
-    // ── BU Phase 3: Composition pattern analysis from test/example diffs ──
-    //
-    // Analyzes test and example file diffs to detect JSX nesting changes
-    // (e.g., MastheadToggle moving inside MastheadMain). These patterns
-    // are usage changes visible in tests/examples but not in the component API.
-    let composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)> =
-        if !no_llm {
-            analyze_composition_patterns(repo, from_ref, to_ref, phase1.llm_command.as_deref())
-        } else {
-            vec![]
-        };
 
     // Merge results
     let behavioral_changes = merge_behavioral_breaks(&shared);
@@ -239,6 +230,9 @@ struct LlmFileTask {
     file_path: String,
     diff_content: String,
     functions: Vec<semver_analyzer_core::ChangedFunction>,
+    /// Git diff of the associated test file (if any test assertions changed).
+    /// Included so the LLM can detect composition pattern changes from tests.
+    test_diff: Option<String>,
 }
 
 /// Output from BU Phase 1 (test-based analysis), including files queued for LLM.
@@ -624,10 +618,29 @@ fn run_bu_phase1(
             let owned_funcs: Vec<semver_analyzer_core::ChangedFunction> =
                 funcs.iter().map(|f| (*f).clone()).collect();
 
+            // Fetch associated test file diff for composition pattern detection
+            let test_diff = {
+                let source_path = std::path::Path::new(&file_path);
+                let test_files = test_analyzer
+                    .find_tests(repo, source_path)
+                    .unwrap_or_default();
+                test_files.iter().find_map(|tf| {
+                    let td = test_analyzer
+                        .diff_test_assertions(repo, tf, from_ref, to_ref)
+                        .ok()?;
+                    if td.full_diff.is_empty() {
+                        None
+                    } else {
+                        Some(td.full_diff)
+                    }
+                })
+            };
+
             files_for_llm.push(LlmFileTask {
                 file_path,
                 diff_content,
                 functions: owned_funcs,
+                test_diff,
             });
         }
 
@@ -731,11 +744,30 @@ fn run_bu_phase1(
                         continue;
                     }
 
+                    // Fetch test diff for these extra files too
+                    let test_diff_content = {
+                        let source_path = std::path::Path::new(&file_path);
+                        let test_files = test_analyzer
+                            .find_tests(repo, source_path)
+                            .unwrap_or_default();
+                        test_files.iter().find_map(|tf| {
+                            let td = test_analyzer
+                                .diff_test_assertions(repo, tf, from_ref, to_ref)
+                                .ok()?;
+                            if td.full_diff.is_empty() {
+                                None
+                            } else {
+                                Some(td.full_diff)
+                            }
+                        })
+                    };
+
                     extra_count += 1;
                     files_for_llm.push(LlmFileTask {
                         file_path,
                         diff_content,
                         functions: vec![], // No function body changes detected
+                        test_diff: test_diff_content,
                     });
                 }
 
@@ -754,164 +786,6 @@ fn run_bu_phase1(
         files_for_llm,
         llm_command,
     })
-}
-
-// ── Composition pattern analysis ─────────────────────────────────────
-
-/// Analyze test and example file diffs for composition pattern changes.
-///
-/// Finds test files (`__tests__/*.test.tsx`) and example files (`examples/*.tsx`)
-/// that changed between from_ref and to_ref, gets their diffs, and runs
-/// the LLM to detect JSX nesting structure changes.
-fn analyze_composition_patterns(
-    repo: &Path,
-    from_ref: &str,
-    to_ref: &str,
-    llm_command: Option<&str>,
-) -> Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)> {
-    let llm_cmd = match llm_command {
-        Some(cmd) => cmd,
-        None => return vec![],
-    };
-
-    // Find changed test and example files
-    let output = match std::process::Command::new("git")
-        .args([
-            "diff",
-            "--name-only",
-            &format!("{}..{}", from_ref, to_ref),
-            "--",
-            "*.tsx",
-            "*.ts",
-        ])
-        .current_dir(repo)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("[warn] Failed to list changed files for composition analysis: {}", e);
-            return vec![];
-        }
-    };
-
-    let changed_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| {
-            // Only include test and example files from component packages
-            let is_test = line.contains("__tests__/") || line.contains(".test.");
-            let is_example = line.contains("/examples/");
-            let is_component = line.contains("/components/") || line.contains("/demos/");
-            (is_test || is_example) && is_component
-        })
-        // Skip token files, node_modules, etc.
-        .filter(|line| {
-            !line.contains("node_modules")
-                && !line.contains("react-tokens")
-                && !line.contains("/dist/")
-        })
-        .map(|s| s.to_string())
-        .collect();
-
-    if changed_files.is_empty() {
-        return vec![];
-    }
-
-    eprintln!(
-        "[BU] Phase 3: Analyzing {} test/example files for composition patterns",
-        changed_files.len()
-    );
-
-    // Group by component directory to avoid sending too many LLM calls.
-    // Analyze at most 10 files (the most relevant ones).
-    let mut results = Vec::new();
-    let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(llm_cmd);
-    let mut analyzed = 0;
-    let max_files = 10;
-
-    for file_path in &changed_files {
-        if analyzed >= max_files {
-            break;
-        }
-
-        // Get the diff for this file
-        let diff_output = match std::process::Command::new("git")
-            .args([
-                "diff",
-                &format!("{}..{}", from_ref, to_ref),
-                "--",
-                file_path,
-            ])
-            .current_dir(repo)
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-
-        let diff_content = String::from_utf8_lossy(&diff_output.stdout).to_string();
-        if diff_content.is_empty() || diff_content.len() < 50 {
-            continue;
-        }
-
-        match analyzer.analyze_composition_patterns(file_path, &diff_content) {
-            Ok(changes) if !changes.is_empty() => {
-                eprintln!(
-                    "  {} composition changes in {}",
-                    changes.len(),
-                    file_path
-                );
-                let mapped: Vec<semver_analyzer_core::CompositionPatternChange> = changes
-                    .into_iter()
-                    .map(|c| semver_analyzer_core::CompositionPatternChange {
-                        component: c.component,
-                        old_parent: c.old_parent,
-                        new_parent: c.new_parent,
-                        description: c.description,
-                    })
-                    .collect();
-                // Derive the source component path from the test/example path
-                let source_path = derive_source_from_test_path(file_path);
-                results.push((source_path, mapped));
-                analyzed += 1;
-            }
-            Ok(_) => {} // No changes found
-            Err(e) => {
-                eprintln!("  [warn] Composition analysis failed for {}: {}", file_path, e);
-            }
-        }
-    }
-
-    if !results.is_empty() {
-        let total: usize = results.iter().map(|(_, v)| v.len()).sum();
-        eprintln!(
-            "[BU] Phase 3: Found {} composition pattern changes across {} files",
-            total,
-            results.len()
-        );
-    }
-
-    results
-}
-
-/// Derive the source component path from a test or example file path.
-///
-/// e.g., `packages/react-core/src/components/Masthead/__tests__/Masthead.test.tsx`
-///     → `packages/react-core/src/components/Masthead/`
-///
-/// e.g., `packages/react-core/src/components/Masthead/examples/MastheadBasic.tsx`
-///     → `packages/react-core/src/components/Masthead/`
-fn derive_source_from_test_path(test_path: &str) -> String {
-    if let Some(pos) = test_path.find("__tests__/") {
-        test_path[..pos].to_string()
-    } else if let Some(pos) = test_path.find("/examples/") {
-        test_path[..pos + 1].to_string()
-    } else {
-        // Fallback: use the directory
-        test_path
-            .rsplit_once('/')
-            .map(|(dir, _)| format!("{}/", dir))
-            .unwrap_or_else(|| test_path.to_string())
-    }
 }
 
 // ── Rename inference ──────────────────────────────────────────────────
@@ -1269,10 +1143,10 @@ async fn run_bu_phase2_llm(
     files: &[LlmFileTask],
     shared: &Arc<SharedFindings>,
     llm_api_entries: &Arc<std::sync::Mutex<Vec<LlmApiChangeEntry>>>,
-) -> LlmPhaseStats {
+) -> (LlmPhaseStats, Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>) {
     let cmd = match llm_command {
         Some(c) => c.clone(),
-        None => return LlmPhaseStats::default(),
+        None => return (LlmPhaseStats::default(), vec![]),
     };
 
     let total = files.len();
@@ -1282,6 +1156,8 @@ async fn run_bu_phase2_llm(
     let llm_breaks = Arc::new(AtomicUsize::new(0));
     let llm_api_count = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
+    let composition_entries: Arc<std::sync::Mutex<Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 
     eprintln!("[BU] Starting LLM analysis ({} concurrent)...", concurrency);
 
@@ -1294,11 +1170,13 @@ async fn run_bu_phase2_llm(
         let calls = llm_calls.clone();
         let breaks = llm_breaks.clone();
         let api_count = llm_api_count.clone();
+        let comp_entries = composition_entries.clone();
         let done = completed.clone();
         let cmd = cmd.clone();
         let file_path = task.file_path.clone();
         let diff_content = task.diff_content.clone();
         let functions = task.functions.clone();
+        let test_diff = task.test_diff.clone();
         let total = total;
 
         let handle = tokio::spawn(async move {
@@ -1311,7 +1189,7 @@ async fn run_bu_phase2_llm(
             // Run the LLM call in a blocking task since it spawns a child process
             let result = tokio::task::spawn_blocking(move || {
                 let analyzer = LlmBehaviorAnalyzer::new(&cmd);
-                analyzer.analyze_file_diff(&file_path, &diff_content, &functions)
+                analyzer.analyze_file_diff(&file_path, &diff_content, &functions, test_diff.as_deref())
                     .map(|result| (file_path, result))
             })
             .await;
@@ -1319,9 +1197,27 @@ async fn run_bu_phase2_llm(
             calls.fetch_add(1, Ordering::Relaxed);
 
             match result {
-                Ok(Ok((file_path, (beh_changes, api_changes)))) => {
+                Ok(Ok((file_path, (beh_changes, api_changes, comp_changes)))) => {
                     let beh_count = beh_changes.len();
                     let api_cnt = api_changes.len();
+                    let comp_cnt = comp_changes.len();
+
+                    // Store composition pattern changes
+                    if !comp_changes.is_empty() {
+                        let mapped: Vec<semver_analyzer_core::CompositionPatternChange> =
+                            comp_changes
+                                .into_iter()
+                                .map(|c| semver_analyzer_core::CompositionPatternChange {
+                                    component: c.component,
+                                    old_parent: c.old_parent,
+                                    new_parent: c.new_parent,
+                                    description: c.description,
+                                })
+                                .collect();
+                        if let Ok(mut entries) = comp_entries.lock() {
+                            entries.push((file_path.clone(), mapped));
+                        }
+                    }
 
                     for change in beh_changes {
                         breaks.fetch_add(1, Ordering::Relaxed);
@@ -1372,11 +1268,12 @@ async fn run_bu_phase2_llm(
                         }
                     }
 
-                    match (beh_count, api_cnt) {
-                        (0, 0) => eprintln!("{} DONE  (no breaks)", label),
-                        (b, 0) => eprintln!("{} DONE  ({} behavioral)", label, b),
-                        (0, a) => eprintln!("{} DONE  ({} API)", label, a),
-                        (b, a) => eprintln!("{} DONE  ({} behavioral, {} API)", label, b, a),
+                    match (beh_count, api_cnt, comp_cnt) {
+                        (0, 0, 0) => eprintln!("{} DONE  (no breaks)", label),
+                        (b, 0, 0) => eprintln!("{} DONE  ({} behavioral)", label, b),
+                        (0, a, 0) => eprintln!("{} DONE  ({} API)", label, a),
+                        (b, a, 0) => eprintln!("{} DONE  ({} behavioral, {} API)", label, b, a),
+                        (b, a, c) => eprintln!("{} DONE  ({} behavioral, {} API, {} composition)", label, b, a, c),
                     }
                 }
                 Ok(Err(e)) => {
@@ -1396,11 +1293,19 @@ async fn run_bu_phase2_llm(
         let _ = handle.await;
     }
 
-    LlmPhaseStats {
-        llm_calls: llm_calls.load(Ordering::Relaxed),
-        llm_behavioral_breaks: llm_breaks.load(Ordering::Relaxed),
-        llm_api_changes: llm_api_count.load(Ordering::Relaxed),
-    }
+    let comp_results = match Arc::try_unwrap(composition_entries) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+
+    (
+        LlmPhaseStats {
+            llm_calls: llm_calls.load(Ordering::Relaxed),
+            llm_behavioral_breaks: llm_breaks.load(Ordering::Relaxed),
+            llm_api_changes: llm_api_count.load(Ordering::Relaxed),
+        },
+        comp_results,
+    )
 }
 
 /// Walk UP the call graph from a private function with a behavioral break.

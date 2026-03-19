@@ -74,11 +74,22 @@ impl LlmBehaviorAnalyzer {
         file_path: &str,
         diff_content: &str,
         changed_functions: &[ChangedFunction],
-    ) -> Result<(Vec<FileBehavioralChange>, Vec<FileApiChange>)> {
-        let prompt =
-            prompts::build_file_behavioral_prompt(file_path, diff_content, changed_functions);
+        test_diff: Option<&str>,
+    ) -> Result<(
+        Vec<FileBehavioralChange>,
+        Vec<FileApiChange>,
+        Vec<invoke::LlmCompositionChange>,
+    )> {
+        let prompt = prompts::build_file_behavioral_prompt(
+            file_path,
+            diff_content,
+            changed_functions,
+            test_diff,
+        );
         let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
-        invoke::parse_file_behavioral_response(&response)
+        let (beh, api) = invoke::parse_file_behavioral_response(&response)?;
+        let comp = invoke::parse_composition_from_file_response(&response).unwrap_or_default();
+        Ok((beh, api, comp))
     }
 
     /// Analyze a test/example file diff for composition pattern changes.

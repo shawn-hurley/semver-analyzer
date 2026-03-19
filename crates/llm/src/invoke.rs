@@ -341,7 +341,7 @@ pub struct LlmCompositionChange {
     pub description: String,
 }
 
-/// Parse the LLM response for composition pattern analysis.
+/// Parse the LLM response for composition pattern analysis (standalone call).
 pub fn parse_composition_pattern_response(response: &str) -> Result<Vec<LlmCompositionChange>> {
     let json_str =
         extract_json(response).with_context(|| "No JSON found in composition pattern response")?;
@@ -353,6 +353,27 @@ pub fn parse_composition_pattern_response(response: &str) -> Result<Vec<LlmCompo
             )
         })?;
     Ok(parsed.composition_changes)
+}
+
+/// Extract composition_pattern_changes from a file behavioral response.
+///
+/// This is a best-effort extraction -- the field may not be present if the
+/// LLM didn't include it (backward compat with older models).
+pub fn parse_composition_from_file_response(response: &str) -> Result<Vec<LlmCompositionChange>> {
+    let json_str = match extract_json(response) {
+        Some(s) => s,
+        None => return Ok(vec![]),
+    };
+    // Try parsing the full response structure with composition field
+    #[derive(Deserialize)]
+    struct WithComposition {
+        #[serde(default)]
+        composition_pattern_changes: Vec<LlmCompositionChange>,
+    }
+    let parsed: WithComposition = serde_json::from_str(&json_str).unwrap_or(WithComposition {
+        composition_pattern_changes: vec![],
+    });
+    Ok(parsed.composition_pattern_changes)
 }
 
 // ── Rename inference response parsing ─────────────────────────────────

@@ -261,6 +261,7 @@ pub fn build_file_behavioral_prompt(
     file_path: &str,
     diff_content: &str,
     changed_functions: &[ChangedFunction],
+    test_diff: Option<&str>,
 ) -> String {
     let mut func_list = String::new();
     for f in changed_functions {
@@ -302,6 +303,19 @@ pub fn build_file_behavioral_prompt(
         func_list
     };
 
+    let test_diff_section = if let Some(td) = test_diff {
+        let truncated_td = if td.len() > 8_000 { &td[..8_000] } else { td };
+        format!(
+            "\n## Associated test diff:\n\
+             The following diff shows how this component's tests/examples changed,\n\
+             revealing expected usage pattern changes:\n\
+             ```diff\n{}\n```\n",
+            truncated_td
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"Analyze this file diff for breaking changes.
 
@@ -314,9 +328,9 @@ pub fn build_file_behavioral_prompt(
 ```diff
 {diff}
 ```
-
+{test_diff_section}
 ## Task:
-Identify TWO categories of breaking changes:
+Identify breaking changes in these categories:
 
 ### A. Behavioral breaking changes
 Changes that alter the OBSERVABLE BEHAVIOR of exported functions/components.
@@ -388,6 +402,14 @@ Return ONLY a JSON object:
       "removal_disposition": null,
       "renders_element": null
     }}
+  ],
+  "composition_pattern_changes": [
+    {{
+      "component": "<component whose parent changed>",
+      "old_parent": "<previous parent component or null>",
+      "new_parent": "<new parent component or null>",
+      "description": "<what nesting changed>"
+    }}
   ]
 }}
 ```
@@ -416,6 +438,11 @@ Rules:
   element the component renders (e.g., "ol", "ul", "div", "footer") when
   the component is being replaced by a generic component that needs an
   explicit element type. Set null if not applicable.
+- For composition: include when the test/example diff shows JSX components
+  whose parent-child nesting changed (e.g., component moved from being a
+  child of A to being a child of B). Also include when children passed
+  inline become a prop value (e.g., `<Button><Icon /></Button>` →
+  `<Button icon={{<Icon />}} />`). Use empty array if no nesting changes.
 - Keep descriptions specific and actionable
 - Only include changes that would break existing consumers
 - Use empty arrays for categories with no changes
@@ -423,6 +450,7 @@ Rules:
         file_path = file_path,
         func_section = func_section,
         diff = diff_truncated,
+        test_diff_section = test_diff_section,
     )
 }
 
