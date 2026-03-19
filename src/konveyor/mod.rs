@@ -253,6 +253,18 @@ impl RenamePatterns {
         None
     }
 
+    /// Add a single rename pattern (compiled regex + replacement string).
+    /// Used to merge LLM-inferred patterns at runtime.
+    pub fn add_pattern(&mut self, match_regex: &str, replace: &str) {
+        match regex::Regex::new(match_regex) {
+            Ok(re) => self.patterns.push((re, replace.to_string())),
+            Err(e) => eprintln!(
+                "[warn] Skipping invalid inferred pattern '{}': {}",
+                match_regex, e
+            ),
+        }
+    }
+
     /// Empty patterns (no-op).
     pub fn empty() -> Self {
         Self {
@@ -1574,6 +1586,80 @@ pub fn generate_rules(
                     rules.push(rule);
                 }
             }
+        }
+
+        // Generate rules from composition pattern changes (from test/example diffs)
+        for comp_change in &file_changes.composition_pattern_changes {
+            let component = &comp_change.component;
+            let slug = component.to_lowercase();
+            let base_id = format!("semver-composition-{}-nesting-changed", slug);
+            let rule_id = unique_id(base_id, &mut id_counts);
+
+            let mut msg = format!(
+                "MIGRATION: <{}> nesting structure has changed.\n\n",
+                component
+            );
+            if let (Some(old_parent), Some(new_parent)) =
+                (&comp_change.old_parent, &comp_change.new_parent)
+            {
+                msg.push_str(&format!(
+                    "In the previous version, <{}> was a direct child of <{}>.\n\
+                     In the new version, <{}> should be a child of <{}>.\n\n\
+                     Change:\n  <{}><{}> → <{}><{}>...</{}>...</{}>\n\n",
+                    component,
+                    old_parent,
+                    component,
+                    new_parent,
+                    old_parent,
+                    component,
+                    old_parent,
+                    new_parent,
+                    new_parent,
+                    old_parent,
+                ));
+            }
+            msg.push_str(&comp_change.description);
+
+            let from_str = from_pkg.as_deref().map(|s| s.to_string());
+            let condition = if let Some(ref _new_parent) = comp_change.new_parent {
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", component),
+                        location: "JSX_COMPONENT".to_string(),
+                        component: None,
+                        parent: comp_change.old_parent.as_ref().map(|p| format!("^{}$", p)),
+                        value: None,
+                        from: from_str.clone(),
+                    },
+                }
+            } else {
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", component),
+                        location: "JSX_COMPONENT".to_string(),
+                        component: None,
+                        parent: None,
+                        value: None,
+                        from: from_str,
+                    },
+                }
+            };
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=composition".to_string(),
+                    "has-codemod=false".to_string(),
+                ],
+                effort: 3,
+                category: "mandatory".to_string(),
+                description: comp_change.description.clone(),
+                message: msg,
+                links: Vec::new(),
+                when: condition,
+                fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+            });
         }
     }
 
@@ -5333,6 +5419,7 @@ mod tests {
             added_files: Vec::new(),
             packages: vec![],
             member_renames: std::collections::HashMap::new(),
+            inferred_rename_patterns: None,
             metadata: AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "0.1.0".to_string(),
@@ -5434,6 +5521,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5478,6 +5566,7 @@ mod tests {
                 referenced_components: vec![],
                 is_internal_only: None,
             }],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5597,6 +5686,7 @@ mod tests {
                 },
             ],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5672,6 +5762,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5711,6 +5802,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5753,6 +5845,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5793,6 +5886,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5837,6 +5931,7 @@ mod tests {
                 referenced_components: vec![],
                 is_internal_only: None,
             }],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5931,6 +6026,7 @@ mod tests {
                 referenced_components: vec![],
                 is_internal_only: None,
             }],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5982,6 +6078,7 @@ mod tests {
                 },
             ],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let manifest = vec![ManifestChange {
@@ -6038,6 +6135,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -6078,6 +6176,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -6123,6 +6222,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -6159,6 +6259,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -6210,6 +6311,7 @@ mod tests {
             renamed_from: None,
             breaking_api_changes: api,
             breaking_behavioral_changes: behavioral,
+            composition_pattern_changes: vec![],
         }
     }
 
@@ -7907,6 +8009,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -8639,6 +8742,7 @@ mod tests {
                 })
                 .collect(),
             breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
         }];
 
         let mut report = make_report(changes, vec![]);

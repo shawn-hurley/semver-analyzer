@@ -607,3 +607,181 @@ mod tests {
         assert!(prompt.contains("propagates"));
     }
 }
+
+// ── Composition pattern analysis prompt ───────────────────────────────
+
+/// Build the prompt for analyzing test/example diffs to detect composition
+/// pattern changes (JSX nesting restructuring).
+///
+/// Given the diff of a test or example file, asks the LLM to identify
+/// components whose parent-child nesting relationship changed.
+pub fn build_composition_pattern_prompt(file_path: &str, diff_content: &str) -> String {
+    // Truncate large diffs
+    let diff_truncated = if diff_content.len() > 15_000 {
+        &diff_content[..15_000]
+    } else {
+        diff_content
+    };
+
+    format!(
+        r#"Analyze this diff of a component library's test/example file to identify changes in JSX component nesting structure.
+
+## File: {file_path}
+
+```diff
+{diff_content}
+```
+
+Identify components whose **parent component changed** between the old and new code. This includes:
+- A component that was a direct child of component A but is now a child of component B
+- A component that gained a new wrapper component
+- A component that was removed from a wrapper and is now a direct child of a higher-level component
+- JSX props that changed from children pattern to named prop pattern (e.g., `<Button><Icon /></Button>` → `<Button icon={{<Icon />}} />`)
+
+Return ONLY a JSON object inside a ```json fenced block:
+```json
+{{
+  "composition_changes": [
+    {{
+      "component": "the component whose parent changed",
+      "old_parent": "the previous parent component (null if newly added)",
+      "new_parent": "the new parent component (null if removed from nesting)",
+      "description": "brief description of the nesting change"
+    }}
+  ]
+}}
+```
+
+Rules:
+- Only include changes where the JSX nesting structure actually changed
+- Ignore CSS class changes, prop value changes, or text content changes
+- Focus on structural parent-child relationships between React components
+- If no composition changes are found, return {{"composition_changes": []}}
+- Return the component names without angle brackets (e.g., "MastheadToggle" not "<MastheadToggle>")"#,
+        file_path = file_path,
+        diff_content = diff_truncated,
+    )
+}
+
+// ── Rename inference prompts ──────────────────────────────────────────
+
+/// Build the prompt for constant rename pattern inference (Call 1).
+///
+/// Given samples of removed and added constant names from a package,
+/// asks the LLM to identify systematic regex-based rename patterns.
+pub fn build_constant_rename_prompt(
+    removed_sample: &[&str],
+    added_sample: &[&str],
+    package_name: &str,
+    from_ref: &str,
+    to_ref: &str,
+) -> String {
+    let removed_list = removed_sample
+        .iter()
+        .map(|s| format!("  {}", s))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let added_list = added_sample
+        .iter()
+        .map(|s| format!("  {}", s))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"These exported constants were removed from {package_name} between {from_ref} and {to_ref}:
+{removed_list}
+
+These exported constants were added:
+{added_list}
+
+Identify ALL systematic naming patterns that map removed constant names to added constant names.
+
+Return ONLY a JSON array of regex substitution rules inside a ```json fenced block:
+```json
+[
+  {{"match": "regex pattern matching removed names", "replace": "replacement using capture groups"}}
+]
+```
+
+Rules:
+- Use capture groups to generalize patterns (e.g., "(.*)Top$" not just "c_alert_PaddingTop")
+- Each pattern should match multiple constants, not just one
+- Order from most specific to least specific
+- Only include patterns where applying the substitution to a removed name produces a name in the added list
+- Do not include identity patterns where match and replace produce the same string"#,
+        package_name = package_name,
+        from_ref = from_ref,
+        to_ref = to_ref,
+        removed_list = removed_list,
+        added_list = added_list,
+    )
+}
+
+/// Build the prompt for interface/component rename mapping inference (Call 2).
+///
+/// Given removed and added interfaces with their member lists,
+/// asks the LLM to identify which removed interfaces map to which added ones.
+pub fn build_interface_rename_prompt(
+    removed: &[(&str, &[String])], // (name, member_names)
+    added: &[(&str, &[String])],   // (name, member_names)
+    package_name: &str,
+    from_ref: &str,
+    to_ref: &str,
+) -> String {
+    let removed_list = removed
+        .iter()
+        .map(|(name, members)| {
+            if members.is_empty() {
+                format!("  {} (no members)", name)
+            } else {
+                format!("  {} (members: {})", name, members.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let added_list = added
+        .iter()
+        .map(|(name, members)| {
+            if members.is_empty() {
+                format!("  {} (no members)", name)
+            } else {
+                format!("  {} (members: {})", name, members.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"These interfaces/components were removed from {package_name} between {from_ref} and {to_ref}:
+{removed_list}
+
+These interfaces/components were added:
+{added_list}
+
+Identify which removed interfaces map to which added interfaces (renames/replacements).
+Consider:
+- Name similarity (e.g., TextProps → ContentProps)
+- Member overlap (same prop names appearing in both)
+- Typo corrections (e.g., FormFiledGroup → FormFieldGroup)
+- Functional equivalence (component that does the same thing under a new name)
+
+Return ONLY a JSON array of mappings inside a ```json fenced block:
+```json
+[
+  {{"old_name": "removed name", "new_name": "added name", "confidence": "high|medium|low", "reason": "brief explanation"}}
+]
+```
+
+Rules:
+- Only include mappings where the added interface is a clear replacement for the removed one
+- Set confidence to "high" for clear renames/typo fixes, "medium" for functional replacements with different names, "low" for uncertain matches
+- If a removed interface has no replacement in the added list, omit it
+- Return an empty array if no mappings can be determined"#,
+        package_name = package_name,
+        from_ref = from_ref,
+        to_ref = to_ref,
+        removed_list = removed_list,
+        added_list = added_list,
+    )
+}

@@ -322,6 +322,94 @@ fn truncate(s: &str, max_len: usize) -> &str {
     }
 }
 
+// ── Composition pattern response parsing ──────────────────────────────
+
+/// Response from composition pattern analysis of test/example diffs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompositionPatternResponse {
+    #[serde(default)]
+    pub composition_changes: Vec<LlmCompositionChange>,
+}
+
+/// A single composition pattern change from the LLM.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmCompositionChange {
+    pub component: String,
+    pub old_parent: Option<String>,
+    pub new_parent: Option<String>,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Parse the LLM response for composition pattern analysis.
+pub fn parse_composition_pattern_response(response: &str) -> Result<Vec<LlmCompositionChange>> {
+    let json_str =
+        extract_json(response).with_context(|| "No JSON found in composition pattern response")?;
+    let parsed: CompositionPatternResponse =
+        serde_json::from_str(&json_str).with_context(|| {
+            format!(
+                "Failed to parse composition pattern response: {}",
+                truncate(&json_str, 200)
+            )
+        })?;
+    Ok(parsed.composition_changes)
+}
+
+// ── Rename inference response parsing ─────────────────────────────────
+
+/// A single constant rename pattern from the LLM response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmConstantRenamePattern {
+    #[serde(alias = "match")]
+    pub match_regex: String,
+    pub replace: String,
+}
+
+/// A single interface rename mapping from the LLM response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmInterfaceRenameMapping {
+    pub old_name: String,
+    pub new_name: String,
+    #[serde(default = "default_confidence")]
+    pub confidence: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+fn default_confidence() -> String {
+    "medium".to_string()
+}
+
+/// Parse the LLM response for constant rename pattern inference.
+/// Returns a list of regex match/replace patterns.
+pub fn parse_constant_rename_response(response: &str) -> Result<Vec<LlmConstantRenamePattern>> {
+    let json_str = extract_json(response)
+        .with_context(|| "No JSON found in constant rename inference response")?;
+    let patterns: Vec<LlmConstantRenamePattern> =
+        serde_json::from_str(&json_str).with_context(|| {
+            format!(
+                "Failed to parse constant rename patterns: {}",
+                truncate(&json_str, 200)
+            )
+        })?;
+    Ok(patterns)
+}
+
+/// Parse the LLM response for interface rename mapping inference.
+/// Returns a list of old_name → new_name mappings.
+pub fn parse_interface_rename_response(response: &str) -> Result<Vec<LlmInterfaceRenameMapping>> {
+    let json_str = extract_json(response)
+        .with_context(|| "No JSON found in interface rename inference response")?;
+    let mappings: Vec<LlmInterfaceRenameMapping> =
+        serde_json::from_str(&json_str).with_context(|| {
+            format!(
+                "Failed to parse interface rename mappings: {}",
+                truncate(&json_str, 200)
+            )
+        })?;
+    Ok(mappings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

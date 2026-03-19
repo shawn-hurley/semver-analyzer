@@ -1,12 +1,18 @@
-# Rename patterns for PatternFly v5 → v6 token migration.
+# Supplemental patterns for PatternFly v5 → v6 migration.
 #
-# These regex patterns map removed CSS token symbol names to their
-# v6 replacements. The patterns are applied when generating fix strategies
-# via `--rename-patterns`.
+# Only entries that CANNOT be auto-detected from the AST or inferred
+# by the LLM rename inference phase belong here.
 #
-# Two categories:
-#   1. CSS logical property renames (generic — any library can use these)
-#   2. PatternFly-specific token restructuring
+# The analyzer auto-generates rules for: prop removals, type changes,
+# component removals, composition restructuring, child component
+# absorption, and behavioral changes.
+#
+# The LLM rename inference phase auto-discovers: CSS logical property
+# renames (PaddingTop → PaddingBlockStart), interface renames
+# (TextProps → ContentProps), and typo corrections.
+#
+# What remains here: domain-specific knowledge that cannot be inferred
+# from the AST diff or LLM pattern matching.
 #
 # Usage:
 #   semver-analyzer konveyor \
@@ -14,114 +20,11 @@
 #     --output-dir ./rules \
 #     --rename-patterns hack/integration/patternfly-rename-patterns.yaml
 
-rename_patterns:
-  # ── CSS Logical Property Renames ─────────────────────────────────
-  # These are standard CSS physical → logical property conversions.
-  # Any library migrating to CSS logical properties can use these.
-
-  # Padding
-  - match: "(.*)PaddingTop$"
-    replace: "${1}PaddingBlockStart"
-  - match: "(.*)PaddingBottom$"
-    replace: "${1}PaddingBlockEnd"
-  - match: "(.*)PaddingLeft$"
-    replace: "${1}PaddingInlineStart"
-  - match: "(.*)PaddingRight$"
-    replace: "${1}PaddingInlineEnd"
-
-  # Margin
-  - match: "(.*)MarginTop$"
-    replace: "${1}MarginBlockStart"
-  - match: "(.*)MarginBottom$"
-    replace: "${1}MarginBlockEnd"
-  - match: "(.*)MarginLeft$"
-    replace: "${1}MarginInlineStart"
-  - match: "(.*)MarginRight$"
-    replace: "${1}MarginInlineEnd"
-
-  # Inset / Offset / Position
-  - match: "(.*)Top$"
-    replace: "${1}BlockStart"
-  - match: "(.*)Bottom$"
-    replace: "${1}BlockEnd"
-  - match: "(.*)Left$"
-    replace: "${1}InlineStart"
-  - match: "(.*)Right$"
-    replace: "${1}InlineEnd"
-
-  # Dimension (Width/Height → InlineSize/BlockSize)
-  - match: "(.*)MaxWidth$"
-    replace: "${1}MaxInlineSize"
-  - match: "(.*)MaxHeight$"
-    replace: "${1}MaxBlockSize"
-  - match: "(.*)MinWidth$"
-    replace: "${1}MinInlineSize"
-  - match: "(.*)MinHeight$"
-    replace: "${1}MinBlockSize"
-
-  # TranslateX/Y
-  - match: "(.*)TranslateX$"
-    replace: "${1}TranslateX"
-  - match: "(.*)TranslateY$"
-    replace: "${1}TranslateY"
-
-  # Border directional (BorderTopWidth, BorderBottomColor, etc.)
-  - match: "(.*)BorderTop(.+)$"
-    replace: "${1}BorderBlockStart${2}"
-  - match: "(.*)BorderBottom(.+)$"
-    replace: "${1}BorderBlockEnd${2}"
-  - match: "(.*)BorderLeft(.+)$"
-    replace: "${1}BorderInlineStart${2}"
-  - match: "(.*)BorderRight(.+)$"
-    replace: "${1}BorderInlineEnd${2}"
-
-  # ── Text → Content renames ──────────────────────────────────────
-  - match: "^TextProps$"
-    replace: "ContentProps"
-  - match: "^TextContentProps$"
-    replace: "ContentProps"
-  - match: "^TextListProps$"
-    replace: "ContentProps"
-  - match: "^TextListItemProps$"
-    replace: "ContentProps"
-
-  # ── Typo fix ────────────────────────────────────────────────────
-  - match: "^FormFiledGroupHeaderTitleTextObject$"
-    replace: "FormFieldGroupHeaderTitleTextObject"
-
-  # NOTE: 32 Chart*Props interfaces show as "removed" but actually just moved
-  # to @patternfly/react-charts/victory. This is an extraction bug — the v6
-  # reachability filter doesn't follow the /victory/ subpath re-exports.
-  # Fix is tracked as an extraction issue, not a rename pattern.
-
-# ── Composition rules (P2-A) ─────────────────────────────────────────
-# Detect JSX component nesting that needs migration.
-# These use the `parent` constraint on `frontend.referenced`.
-composition_rules:
-  - child_pattern: "Icon$"
-    parent: "^Button$"
-    category: mandatory
-    description: "Button: icon children should use icon prop instead — replace <Button><SomeIcon /></Button> with <Button icon={<SomeIcon />} />"
-    effort: 2
-    package: "@patternfly/react-core"
-
-  - child_pattern: "^BarsIcon$"
-    parent: "^(PageToggleButton|Button)$"
-    category: mandatory
-    description: "PageToggleButton: BarsIcon child should use isHamburgerButton prop — replace <PageToggleButton><BarsIcon /></PageToggleButton> with <PageToggleButton isHamburgerButton />"
-    effort: 1
-    package: "@patternfly/react-core"
-
-  - child_pattern: "^MastheadToggle$"
-    parent: "^Masthead$"
-    category: mandatory
-    description: "Masthead: MastheadToggle must be moved inside MastheadMain (not a direct child of Masthead)"
-    effort: 3
-    package: "@patternfly/react-core"
+rename_patterns: []
 
 # ── Prop renames (P3-A) ──────────────────────────────────────────────
-# Props removed from component interfaces that aren't in .d.ts files
-# (e.g., runtime-only props passed via spread/forwarding).
+# Props removed from component interfaces where the replacement is a
+# React builtin (not a declared TypeScript prop).
 prop_renames:
   - old_prop: innerRef
     new_prop: ref
@@ -142,7 +45,7 @@ value_reviews:
 
 # ── Component warnings ────────────────────────────────────────────────
 # Components whose internal DOM/CSS rendering changed without an API
-# surface change.  These emit JSX_COMPONENT rules so consumers are
+# surface change. These emit JSX_COMPONENT rules so consumers are
 # alerted at the exact usage site.
 component_warnings:
   - pattern: "^TextArea$"
@@ -159,7 +62,6 @@ component_warnings:
 
 # ── Missing imports (P5) ─────────────────────────────────────────────
 # Co-requisite imports: flag when pattern A is present but pattern B is absent.
-# Uses and/not combinators with builtin.filecontent.
 missing_imports:
   - has_pattern: "@patternfly/react-core/dist/styles/base\\.css"
     missing_pattern: "@patternfly/patternfly/utilities/_index\\.css"

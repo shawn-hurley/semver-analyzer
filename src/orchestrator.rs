@@ -78,6 +78,30 @@ pub async fn run_concurrent_analysis(
         .map_err(|e| anyhow::anyhow!("BU Phase 1 task panicked: {}", e))?
         .context("BU Phase 1 pipeline failed")?;
 
+    // ── Rename Inference Phase (between TD and BU Phase 2) ─────────
+    //
+    // Uses LLM to discover systematic rename patterns for constants and
+    // interfaces. Requires TD results (structural changes) and API surfaces.
+    let empty_surface = semver_analyzer_core::ApiSurface { symbols: vec![] };
+    let inferred_rename_patterns = if !no_llm {
+        let old_surf = shared.try_get_old_surface().unwrap_or(&empty_surface);
+        let new_surf = shared.try_get_new_surface().unwrap_or(&empty_surface);
+        let llm_cmd = phase1
+            .llm_command
+            .as_deref()
+            .unwrap_or("goose run --no-session -q -t");
+        infer_rename_patterns(
+            &td.structural_changes,
+            old_surf,
+            new_surf,
+            llm_cmd,
+            from_ref,
+            to_ref,
+        )
+    } else {
+        None
+    };
+
     // BU Phase 2: Concurrent LLM file analysis (async, 5 at a time)
     let mut llm_stats = LlmPhaseStats::default();
     let llm_api_entries = Arc::new(std::sync::Mutex::new(Vec::<LlmApiChangeEntry>::new()));
@@ -93,6 +117,18 @@ pub async fn run_concurrent_analysis(
         )
         .await;
     }
+
+    // ── BU Phase 3: Composition pattern analysis from test/example diffs ──
+    //
+    // Analyzes test and example file diffs to detect JSX nesting changes
+    // (e.g., MastheadToggle moving inside MastheadMain). These patterns
+    // are usage changes visible in tests/examples but not in the component API.
+    let composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)> =
+        if !no_llm {
+            analyze_composition_patterns(repo, from_ref, to_ref, phase1.llm_command.as_deref())
+        } else {
+            vec![]
+        };
 
     // Merge results
     let behavioral_changes = merge_behavioral_breaks(&shared);
@@ -140,6 +176,8 @@ pub async fn run_concurrent_analysis(
         bu_stats,
         old_surface,
         new_surface,
+        inferred_rename_patterns,
+        composition_changes,
     })
 }
 
@@ -158,6 +196,11 @@ pub struct AnalysisResult {
     pub old_surface: semver_analyzer_core::ApiSurface,
     /// Full API surface at the new ref (for build_report aggregation).
     pub new_surface: semver_analyzer_core::ApiSurface,
+    /// LLM-inferred rename patterns (None when --no-llm).
+    pub inferred_rename_patterns: Option<semver_analyzer_core::InferredRenamePatterns>,
+    /// Composition pattern changes from test/example diffs.
+    /// Keyed by source file path (the component these patterns are about).
+    pub composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>,
 }
 
 /// An API change detected by the LLM during file-level analysis.
@@ -710,6 +753,508 @@ fn run_bu_phase1(
         stats,
         files_for_llm,
         llm_command,
+    })
+}
+
+// ── Composition pattern analysis ─────────────────────────────────────
+
+/// Analyze test and example file diffs for composition pattern changes.
+///
+/// Finds test files (`__tests__/*.test.tsx`) and example files (`examples/*.tsx`)
+/// that changed between from_ref and to_ref, gets their diffs, and runs
+/// the LLM to detect JSX nesting structure changes.
+fn analyze_composition_patterns(
+    repo: &Path,
+    from_ref: &str,
+    to_ref: &str,
+    llm_command: Option<&str>,
+) -> Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)> {
+    let llm_cmd = match llm_command {
+        Some(cmd) => cmd,
+        None => return vec![],
+    };
+
+    // Find changed test and example files
+    let output = match std::process::Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            &format!("{}..{}", from_ref, to_ref),
+            "--",
+            "*.tsx",
+            "*.ts",
+        ])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[warn] Failed to list changed files for composition analysis: {}", e);
+            return vec![];
+        }
+    };
+
+    let changed_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            // Only include test and example files from component packages
+            let is_test = line.contains("__tests__/") || line.contains(".test.");
+            let is_example = line.contains("/examples/");
+            let is_component = line.contains("/components/") || line.contains("/demos/");
+            (is_test || is_example) && is_component
+        })
+        // Skip token files, node_modules, etc.
+        .filter(|line| {
+            !line.contains("node_modules")
+                && !line.contains("react-tokens")
+                && !line.contains("/dist/")
+        })
+        .map(|s| s.to_string())
+        .collect();
+
+    if changed_files.is_empty() {
+        return vec![];
+    }
+
+    eprintln!(
+        "[BU] Phase 3: Analyzing {} test/example files for composition patterns",
+        changed_files.len()
+    );
+
+    // Group by component directory to avoid sending too many LLM calls.
+    // Analyze at most 10 files (the most relevant ones).
+    let mut results = Vec::new();
+    let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(llm_cmd);
+    let mut analyzed = 0;
+    let max_files = 10;
+
+    for file_path in &changed_files {
+        if analyzed >= max_files {
+            break;
+        }
+
+        // Get the diff for this file
+        let diff_output = match std::process::Command::new("git")
+            .args([
+                "diff",
+                &format!("{}..{}", from_ref, to_ref),
+                "--",
+                file_path,
+            ])
+            .current_dir(repo)
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+
+        let diff_content = String::from_utf8_lossy(&diff_output.stdout).to_string();
+        if diff_content.is_empty() || diff_content.len() < 50 {
+            continue;
+        }
+
+        match analyzer.analyze_composition_patterns(file_path, &diff_content) {
+            Ok(changes) if !changes.is_empty() => {
+                eprintln!(
+                    "  {} composition changes in {}",
+                    changes.len(),
+                    file_path
+                );
+                let mapped: Vec<semver_analyzer_core::CompositionPatternChange> = changes
+                    .into_iter()
+                    .map(|c| semver_analyzer_core::CompositionPatternChange {
+                        component: c.component,
+                        old_parent: c.old_parent,
+                        new_parent: c.new_parent,
+                        description: c.description,
+                    })
+                    .collect();
+                // Derive the source component path from the test/example path
+                let source_path = derive_source_from_test_path(file_path);
+                results.push((source_path, mapped));
+                analyzed += 1;
+            }
+            Ok(_) => {} // No changes found
+            Err(e) => {
+                eprintln!("  [warn] Composition analysis failed for {}: {}", file_path, e);
+            }
+        }
+    }
+
+    if !results.is_empty() {
+        let total: usize = results.iter().map(|(_, v)| v.len()).sum();
+        eprintln!(
+            "[BU] Phase 3: Found {} composition pattern changes across {} files",
+            total,
+            results.len()
+        );
+    }
+
+    results
+}
+
+/// Derive the source component path from a test or example file path.
+///
+/// e.g., `packages/react-core/src/components/Masthead/__tests__/Masthead.test.tsx`
+///     → `packages/react-core/src/components/Masthead/`
+///
+/// e.g., `packages/react-core/src/components/Masthead/examples/MastheadBasic.tsx`
+///     → `packages/react-core/src/components/Masthead/`
+fn derive_source_from_test_path(test_path: &str) -> String {
+    if let Some(pos) = test_path.find("__tests__/") {
+        test_path[..pos].to_string()
+    } else if let Some(pos) = test_path.find("/examples/") {
+        test_path[..pos + 1].to_string()
+    } else {
+        // Fallback: use the directory
+        test_path
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{}/", dir))
+            .unwrap_or_else(|| test_path.to_string())
+    }
+}
+
+// ── Rename inference ──────────────────────────────────────────────────
+
+/// Infer rename patterns for constants and interfaces using LLM.
+///
+/// Called between the TD and BU phases. Makes up to 2 LLM calls:
+/// 1. Constant rename patterns (when >50 removed + >50 added constants)
+/// 2. Interface rename mappings (when >2 unmapped removed interfaces)
+fn infer_rename_patterns(
+    structural_changes: &[semver_analyzer_core::StructuralChange],
+    old_surface: &semver_analyzer_core::ApiSurface,
+    new_surface: &semver_analyzer_core::ApiSurface,
+    llm_command: &str,
+    from_ref: &str,
+    to_ref: &str,
+) -> Option<semver_analyzer_core::InferredRenamePatterns> {
+    use semver_analyzer_core::{
+        InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
+        InferredRenamePatterns, StructuralChangeType, SymbolKind,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    let mut llm_calls = 0;
+    let mut constant_patterns = Vec::new();
+    let mut interface_mappings = Vec::new();
+    let mut constant_hit_rate = 0.0;
+
+    // ── Call 1: Constant rename patterns ──────────────────────────
+
+    // Group removed/added constants by package directory
+    let mut removed_constants: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut added_constants: HashMap<String, Vec<&str>> = HashMap::new();
+
+    for change in structural_changes {
+        // Extract package from qualified name (e.g., "packages/react-tokens/src/...")
+        let pkg = change
+            .qualified_name
+            .split('/')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("/");
+
+        match change.change_type {
+            StructuralChangeType::SymbolRemoved => {
+                // Check if it's a constant/variable (no members = standalone export)
+                if !change.symbol.contains('.') {
+                    removed_constants
+                        .entry(pkg)
+                        .or_default()
+                        .push(&change.symbol);
+                }
+            }
+            StructuralChangeType::SymbolAdded => {
+                if !change.symbol.contains('.') {
+                    added_constants
+                        .entry(pkg)
+                        .or_default()
+                        .push(&change.symbol);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Check each package for constant rename inference trigger
+    for (pkg, removed) in &removed_constants {
+        let added = match added_constants.get(pkg) {
+            Some(a) if a.len() > 50 => a,
+            _ => continue,
+        };
+        if removed.len() < 50 {
+            continue;
+        }
+
+        eprintln!(
+            "  Rename inference: {} has {} removed + {} added constants — inferring patterns",
+            pkg,
+            removed.len(),
+            added.len()
+        );
+
+        // Sample: prioritize directional suffixes for better pattern discovery
+        let directional_suffixes = [
+            "Top", "Bottom", "Left", "Right", "Width", "Height",
+            "MaxWidth", "MaxHeight", "MinWidth", "MinHeight",
+        ];
+        let mut removed_sample: Vec<&str> = removed
+            .iter()
+            .filter(|s| directional_suffixes.iter().any(|d| s.ends_with(d)))
+            .take(20)
+            .copied()
+            .collect();
+        // Fill remaining with random samples
+        for s in removed.iter() {
+            if removed_sample.len() >= 30 {
+                break;
+            }
+            if !removed_sample.contains(s) {
+                removed_sample.push(s);
+            }
+        }
+
+        let mut added_sample: Vec<&str> = added
+            .iter()
+            .filter(|s| {
+                ["BlockStart", "BlockEnd", "InlineStart", "InlineEnd", "InlineSize", "BlockSize"]
+                    .iter()
+                    .any(|d| s.contains(d))
+            })
+            .take(20)
+            .copied()
+            .collect();
+        for s in added.iter() {
+            if added_sample.len() >= 30 {
+                break;
+            }
+            if !added_sample.contains(s) {
+                added_sample.push(s);
+            }
+        }
+
+        // Resolve package name from directory
+        let pkg_name = pkg.replace("packages/", "@patternfly/");
+
+        let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(llm_command);
+        match analyzer.infer_constant_renames(
+            &removed_sample,
+            &added_sample,
+            &pkg_name,
+            from_ref,
+            to_ref,
+        ) {
+            Ok(patterns) => {
+                llm_calls += 1;
+                // Validate: apply each pattern against full lists
+                let added_set: HashSet<&str> = added.iter().copied().collect();
+                let total_removed = removed.len();
+                let mut total_hits = 0;
+
+                for llm_pat in patterns {
+                    let re = match regex::Regex::new(&llm_pat.match_regex) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!(
+                                "    [warn] Invalid regex from LLM: '{}': {}",
+                                llm_pat.match_regex, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let mut hits = 0;
+                    for name in removed.iter() {
+                        if re.is_match(name) {
+                            let replacement = re.replace(name, &llm_pat.replace);
+                            if replacement == *name {
+                                continue; // identity pattern, skip
+                            }
+                            if added_set.contains(replacement.as_ref()) {
+                                hits += 1;
+                            }
+                        }
+                    }
+
+                    if hits > 0 {
+                        eprintln!(
+                            "    Pattern '{}' → '{}' matched {} constants",
+                            llm_pat.match_regex, llm_pat.replace, hits
+                        );
+                        total_hits += hits;
+                        constant_patterns.push(InferredConstantPattern {
+                            match_regex: llm_pat.match_regex,
+                            replace: llm_pat.replace,
+                            hit_count: hits,
+                            total_removed,
+                        });
+                    }
+                }
+
+                constant_hit_rate = if total_removed > 0 {
+                    total_hits as f64 / total_removed as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "    Constant rename inference: {}/{} mapped ({:.0}%)",
+                    total_hits,
+                    total_removed,
+                    constant_hit_rate * 100.0
+                );
+            }
+            Err(e) => {
+                eprintln!("  [warn] Constant rename inference failed: {}", e);
+            }
+        }
+    }
+
+    // ── Call 2: Interface/component rename mappings ───────────────
+
+    // Find removed interfaces with no migration_target
+    let removed_interfaces: Vec<(&str, Vec<String>)> = structural_changes
+        .iter()
+        .filter(|c| {
+            c.change_type == StructuralChangeType::SymbolRemoved
+                && c.migration_target.is_none()
+                && (c.kind == "Interface" || c.kind == "Class")
+                && !c.symbol.contains('.')
+        })
+        .filter_map(|c| {
+            // Look up member names from old surface
+            let sym = old_surface
+                .symbols
+                .iter()
+                .find(|s| s.qualified_name == c.qualified_name)?;
+            let members: Vec<String> = sym.members.iter().map(|m| m.name.clone()).collect();
+            Some((c.symbol.as_str(), members))
+        })
+        .collect();
+
+    // Find added interfaces
+    let added_interfaces: Vec<(&str, Vec<String>)> = structural_changes
+        .iter()
+        .filter(|c| {
+            c.change_type == StructuralChangeType::SymbolAdded
+                && (c.kind == "Interface" || c.kind == "Class")
+                && !c.symbol.contains('.')
+        })
+        .filter_map(|c| {
+            let sym = new_surface
+                .symbols
+                .iter()
+                .find(|s| s.qualified_name == c.qualified_name)?;
+            let members: Vec<String> = sym.members.iter().map(|m| m.name.clone()).collect();
+            Some((c.symbol.as_str(), members))
+        })
+        .collect();
+
+    if removed_interfaces.len() > 2 && !added_interfaces.is_empty() {
+        eprintln!(
+            "  Rename inference: {} removed interfaces + {} added — inferring mappings",
+            removed_interfaces.len(),
+            added_interfaces.len()
+        );
+
+        // Cap at 20 each to keep the prompt manageable
+        let removed_capped: Vec<(&str, &[String])> = removed_interfaces
+            .iter()
+            .take(20)
+            .map(|(n, m)| (*n, m.as_slice()))
+            .collect();
+        let added_capped: Vec<(&str, &[String])> = added_interfaces
+            .iter()
+            .take(20)
+            .map(|(n, m)| (*n, m.as_slice()))
+            .collect();
+
+        let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(llm_command);
+        match analyzer.infer_interface_renames(
+            &removed_capped,
+            &added_capped,
+            "@patternfly/react-core", // TODO: determine from package context
+            from_ref,
+            to_ref,
+        ) {
+            Ok(mappings) => {
+                llm_calls += 1;
+                let removed_names: HashSet<&str> =
+                    removed_interfaces.iter().map(|(n, _)| *n).collect();
+                let added_names: HashSet<&str> =
+                    added_interfaces.iter().map(|(n, _)| *n).collect();
+
+                for mapping in mappings {
+                    // Validate: both names must exist in the removed/added lists
+                    if !removed_names.contains(mapping.old_name.as_str()) {
+                        eprintln!(
+                            "    [warn] LLM mapping old_name '{}' not in removed list, skipping",
+                            mapping.old_name
+                        );
+                        continue;
+                    }
+                    if !added_names.contains(mapping.new_name.as_str()) {
+                        eprintln!(
+                            "    [warn] LLM mapping new_name '{}' not in added list, skipping",
+                            mapping.new_name
+                        );
+                        continue;
+                    }
+
+                    // Compute member overlap for validation
+                    let old_members: HashSet<&str> = removed_interfaces
+                        .iter()
+                        .find(|(n, _)| *n == mapping.old_name)
+                        .map(|(_, m)| m.iter().map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    let new_members: HashSet<&str> = added_interfaces
+                        .iter()
+                        .find(|(n, _)| *n == mapping.new_name)
+                        .map(|(_, m)| m.iter().map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    let overlap = old_members.intersection(&new_members).count();
+                    let overlap_ratio = if old_members.is_empty() {
+                        0.0
+                    } else {
+                        overlap as f64 / old_members.len() as f64
+                    };
+
+                    eprintln!(
+                        "    Mapping '{}' → '{}' (confidence: {}, overlap: {:.0}%, reason: {})",
+                        mapping.old_name,
+                        mapping.new_name,
+                        mapping.confidence,
+                        overlap_ratio * 100.0,
+                        mapping.reason
+                    );
+
+                    interface_mappings.push(InferredInterfaceMapping {
+                        old_name: mapping.old_name,
+                        new_name: mapping.new_name,
+                        confidence: mapping.confidence,
+                        reason: mapping.reason,
+                        member_overlap_ratio: overlap_ratio,
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("  [warn] Interface rename inference failed: {}", e);
+            }
+        }
+    }
+
+    if llm_calls == 0 {
+        return None;
+    }
+
+    Some(InferredRenamePatterns {
+        constant_patterns,
+        interface_mappings: interface_mappings.clone(),
+        metadata: InferenceMetadata {
+            llm_calls,
+            constant_hit_rate,
+            interface_mappings_found: interface_mappings.len(),
+        },
     })
 }
 

@@ -22,7 +22,10 @@ mod prompts;
 mod spec_compare;
 
 use anyhow::Result;
-pub use invoke::{FileApiChange, FileBehavioralChange, LlmRemovalDisposition};
+pub use invoke::{
+    FileApiChange, FileBehavioralChange, LlmCompositionChange, LlmConstantRenamePattern,
+    LlmInterfaceRenameMapping, LlmRemovalDisposition,
+};
 use semver_analyzer_core::{
     BehaviorAnalyzer, BreakingVerdict, ChangedFunction, EvidenceSource, FunctionSpec, TestDiff,
 };
@@ -76,6 +79,52 @@ impl LlmBehaviorAnalyzer {
             prompts::build_file_behavioral_prompt(file_path, diff_content, changed_functions);
         let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
         invoke::parse_file_behavioral_response(&response)
+    }
+
+    /// Analyze a test/example file diff for composition pattern changes.
+    pub fn analyze_composition_patterns(
+        &self,
+        file_path: &str,
+        diff_content: &str,
+    ) -> Result<Vec<LlmCompositionChange>> {
+        let prompt = prompts::build_composition_pattern_prompt(file_path, diff_content);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_composition_pattern_response(&response)
+    }
+
+    /// Infer constant rename patterns from sampled removed/added constant names.
+    pub fn infer_constant_renames(
+        &self,
+        removed_sample: &[&str],
+        added_sample: &[&str],
+        package_name: &str,
+        from_ref: &str,
+        to_ref: &str,
+    ) -> Result<Vec<LlmConstantRenamePattern>> {
+        let prompt = prompts::build_constant_rename_prompt(
+            removed_sample,
+            added_sample,
+            package_name,
+            from_ref,
+            to_ref,
+        );
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_constant_rename_response(&response)
+    }
+
+    /// Infer interface/component rename mappings from removed/added interface data.
+    pub fn infer_interface_renames(
+        &self,
+        removed: &[(&str, &[String])],
+        added: &[(&str, &[String])],
+        package_name: &str,
+        from_ref: &str,
+        to_ref: &str,
+    ) -> Result<Vec<LlmInterfaceRenameMapping>> {
+        let prompt =
+            prompts::build_interface_rename_prompt(removed, added, package_name, from_ref, to_ref);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_interface_rename_response(&response)
     }
 }
 

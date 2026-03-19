@@ -59,6 +59,12 @@ pub struct AnalysisReport {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub member_renames: HashMap<String, String>,
 
+    /// LLM-inferred rename patterns for constants and interfaces.
+    /// Populated by the rename inference phase between TD and BU.
+    /// None when --no-llm is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_rename_patterns: Option<InferredRenamePatterns>,
+
     /// Metadata about the analysis run.
     pub metadata: AnalysisMetadata,
 }
@@ -101,6 +107,12 @@ pub struct FileChanges {
 
     /// Breaking behavioral changes (DOM structure, CSS, defaults, rendering).
     pub breaking_behavioral_changes: Vec<BehavioralChange>,
+
+    /// Composition pattern changes detected from test/example diffs.
+    /// These describe how JSX nesting structure changed between versions
+    /// (e.g., MastheadToggle moved inside MastheadMain).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub composition_pattern_changes: Vec<CompositionPatternChange>,
 }
 
 /// Git file status.
@@ -268,6 +280,26 @@ pub enum BehavioralCategory {
     DataAttribute,
     /// General render output change not covered by other categories.
     RenderOutput,
+}
+
+/// A composition pattern change detected from test/example file diffs.
+///
+/// When a library's tests or examples restructure JSX nesting (e.g.,
+/// MastheadToggle moves from being a child of Masthead to a child of
+/// MastheadMain), this captures the old and new parent-child relationships.
+/// Detected by LLM analysis of test/example diffs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositionPatternChange {
+    /// The component whose parent changed (e.g., "MastheadToggle").
+    pub component: String,
+    /// The old parent component (e.g., "Masthead"). None if newly added.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_parent: Option<String>,
+    /// The new parent component (e.g., "MastheadMain"). None if removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_parent: Option<String>,
+    /// Description of the change from the LLM.
+    pub description: String,
 }
 
 // ── Package-level hierarchical report types ─────────────────────────────
@@ -795,4 +827,63 @@ pub struct LlmUsage {
     pub total_output_tokens: usize,
     pub estimated_cost_usd: f64,
     pub circuit_breaker_triggered: bool,
+}
+
+// ── LLM-inferred rename patterns ──────────────────────────────────────
+
+/// Rename patterns discovered by the LLM rename inference phase.
+/// Stored in the report for transparency and reuse.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InferredRenamePatterns {
+    /// Regex substitution patterns for bulk constant renames
+    /// (e.g., PaddingTop → PaddingBlockStart).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constant_patterns: Vec<InferredConstantPattern>,
+
+    /// Direct name mappings for interface/component renames
+    /// (e.g., TextProps → ContentProps).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface_mappings: Vec<InferredInterfaceMapping>,
+
+    /// Statistics about the inference run.
+    pub metadata: InferenceMetadata,
+}
+
+/// A regex-based rename pattern for constants, inferred by the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferredConstantPattern {
+    /// Regex pattern matching removed constant names.
+    pub match_regex: String,
+    /// Replacement string (may use capture group references like ${1}).
+    pub replace: String,
+    /// Number of removed constants this pattern successfully maps to an added constant.
+    pub hit_count: usize,
+    /// Total number of removed constants in the package.
+    pub total_removed: usize,
+}
+
+/// A direct name mapping for an interface/component rename, inferred by the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferredInterfaceMapping {
+    /// The removed interface/component name.
+    pub old_name: String,
+    /// The added interface/component name (the replacement).
+    pub new_name: String,
+    /// LLM confidence: "high", "medium", or "low".
+    pub confidence: String,
+    /// Brief explanation from the LLM.
+    pub reason: String,
+    /// Member overlap ratio between old and new (computed during validation).
+    pub member_overlap_ratio: f64,
+}
+
+/// Statistics about the LLM rename inference run.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InferenceMetadata {
+    /// Number of LLM calls made (0, 1, or 2).
+    pub llm_calls: usize,
+    /// Fraction of removed constants mapped by inferred patterns.
+    pub constant_hit_rate: f64,
+    /// Number of interface rename mappings found.
+    pub interface_mappings_found: usize,
 }

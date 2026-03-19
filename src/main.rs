@@ -212,7 +212,7 @@ async fn cmd_analyze(
     }
 
     // Build report
-    let report = build_report(
+    let mut report = build_report(
         repo,
         from_ref,
         to_ref,
@@ -222,7 +222,29 @@ async fn cmd_analyze(
         result.llm_api_changes,
         &result.old_surface,
         &result.new_surface,
+        result.inferred_rename_patterns,
     );
+
+    // Merge composition pattern changes into the report's file entries.
+    for (source_path, comp_changes) in result.composition_changes {
+        // Find or create a FileChanges entry for the source component
+        let existing = report.changes.iter_mut().find(|fc| {
+            fc.file.to_string_lossy().starts_with(&source_path)
+        });
+        if let Some(fc) = existing {
+            fc.composition_pattern_changes.extend(comp_changes);
+        } else if !comp_changes.is_empty() {
+            // Create a new entry for the component directory
+            report.changes.push(semver_analyzer_core::FileChanges {
+                file: std::path::PathBuf::from(&source_path),
+                status: semver_analyzer_core::FileStatus::Modified,
+                renamed_from: None,
+                breaking_api_changes: vec![],
+                breaking_behavioral_changes: vec![],
+                composition_pattern_changes: comp_changes,
+            });
+        }
+    }
 
     let total_breaking = report.summary.total_breaking_changes;
     eprintln!();
@@ -263,7 +285,7 @@ async fn cmd_konveyor(
     no_consolidate: bool,
     rename_patterns_path: Option<&Path>,
 ) -> Result<()> {
-    let rename_patterns = if let Some(path) = rename_patterns_path {
+    let mut rename_patterns = if let Some(path) = rename_patterns_path {
         konveyor::RenamePatterns::load(path)?
     } else {
         konveyor::RenamePatterns::empty()
@@ -308,6 +330,7 @@ async fn cmd_konveyor(
             result.llm_api_changes,
             &result.old_surface,
             &result.new_surface,
+            result.inferred_rename_patterns,
         )
     };
 
@@ -353,6 +376,21 @@ async fn cmd_konveyor(
         if let Some(info) = pkg_info_cache.get(&pkg.name) {
             pkg.name = info.name.clone();
             pkg.old_version = info.version.clone();
+        }
+    }
+
+    // Merge LLM-inferred constant rename patterns into rename_patterns.
+    // These are discovered by the rename inference phase and stored in the
+    // report. They supplement (or replace) the manually authored YAML patterns.
+    if let Some(ref inferred) = report.inferred_rename_patterns {
+        for pat in &inferred.constant_patterns {
+            rename_patterns.add_pattern(&pat.match_regex, &pat.replace);
+        }
+        if !inferred.constant_patterns.is_empty() {
+            eprintln!(
+                "Merged {} LLM-inferred constant rename patterns into rename_patterns",
+                inferred.constant_patterns.len()
+            );
         }
     }
 
@@ -452,6 +490,7 @@ fn build_report(
     llm_api_changes: Vec<orchestrator::LlmApiChangeEntry>,
     old_surface: &semver_analyzer_core::ApiSurface,
     new_surface: &semver_analyzer_core::ApiSurface,
+    inferred_rename_patterns: Option<semver_analyzer_core::InferredRenamePatterns>,
 ) -> AnalysisReport {
     // Group breaking structural changes by file, converting to v2 ApiChange format.
     // Non-breaking changes (symbol_added, etc.) are excluded from the report.
@@ -587,6 +626,7 @@ fn build_report(
                 renamed_from: None,
                 breaking_api_changes: api_changes,
                 breaking_behavioral_changes: behavioral,
+                composition_pattern_changes: vec![],
             }
         })
         .collect();
@@ -630,6 +670,7 @@ fn build_report(
         added_files,
         packages,
         member_renames: std::collections::HashMap::new(), // Populated in Phase 2e
+        inferred_rename_patterns,
         metadata: AnalysisMetadata {
             call_graph_analysis: call_graph_info.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1688,6 +1729,7 @@ mod tests {
             vec![],
             &semver_analyzer_core::ApiSurface { symbols: vec![] },
             &semver_analyzer_core::ApiSurface { symbols: vec![] },
+            None,
         );
         assert_eq!(report.summary.total_breaking_changes, 0);
         assert!(report.changes.is_empty());
@@ -1741,6 +1783,7 @@ mod tests {
             vec![],
             &semver_analyzer_core::ApiSurface { symbols: vec![] },
             &semver_analyzer_core::ApiSurface { symbols: vec![] },
+            None,
         );
         // Only the breaking structural change counts (non-breaking excluded)
         assert_eq!(report.summary.breaking_api_changes, 1);
@@ -1778,6 +1821,7 @@ mod tests {
             vec![],
             &semver_analyzer_core::ApiSurface { symbols: vec![] },
             &semver_analyzer_core::ApiSurface { symbols: vec![] },
+            None,
         );
         assert_eq!(report.summary.breaking_api_changes, 0);
         assert_eq!(report.summary.breaking_behavioral_changes, 1);
@@ -2107,6 +2151,7 @@ mod tests {
             vec![],
             &old_surface,
             &new_surface,
+            None,
         );
 
         // Find the "Icon" component in the report
@@ -2199,6 +2244,7 @@ mod tests {
             vec![],
             &old_surface,
             &new_surface,
+            None,
         );
 
         let foo_comp = report

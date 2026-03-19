@@ -24,9 +24,23 @@ use std::collections::{HashMap, HashSet};
 /// match, but 11/28 (39%) of the new interface matches.
 const MIN_OVERLAP_RATIO: f64 = 0.25;
 
-/// Minimum number of overlapping members to emit a suggestion.
-/// Prevents false positives from single-member matches on tiny interfaces.
-const MIN_OVERLAP_COUNT: usize = 3;
+/// Adaptive minimum overlap count based on the removed interface's size.
+///
+/// A fixed minimum of 3 makes it impossible to detect absorption for small
+/// interfaces like `EmptyStateIconProps` (2-3 members) even when 100% of
+/// unique props match. The minimum scales with interface size:
+///
+/// - 1-3 members: require at least 1 match (ratio threshold catches false positives)
+/// - 4-6 members: require at least 2 matches
+/// - 7+ members: require at least 3 matches
+fn min_overlap_count(member_count: usize) -> usize {
+    match member_count {
+        0 => 1,
+        1..=3 => 1,
+        4..=6 => 2,
+        _ => 3,
+    }
+}
 
 /// A detected migration relationship between a removed symbol and a candidate
 /// replacement in the same component directory.
@@ -173,7 +187,7 @@ pub(super) fn detect_migrations<'a>(
                 })
                 .collect();
 
-            if matching.len() < MIN_OVERLAP_COUNT {
+            if matching.len() < min_overlap_count(removed_members.len()) {
                 continue;
             }
 
@@ -575,8 +589,12 @@ mod tests {
     }
 
     #[test]
-    fn test_no_false_positive_small_overlap() {
-        // Two interfaces in the same directory but with tiny overlap.
+    fn test_small_overlap_with_adaptive_threshold() {
+        // FooHeaderProps (2 members: title, subtitle) removed.
+        // FooProps (new, 8 members) includes "title".
+        // With adaptive thresholds: 1 match from 2-member interface = 50% ratio.
+        // This IS a valid absorption signal — the removed child's primary prop
+        // appeared on the parent.
         let removed_header = make_interface(
             "FooHeaderProps",
             "components/Foo/FooHeader.d.ts",
@@ -603,12 +621,16 @@ mod tests {
         let removed: Vec<&Symbol> = vec![&removed_header];
 
         let results = detect_migrations(&removed, &old_symbols, &new_symbols);
-        // Only 1 member overlaps ("title") out of 2 — below MIN_OVERLAP_COUNT of 3.
+        // 1 match (title) from 2-member interface = 50% ratio.
+        // Adaptive min_overlap_count(2) = 1, ratio 50% > 25%.
+        // This is correctly detected as an absorption.
         assert_eq!(
             results.len(),
-            0,
-            "Too few matching members should not produce a suggestion"
+            1,
+            "Small interface with 50% match should be detected as absorption"
         );
+        assert_eq!(results[0].target.removed_symbol, "FooHeaderProps");
+        assert_eq!(results[0].target.replacement_symbol, "FooProps");
     }
 
     #[test]
@@ -630,6 +652,121 @@ mod tests {
                 "packages/react-core/dist/esm/next/components/Modal/ModalHeader.d.ts"
             ),
             "packages/react-core/dist/esm/components/Modal"
+        );
+    }
+
+    // ── Adaptive threshold: small interface absorption ──────────────
+
+    #[test]
+    fn test_small_interface_absorption_emptystate_icon() {
+        // EmptyStateIconProps has only 2 unique members (icon, className).
+        // className already exists on EmptyStateProps, so only icon is a new match.
+        // With the old fixed MIN_OVERLAP_COUNT=3, this would NOT be detected.
+        // With adaptive thresholds, 1 match from a 2-member interface (50%) passes.
+        let old_icon_props = make_interface(
+            "EmptyStateIconProps",
+            "components/EmptyState/EmptyStateIcon.d.ts",
+            &["icon", "className"],
+        );
+
+        let old_parent = make_interface(
+            "EmptyStateProps",
+            "components/EmptyState/EmptyState.d.ts",
+            &["children", "className", "variant"],
+        );
+
+        let new_parent = make_interface(
+            "EmptyStateProps",
+            "components/EmptyState/EmptyState.d.ts",
+            &[
+                "children",
+                "className",
+                "variant",
+                "icon", // newly added — matches EmptyStateIconProps.icon
+                "titleText",
+                "headingLevel",
+                "status",
+            ],
+        );
+
+        let old_symbols: Vec<&Symbol> = vec![&old_icon_props, &old_parent];
+        let new_symbols: Vec<&Symbol> = vec![&new_parent];
+        let removed: Vec<&Symbol> = vec![&old_icon_props];
+
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "Should detect EmptyStateIconProps → EmptyStateProps absorption. Got {} results.",
+            results.len()
+        );
+
+        let m = &results[0];
+        assert_eq!(m.target.removed_symbol, "EmptyStateIconProps");
+        assert_eq!(m.target.replacement_symbol, "EmptyStateProps");
+
+        // Should match: icon (1 member). className already existed on parent, not counted.
+        let matched_names: Vec<&str> = m
+            .target
+            .matching_members
+            .iter()
+            .map(|mm| mm.old_name.as_str())
+            .collect();
+        assert!(
+            matched_names.contains(&"icon"),
+            "Should match 'icon'. Matched: {:?}",
+            matched_names
+        );
+
+        // Ratio: 1 match / 2 members = 0.5
+        assert!(
+            m.target.overlap_ratio >= 0.25,
+            "Overlap ratio should be >= 25%, got {}",
+            m.target.overlap_ratio
+        );
+    }
+
+    #[test]
+    fn test_adaptive_threshold_values() {
+        assert_eq!(min_overlap_count(0), 1);
+        assert_eq!(min_overlap_count(1), 1);
+        assert_eq!(min_overlap_count(2), 1);
+        assert_eq!(min_overlap_count(3), 1);
+        assert_eq!(min_overlap_count(4), 2);
+        assert_eq!(min_overlap_count(5), 2);
+        assert_eq!(min_overlap_count(6), 2);
+        assert_eq!(min_overlap_count(7), 3);
+        assert_eq!(min_overlap_count(10), 3);
+        assert_eq!(min_overlap_count(50), 3);
+    }
+
+    #[test]
+    fn test_single_member_interface_no_false_positive() {
+        // A 1-member interface with no matching props on the candidate
+        // should NOT produce a migration, even with relaxed thresholds.
+        let old_tiny = make_interface("TinyProps", "components/Foo/Tiny.d.ts", &["uniqueProp"]);
+
+        let old_parent = make_interface(
+            "FooProps",
+            "components/Foo/Foo.d.ts",
+            &["children", "className"],
+        );
+
+        let new_parent = make_interface(
+            "FooProps",
+            "components/Foo/Foo.d.ts",
+            &["children", "className", "newProp"], // no overlap with uniqueProp
+        );
+
+        let old_symbols: Vec<&Symbol> = vec![&old_tiny, &old_parent];
+        let new_symbols: Vec<&Symbol> = vec![&new_parent];
+        let removed: Vec<&Symbol> = vec![&old_tiny];
+
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        assert!(
+            results.is_empty(),
+            "Should NOT produce migration for non-matching single-member interface"
         );
     }
 }
