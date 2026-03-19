@@ -18,6 +18,7 @@
 
 mod compare;
 mod helpers;
+mod migration;
 mod relocate;
 mod rename;
 
@@ -29,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
 use helpers::{is_star_reexport, kind_label, symbol_summary};
+use migration::detect_migrations;
 use relocate::{detect_relocations, RelocationType};
 use rename::detect_renames;
 
@@ -118,12 +120,10 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
                     ),
                     is_breaking: true,
                     impact: None,
+                    migration_target: None,
                 });
             }
             RelocationType::PromotedFromDeprecated => {
-                // Promotion from deprecated is generally non-breaking
-                // (the symbol is still available, just at a better path).
-                // We still record it but don't mark it breaking.
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
@@ -138,12 +138,10 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
                     ),
                     is_breaking: false,
                     impact: None,
+                    migration_target: None,
                 });
             }
             RelocationType::PromotedFromNext => {
-                // Promoted from next/ (preview) to main exports.
-                // This is breaking: consumers importing from the `next/`
-                // path need to update their imports.
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
@@ -158,11 +156,10 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
                     ),
                     is_breaking: true,
                     impact: None,
+                    migration_target: None,
                 });
             }
             RelocationType::MovedToNext => {
-                // Moved from main to next/ (preview) — breaking,
-                // consumers importing from the main path lose access.
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
@@ -177,6 +174,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
                     ),
                     is_breaking: true,
                     impact: None,
+                    migration_target: None,
                 });
             }
             RelocationType::Relocated => {
@@ -232,6 +230,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
             ),
             is_breaking: true,
             impact: None,
+            migration_target: None,
         });
     }
 
@@ -257,6 +256,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
             ),
             is_breaking: true,
             impact: None,
+            migration_target: None,
         });
     }
 
@@ -277,6 +277,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
             description: format!("Exported {} `{}` was added", kind_label(sym.kind), sym.name),
             is_breaking: false,
             impact: None,
+            migration_target: None,
         });
     }
 
@@ -288,7 +289,68 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
         }
     }
 
-    // ── Phase 5: Deduplicate default exports ─────────────────────────
+    // ── Phase 5: Structural migration detection ────────────────────────
+    // For removed interfaces/classes, look for surviving or added interfaces
+    // in the same component directory with significant member name overlap.
+    // This detects "merge child into parent" and "same-name replacement"
+    // patterns and annotates the existing SymbolRemoved changes with
+    // migration target metadata.
+    {
+        let final_removed: Vec<&Symbol> = removed
+            .iter()
+            .filter(|s| {
+                !relocated_old.contains(s.qualified_name.as_str())
+                    && !renamed_old.contains(s.qualified_name.as_str())
+            })
+            .copied()
+            .collect();
+
+        let migrations = detect_migrations(&final_removed, &old_symbols, &new_symbols);
+
+        // Annotate existing SymbolRemoved changes with migration targets.
+        for mig in &migrations {
+            for change in changes.iter_mut() {
+                if change.qualified_name == mig.removed.qualified_name
+                    && change.change_type == StructuralChangeType::SymbolRemoved
+                {
+                    change.change_type = StructuralChangeType::MigrationSuggested;
+                    change.migration_target = Some(mig.target.clone());
+                    // Enrich the description with the full migration recipe
+                    // so the rule message gives the LLM actionable context.
+                    let matching_names: Vec<&str> = mig
+                        .target
+                        .matching_members
+                        .iter()
+                        .map(|m| m.old_name.as_str())
+                        .collect();
+                    let removed_names: Vec<&str> = mig
+                        .target
+                        .removed_only_members
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    let base = change.description.trim_end_matches(" was removed");
+                    let mut desc = format!(
+                        "{} was removed — migrate to `{}`.\n  Matching props (use on `{}` instead): {}",
+                        base,
+                        mig.target.replacement_symbol,
+                        mig.target.replacement_symbol,
+                        matching_names.join(", "),
+                    );
+                    if !removed_names.is_empty() {
+                        desc.push_str(&format!(
+                            "\n  Removed props with no direct equivalent: {}",
+                            removed_names.join(", "),
+                        ));
+                    }
+                    change.description = desc;
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Phase 6: Deduplicate default exports ─────────────────────────
     // Many TypeScript files export both a named export and a default export
     // for the same symbol: `export { Foo }; export default Foo;`
     // When both are removed/added/changed, reporting both is redundant.

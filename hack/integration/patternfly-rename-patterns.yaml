@@ -76,6 +76,16 @@ rename_patterns:
     replace: "${1}BorderInlineEnd${2}"
 
   # ── Text → Content renames ──────────────────────────────────────
+  # Component constants (used by P0-C rules to find replacement)
+  - match: "^Text$"
+    replace: "Content"
+  - match: "^TextContent$"
+    replace: "Content"
+  - match: "^TextList$"
+    replace: "Content"
+  - match: "^TextListItem$"
+    replace: "Content"
+  # Props interfaces (used by fix strategy assignment)
   - match: "^TextProps$"
     replace: "ContentProps"
   - match: "^TextContentProps$"

@@ -36,6 +36,7 @@ pub(super) fn change(
         description,
         is_breaking,
         impact: None,
+        migration_target: None,
     }
 }
 

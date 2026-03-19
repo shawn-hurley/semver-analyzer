@@ -2,23 +2,11 @@ mod cli;
 mod konveyor;
 mod orchestrator;
 
-/// Priority for fix strategy selection when multiple pre-consolidation strategies
-/// map to the same consolidated rule.  Higher = more actionable.
-fn strategy_priority(strategy: &str) -> u8 {
-    match strategy {
-        "Rename" => 5,
-        "RemoveProp" => 4,
-        "CssVariablePrefix" => 4,
-        "ImportPathChange" => 3,
-        "PropValueChange" => 2,
-        "PropTypeChange" => 2,
-        "LlmAssisted" => 1,
-        _ => 0, // Manual
-    }
-}
+
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::collections::HashMap;
 use std::path::Path;
 
 use cli::{Cli, Command};
@@ -319,8 +307,13 @@ async fn cmd_konveyor(
         )
     };
 
-    // Build package name cache from package.json files
-    let pkg_cache = konveyor::build_package_name_cache(&report);
+    // Build package info cache (name + version) from package.json files.
+    // The name-only cache is derived from this for generate_rules().
+    let pkg_info_cache = konveyor::build_package_info_cache(&report);
+    let pkg_cache: HashMap<String, String> = pkg_info_cache
+        .iter()
+        .map(|(k, v)| (k.clone(), v.name.clone()))
+        .collect();
 
     // Analyze token member objects for redundancy suppression and member renames
     let (covered_symbols, member_renames) =
@@ -333,56 +326,55 @@ async fn cmd_konveyor(
         );
     }
 
-    // Generate rules
-    let raw_rules = konveyor::generate_rules(&report, file_pattern, &pkg_cache, &rename_patterns);
+    // Generate rules — each rule carries its own fix_strategy
+    let raw_rules = konveyor::generate_rules(
+        &report,
+        file_pattern,
+        &pkg_cache,
+        &rename_patterns,
+        &member_renames,
+    );
     let raw_count = raw_rules.len();
-
-    // Generate fix strategies keyed by pre-consolidation rule IDs
-    let pre_strategies =
-        konveyor::generate_fix_strategies(&report, &raw_rules, &rename_patterns, &member_renames);
 
     // Suppress redundant individual token removal rules
     let filtered_rules = konveyor::suppress_redundant_token_rules(raw_rules, &covered_symbols);
 
-    let (rules, id_mapping) = if no_consolidate {
-        // No consolidation: identity mapping
-        let mapping: std::collections::HashMap<String, String> = filtered_rules
-            .iter()
-            .map(|r| (r.rule_id.clone(), r.rule_id.clone()))
-            .collect();
-        (filtered_rules, mapping)
+    let rules = if no_consolidate {
+        filtered_rules
     } else {
-        let (consolidated, mapping) = konveyor::consolidate_rules(filtered_rules);
+        let (consolidated, _id_mapping) = konveyor::consolidate_rules(filtered_rules);
         eprintln!(
             "Consolidated {} rules → {} rules",
             raw_count,
             consolidated.len()
         );
-        (consolidated, mapping)
+        consolidated
     };
 
-    // Re-key strategies using the consolidation mapping so they match the
-    // post-consolidation rule IDs that appear in kantra output.  When multiple
-    // pre-consolidation rules map to the same consolidated rule, pick the most
-    // actionable strategy (Rename > RemoveProp > CssVariablePrefix > others).
-    let mut strategies: std::collections::HashMap<String, konveyor::FixStrategyEntry> =
-        std::collections::HashMap::new();
-    for (old_id, entry) in pre_strategies {
-        if let Some(new_id) = id_mapping.get(&old_id) {
-            let dominated = strategies.get(new_id).map_or(true, |existing| {
-                strategy_priority(&entry.strategy) > strategy_priority(&existing.strategy)
-            });
-            if dominated {
-                strategies.insert(new_id.clone(), entry);
-            }
-        }
-    }
+    // Suppress prop-level RemoveProp rules when a component-level
+    // component-import-deprecated rule already covers the same component.
+    let rules = konveyor::suppress_redundant_prop_rules(rules);
 
-    let fix_guidance = konveyor::generate_fix_guidance(&report, &rules, file_pattern);
-    let rule_count = rules.len();
+    // Extract strategies from the final rules (strategies were merged during
+    // consolidation by merge_rule_group)
+    let mut strategies = konveyor::extract_fix_strategies(&rules);
+
+    // Generate dependency update rules (package.json version bumps)
+    let (dep_update_rules, dep_update_strategies) =
+        konveyor::generate_dependency_update_rules(&report, &pkg_info_cache);
+
+    // Merge dependency update strategies into the main strategies map
+    strategies.extend(dep_update_strategies);
+
+    // Combine all rules for writing (API/behavioral rules + dependency update rules)
+    let mut all_rules = rules;
+    all_rules.extend(dep_update_rules);
+
+    let fix_guidance = konveyor::generate_fix_guidance(&report, &all_rules, file_pattern);
+    let rule_count = all_rules.len();
 
     // Write ruleset directory
-    konveyor::write_ruleset_dir(output_dir, ruleset_name, &report, &rules)?;
+    konveyor::write_ruleset_dir(output_dir, ruleset_name, &report, &all_rules)?;
 
     // Write fix guidance to sibling directory
     let fix_dir = konveyor::write_fix_guidance_dir(output_dir, &fix_guidance)?;
@@ -462,6 +454,7 @@ fn build_report(
             before: None,
             after: None,
             description: entry.description.clone(),
+            migration_target: None,
         };
         // Only add if not already present (avoid duplicating TD findings)
         let existing = file_api_map.entry(file).or_default();
@@ -538,6 +531,11 @@ fn build_report(
         "none (no behavioral analysis)"
     };
 
+    // Collect files added between the two refs.
+    // These are new exports (new components, new modules) that consumers
+    // may need to adopt when migrating from from_ref to to_ref.
+    let added_files = collect_added_files(repo, from_ref, to_ref);
+
     AnalysisReport {
         repository: repo.to_path_buf(),
         comparison: Comparison {
@@ -556,11 +554,65 @@ fn build_report(
         },
         changes,
         manifest_changes,
+        added_files,
         metadata: AnalysisMetadata {
             call_graph_analysis: call_graph_info.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
             llm_usage: None,
         },
+    }
+}
+
+/// Collect files added between two git refs.
+///
+/// Returns paths of `.ts`/`.tsx` files that exist at `to_ref` but not at
+/// `from_ref`.  These represent new exports (components, modules) that
+/// consumers may need to use when migrating.
+fn collect_added_files(repo: &Path, from_ref: &str, to_ref: &str) -> Vec<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "diff",
+            "--name-status",
+            "--diff-filter=A",
+            &format!("{}..{}", from_ref, to_ref),
+            "--",
+            "*.ts",
+            "*.tsx",
+        ])
+        .output();
+
+    match output {
+        Ok(out) => {
+            let files: Vec<std::path::PathBuf> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    // Format: "A\tpath/to/file.tsx"
+                    let path = line.strip_prefix("A\t")?;
+                    // Only include source files, not tests/examples/stories
+                    if path.contains("/test")
+                        || path.contains("/__tests__")
+                        || path.contains("/examples/")
+                        || path.contains("/stories/")
+                        || path.contains("/demo/")
+                        || path.contains(".test.")
+                        || path.contains(".spec.")
+                    {
+                        return None;
+                    }
+                    Some(std::path::PathBuf::from(path))
+                })
+                .collect();
+            if !files.is_empty() {
+                eprintln!("Found {} added source files between refs", files.len());
+            }
+            files
+        }
+        Err(e) => {
+            eprintln!("Warning: could not enumerate added files: {}", e);
+            Vec::new()
+        }
     }
 }
 
@@ -581,6 +633,7 @@ fn structural_to_api_change(sc: &StructuralChange) -> ApiChange {
         before: sc.before.clone(),
         after: sc.after.clone(),
         description: sc.description.clone(),
+        migration_target: sc.migration_target.clone(),
     }
 }
 
@@ -771,6 +824,7 @@ mod tests {
                 description: "removed".into(),
                 is_breaking: true,
                 impact: None,
+            migration_target: None,
             },
             StructuralChange {
                 symbol: "bar".into(),
@@ -782,6 +836,7 @@ mod tests {
                 description: "added".into(),
                 is_breaking: false,
                 impact: None,
+            migration_target: None,
             },
         ];
         let manifest = vec![ManifestChange {
@@ -892,4 +947,5 @@ mod tests {
             "Button.variant"
         );
     }
+
 }

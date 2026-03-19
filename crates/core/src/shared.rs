@@ -281,6 +281,7 @@ mod tests {
             description: format!("{} was removed", name),
             is_breaking: true,
             impact: None,
+            migration_target: None,
         }
     }
 

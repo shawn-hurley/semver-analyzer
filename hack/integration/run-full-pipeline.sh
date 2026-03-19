@@ -73,6 +73,7 @@ REPORT="$WORK_DIR/patternfly-report.json"
 RULES_BUILTIN="$WORK_DIR/konveyor-rules-builtin"
 RULES_FRONTEND="$WORK_DIR/konveyor-rules-frontend"
 FIX_GUIDANCE="$WORK_DIR/fix-guidance"
+RULES_STRATEGIES="$FAP_DIR/rules/patternfly-v5-to-v6/fix-strategies.json"
 QUIPUCORDS="$WORK_DIR/quipucords-ui"
 QUIPUCORDS_FIXED="$WORK_DIR/quipucords-ui-fixed"
 KANTRA_OUTPUT="$WORK_DIR/kantra-output"
@@ -200,17 +201,17 @@ echo ""
 echo "==> Step 3: Preparing quipucords-ui..."
 
 if [[ -d "$QUIPUCORDS/.git" ]]; then
-    echo "    Using existing clone at $QUIPUCORDS"
-    (cd "$QUIPUCORDS" && git checkout "$QUIPUCORDS_V5_COMMIT" --force 2>/dev/null)
+    echo "    Using existing clone at $QUIPUCORDS, hard-resetting to $QUIPUCORDS_V5_COMMIT"
+    (cd "$QUIPUCORDS" && git checkout "$QUIPUCORDS_V5_COMMIT" --force 2>/dev/null && git clean -fd 2>/dev/null)
 else
     echo "    Cloning from $QUIPUCORDS_REPO..."
     if [[ -d "/tmp/quipucords-ui/.git" ]]; then
         echo "    (Copying from cached /tmp/quipucords-ui)"
         cp -a /tmp/quipucords-ui "$QUIPUCORDS"
-        (cd "$QUIPUCORDS" && git checkout "$QUIPUCORDS_V5_COMMIT" --force 2>/dev/null)
+        (cd "$QUIPUCORDS" && git checkout "$QUIPUCORDS_V5_COMMIT" --force 2>/dev/null && git clean -fd 2>/dev/null)
     else
         git clone "$QUIPUCORDS_REPO" "$QUIPUCORDS"
-        (cd "$QUIPUCORDS" && git checkout "$QUIPUCORDS_V5_COMMIT" 2>/dev/null)
+        (cd "$QUIPUCORDS" && git checkout "$QUIPUCORDS_V5_COMMIT" --force 2>/dev/null)
     fi
 fi
 
@@ -329,9 +330,16 @@ fi
 if [[ "$SKIP_FIX" == false ]] && [[ -f "$FIX_INPUT" ]]; then
     echo "==> Step 5: Applying pattern-based fixes..."
 
+    # Reset the fixed copy from the clean baseline so re-runs
+    # don't stack fixes on top of a previous run's output.
+    echo "    Resetting quipucords-ui-fixed from clean baseline..."
+    rm -rf "$QUIPUCORDS_FIXED"
+    cp -a "$QUIPUCORDS" "$QUIPUCORDS_FIXED"
+
     "$FAP_BIN" fix "$QUIPUCORDS_FIXED" \
         --input "$FIX_INPUT" \
         --apply \
+        --rules-strategies "$RULES_STRATEGIES" \
         2>&1 | tail -10
 
     echo ""

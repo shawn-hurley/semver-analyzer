@@ -31,6 +31,12 @@ pub struct AnalysisReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub manifest_changes: Vec<ManifestChange>,
 
+    /// Files added between from_ref and to_ref (new exports, new components).
+    /// Used to detect new sibling components that may be needed alongside
+    /// modified components.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_files: Vec<PathBuf>,
+
     /// Metadata about the analysis run.
     pub metadata: AnalysisMetadata,
 }
@@ -112,6 +118,10 @@ pub struct ApiChange {
 
     /// Human-readable description of what broke and how it affects consumers.
     pub description: String,
+
+    /// Migration target metadata when a replacement has been detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_target: Option<MigrationTarget>,
 }
 
 /// Kind of symbol affected by an API change.
@@ -134,7 +144,7 @@ pub enum ApiChangeKind {
 }
 
 /// Type of breaking API change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiChangeType {
     Removed,
@@ -245,6 +255,11 @@ pub struct StructuralChange {
     /// Impact analysis: what code depends on this symbol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impact: Option<ImpactAnalysis>,
+
+    /// Migration target: a suggested replacement for a removed symbol,
+    /// detected via same-directory member overlap analysis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_target: Option<MigrationTarget>,
 }
 
 /// Categories of structural changes.
@@ -312,6 +327,11 @@ pub enum StructuralChangeType {
 
     // Special
     ThisParameterTypeChanged,
+
+    // Structural migration suggestions
+    /// A removed symbol has a likely replacement in the same component directory,
+    /// detected via member name overlap analysis.
+    MigrationSuggested,
 }
 
 impl StructuralChangeType {
@@ -362,8 +382,51 @@ impl StructuralChangeType {
             Self::VisibilityReduced | Self::VisibilityIncreased => ApiChangeType::VisibilityChanged,
 
             Self::SymbolAdded => ApiChangeType::SignatureChanged,
+
+            Self::MigrationSuggested => ApiChangeType::Removed,
         }
     }
+}
+
+/// A member-level mapping between a removed symbol and its suggested replacement.
+///
+/// When a removed interface/class has members that overlap with a surviving
+/// interface in the same component directory, this records the mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberMapping {
+    /// Name of the member in the removed interface.
+    pub old_name: String,
+    /// Name of the matching member in the replacement interface.
+    pub new_name: String,
+    /// Type annotation of the member in the removed interface (from `signature.return_type`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_type: Option<String>,
+    /// Type annotation of the member in the replacement interface (from `signature.return_type`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_type: Option<String>,
+}
+
+/// A structural migration target detected by same-directory member overlap.
+///
+/// Produced by the migration detection phase in the diff engine. Records
+/// that a removed symbol has a plausible replacement, including the specific
+/// member-level overlap that signals the relationship.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationTarget {
+    /// The removed symbol name (e.g., "EmptyStateHeaderProps").
+    pub removed_symbol: String,
+    /// Qualified name of the removed symbol.
+    pub removed_qualified_name: String,
+    /// The suggested replacement symbol name (e.g., "EmptyStateProps").
+    pub replacement_symbol: String,
+    /// Qualified name of the replacement symbol.
+    pub replacement_qualified_name: String,
+    /// Member names that overlap between removed and replacement.
+    pub matching_members: Vec<MemberMapping>,
+    /// Member names only in the removed symbol (no match in replacement).
+    pub removed_only_members: Vec<String>,
+    /// The ratio of overlap: |matching| / |removed.members|.
+    pub overlap_ratio: f64,
 }
 
 /// Impact analysis: what code depends on a broken symbol.

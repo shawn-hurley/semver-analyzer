@@ -46,6 +46,8 @@ pub use types::{
     LlmUsage,
     ManifestChange,
     ManifestChangeType,
+    MemberMapping,
+    MigrationTarget,
     Parameter,
     Postcondition,
     Precondition,

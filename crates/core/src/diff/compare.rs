@@ -625,6 +625,7 @@ pub(super) fn diff_members(old: &Symbol, new: &Symbol, changes: &mut Vec<Structu
             ),
             is_breaking: true,
             impact: None,
+            migration_target: None,
         });
     }
 
@@ -816,6 +817,7 @@ fn diff_union_literals(
             ),
             is_breaking: true,
             impact: None,
+            migration_target: None,
         });
     }
 
@@ -834,6 +836,7 @@ fn diff_union_literals(
             ),
             is_breaking: false,
             impact: None,
+            migration_target: None,
         });
     }
 }
