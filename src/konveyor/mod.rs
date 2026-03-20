@@ -1283,6 +1283,7 @@ pub fn generate_rules(
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
+    let mut seen_composition_keys: HashSet<String> = HashSet::new();
 
     // ── Pre-scan: build set of changes covered by component-level (P0-C) rules ──
     //
@@ -1588,9 +1589,29 @@ pub fn generate_rules(
             }
         }
 
-        // Generate rules from composition pattern changes (from test/example diffs)
+        // Generate rules from composition pattern changes (from test/example diffs).
+        // Deduplicate by (component, old_parent, new_parent) since multiple
+        // test/example files may report the same nesting change.
         for comp_change in &file_changes.composition_pattern_changes {
             let component = &comp_change.component;
+
+            // Skip duplicates
+            let dedup_key = format!(
+                "{}|{}|{}",
+                component,
+                comp_change.old_parent.as_deref().unwrap_or(""),
+                comp_change.new_parent.as_deref().unwrap_or("")
+            );
+            if seen_composition_keys.contains(&dedup_key) {
+                continue;
+            }
+            seen_composition_keys.insert(dedup_key);
+
+            // Skip hallucinated template variables
+            if component.contains('{') || component.contains('}') {
+                continue;
+            }
+
             let slug = component.to_lowercase();
             let base_id = format!("semver-composition-{}-nesting-changed", slug);
             let rule_id = unique_id(base_id, &mut id_counts);
