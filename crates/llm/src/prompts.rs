@@ -429,11 +429,16 @@ Rules:
   - `{{"type": "moved_to_child", "target_component": "ChildName", "mechanism": "children"}}` —
     prop value should now be passed as children of the child component
     (e.g., actions → <ModalFooter>{{actions}}</ModalFooter>)
-  - `{{"type": "replaced_by_prop", "new_prop": "newPropName"}}` —
-    replaced by a different prop on the same component
-  - `{{"type": "made_automatic"}}` — functionality is now inferred automatically
-  - `{{"type": "truly_removed"}}` — removed with no replacement
-  - `null` if you cannot determine the disposition
+   - `{{"type": "replaced_by_prop", "new_prop": "newPropName"}}` —
+     replaced by a different prop on the SAME component. Rules:
+     * `new_prop` MUST be an exact prop name that was ADDED to the same interface in the diff
+     * The new prop must serve the same purpose (e.g., `chips` → `labels`, NOT `chips` → `deleteLabel`)
+     * If the types are fundamentally different (e.g., boolean → element, callback → array), use `truly_removed` instead
+     * If the new prop name contains "or" or you're unsure which prop replaced it, use `null` instead
+     * Do NOT guess — if you cannot find a clear 1:1 replacement in the added props, use `null`
+   - `{{"type": "made_automatic"}}` — functionality is now inferred automatically
+   - `{{"type": "truly_removed"}}` — removed with no replacement
+   - `null` if you cannot determine the disposition
 - For API removals of components: include `renders_element` with the HTML
   element the component renders (e.g., "ol", "ul", "div", "footer") when
   the component is being replaced by a generic component that needs an

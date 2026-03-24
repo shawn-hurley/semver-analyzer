@@ -377,7 +377,7 @@ pub struct FileContentFields {
 pub struct JsonFields {
     pub xpath: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub filepaths: Option<String>,
+    pub filepaths: Option<Vec<String>>,
 }
 
 /// Fields for a `frontend.referenced` condition.
@@ -3412,7 +3412,7 @@ pub fn generate_dependency_update_rules(
             .map(|field| KonveyorCondition::Json {
                 json: JsonFields {
                     xpath: format!("//{}/{}", field, xpath_name),
-                    filepaths: Some("**/package.json".into()),
+                    filepaths: Some(vec!["*package.json".into()]),
                 },
             })
             .collect();
@@ -4807,6 +4807,20 @@ fn api_change_to_strategy(
             }
 
             if matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field) {
+                // If the LLM identified a replacement prop on the same component,
+                // generate a Rename strategy instead of destructive RemoveProp.
+                if let Some(semver_analyzer_core::RemovalDisposition::ReplacedByProp {
+                    ref new_prop,
+                }) = change.removal_disposition
+                {
+                    let old_name = change
+                        .symbol
+                        .rsplit_once('.')
+                        .map(|(_, p)| p)
+                        .unwrap_or(&change.symbol);
+                    return Some(FixStrategyEntry::rename(old_name, new_prop));
+                }
+
                 let (component, prop) = extract_component_prop(&change.symbol);
                 let mut e = FixStrategyEntry::new("RemoveProp");
                 e.component = component;
@@ -5173,6 +5187,9 @@ fn api_change_to_rules(
     let has_codemod = matches!(
         change.change,
         ApiChangeType::Renamed | ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
+    ) || matches!(
+        change.removal_disposition,
+        Some(semver_analyzer_core::RemovalDisposition::ReplacedByProp { .. })
     );
     labels.push(format!("has-codemod={}", has_codemod));
 
@@ -6337,7 +6354,7 @@ fn build_manifest_condition_and_message(
                 KonveyorCondition::Json {
                     json: JsonFields {
                         xpath: format!("//peerDependencies/{}", change.field),
-                        filepaths: Some("package.json".to_string()),
+                        filepaths: Some(vec!["*package.json".into()]),
                     },
                 },
                 message,
@@ -6358,7 +6375,7 @@ fn build_manifest_condition_and_message(
                 KonveyorCondition::Json {
                     json: JsonFields {
                         xpath: format!("//{}", change.field),
-                        filepaths: Some("package.json".to_string()),
+                        filepaths: Some(vec!["*package.json".into()]),
                     },
                 },
                 message,
@@ -11763,5 +11780,161 @@ mod tests {
 
         let rules = generate_conformance_rules(&report);
         assert_eq!(rules.len(), 0);
+    }
+
+    // ── api_change_to_strategy: ReplacedByProp → Rename ──────────────────
+
+    fn empty_rename_patterns() -> RenamePatterns {
+        RenamePatterns {
+            patterns: vec![],
+            composition_rules: vec![],
+            prop_renames: vec![],
+            value_reviews: vec![],
+            missing_imports: vec![],
+            component_warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn test_removed_prop_with_replaced_by_prop_becomes_rename() {
+        use semver_analyzer_core::RemovalDisposition;
+
+        let change = ApiChange {
+            symbol: "ToolbarFilterProps.chips".to_string(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: chips: (ToolbarChip | string)[]".to_string()),
+            after: None,
+            description: "chips removed".to_string(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByProp {
+                new_prop: "labels".to_string(),
+            }),
+            renders_element: None,
+        };
+
+        let rename_patterns = empty_rename_patterns();
+        let member_renames = HashMap::new();
+        let strat = api_change_to_strategy(&change, &rename_patterns, &member_renames, "test.ts");
+
+        let strat = strat.expect("should produce a strategy");
+        assert_eq!(
+            strat.strategy, "Rename",
+            "ReplacedByProp should produce Rename, not RemoveProp"
+        );
+        assert_eq!(strat.from.as_deref(), Some("chips"));
+        assert_eq!(strat.to.as_deref(), Some("labels"));
+    }
+
+    #[test]
+    fn test_removed_prop_with_replaced_by_prop_dotted_symbol() {
+        use semver_analyzer_core::RemovalDisposition;
+
+        let change = ApiChange {
+            symbol: "ToolbarFilterProps.deleteChip".to_string(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: deleteChip: (category: string) => void".to_string()),
+            after: None,
+            description: "deleteChip removed".to_string(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByProp {
+                new_prop: "deleteLabel".to_string(),
+            }),
+            renders_element: None,
+        };
+
+        let rename_patterns = empty_rename_patterns();
+        let member_renames = HashMap::new();
+        let strat = api_change_to_strategy(&change, &rename_patterns, &member_renames, "test.ts");
+
+        let strat = strat.expect("should produce a strategy");
+        assert_eq!(strat.strategy, "Rename");
+        assert_eq!(strat.from.as_deref(), Some("deleteChip"));
+        assert_eq!(strat.to.as_deref(), Some("deleteLabel"));
+    }
+
+    #[test]
+    fn test_removed_prop_without_disposition_stays_remove_prop() {
+        let change = ApiChange {
+            symbol: "ToolbarFilterProps.expandableChipContainerRef".to_string(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some(
+                "property: expandableChipContainerRef: RefObject<HTMLDivElement>".to_string(),
+            ),
+            after: None,
+            description: "expandableChipContainerRef removed".to_string(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        };
+
+        let rename_patterns = empty_rename_patterns();
+        let member_renames = HashMap::new();
+        let strat = api_change_to_strategy(&change, &rename_patterns, &member_renames, "test.ts");
+
+        let strat = strat.expect("should produce a strategy");
+        assert_eq!(
+            strat.strategy, "RemoveProp",
+            "No disposition should stay RemoveProp"
+        );
+    }
+
+    #[test]
+    fn test_removed_prop_with_truly_removed_stays_remove_prop() {
+        use semver_analyzer_core::RemovalDisposition;
+
+        let change = ApiChange {
+            symbol: "ModalProps.showClose".to_string(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: showClose: boolean".to_string()),
+            after: None,
+            description: "showClose removed".to_string(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::TrulyRemoved),
+            renders_element: None,
+        };
+
+        let rename_patterns = empty_rename_patterns();
+        let member_renames = HashMap::new();
+        let strat = api_change_to_strategy(&change, &rename_patterns, &member_renames, "test.ts");
+
+        let strat = strat.expect("should produce a strategy");
+        assert_eq!(
+            strat.strategy, "RemoveProp",
+            "TrulyRemoved should stay RemoveProp"
+        );
+    }
+
+    #[test]
+    fn test_removed_prop_with_moved_to_child_stays_remove_prop() {
+        use semver_analyzer_core::RemovalDisposition;
+
+        let change = ApiChange {
+            symbol: "ModalProps.title".to_string(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: title: string".to_string()),
+            after: None,
+            description: "title moved to ModalHeader".to_string(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::MovedToChild {
+                target_component: "ModalHeader".to_string(),
+                mechanism: "prop".to_string(),
+            }),
+            renders_element: None,
+        };
+
+        let rename_patterns = empty_rename_patterns();
+        let member_renames = HashMap::new();
+        let strat = api_change_to_strategy(&change, &rename_patterns, &member_renames, "test.ts");
+
+        let strat = strat.expect("should produce a strategy");
+        assert_eq!(
+            strat.strategy, "RemoveProp",
+            "MovedToChild should stay RemoveProp (handled by hierarchy rule)"
+        );
     }
 }

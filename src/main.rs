@@ -675,11 +675,63 @@ fn build_report(
             removal_disposition,
             renders_element: entry.renders_element.clone(),
         };
-        // Only add if not already present (avoid duplicating TD findings)
+        // Only add if not already present (avoid duplicating TD findings).
+        // If the symbol already exists from TD, enrich it with LLM data
+        // (removal_disposition, renders_element) that TD doesn't produce.
         let existing = file_api_map.entry(file).or_default();
-        let already_exists = existing.iter().any(|c| c.symbol == entry.symbol);
-        if !already_exists {
+        if let Some(td_entry) = existing.iter_mut().find(|c| c.symbol == api_change.symbol) {
+            if td_entry.removal_disposition.is_none() && api_change.removal_disposition.is_some() {
+                td_entry.removal_disposition = api_change.removal_disposition;
+            }
+            if td_entry.renders_element.is_none() && api_change.renders_element.is_some() {
+                td_entry.renders_element = api_change.renders_element;
+            }
+        } else {
             existing.push(api_change);
+        }
+    }
+
+    // ── Cross-file enrichment pass: propagate removal_disposition ──
+    //
+    // The TD analysis (from .d.ts files) and BU analysis (from .tsx files)
+    // produce separate ApiChange entries for the same logical prop removal.
+    // The symbols differ in prefix (e.g., "ToolbarFilter.chips" from TD vs
+    // "ToolbarFilterProps.chips" from BU) and live in different files.
+    // BU entries carry removal_disposition from LLM analysis; TD entries don't.
+    // Propagate dispositions from BU entries to any TD entry whose prop name
+    // suffix matches (after the last dot).
+    {
+        // Collect all dispositions keyed by prop suffix (the part after the last dot)
+        let mut disposition_by_prop: std::collections::HashMap<
+            String,
+            semver_analyzer_core::RemovalDisposition,
+        > = std::collections::HashMap::new();
+        for changes in file_api_map.values() {
+            for change in changes {
+                if let Some(ref disp) = change.removal_disposition {
+                    if let Some(prop) = change.symbol.rsplit_once('.').map(|(_, p)| p) {
+                        disposition_by_prop
+                            .entry(prop.to_string())
+                            .or_insert_with(|| disp.clone());
+                    }
+                }
+            }
+        }
+        // Apply to entries missing disposition
+        if !disposition_by_prop.is_empty() {
+            for changes in file_api_map.values_mut() {
+                for change in changes.iter_mut() {
+                    if change.removal_disposition.is_none()
+                        && change.change == semver_analyzer_core::ApiChangeType::Removed
+                    {
+                        if let Some(prop) = change.symbol.rsplit_once('.').map(|(_, p)| p) {
+                            if let Some(disp) = disposition_by_prop.get(prop) {
+                                change.removal_disposition = Some(disp.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
