@@ -342,10 +342,58 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
                         .map(|s| s.as_str())
                         .collect();
                     let base = change.description.trim_end_matches(" was removed");
+
+                    // When removed and replacement have the same name but live
+                    // in different packages (e.g., SelectOptionProps moved from
+                    // deprecated to the main package), add explicit import
+                    // guidance so the LLM changes the import source rather than
+                    // creating a local replacement type.
+                    let import_hint = if mig.target.removed_symbol == mig.target.replacement_symbol
+                        && mig.target.removed_qualified_name
+                            != mig.target.replacement_qualified_name
+                    {
+                        let old_path = &mig.target.removed_qualified_name;
+                        let new_path = &mig.target.replacement_qualified_name;
+
+                        // Derive npm import paths from qualified names
+                        // e.g., "packages/react-core/src/deprecated/..." -> "@patternfly/react-core/deprecated"
+                        //        "packages/react-core/src/components/..." -> "@patternfly/react-core"
+                        let to_import_path = |qn: &str| -> String {
+                            // Extract "packages/<pkg-name>/src/..." and convert
+                            if let Some(rest) = qn.strip_prefix("packages/") {
+                                if let Some(idx) = rest.find("/src/") {
+                                    let pkg = &rest[..idx];
+                                    let after_src = &rest[idx + 5..]; // skip "/src/"
+                                    if after_src.starts_with("deprecated") {
+                                        return format!("@patternfly/{}/deprecated", pkg);
+                                    }
+                                    return format!("@patternfly/{}", pkg);
+                                }
+                            }
+                            qn.to_string()
+                        };
+
+                        let old_import = to_import_path(old_path);
+                        let new_import = to_import_path(new_path);
+
+                        if old_import != new_import {
+                            format!(
+                                "\n  Import change: replace `import {{ {} }} from '{}'` with `import {{ {} }} from '{}'`",
+                                mig.target.removed_symbol, old_import,
+                                mig.target.replacement_symbol, new_import,
+                            )
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
                     let mut desc = format!(
-                        "{} was removed — migrate to `{}`.\n  Matching props (use on `{}` instead): {}",
+                        "{} was removed — migrate to `{}`.{}\n  Matching props (use on `{}` instead): {}",
                         base,
                         mig.target.replacement_symbol,
+                        import_hint,
                         mig.target.replacement_symbol,
                         matching_names.join(", "),
                     );

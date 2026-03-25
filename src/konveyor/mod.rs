@@ -3390,32 +3390,18 @@ pub fn generate_dependency_update_rules(
             .replace('.', "-");
         let rule_id = format!("semver-dep-update-{}", slug);
 
-        // Escape the package name for xpath — replace / with ~1 (JSON pointer encoding)
-        let xpath_name = npm_name.replace('/', "~1");
-
         let new_version = format!("^{}", version);
 
-        // Match the package in all dependency fields of package.json:
-        // dependencies, devDependencies, peerDependencies, optionalDependencies,
-        // and resolution/override fields (yarn resolutions, npm overrides).
-        let dep_fields = [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-            "resolutions", // yarn classic
-            "overrides",   // npm
-        ];
-
-        let conditions: Vec<KonveyorCondition> = dep_fields
-            .iter()
-            .map(|field| KonveyorCondition::Json {
-                json: JsonFields {
-                    xpath: format!("//{}/{}", field, xpath_name),
-                    filepaths: Some(vec!["*package.json".into()]),
-                },
-            })
-            .collect();
+        // Match the package name in package.json using filecontent regex.
+        // We use filecontent instead of builtin.json xpath because xpath
+        // cannot handle keys containing '/' (e.g., @patternfly/react-core).
+        let escaped_name = npm_name.replace('/', r"\/").replace('@', r"\@");
+        let condition = KonveyorCondition::FileContent {
+            filecontent: FileContentFields {
+                pattern: format!("\"{}\"\\s*:", escaped_name),
+                file_pattern: "package\\.json$".to_string(),
+            },
+        };
 
         rules.push(KonveyorRule {
             rule_id: rule_id.clone(),
@@ -3428,7 +3414,7 @@ pub fn generate_dependency_update_rules(
             effort: 1,
             category: "mandatory".into(),
             links: Vec::new(),
-            when: KonveyorCondition::Or { or: conditions },
+            when: condition,
             message: format!(
                 "Update {} from current version to {}. \
                  This package has breaking changes between {} and {}.\n\n\
@@ -6351,10 +6337,13 @@ fn build_manifest_condition_and_message(
             );
 
             (
-                KonveyorCondition::Json {
-                    json: JsonFields {
-                        xpath: format!("//peerDependencies/{}", change.field),
-                        filepaths: Some(vec!["*package.json".into()]),
+                KonveyorCondition::FileContent {
+                    filecontent: FileContentFields {
+                        pattern: format!(
+                            "\"{}\"\\s*:",
+                            change.field.replace('/', r"\/").replace('@', r"\@")
+                        ),
+                        file_pattern: "package\\.json$".to_string(),
                     },
                 },
                 message,
@@ -6372,10 +6361,13 @@ fn build_manifest_condition_and_message(
             );
 
             (
-                KonveyorCondition::Json {
-                    json: JsonFields {
-                        xpath: format!("//{}", change.field),
-                        filepaths: Some(vec!["*package.json".into()]),
+                KonveyorCondition::FileContent {
+                    filecontent: FileContentFields {
+                        pattern: format!(
+                            "\"{}\"\\s*:",
+                            change.field.replace('/', r"\/").replace('@', r"\@")
+                        ),
+                        file_pattern: "package\\.json$".to_string(),
                     },
                 },
                 message,
@@ -6932,12 +6924,13 @@ mod tests {
         );
 
         assert_eq!(rules.len(), 1);
-        // Should use builtin.json condition
+        // Should use builtin.filecontent condition matching the field in package.json
         match &rules[0].when {
-            KonveyorCondition::Json { json } => {
-                assert!(json.xpath.contains("peerDependencies"));
+            KonveyorCondition::FileContent { filecontent } => {
+                assert!(filecontent.pattern.contains("react"));
+                assert!(filecontent.file_pattern.contains("package"));
             }
-            _ => panic!("Expected Json condition for peer dependency change"),
+            _ => panic!("Expected FileContent condition for peer dependency change"),
         }
     }
 
