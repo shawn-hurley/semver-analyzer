@@ -46,6 +46,7 @@ pub(super) fn kind_label(kind: SymbolKind) -> &'static str {
         SymbolKind::Function => "function",
         SymbolKind::Method => "method",
         SymbolKind::Class => "class",
+        SymbolKind::Struct => "struct",
         SymbolKind::Interface => "interface",
         SymbolKind::TypeAlias => "type alias",
         SymbolKind::Enum => "enum",
@@ -102,11 +103,34 @@ pub(super) fn type_param_summary(tp: &TypeParameter) -> String {
 }
 
 /// Numeric rank for visibility levels (higher = more visible).
+///
+/// NOTE: This hardcoded ranking will move to `LanguageSemantics::visibility_rank`
+/// in Phase 3, since the ordering differs by language (e.g., Java's `protected`
+/// is more visible than package-private).
 pub(super) fn visibility_rank(v: Visibility) -> u8 {
     match v {
         Visibility::Private => 0,
         Visibility::Internal => 1,
-        Visibility::Public => 2,
-        Visibility::Exported => 3,
+        Visibility::Protected => 2,
+        Visibility::Public => 3,
+        Visibility::Exported => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visibility_rank_ordering() {
+        assert!(visibility_rank(Visibility::Private) < visibility_rank(Visibility::Internal));
+        assert!(visibility_rank(Visibility::Internal) < visibility_rank(Visibility::Protected));
+        assert!(visibility_rank(Visibility::Protected) < visibility_rank(Visibility::Public));
+        assert!(visibility_rank(Visibility::Public) < visibility_rank(Visibility::Exported));
+    }
+
+    #[test]
+    fn kind_label_includes_struct() {
+        assert_eq!(kind_label(SymbolKind::Struct), "struct");
     }
 }

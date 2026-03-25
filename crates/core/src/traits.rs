@@ -15,9 +15,12 @@
 
 use crate::types::{
     ApiSurface, BreakingVerdict, Caller, ChangedFunction, EvidenceSource, FunctionSpec, Reference,
-    StructuralChange, TestDiff, TestFile,
+    StructuralChange, Symbol, TestDiff, TestFile, Visibility,
 };
 use anyhow::Result;
+use serde::{de::DeserializeOwned, Serialize};
+use std::collections::BTreeSet;
+use std::fmt::Debug;
 use std::path::Path;
 
 // ── TD Traits ───────────────────────────────────────────────────────────
@@ -176,6 +179,117 @@ pub trait BehaviorAnalyzer {
         callee_name: &str,
         evidence: &EvidenceSource,
     ) -> Result<bool>;
+}
+
+// ── Language abstraction traits (multi-language architecture) ────────────
+//
+// These traits define the integration point for multi-language support.
+// See `design/01-traits.md` for detailed documentation.
+
+/// Language-specific semantic rules consumed by the diff engine.
+///
+/// These encode the places where "is this breaking?" or "are these related?"
+/// differ fundamentally by language. The diff engine calls these methods
+/// instead of hardcoding language-specific rules.
+pub trait LanguageSemantics {
+    /// Is adding this member to this container a breaking change?
+    ///
+    /// This is the single rule that differs most fundamentally by language:
+    /// - TypeScript: breaking only if the member is required (non-optional).
+    /// - Go: ALWAYS breaking for interfaces (all implementors must add it).
+    /// - Java: breaking for abstract methods, not for default methods.
+    /// - C#: breaking for abstract members on interfaces.
+    /// - Python: breaking for abstract methods on Protocol/ABC.
+    fn is_member_addition_breaking(&self, container: &Symbol, member: &Symbol) -> bool;
+
+    /// Are these two symbols part of the same logical family/group?
+    ///
+    /// Used to scope migration detection. When a symbol is removed, only
+    /// symbols in the same family are considered as potential absorption targets.
+    ///
+    /// - TypeScript/React: same component directory
+    /// - Go: same package
+    /// - Java: same package
+    /// - Python: same module
+    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool;
+
+    /// Are these two symbols the same concept, possibly at different paths?
+    ///
+    /// When true, migration detection does a full member comparison (all members,
+    /// not just newly-added ones) because the candidate is assumed to be a direct
+    /// replacement for the removed symbol.
+    ///
+    /// Resolves companion types linked by naming convention:
+    /// - TypeScript: `Button` and `ButtonProps` (component + its props interface)
+    /// - Go: `Client` and `ClientOptions` (struct + its configuration)
+    /// - Java: `UserService` and `UserServiceImpl` (interface + implementation)
+    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool;
+
+    /// Numeric rank for a visibility level (higher = more visible).
+    ///
+    /// Used to determine if visibility was reduced (breaking) or increased.
+    /// The ordering differs by language:
+    /// - TypeScript: Private(0) < Internal(1) < Protected(1) < Public(2) < Exported(3)
+    /// - Java: Private(0) < PackagePrivate(1) < Protected(2) < Public(3)
+    /// - Go: Internal(0) < Exported(1)
+    fn visibility_rank(&self, v: Visibility) -> u8;
+
+    /// Parse union/constrained type values for fine-grained diffing.
+    ///
+    /// TypeScript: parse `'primary' | 'secondary' | 'danger'`.
+    /// Python: parse `Literal['a', 'b']`.
+    /// Most other languages return `None`.
+    fn parse_union_values(&self, _type_str: &str) -> Option<BTreeSet<String>> {
+        None
+    }
+
+    /// Post-process the change list before returning from diff_surfaces.
+    ///
+    /// TypeScript: dedup default export changes.
+    /// Most languages: no-op.
+    fn post_process(&self, _changes: &mut Vec<StructuralChange>) {}
+}
+
+/// Language-specific human-readable descriptions for changes.
+///
+/// Each language owns its messaging entirely -- there is no generic
+/// template in core. These descriptions are consumed by LLMs downstream,
+/// so language-appropriate terminology matters.
+pub trait MessageFormatter {
+    /// Produce a human-readable description for a structural change.
+    fn describe(&self, change: &StructuralChange) -> String;
+}
+
+/// The core language abstraction.
+///
+/// Composes `LanguageSemantics + MessageFormatter` and adds four associated
+/// types representing language-specific data flowing through the pipeline.
+///
+/// Code that only needs semantic rules can take `&dyn LanguageSemantics`
+/// (no generic parameter). Code that needs the associated types takes
+/// `L: Language`.
+pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static {
+    /// Behavioral change categories for this language.
+    type Category: Debug + Clone + Serialize + DeserializeOwned + Eq + std::hash::Hash + Send + Sync;
+
+    /// Manifest change types for this language's package system.
+    type ManifestChangeType: Debug
+        + Clone
+        + Serialize
+        + DeserializeOwned
+        + Eq
+        + PartialEq
+        + Send
+        + Sync;
+
+    /// Evidence data carried on behavioral changes.
+    type Evidence: Debug + Clone + Serialize + DeserializeOwned + Send + Sync;
+
+    /// Language-specific report data.
+    type ReportData: Debug + Clone + Serialize + DeserializeOwned + Send + Sync;
+
+    /// Language identifier for serialization dispatch.
+    fn name() -> &'static str;
 }
 
 // ── Convenience function (TD) ───────────────────────────────────────────

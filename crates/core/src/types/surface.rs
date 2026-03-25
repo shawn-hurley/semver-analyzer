@@ -115,6 +115,8 @@ pub enum SymbolKind {
     Function,
     Method,
     Class,
+    /// Value type (Go, C#). Distinct from Class in languages that differentiate.
+    Struct,
     Interface,
     TypeAlias,
     Enum,
@@ -136,6 +138,8 @@ pub enum Visibility {
     Exported,
     /// Public class member (not `private` or `protected`).
     Public,
+    /// Accessible to subclasses. Java: `protected`. C#: `protected`. Python: `_prefix`.
+    Protected,
     /// Module-internal (not exported).
     Internal,
     /// Explicitly marked private (`private` keyword or `#field`).
