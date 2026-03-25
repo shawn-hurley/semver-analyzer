@@ -4,6 +4,7 @@
 //! (visibility, modifiers, hierarchy, signatures, members) and emits
 //! `StructuralChange` entries for detected differences.
 
+use crate::traits::LanguageSemantics;
 use crate::types::{
     Parameter, Signature, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
 };
@@ -22,23 +23,33 @@ use super::rename::detect_renames;
 /// individual comparison functions for each aspect. Note the mutual
 /// recursion with `diff_members` (which calls back into `diff_symbol`
 /// for matched member pairs).
-pub(super) fn diff_symbol(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange>) {
-    diff_visibility(old, new, changes);
+pub(super) fn diff_symbol(
+    old: &Symbol,
+    new: &Symbol,
+    changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
+) {
+    diff_visibility(old, new, changes, semantics);
     diff_modifiers(old, new, changes);
     diff_hierarchy(old, new, changes);
-    diff_signatures(old, new, changes);
-    diff_members(old, new, changes);
+    diff_signatures(old, new, changes, semantics);
+    diff_members(old, new, changes, semantics);
 }
 
 // ─── Visibility diff ─────────────────────────────────────────────────────
 
-fn diff_visibility(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange>) {
+fn diff_visibility(
+    old: &Symbol,
+    new: &Symbol,
+    changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
+) {
     if old.visibility == new.visibility {
         return;
     }
 
-    let old_rank = visibility_rank(old.visibility);
-    let new_rank = visibility_rank(new.visibility);
+    let old_rank = semantics.visibility_rank(old.visibility);
+    let new_rank = semantics.visibility_rank(new.visibility);
 
     if new_rank < old_rank {
         changes.push(change(
@@ -196,11 +207,16 @@ fn diff_hierarchy(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
 
 // ─── Signature diff ──────────────────────────────────────────────────────
 
-fn diff_signatures(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange>) {
+fn diff_signatures(
+    old: &Symbol,
+    new: &Symbol,
+    changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
+) {
     match (&old.signature, &new.signature) {
         (Some(old_sig), Some(new_sig)) => {
-            diff_parameters(old, old_sig, new_sig, changes);
-            diff_return_type(old, old_sig, new_sig, changes);
+            diff_parameters(old, old_sig, new_sig, changes, semantics);
+            diff_return_type(old, old_sig, new_sig, changes, semantics);
             diff_type_parameters(old, old_sig, new_sig, changes);
         }
         (Some(_), None) => {
@@ -231,6 +247,7 @@ fn diff_parameters(
     old_sig: &Signature,
     new_sig: &Signature,
     changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
 ) {
     let old_params = &old_sig.parameters;
     let new_params = &new_sig.parameters;
@@ -265,7 +282,7 @@ fn diff_parameters(
 
             // Also emit per-value union literal changes
             if let (Some(old_ta), Some(new_ta)) = (&old_p.type_annotation, &new_p.type_annotation) {
-                diff_union_literals(sym, &old_p.name, old_ta, new_ta, changes);
+                diff_union_literals(sym, &old_p.name, old_ta, new_ta, changes, semantics);
             }
         }
 
@@ -398,6 +415,7 @@ fn diff_return_type(
     old_sig: &Signature,
     new_sig: &Signature,
     changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
 ) {
     if old_sig.return_type == new_sig.return_type {
         return;
@@ -444,7 +462,7 @@ fn diff_return_type(
         ));
 
         // Also emit per-value union literal changes if both types are string literal unions
-        diff_union_literals(sym, &sym.name, old_ret, new_ret, changes);
+        diff_union_literals(sym, &sym.name, old_ret, new_ret, changes, semantics);
     }
 }
 
@@ -572,7 +590,12 @@ fn diff_type_parameters(
 /// This function is mutually recursive with `diff_symbol` — matched members
 /// are compared by calling `diff_symbol` again. This is why both functions
 /// live in the same module visibility scope.
-pub(super) fn diff_members(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange>) {
+pub(super) fn diff_members(
+    old: &Symbol,
+    new: &Symbol,
+    changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
+) {
     if old.members.is_empty() && new.members.is_empty() {
         return;
     }
@@ -669,30 +692,12 @@ pub(super) fn diff_members(old: &Symbol, new: &Symbol, changes: &mut Vec<Structu
         if renamed_new.contains(member.name.as_str()) {
             continue;
         }
-        let (change_type, description, is_breaking) = match new.kind {
+        let is_breaking = semantics.is_member_addition_breaking(new, member);
+        let (change_type, description) = match new.kind {
             SymbolKind::Enum => (
                 StructuralChangeType::EnumMemberAdded,
                 format!("Enum member `{}` was added to `{}`", member.name, new.name),
-                false,
             ),
-            SymbolKind::Interface | SymbolKind::TypeAlias => {
-                let is_optional = member
-                    .signature
-                    .as_ref()
-                    .and_then(|s| s.parameters.first())
-                    .map(|p| p.optional)
-                    .unwrap_or(false);
-                (
-                    StructuralChangeType::PropertyAdded,
-                    format!(
-                        "{} `{}` was added to `{}`",
-                        kind_label(member.kind),
-                        member.name,
-                        new.name
-                    ),
-                    !is_optional,
-                )
-            }
             _ => (
                 StructuralChangeType::PropertyAdded,
                 format!(
@@ -701,7 +706,6 @@ pub(super) fn diff_members(old: &Symbol, new: &Symbol, changes: &mut Vec<Structu
                     member.name,
                     new.name
                 ),
-                false,
             ),
         };
         changes.push(change(
@@ -720,7 +724,7 @@ pub(super) fn diff_members(old: &Symbol, new: &Symbol, changes: &mut Vec<Structu
             if old.kind == SymbolKind::Enum {
                 diff_enum_member_value(old, old_member, new_member, changes);
             } else {
-                diff_symbol(old_member, new_member, changes);
+                diff_symbol(old_member, new_member, changes, semantics);
             }
         }
     }
@@ -787,12 +791,13 @@ fn diff_union_literals(
     old_type: &str,
     new_type: &str,
     changes: &mut Vec<StructuralChange>,
+    semantics: &dyn LanguageSemantics,
 ) {
-    let old_literals = match parse_union_literals(old_type) {
+    let old_literals = match semantics.parse_union_values(old_type) {
         Some(l) => l,
         None => return,
     };
-    let new_literals = match parse_union_literals(new_type) {
+    let new_literals = match semantics.parse_union_values(new_type) {
         Some(l) => l,
         None => return,
     };

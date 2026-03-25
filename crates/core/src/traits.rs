@@ -292,16 +292,24 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
     fn name() -> &'static str;
 }
 
-// ── Convenience function (TD) ───────────────────────────────────────────
+// ── Convenience functions (TD) ──────────────────────────────────────────
 
-/// Compare two API surfaces and produce structural changes.
+/// Compare two API surfaces using language-specific semantic rules.
 ///
-/// This is language-agnostic and written once. It operates on the
-/// `ApiSurface` type produced by `ApiExtractor` implementations.
+/// This is the primary entry point for the TD (Top-Down) pipeline.
+/// The `semantics` parameter provides language-specific rules.
+pub fn diff_surfaces_with_semantics(
+    old: &ApiSurface,
+    new: &ApiSurface,
+    semantics: &dyn LanguageSemantics,
+) -> Vec<StructuralChange> {
+    crate::diff::diff_surfaces_with_semantics(old, new, semantics)
+}
+
+/// Compare two API surfaces using default (TypeScript) semantics.
 ///
-/// Type comparison is done via canonicalized string equality — the
-/// `ApiExtractor` is responsible for normalizing types before they
-/// reach this function.
+/// Backward-compatible convenience function. Prefer
+/// `diff_surfaces_with_semantics` for new code.
 pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
     crate::diff::diff_surfaces(old, new)
 }

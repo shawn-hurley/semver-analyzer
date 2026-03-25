@@ -25,7 +25,8 @@ mod rename;
 #[cfg(test)]
 mod tests;
 
-use crate::types::{ApiSurface, StructuralChange, StructuralChangeType, Symbol};
+use crate::traits::LanguageSemantics;
+use crate::types::{ApiSurface, StructuralChange, StructuralChangeType, Symbol, SymbolKind};
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
@@ -34,11 +35,18 @@ use migration::detect_migrations;
 use relocate::{detect_relocations, RelocationType};
 use rename::detect_renames;
 
-/// Compare two API surfaces and produce a list of structural changes.
+/// Compare two API surfaces using language-specific semantic rules.
 ///
 /// This is the core of the TD (Top-Down) pipeline. It matches symbols by
 /// `qualified_name`, then compares every field to detect additions, removals,
 /// and modifications.
+///
+/// The `semantics` parameter provides language-specific rules for:
+/// - Whether adding a member is breaking (`is_member_addition_breaking`)
+/// - How to group related symbols (`same_family`, `same_identity`)
+/// - How to rank visibility levels (`visibility_rank`)
+/// - How to parse union/literal types (`parse_union_values`)
+/// - Post-processing of the change list (`post_process`)
 ///
 /// The matching pipeline is:
 /// 1. **Exact qualified_name match** — symbols at the same path are compared directly.
@@ -49,7 +57,11 @@ use rename::detect_renames;
 /// 4. **Unmatched** — remaining removed symbols are reported as removed, added as added.
 ///
 /// Star re-export symbols (`export * from './module'`) are filtered out.
-pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
+pub fn diff_surfaces_with_semantics(
+    old: &ApiSurface,
+    new: &ApiSurface,
+    semantics: &dyn LanguageSemantics,
+) -> Vec<StructuralChange> {
     let mut changes = Vec::new();
 
     // Filter out star re-export symbols — they represent `export * from '...'`
@@ -186,7 +198,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
 
         // Diff members of relocated symbols to catch property-level changes
         // (e.g., ChipProps lost the `component` prop when moved to deprecated)
-        diff_symbol(reloc.old, reloc.new, &mut changes);
+        diff_symbol(reloc.old, reloc.new, &mut changes, semantics);
     }
 
     // ── Phase 2: Rename detection ────────────────────────────────────
@@ -297,7 +309,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
     // Symbols that matched by exact qualified_name — diff their contents.
     for sym_old in &old_symbols {
         if let Some(sym_new) = new_map.get(sym_old.qualified_name.as_str()) {
-            diff_symbol(sym_old, sym_new, &mut changes);
+            diff_symbol(sym_old, sym_new, &mut changes, semantics);
         }
     }
 
@@ -317,7 +329,7 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
             .copied()
             .collect();
 
-        let migrations = detect_migrations(&final_removed, &old_symbols, &new_symbols);
+        let migrations = detect_migrations(&final_removed, &old_symbols, &new_symbols, semantics);
 
         // Annotate existing SymbolRemoved changes with migration targets.
         for mig in &migrations {
@@ -412,15 +424,119 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
         }
     }
 
-    // ── Phase 6: Deduplicate default exports ─────────────────────────
-    // Many TypeScript files export both a named export and a default export
-    // for the same symbol: `export { Foo }; export default Foo;`
-    // When both are removed/added/changed, reporting both is redundant.
-    // Suppress `default` changes when a sibling named export from the same
-    // file has the same change type.
-    dedup_default_exports(&mut changes);
+    // ── Phase 6: Language-specific post-processing ────────────────────
+    // Each language can clean up the change list. For TypeScript, this
+    // deduplicates default export changes when a named sibling exists.
+    semantics.post_process(&mut changes);
 
     changes
+}
+
+/// Backward-compatible wrapper that uses the default (TypeScript) semantics.
+///
+/// This exists so that existing callers (orchestrator, tests, convenience
+/// function in traits.rs) continue to work without modification.
+/// Will be removed once all callers migrate to `diff_surfaces_with_semantics`.
+pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
+    diff_surfaces_with_semantics(old, new, &DefaultSemantics)
+}
+
+/// Default semantics that replicates the original hardcoded TypeScript behavior.
+///
+/// This is a temporary shim that preserves backward compatibility. It will be
+/// removed when all callers switch to passing an explicit `LanguageSemantics`.
+pub(crate) struct DefaultSemantics;
+
+impl LanguageSemantics for DefaultSemantics {
+    fn is_member_addition_breaking(&self, container: &Symbol, member: &Symbol) -> bool {
+        // Original TS behavior from compare.rs
+        match container.kind {
+            SymbolKind::Interface | SymbolKind::TypeAlias => {
+                let is_optional = member
+                    .signature
+                    .as_ref()
+                    .and_then(|s| s.parameters.first())
+                    .map(|p| p.optional)
+                    .unwrap_or(false);
+                !is_optional
+            }
+            _ => false,
+        }
+    }
+
+    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool {
+        canonical_component_dir(&a.file.to_string_lossy())
+            == canonical_component_dir(&b.file.to_string_lossy())
+    }
+
+    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool {
+        strip_props_suffix(&a.name) == strip_props_suffix(&b.name)
+    }
+
+    fn visibility_rank(&self, v: crate::types::Visibility) -> u8 {
+        helpers::visibility_rank(v)
+    }
+
+    fn parse_union_values(&self, type_str: &str) -> Option<std::collections::BTreeSet<String>> {
+        parse_union_literals(type_str)
+    }
+
+    fn post_process(&self, changes: &mut Vec<StructuralChange>) {
+        dedup_default_exports(changes);
+    }
+}
+
+/// Parse TypeScript string literal union type (used by DefaultSemantics).
+fn parse_union_literals(type_str: &str) -> Option<std::collections::BTreeSet<String>> {
+    if !type_str.contains('\'') && !type_str.contains('"') {
+        return None;
+    }
+    if !type_str.contains('|') {
+        return None;
+    }
+    let mut literals = std::collections::BTreeSet::new();
+    for part in type_str.split('|') {
+        let trimmed = part.trim();
+        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        {
+            let value = &trimmed[1..trimmed.len() - 1];
+            if !value.is_empty() {
+                literals.insert(value.to_string());
+            }
+        }
+    }
+    if literals.len() >= 2 {
+        Some(literals)
+    } else {
+        None
+    }
+}
+
+/// Extract component directory, stripping /deprecated/ and /next/ (used by DefaultSemantics).
+fn canonical_component_dir(file_path: &str) -> String {
+    let canonical = file_path
+        .replace("/deprecated/", "/")
+        .replace("/next/", "/");
+    let canonical = if canonical.starts_with("deprecated/") {
+        canonical.strip_prefix("deprecated/").unwrap().to_string()
+    } else {
+        canonical
+    };
+    let canonical = if canonical.starts_with("next/") {
+        canonical.strip_prefix("next/").unwrap().to_string()
+    } else {
+        canonical
+    };
+    match canonical.rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => canonical,
+    }
+}
+
+/// Strip "Props" suffix (used by DefaultSemantics).
+fn strip_props_suffix(name: &str) -> &str {
+    name.strip_suffix("Props").unwrap_or(name)
 }
 
 /// Remove redundant `default` export changes when a named sibling from the

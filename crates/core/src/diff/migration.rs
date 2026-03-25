@@ -68,6 +68,7 @@ pub(super) fn detect_migrations<'a>(
     removed: &[&'a Symbol],
     old_symbols: &[&'a Symbol],
     new_symbols: &[&'a Symbol],
+    semantics: &dyn crate::traits::LanguageSemantics,
 ) -> Vec<MigrationMatch<'a>> {
     // Only consider removed interfaces and classes — these are the container
     // types whose members might have moved.
@@ -80,17 +81,12 @@ pub(super) fn detect_migrations<'a>(
         return Vec::new();
     }
 
-    // Build a map of surviving/added interface symbols by canonical directory.
-    // "Canonical directory" strips /deprecated/ and /next/ from the path so
-    // that `deprecated/components/Select/` matches `components/Select/`.
-    let mut new_by_dir: HashMap<String, Vec<&Symbol>> = HashMap::new();
-    for sym in new_symbols {
-        if !is_container_kind(sym.kind) {
-            continue;
-        }
-        let dir = canonical_component_dir(&sym.file.to_string_lossy());
-        new_by_dir.entry(dir).or_default().push(sym);
-    }
+    // Collect new container symbols for candidate matching.
+    let new_containers: Vec<&Symbol> = new_symbols
+        .iter()
+        .filter(|s| is_container_kind(s.kind))
+        .copied()
+        .collect();
 
     // Also index old surviving symbols (interfaces that exist in both versions
     // but gained new members). We detect "added members" by checking which
@@ -111,7 +107,6 @@ pub(super) fn detect_migrations<'a>(
     let mut matched_removed: HashSet<&str> = HashSet::new();
 
     for removed_sym in &removed_interfaces {
-        let removed_dir = canonical_component_dir(&removed_sym.file.to_string_lossy());
         let removed_members: HashSet<&str> = removed_sym
             .members
             .iter()
@@ -122,11 +117,11 @@ pub(super) fn detect_migrations<'a>(
             continue;
         }
 
-        // Find candidate replacements in the same canonical directory.
-        let candidates = match new_by_dir.get(&removed_dir) {
-            Some(c) => c,
-            None => continue,
-        };
+        // Find candidate replacements in the same family (same_family check).
+        let candidates: Vec<&&Symbol> = new_containers
+            .iter()
+            .filter(|c| semantics.same_family(removed_sym, c))
+            .collect();
 
         let mut best_match: Option<(&Symbol, f64, Vec<MemberMapping>, Vec<String>)> = None;
 
@@ -160,13 +155,13 @@ pub(super) fn detect_migrations<'a>(
                     candidate.members.iter().map(|m| m.name.as_str()).collect()
                 };
 
-            // Also check same-name replacement: when a removed interface has
-            // the same canonical base name as a surviving candidate (e.g.,
-            // deprecated Select -> main Select), compare ALL members, not just added.
-            let is_same_name =
-                strip_props_suffix(&removed_sym.name) == strip_props_suffix(&candidate.name);
+            // Also check same-identity replacement: when a removed interface
+            // represents the same concept as a surviving candidate (e.g.,
+            // deprecated Select -> main Select, or ButtonProps -> Button),
+            // compare ALL members, not just added.
+            let is_same_identity = semantics.same_identity(removed_sym, candidate);
 
-            let effective_candidate_members: HashSet<&str> = if is_same_name {
+            let effective_candidate_members: HashSet<&str> = if is_same_identity {
                 // Same-name replacement: compare full member lists.
                 candidate.members.iter().map(|m| m.name.as_str()).collect()
             } else {
@@ -309,6 +304,7 @@ fn canonical_path(qualified_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::DefaultSemantics;
     use crate::types::{Symbol, SymbolKind, Visibility};
     use std::path::PathBuf;
 
@@ -378,7 +374,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_header];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
         assert_eq!(results.len(), 1);
 
         let m = &results[0];
@@ -484,7 +480,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_main_select];
         let removed: Vec<&Symbol> = vec![&old_select];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
         assert_eq!(results.len(), 1);
 
         let m = &results[0];
@@ -557,7 +553,7 @@ mod tests {
         // This module handles the case where the INTERFACE is removed, not props.
         let removed: Vec<&Symbol> = vec![];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
         assert_eq!(
             results.len(),
             0,
@@ -584,7 +580,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_bar];
         let removed: Vec<&Symbol> = vec![&removed_foo];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
         assert_eq!(results.len(), 0, "Different directories should not match");
     }
 
@@ -620,7 +616,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_foo];
         let removed: Vec<&Symbol> = vec![&removed_header];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
         // 1 match (title) from 2-member interface = 50% ratio.
         // Adaptive min_overlap_count(2) = 1, ratio 50% > 25%.
         // This is correctly detected as an absorption.
@@ -693,7 +689,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_icon_props];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
 
         assert_eq!(
             results.len(),
@@ -763,7 +759,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_tiny];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
         assert!(
             results.is_empty(),
             "Should NOT produce migration for non-matching single-member interface"
