@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return <li role=\"separator\"></li>; }\"#,\nr#\"{ return <li role=\"presentation\"></li>; }\"#, \"NavSeparator\",)"
+---
+- symbol: NavSeparator
+  category: Accessibility
+  description: "role changed on <li> from \"separator\" to \"presentation\""
+  before: "role=\"separator\""
+  after: "role=\"presentation\""

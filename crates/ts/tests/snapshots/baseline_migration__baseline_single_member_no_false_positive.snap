@@ -1,0 +1,22 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: TinyProps
+  qualified_name: components/Foo/Tiny.d.ts.TinyProps
+  kind: Interface
+  change_type: SymbolRemoved
+  is_breaking: true
+  description: "Exported interface `TinyProps` was removed"
+  before: "interface: TinyProps"
+  after: ~
+  has_migration_target: false
+- symbol: newProp
+  qualified_name: components/Foo/Foo.d.ts.FooProps.newProp
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `newProp` was added to `FooProps`"
+  before: ~
+  after: "property: newProp"
+  has_migration_target: false

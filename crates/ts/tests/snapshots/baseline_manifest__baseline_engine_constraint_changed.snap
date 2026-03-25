@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"engines\": { \"node\": \">=16\" } }),\njson!({ \"engines\": { \"node\": \">=18\" } }),)"
+---
+- field: engines.node
+  change_type: EngineConstraintChanged
+  is_breaking: true
+  description: "Engine constraint for `node` changed from `>=16` to `>=18`"
+  before: ">=16"
+  after: ">=18"

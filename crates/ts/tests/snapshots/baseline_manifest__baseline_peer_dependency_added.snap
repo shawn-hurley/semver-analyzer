@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({}),\njson!({ \"peerDependencies\": { \"react\": \"^18.0.0\" } }),)"
+---
+- field: peerDependencies.react
+  change_type: PeerDependencyAdded
+  is_breaking: true
+  description: "Peer dependency `react@^18.0.0` was added. Consumers must install it."
+  before: ~
+  after: ^18.0.0

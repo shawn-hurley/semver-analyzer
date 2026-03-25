@@ -1,0 +1,22 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: Foo
+  qualified_name: pkg/dist/foo.Foo
+  kind: Constant
+  change_type: SymbolRemoved
+  is_breaking: true
+  description: "Exported constant `Foo` was removed"
+  before: "constant: Foo"
+  after: ~
+  has_migration_target: false
+- symbol: default
+  qualified_name: pkg/dist/foo.default
+  kind: Function
+  change_type: ParameterTypeChanged
+  is_breaking: true
+  description: "Parameter `x` of `default` changed type from `string` to `number`"
+  before: string
+  after: number
+  has_migration_target: false

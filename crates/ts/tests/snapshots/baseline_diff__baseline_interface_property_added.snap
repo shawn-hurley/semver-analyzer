@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: age
+  qualified_name: age
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `age` was added to `Options`"
+  before: ~
+  after: "property: age"
+  has_migration_target: false

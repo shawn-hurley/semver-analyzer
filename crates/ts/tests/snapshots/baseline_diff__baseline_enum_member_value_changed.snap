@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: Red
+  qualified_name: Red
+  kind: EnumMember
+  change_type: EnumMemberValueChanged
+  is_breaking: true
+  description: "Value of enum member `Color.Red` changed from `0` to `1`"
+  before: "0"
+  after: "1"
+  has_migration_target: false

@@ -1,0 +1,5 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(\"{ return 42; }\", \"{ return 43; }\", \"foo\",)"
+---
+[]

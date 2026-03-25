@@ -1,0 +1,49 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: EmptyStateIconProps
+  qualified_name: components/EmptyState/EmptyStateIcon.d.ts.EmptyStateIconProps
+  kind: Interface
+  change_type: MigrationSuggested
+  is_breaking: true
+  description: "Exported interface `EmptyStateIconProps` was removed — migrate to `EmptyStateProps`.\n  Matching props (use on `EmptyStateProps` instead): icon\n  Removed props with no direct equivalent: className"
+  before: "interface: EmptyStateIconProps"
+  after: ~
+  has_migration_target: true
+- symbol: icon
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.icon
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `icon` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: icon"
+  has_migration_target: false
+- symbol: titleText
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.titleText
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `titleText` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: titleText"
+  has_migration_target: false
+- symbol: headingLevel
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.headingLevel
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `headingLevel` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: headingLevel"
+  has_migration_target: false
+- symbol: status
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.status
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `status` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: status"
+  has_migration_target: false

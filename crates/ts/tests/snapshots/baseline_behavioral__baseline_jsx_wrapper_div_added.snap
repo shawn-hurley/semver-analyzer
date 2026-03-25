@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(\"{ return <button>Click</button>; }\",\n\"{ return <div><button>Click</button></div>; }\", \"Toggle\",)"
+---
+- symbol: Toggle
+  category: DomStructure
+  description: "<div> element added to render output (1 instance)"
+  before: ~
+  after: "<div>"

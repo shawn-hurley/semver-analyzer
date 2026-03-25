@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: f
+  qualified_name: f
+  kind: Function
+  change_type: ParameterMadeRequired
+  is_breaking: true
+  description: "Parameter `a` of `f` was made required"
+  before: optional
+  after: required
+  has_migration_target: false

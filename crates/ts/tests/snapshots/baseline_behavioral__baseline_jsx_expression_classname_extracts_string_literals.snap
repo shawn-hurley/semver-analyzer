@@ -1,0 +1,14 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return <div className={css(\"pf-v5-c-button\", isActive && \"pf-m-active\")}>btn</div>; }\"#,\nr#\"{ return <div className={css(\"pf-v6-c-button\", isActive && \"pf-m-active\")}>btn</div>; }\"#,\n\"Button\",)"
+---
+- symbol: Button
+  category: CssClass
+  description: "CSS class 'pf-v5-c-button' removed from render output"
+  before: pf-v5-c-button
+  after: ~
+- symbol: Button
+  category: CssClass
+  description: "CSS class 'pf-v6-c-button' added to render output"
+  before: ~
+  after: pf-v6-c-button

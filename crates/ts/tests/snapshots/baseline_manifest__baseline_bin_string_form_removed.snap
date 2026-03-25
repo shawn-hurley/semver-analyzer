@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"name\": \"myapp\", \"bin\": \"./cli.js\" }),\njson!({ \"name\": \"myapp\" }),)"
+---
+- field: bin.myapp
+  change_type: BinEntryRemoved
+  is_breaking: true
+  description: "CLI command `myapp` was removed"
+  before: "./cli.js"
+  after: ~

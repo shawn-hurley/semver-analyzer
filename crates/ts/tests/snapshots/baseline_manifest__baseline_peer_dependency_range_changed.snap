@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({\n    \"peerDependencies\": { \"react\": \"^17.0.0 || ^18.0.0\" }\n}), json!({ \"peerDependencies\": { \"react\": \"^18.0.0\" } }),)"
+---
+- field: peerDependencies.react
+  change_type: PeerDependencyRangeChanged
+  is_breaking: true
+  description: "Peer dependency `react` range changed from `^17.0.0 || ^18.0.0` to `^18.0.0`"
+  before: ^17.0.0 || ^18.0.0
+  after: ^18.0.0

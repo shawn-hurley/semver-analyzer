@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: isActive
+  qualified_name: ButtonProps.isActive
+  kind: Property
+  change_type: PropertyRenamed
+  is_breaking: true
+  description: "property `isActive` was renamed to `isClicked` in `ButtonProps`"
+  before: isActive
+  after: isClicked
+  has_migration_target: false

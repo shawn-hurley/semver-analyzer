@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: method
+  qualified_name: method
+  kind: Method
+  change_type: StaticInstanceChanged
+  is_breaking: true
+  description: "`method` changed from instance to static member"
+  before: instance
+  after: static
+  has_migration_target: false

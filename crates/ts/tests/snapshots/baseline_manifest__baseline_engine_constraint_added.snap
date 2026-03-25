@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({}), json!({ \"engines\": { \"node\": \">=18\" } }),)"
+---
+- field: engines.node
+  change_type: EngineConstraintChanged
+  is_breaking: true
+  description: "Engine constraint `node: >=18` was added. Consumers on unsupported runtimes will be affected."
+  before: ~
+  after: ">=18"

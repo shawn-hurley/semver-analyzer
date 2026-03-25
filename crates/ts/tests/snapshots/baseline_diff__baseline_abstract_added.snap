@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: validate
+  qualified_name: validate
+  kind: Method
+  change_type: AbstractAdded
+  is_breaking: true
+  description: "`validate` was made abstract"
+  before: concrete
+  after: abstract
+  has_migration_target: false

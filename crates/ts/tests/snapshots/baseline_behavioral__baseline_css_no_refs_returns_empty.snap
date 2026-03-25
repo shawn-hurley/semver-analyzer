@@ -1,0 +1,5 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "css_diff(\"const x = 42;\", \"const x = 43;\", \"foo\",)"
+---
+[]

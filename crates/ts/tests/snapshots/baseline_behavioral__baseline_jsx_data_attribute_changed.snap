@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return <div data-ouia-component-type=\"PF4/Button\">btn</div>; }\"#,\nr#\"{ return <div data-ouia-component-type=\"PF5/Button\">btn</div>; }\"#,\n\"Button\",)"
+---
+- symbol: Button
+  category: DataAttribute
+  description: data-ouia-component-type value changed on <div>
+  before: "data-ouia-component-type=\"PF4/Button\""
+  after: "data-ouia-component-type=\"PF5/Button\""

@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: f
+  qualified_name: f
+  kind: Function
+  change_type: ParameterAdded
+  is_breaking: false
+  description: "Optional parameter `b` was added to `f`"
+  before: ~
+  after: "b?: number"
+  has_migration_target: false

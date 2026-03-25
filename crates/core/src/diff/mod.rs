@@ -329,18 +329,20 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
                     change.migration_target = Some(mig.target.clone());
                     // Enrich the description with the full migration recipe
                     // so the rule message gives the LLM actionable context.
-                    let matching_names: Vec<&str> = mig
+                    let mut matching_names: Vec<&str> = mig
                         .target
                         .matching_members
                         .iter()
                         .map(|m| m.old_name.as_str())
                         .collect();
-                    let removed_names: Vec<&str> = mig
+                    matching_names.sort();
+                    let mut removed_names: Vec<&str> = mig
                         .target
                         .removed_only_members
                         .iter()
                         .map(|s| s.as_str())
                         .collect();
+                    removed_names.sort();
                     let base = change.description.trim_end_matches(" was removed");
 
                     // When removed and replacement have the same name but live

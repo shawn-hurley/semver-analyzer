@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(\"{ return <div>hello</div>; }\",\n\"{ return <div><section>hello</section></div>; }\", \"MyComponent\",)"
+---
+- symbol: MyComponent
+  category: DomStructure
+  description: "<section> element added to render output (1 instance)"
+  before: ~
+  after: "<section>"

@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(\"{ return <div><span>text</span></div>; }\",\n\"{ return <div>text</div>; }\", \"Comp\",)"
+---
+- symbol: Comp
+  category: DomStructure
+  description: "<span> element removed from render output (1 instance)"
+  before: "<span>"
+  after: ~

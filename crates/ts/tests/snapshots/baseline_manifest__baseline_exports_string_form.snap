@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"exports\": \"./index.js\" }),\njson!({ \"exports\": \"./dist/index.js\" }),)"
+---
+- field: exports...default
+  change_type: EntryPointChanged
+  is_breaking: true
+  description: "Export `.` condition `default` target changed from `./index.js` to `./dist/index.js`"
+  before: "./index.js"
+  after: "./dist/index.js"

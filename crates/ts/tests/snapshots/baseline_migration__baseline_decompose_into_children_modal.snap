@@ -1,0 +1,85 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: ModalHeaderProps
+  qualified_name: components/Modal/ModalHeader.d.ts.ModalHeaderProps
+  kind: Interface
+  change_type: SymbolAdded
+  is_breaking: false
+  description: "Exported interface `ModalHeaderProps` was added"
+  before: ~
+  after: "interface: ModalHeaderProps"
+  has_migration_target: false
+- symbol: title
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.title
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `title` was removed from `ModalProps`"
+  before: "property: title"
+  after: ~
+  has_migration_target: false
+- symbol: actions
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.actions
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `actions` was removed from `ModalProps`"
+  before: "property: actions"
+  after: ~
+  has_migration_target: false
+- symbol: description
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.description
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `description` was removed from `ModalProps`"
+  before: "property: description"
+  after: ~
+  has_migration_target: false
+- symbol: footer
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.footer
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `footer` was removed from `ModalProps`"
+  before: "property: footer"
+  after: ~
+  has_migration_target: false
+- symbol: header
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.header
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `header` was removed from `ModalProps`"
+  before: "property: header"
+  after: ~
+  has_migration_target: false
+- symbol: help
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.help
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `help` was removed from `ModalProps`"
+  before: "property: help"
+  after: ~
+  has_migration_target: false
+- symbol: titleIconVariant
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.titleIconVariant
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `titleIconVariant` was removed from `ModalProps`"
+  before: "property: titleIconVariant"
+  after: ~
+  has_migration_target: false
+- symbol: showClose
+  qualified_name: components/Modal/Modal.d.ts.ModalProps.showClose
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `showClose` was removed from `ModalProps`"
+  before: "property: showClose"
+  after: ~
+  has_migration_target: false

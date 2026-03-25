@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: getUser
+  qualified_name: getUser
+  kind: Method
+  change_type: MadeAsync
+  is_breaking: true
+  description: "`getUser` was made async (return type wrapped in Promise)"
+  before: User
+  after: Promise<User>
+  has_migration_target: false

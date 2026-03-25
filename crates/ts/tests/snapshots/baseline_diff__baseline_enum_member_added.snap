@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: Green
+  qualified_name: Green
+  kind: EnumMember
+  change_type: EnumMemberAdded
+  is_breaking: false
+  description: "Enum member `Green` was added to `Color`"
+  before: ~
+  after: "enum member: Green: 1"
+  has_migration_target: false

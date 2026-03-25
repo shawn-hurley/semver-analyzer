@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"peerDependencies\": { \"react\": \"^18.0.0\" } }),\njson!({}),)"
+---
+- field: peerDependencies.react
+  change_type: PeerDependencyRemoved
+  is_breaking: false
+  description: "Peer dependency `react` was removed"
+  before: ^18.0.0
+  after: ~

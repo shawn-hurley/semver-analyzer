@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: FooProps
+  qualified_name: components/Foo/Foo.d.ts.FooProps
+  kind: Interface
+  change_type: SymbolRenamed
+  is_breaking: true
+  description: "Exported interface `FooProps` was renamed to `BarProps`"
+  before: FooProps
+  after: BarProps
+  has_migration_target: false

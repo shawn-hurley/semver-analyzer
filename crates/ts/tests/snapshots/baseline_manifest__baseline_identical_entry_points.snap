@@ -1,0 +1,5 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"main\": \"./index.js\", \"types\": \"./index.d.ts\" }),\njson!({ \"main\": \"./index.js\", \"types\": \"./index.d.ts\" }),)"
+---
+[]

@@ -1,0 +1,29 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "css_diff(r#\"\n            const a = \"var(--pf-v5-global--Color--100)\";\n            const b = \"var(--pf-v5-global--spacer--md)\";\n            const c = \"var(--pf-v5-global--FontSize--sm)\";\n        \"#,\nr#\"\n            const a = \"var(--pf-v6-global--Color--100)\";\n            const b = \"var(--pf-v5-global--spacer--md)\";\n        \"#,\n\"Comp\",)"
+---
+- symbol: Comp
+  category: CssVariable
+  description: "CSS variable '--pf-v5-global--Color--100' removed from source"
+  before: "--pf-v5-global--Color--100"
+  after: ~
+- symbol: Comp
+  category: CssVariable
+  description: "CSS variable '--pf-v5-global--FontSize--sm' removed from source"
+  before: "--pf-v5-global--FontSize--sm"
+  after: ~
+- symbol: Comp
+  category: CssVariable
+  description: "CSS variable '--pf-v6-global--Color--100' added to source"
+  before: ~
+  after: "--pf-v6-global--Color--100"
+- symbol: Comp
+  category: CssClass
+  description: "CSS class prefix 'pf-v5-global--' removed from source"
+  before: pf-v5-global--
+  after: ~
+- symbol: Comp
+  category: CssClass
+  description: "CSS class prefix 'pf-v6-global--' added to source"
+  before: ~
+  after: pf-v6-global--

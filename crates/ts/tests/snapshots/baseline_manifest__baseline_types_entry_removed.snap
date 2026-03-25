@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"types\": \"./dist/index.d.ts\" }), json!({}),)"
+---
+- field: types
+  change_type: EntryPointChanged
+  is_breaking: true
+  description: "`types` entry point was removed (was `./dist/index.d.ts`)"
+  before: "./dist/index.d.ts"
+  after: ~

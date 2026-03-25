@@ -1,0 +1,67 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: EmptyStateHeaderProps
+  qualified_name: components/EmptyState/EmptyStateHeader.d.ts.EmptyStateHeaderProps
+  kind: Interface
+  change_type: MigrationSuggested
+  is_breaking: true
+  description: "Exported interface `EmptyStateHeaderProps` was removed — migrate to `EmptyStateProps`.\n  Matching props (use on `EmptyStateProps` instead): headingLevel, icon, titleClassName, titleText\n  Removed props with no direct equivalent: children, className"
+  before: "interface: EmptyStateHeaderProps"
+  after: ~
+  has_migration_target: true
+- symbol: titleText
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.titleText
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `titleText` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: titleText"
+  has_migration_target: false
+- symbol: headingLevel
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.headingLevel
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `headingLevel` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: headingLevel"
+  has_migration_target: false
+- symbol: icon
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.icon
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `icon` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: icon"
+  has_migration_target: false
+- symbol: status
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.status
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `status` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: status"
+  has_migration_target: false
+- symbol: titleClassName
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.titleClassName
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `titleClassName` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: titleClassName"
+  has_migration_target: false
+- symbol: headerClassName
+  qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.headerClassName
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `headerClassName` was added to `EmptyStateProps`"
+  before: ~
+  after: "property: headerClassName"
+  has_migration_target: false

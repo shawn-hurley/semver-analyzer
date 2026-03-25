@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({\n    \"exports\": { \".\": { \"import\": \"./index.mjs\", \"require\": \"./index.cjs\" } }\n}), json!({ \"exports\": { \".\": { \"import\": \"./index.mjs\" } } }),)"
+---
+- field: exports...require
+  change_type: ExportsConditionRemoved
+  is_breaking: true
+  description: "Export condition `require` was removed from `.`"
+  before: "./index.cjs"
+  after: ~

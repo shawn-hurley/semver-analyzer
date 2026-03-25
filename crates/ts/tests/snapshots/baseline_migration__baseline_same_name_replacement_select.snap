@@ -1,0 +1,49 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: SelectProps
+  qualified_name: deprecated/components/Select/Select.d.ts.SelectProps
+  kind: Interface
+  change_type: MigrationSuggested
+  is_breaking: true
+  description: "Exported interface `SelectProps` was removed — migrate to `SelectProps`.\n  Import change: replace `import { SelectProps } from 'deprecated/components/Select/Select.d.ts.SelectProps'` with `import { SelectProps } from 'components/Select/Select.d.ts.SelectProps'`\n  Matching props (use on `SelectProps` instead): children, className, direction, isOpen, isPlain, onSelect, position, toggleRef, variant, width, zIndex\n  Removed props with no direct equivalent: isCreatable, isDisabled, isGrouped, onToggle, selections"
+  before: "interface: SelectProps"
+  after: ~
+  has_migration_target: true
+- symbol: variant
+  qualified_name: components/Select/Select.d.ts.SelectProps.variant
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `variant` was added to `SelectProps`"
+  before: ~
+  after: "property: variant"
+  has_migration_target: false
+- symbol: focusTimeoutDelay
+  qualified_name: components/Select/Select.d.ts.SelectProps.focusTimeoutDelay
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `focusTimeoutDelay` was added to `SelectProps`"
+  before: ~
+  after: "property: focusTimeoutDelay"
+  has_migration_target: false
+- symbol: onToggleKeydown
+  qualified_name: components/Select/Select.d.ts.SelectProps.onToggleKeydown
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `onToggleKeydown` was added to `SelectProps`"
+  before: ~
+  after: "property: onToggleKeydown"
+  has_migration_target: false
+- symbol: shouldPreventScrollOnItemFocus
+  qualified_name: components/Select/Select.d.ts.SelectProps.shouldPreventScrollOnItemFocus
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `shouldPreventScrollOnItemFocus` was added to `SelectProps`"
+  before: ~
+  after: "property: shouldPreventScrollOnItemFocus"
+  has_migration_target: false

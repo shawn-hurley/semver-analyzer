@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"exports\": { \".\": \"./index.js\" } }),\njson!({ \"exports\": { \".\": \"./index.js\", \"./utils\": \"./utils.js\" } }),)"
+---
+- field: exports../utils
+  change_type: ExportsEntryAdded
+  is_breaking: false
+  description: "Export path `./utils` was added"
+  before: ~
+  after: "./utils"

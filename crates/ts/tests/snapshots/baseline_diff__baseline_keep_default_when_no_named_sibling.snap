@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: default
+  qualified_name: pkg/dist/utils.default
+  kind: Constant
+  change_type: SymbolRemoved
+  is_breaking: true
+  description: "Exported constant `default` was removed"
+  before: "constant: default"
+  after: ~
+  has_migration_target: false

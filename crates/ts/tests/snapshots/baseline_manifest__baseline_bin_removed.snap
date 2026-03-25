@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({\n    \"name\": \"myapp\", \"bin\": { \"myapp\": \"./cli.js\", \"myapp-dev\": \"./dev.js\" }\n}), json!({ \"name\": \"myapp\", \"bin\": { \"myapp\": \"./cli.js\" } }),)"
+---
+- field: bin.myapp-dev
+  change_type: BinEntryRemoved
+  is_breaking: true
+  description: "CLI command `myapp-dev` was removed"
+  before: "./dev.js"
+  after: ~

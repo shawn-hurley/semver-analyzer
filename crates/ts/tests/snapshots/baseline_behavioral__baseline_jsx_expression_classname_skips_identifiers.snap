@@ -1,0 +1,5 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return <div className={css(styles.button, isBlock && styles.modifiers.block)}>btn</div>; }\"#,\nr#\"{ return <div className={css(styles.button, isBlock && styles.modifiers.fill)}>btn</div>; }\"#,\n\"Button\",)"
+---
+[]

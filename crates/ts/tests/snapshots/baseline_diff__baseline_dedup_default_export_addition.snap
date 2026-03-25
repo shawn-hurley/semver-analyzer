@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: c_button
+  qualified_name: pkg/dist/c_button.c_button
+  kind: Constant
+  change_type: SymbolAdded
+  is_breaking: false
+  description: "Exported constant `c_button` was added"
+  before: ~
+  after: "constant: c_button"
+  has_migration_target: false

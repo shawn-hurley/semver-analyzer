@@ -1,0 +1,5 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({\n    \"name\": \"my-lib\", \"version\": \"1.0.0\", \"main\": \"./dist/index.js\", \"types\":\n    \"./dist/index.d.ts\", \"exports\":\n    { \".\": { \"import\": \"./dist/index.mjs\", \"require\": \"./dist/index.cjs\" } },\n    \"peerDependencies\": { \"react\": \"^18.0.0\" }, \"engines\": { \"node\": \">=16\" },\n    \"bin\": { \"myapp\": \"./cli.js\" }\n}),\njson!({\n    \"name\": \"my-lib\", \"version\": \"1.0.0\", \"main\": \"./dist/index.js\", \"types\":\n    \"./dist/index.d.ts\", \"exports\":\n    { \".\": { \"import\": \"./dist/index.mjs\", \"require\": \"./dist/index.cjs\" } },\n    \"peerDependencies\": { \"react\": \"^18.0.0\" }, \"engines\": { \"node\": \">=16\" },\n    \"bin\": { \"myapp\": \"./cli.js\" }\n}),)"
+---
+[]

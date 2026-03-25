@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return <button aria-labelledby=\"title\">Click</button>; }\"#,\n\"{ return <button>Click</button>; }\", \"MyButton\",)"
+---
+- symbol: MyButton
+  category: Accessibility
+  description: aria-labelledby attribute removed from <button>
+  before: "aria-labelledby=\"title\""
+  after: ~

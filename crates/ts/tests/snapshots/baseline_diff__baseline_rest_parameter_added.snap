@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: f
+  qualified_name: f
+  kind: Function
+  change_type: RestParameterAdded
+  is_breaking: false
+  description: "Rest parameter `args` was added to `f`"
+  before: ~
+  after: "...args: unknown[]"
+  has_migration_target: false

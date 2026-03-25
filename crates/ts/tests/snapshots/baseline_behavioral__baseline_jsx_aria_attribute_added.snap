@@ -1,0 +1,9 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(\"{ return <div>content</div>; }\",\nr#\"{ return <div aria-hidden=\"true\">content</div>; }\"#, \"Panel\",)"
+---
+- symbol: Panel
+  category: Accessibility
+  description: aria-hidden attribute added to <div>
+  before: ~
+  after: "aria-hidden=\"true\""

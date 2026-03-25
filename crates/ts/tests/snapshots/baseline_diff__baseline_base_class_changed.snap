@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: MyClass
+  qualified_name: MyClass
+  kind: Class
+  change_type: BaseClassChanged
+  is_breaking: true
+  description: "`MyClass` base class changed from BaseA to BaseB"
+  before: BaseA
+  after: BaseB
+  has_migration_target: false

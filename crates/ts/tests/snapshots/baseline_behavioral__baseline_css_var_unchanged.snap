@@ -1,0 +1,5 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "css_diff(r#\"const color = \"var(--pf-v5-global--Color--100)\";\"#,\nr#\"const color = \"var(--pf-v5-global--Color--100)\";\"#, \"Comp\",)"
+---
+[]

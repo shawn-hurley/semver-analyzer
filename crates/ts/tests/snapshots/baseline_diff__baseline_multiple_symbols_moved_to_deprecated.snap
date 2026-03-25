@@ -1,0 +1,31 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: Chip
+  qualified_name: pkg/dist/esm/components/Chip/Chip.Chip
+  kind: Constant
+  change_type: SymbolMovedToDeprecated
+  is_breaking: true
+  description: "constant `Chip` moved to deprecated exports"
+  before: pkg/dist/esm/components/Chip/Chip.Chip
+  after: pkg/dist/esm/deprecated/components/Chip/Chip.Chip
+  has_migration_target: false
+- symbol: ChipGroup
+  qualified_name: pkg/dist/esm/components/Chip/ChipGroup.ChipGroup
+  kind: Constant
+  change_type: SymbolMovedToDeprecated
+  is_breaking: true
+  description: "constant `ChipGroup` moved to deprecated exports"
+  before: pkg/dist/esm/components/Chip/ChipGroup.ChipGroup
+  after: pkg/dist/esm/deprecated/components/Chip/ChipGroup.ChipGroup
+  has_migration_target: false
+- symbol: ChipProps
+  qualified_name: pkg/dist/esm/components/Chip/ChipProps.ChipProps
+  kind: Constant
+  change_type: SymbolMovedToDeprecated
+  is_breaking: true
+  description: "constant `ChipProps` moved to deprecated exports"
+  before: pkg/dist/esm/components/Chip/ChipProps.ChipProps
+  after: pkg/dist/esm/deprecated/components/Chip/ChipProps.ChipProps
+  has_migration_target: false

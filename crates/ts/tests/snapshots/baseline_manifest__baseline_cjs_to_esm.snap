@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({}), json!({ \"type\": \"module\" }),)"
+---
+- field: type
+  change_type: ModuleSystemChanged
+  is_breaking: true
+  description: "Package switched from CJS to ESM (`\"type\": \"module\"` added). `require()` consumers will break."
+  before: commonjs
+  after: module

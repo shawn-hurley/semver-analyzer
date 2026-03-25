@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: f
+  qualified_name: f
+  kind: Function
+  change_type: TypeParameterRemoved
+  is_breaking: true
+  description: "Type parameter `U` was removed from `f`"
+  before: U
+  after: ~
+  has_migration_target: false

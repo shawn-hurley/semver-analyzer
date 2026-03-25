@@ -1,0 +1,22 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: isActive
+  qualified_name: isActive
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `isActive` was removed from `Props`"
+  before: "property: isActive: boolean"
+  after: ~
+  has_migration_target: false
+- symbol: count
+  qualified_name: count
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `count` was added to `Props`"
+  before: ~
+  after: "property: count: number"
+  has_migration_target: false

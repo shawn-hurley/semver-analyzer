@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({\n    \"exports\": { \".\": \"./index.js\", \"./utils\": \"./utils.js\" }\n}), json!({ \"exports\": { \".\": \"./index.js\" } }),)"
+---
+- field: exports../utils
+  change_type: ExportsEntryRemoved
+  is_breaking: true
+  description: "Export path `./utils` was removed"
+  before: "{\"default\": \"./utils.js\"}"
+  after: ~

@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: oldFunc
+  qualified_name: oldFunc
+  kind: Function
+  change_type: SymbolRenamed
+  is_breaking: true
+  description: "Exported function `oldFunc` was renamed to `newFunc`"
+  before: oldFunc
+  after: newFunc
+  has_migration_target: false

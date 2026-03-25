@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: DualListSelector
+  qualified_name: pkg/dist/esm/next/components/DLS/DLS.DualListSelector
+  kind: Variable
+  change_type: SymbolMovedToDeprecated
+  is_breaking: true
+  description: "variable `DualListSelector` moved to deprecated exports"
+  before: pkg/dist/esm/next/components/DLS/DLS.DualListSelector
+  after: pkg/dist/esm/deprecated/components/DLS/DLS.DualListSelector
+  has_migration_target: false

@@ -1,0 +1,24 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "css_diff(r#\"const color = \"var(--pf-v5-global--Color--100)\";\"#,\nr#\"const color = \"var(--pf-v6-global--Color--100)\";\"#, \"MyComponent\",)"
+---
+- symbol: MyComponent
+  category: CssVariable
+  description: "CSS variable '--pf-v5-global--Color--100' removed from source"
+  before: "--pf-v5-global--Color--100"
+  after: ~
+- symbol: MyComponent
+  category: CssVariable
+  description: "CSS variable '--pf-v6-global--Color--100' added to source"
+  before: ~
+  after: "--pf-v6-global--Color--100"
+- symbol: MyComponent
+  category: CssClass
+  description: "CSS class prefix 'pf-v5-global--' removed from source"
+  before: pf-v5-global--
+  after: ~
+- symbol: MyComponent
+  category: CssClass
+  description: "CSS class prefix 'pf-v6-global--' added to source"
+  before: ~
+  after: pf-v6-global--

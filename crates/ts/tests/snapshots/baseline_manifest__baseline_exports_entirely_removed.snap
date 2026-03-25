@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"exports\": { \".\": \"./index.js\" } }), json!({}),)"
+---
+- field: exports
+  change_type: ExportsEntryRemoved
+  is_breaking: true
+  description: "The `exports` field was removed entirely"
+  before: "{\".\":\"./index.js\"}"
+  after: ~

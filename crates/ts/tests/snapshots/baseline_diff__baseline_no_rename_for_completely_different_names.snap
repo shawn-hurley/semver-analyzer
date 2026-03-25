@@ -1,0 +1,22 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: x
+  qualified_name: x
+  kind: Property
+  change_type: PropertyRemoved
+  is_breaking: true
+  description: "property `x` was removed from `Props`"
+  before: "property: x: string"
+  after: ~
+  has_migration_target: false
+- symbol: processDataHandler
+  qualified_name: processDataHandler
+  kind: Property
+  change_type: PropertyAdded
+  is_breaking: true
+  description: "property `processDataHandler` was added to `Props`"
+  before: ~
+  after: "property: processDataHandler: string"
+  has_migration_target: false

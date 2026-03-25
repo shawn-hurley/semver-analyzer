@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_migration.rs
+expression: "diff(&old, &new)"
+---
+- symbol: FooHeaderProps
+  qualified_name: components/Foo/FooHeader.d.ts.FooHeaderProps
+  kind: Interface
+  change_type: SymbolRenamed
+  is_breaking: true
+  description: "Exported interface `FooHeaderProps` was renamed to `FooProps`"
+  before: FooHeaderProps
+  after: FooProps
+  has_migration_target: false

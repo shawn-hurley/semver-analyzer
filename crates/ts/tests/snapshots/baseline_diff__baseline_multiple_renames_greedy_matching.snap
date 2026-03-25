@@ -1,0 +1,22 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: isExpanded
+  qualified_name: Props.isExpanded
+  kind: Property
+  change_type: PropertyRenamed
+  is_breaking: true
+  description: "property `isExpanded` was renamed to `isOpened` in `Props`"
+  before: isExpanded
+  after: isOpened
+  has_migration_target: false
+- symbol: isActive
+  qualified_name: Props.isActive
+  kind: Property
+  change_type: PropertyRenamed
+  is_breaking: true
+  description: "property `isActive` was renamed to `isClicked` in `Props`"
+  before: isActive
+  after: isClicked
+  has_migration_target: false

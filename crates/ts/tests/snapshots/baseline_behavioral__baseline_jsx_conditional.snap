@@ -1,0 +1,19 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return isOpen ? <div role=\"dialog\">content</div> : null; }\"#,\nr#\"{ return isOpen ? <section role=\"dialog\">content</section> : null; }\"#,\n\"Modal\",)"
+---
+- symbol: Modal
+  category: DomStructure
+  description: "<div> element removed from render output (1 instance)"
+  before: "<div>"
+  after: ~
+- symbol: Modal
+  category: DomStructure
+  description: "<section> element added to render output (1 instance)"
+  before: ~
+  after: "<section>"
+- symbol: Modal
+  category: Accessibility
+  description: "role=\"dialog\" removed from <div>"
+  before: "role=\"dialog\""
+  after: ~

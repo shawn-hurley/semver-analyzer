@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: prop
+  qualified_name: prop
+  kind: Property
+  change_type: ReadonlyRemoved
+  is_breaking: false
+  description: "`prop` is no longer readonly"
+  before: readonly
+  after: mutable
+  has_migration_target: false

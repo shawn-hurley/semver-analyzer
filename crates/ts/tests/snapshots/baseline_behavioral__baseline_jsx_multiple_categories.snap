@@ -1,0 +1,34 @@
+---
+source: crates/ts/tests/baseline_behavioral.rs
+expression: "jsx_diff(r#\"{ return <div role=\"separator\" className=\"pf-v5-sep\" aria-label=\"sep\">line</div>; }\"#,\nr#\"{ return <hr className=\"pf-v6-sep\">line</hr>; }\"#, \"Sep\",)"
+---
+- symbol: Sep
+  category: DomStructure
+  description: "<div> element removed from render output (1 instance)"
+  before: "<div>"
+  after: ~
+- symbol: Sep
+  category: DomStructure
+  description: "<hr> element added to render output (1 instance)"
+  before: ~
+  after: "<hr>"
+- symbol: Sep
+  category: Accessibility
+  description: aria-label attribute removed from <div>
+  before: "aria-label=\"sep\""
+  after: ~
+- symbol: Sep
+  category: Accessibility
+  description: "role=\"separator\" removed from <div>"
+  before: "role=\"separator\""
+  after: ~
+- symbol: Sep
+  category: CssClass
+  description: "CSS class 'pf-v5-sep' removed from render output"
+  before: pf-v5-sep
+  after: ~
+- symbol: Sep
+  category: CssClass
+  description: "CSS class 'pf-v6-sep' added to render output"
+  before: ~
+  after: pf-v6-sep

@@ -1,0 +1,10 @@
+---
+source: crates/ts/tests/baseline_manifest.rs
+expression: "manifest_diff(json!({ \"main\": \"./dist/index.js\" }),\njson!({ \"main\": \"./lib/index.js\" }),)"
+---
+- field: main
+  change_type: EntryPointChanged
+  is_breaking: true
+  description: "`main` entry point changed from `./dist/index.js` to `./lib/index.js`"
+  before: "./dist/index.js"
+  after: "./lib/index.js"

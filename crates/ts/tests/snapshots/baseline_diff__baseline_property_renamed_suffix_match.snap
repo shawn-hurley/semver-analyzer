@@ -1,0 +1,13 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: chipGroupContentRef
+  qualified_name: ToolbarContextProps.chipGroupContentRef
+  kind: Property
+  change_type: PropertyRenamed
+  is_breaking: true
+  description: "property `chipGroupContentRef` was renamed to `labelGroupContentRef` in `ToolbarContextProps`"
+  before: chipGroupContentRef
+  after: labelGroupContentRef
+  has_migration_target: false
