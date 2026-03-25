@@ -26,7 +26,9 @@ mod rename;
 mod tests;
 
 use crate::traits::LanguageSemantics;
-use crate::types::{ApiSurface, StructuralChange, StructuralChangeType, Symbol, SymbolKind};
+use crate::types::{
+    ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
+};
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
@@ -121,8 +123,15 @@ pub fn diff_surfaces_with_semantics(
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
-                    kind: format!("{:?}", reloc.old.kind),
-                    change_type: StructuralChangeType::SymbolMovedToDeprecated,
+                    kind: reloc.old.kind,
+                    change_type: StructuralChangeType::Relocated {
+                        from: ChangeSubject::Symbol {
+                            kind: reloc.old.kind,
+                        },
+                        to: ChangeSubject::Symbol {
+                            kind: reloc.old.kind,
+                        },
+                    },
                     before: Some(reloc.old.qualified_name.clone()),
                     after: Some(reloc.new.qualified_name.clone()),
                     description: format!(
@@ -139,8 +148,10 @@ pub fn diff_surfaces_with_semantics(
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
-                    kind: format!("{:?}", reloc.old.kind),
-                    change_type: StructuralChangeType::SymbolAdded,
+                    kind: reloc.old.kind,
+                    change_type: StructuralChangeType::Added(ChangeSubject::Symbol {
+                        kind: reloc.old.kind,
+                    }),
                     before: Some(reloc.old.qualified_name.clone()),
                     after: Some(reloc.new.qualified_name.clone()),
                     description: format!(
@@ -157,8 +168,11 @@ pub fn diff_surfaces_with_semantics(
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
-                    kind: format!("{:?}", reloc.old.kind),
-                    change_type: StructuralChangeType::SymbolRenamed,
+                    kind: reloc.old.kind,
+                    change_type: StructuralChangeType::Renamed {
+                        from: ChangeSubject::Symbol { kind: reloc.old.kind },
+                        to: ChangeSubject::Symbol { kind: reloc.new.kind },
+                    },
                     before: Some(reloc.old.qualified_name.clone()),
                     after: Some(reloc.new.qualified_name.clone()),
                     description: format!(
@@ -175,8 +189,15 @@ pub fn diff_surfaces_with_semantics(
                 changes.push(StructuralChange {
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
-                    kind: format!("{:?}", reloc.old.kind),
-                    change_type: StructuralChangeType::SymbolRenamed,
+                    kind: reloc.old.kind,
+                    change_type: StructuralChangeType::Renamed {
+                        from: ChangeSubject::Symbol {
+                            kind: reloc.old.kind,
+                        },
+                        to: ChangeSubject::Symbol {
+                            kind: reloc.new.kind,
+                        },
+                    },
                     before: Some(reloc.old.qualified_name.clone()),
                     after: Some(reloc.new.qualified_name.clone()),
                     description: format!(
@@ -242,8 +263,11 @@ pub fn diff_surfaces_with_semantics(
         changes.push(StructuralChange {
             symbol: rm.old.name.clone(),
             qualified_name: rm.old.qualified_name.clone(),
-            kind: format!("{:?}", rm.old.kind),
-            change_type: StructuralChangeType::SymbolRenamed,
+            kind: rm.old.kind,
+            change_type: StructuralChangeType::Renamed {
+                from: ChangeSubject::Symbol { kind: rm.old.kind },
+                to: ChangeSubject::Symbol { kind: rm.new.kind },
+            },
             before: Some(rm.old.name.clone()),
             after: Some(rm.new.name.clone()),
             description: format!(
@@ -269,8 +293,8 @@ pub fn diff_surfaces_with_semantics(
         changes.push(StructuralChange {
             symbol: sym.name.clone(),
             qualified_name: sym.qualified_name.clone(),
-            kind: format!("{:?}", sym.kind),
-            change_type: StructuralChangeType::SymbolRemoved,
+            kind: sym.kind,
+            change_type: StructuralChangeType::Removed(ChangeSubject::Symbol { kind: sym.kind }),
             before: Some(symbol_summary(sym)),
             after: None,
             description: format!(
@@ -294,8 +318,8 @@ pub fn diff_surfaces_with_semantics(
         changes.push(StructuralChange {
             symbol: sym.name.clone(),
             qualified_name: sym.qualified_name.clone(),
-            kind: format!("{:?}", sym.kind),
-            change_type: StructuralChangeType::SymbolAdded,
+            kind: sym.kind,
+            change_type: StructuralChangeType::Added(ChangeSubject::Symbol { kind: sym.kind }),
             before: None,
             after: Some(symbol_summary(sym)),
             description: format!("Exported {} `{}` was added", kind_label(sym.kind), sym.name),
@@ -331,13 +355,16 @@ pub fn diff_surfaces_with_semantics(
 
         let migrations = detect_migrations(&final_removed, &old_symbols, &new_symbols, semantics);
 
-        // Annotate existing SymbolRemoved changes with migration targets.
+        // Annotate existing Removed(Symbol) changes with migration targets.
+        // MigrationSuggested is now represented as Removed(Symbol) with migration_target set.
         for mig in &migrations {
             for change in changes.iter_mut() {
                 if change.qualified_name == mig.removed.qualified_name
-                    && change.change_type == StructuralChangeType::SymbolRemoved
+                    && matches!(
+                        change.change_type,
+                        StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+                    )
                 {
-                    change.change_type = StructuralChangeType::MigrationSuggested;
                     change.migration_target = Some(mig.target.clone());
                     // Enrich the description with the full migration recipe
                     // so the rule message gives the LLM actionable context.

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: isActive
   qualified_name: isActive
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"isActive\", kind: Property })"
   is_breaking: true
   description: "property `isActive` was removed from `Props`"
   before: "property: isActive: boolean"
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: count
   qualified_name: count
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"count\", kind: Property })"
   is_breaking: true
   description: "property `count` was added to `Props`"
   before: ~

@@ -29,7 +29,7 @@ pub(super) fn change(
     StructuralChange {
         symbol: sym.name.clone(),
         qualified_name: sym.qualified_name.clone(),
-        kind: format!("{:?}", sym.kind),
+        kind: sym.kind,
         change_type,
         before,
         after,

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: method
   qualified_name: method
   kind: Method
-  change_type: StaticInstanceChanged
+  change_type: "Changed(Modifier { modifier: \"static\" })"
   is_breaking: true
   description: "`method` changed from instance to static member"
   before: instance

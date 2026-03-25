@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: isFlat
   qualified_name: packages/react-core/src/components/Card/Card.CardProps.isFlat
   kind: Property
-  change_type: SymbolRenamed
+  change_type: "Renamed { from: Symbol { kind: Property }, to: Symbol { kind: Property } }"
   is_breaking: true
   description: "Exported property `isFlat` was renamed to `isPlain`"
   before: isFlat

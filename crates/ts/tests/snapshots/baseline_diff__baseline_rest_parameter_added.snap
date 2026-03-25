@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: RestParameterAdded
+  change_type: "Added(Parameter { name: \"args\" })"
   is_breaking: false
   description: "Rest parameter `args` was added to `f`"
   before: ~

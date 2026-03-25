@@ -267,15 +267,15 @@ pub fn should_skip_for_bu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::StructuralChangeType;
+    use crate::types::{ChangeSubject, StructuralChangeType, SymbolKind};
     use std::sync::Arc;
 
     fn make_structural_change(name: &str) -> StructuralChange {
         StructuralChange {
             symbol: name.to_string(),
             qualified_name: name.to_string(),
-            kind: "function".to_string(),
-            change_type: StructuralChangeType::SymbolRemoved,
+            kind: SymbolKind::Function,
+            change_type: StructuralChangeType::Removed(ChangeSubject::Symbol { kind: SymbolKind::Function }),
             before: None,
             after: None,
             description: format!("{} was removed", name),

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: EmptyStateHeaderProps
   qualified_name: components/EmptyState/EmptyStateHeader.d.ts.EmptyStateHeaderProps
   kind: Interface
-  change_type: MigrationSuggested
+  change_type: "Removed(Symbol { kind: Interface })"
   is_breaking: true
   description: "Exported interface `EmptyStateHeaderProps` was removed — migrate to `EmptyStateProps`.\n  Matching props (use on `EmptyStateProps` instead): headingLevel, icon, titleClassName, titleText\n  Removed props with no direct equivalent: children, className"
   before: "interface: EmptyStateHeaderProps"
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: titleText
   qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.titleText
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"titleText\", kind: Property })"
   is_breaking: true
   description: "property `titleText` was added to `EmptyStateProps`"
   before: ~
@@ -23,7 +23,7 @@ expression: "diff(&old, &new)"
 - symbol: headingLevel
   qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.headingLevel
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"headingLevel\", kind: Property })"
   is_breaking: true
   description: "property `headingLevel` was added to `EmptyStateProps`"
   before: ~
@@ -32,7 +32,7 @@ expression: "diff(&old, &new)"
 - symbol: icon
   qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.icon
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"icon\", kind: Property })"
   is_breaking: true
   description: "property `icon` was added to `EmptyStateProps`"
   before: ~
@@ -41,7 +41,7 @@ expression: "diff(&old, &new)"
 - symbol: status
   qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.status
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"status\", kind: Property })"
   is_breaking: true
   description: "property `status` was added to `EmptyStateProps`"
   before: ~
@@ -50,7 +50,7 @@ expression: "diff(&old, &new)"
 - symbol: titleClassName
   qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.titleClassName
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"titleClassName\", kind: Property })"
   is_breaking: true
   description: "property `titleClassName` was added to `EmptyStateProps`"
   before: ~
@@ -59,7 +59,7 @@ expression: "diff(&old, &new)"
 - symbol: headerClassName
   qualified_name: components/EmptyState/EmptyState.d.ts.EmptyStateProps.headerClassName
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"headerClassName\", kind: Property })"
   is_breaking: true
   description: "property `headerClassName` was added to `EmptyStateProps`"
   before: ~

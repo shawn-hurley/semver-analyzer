@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: c_button
   qualified_name: pkg/dist/c_button.c_button
   kind: Constant
-  change_type: SymbolRemoved
+  change_type: "Removed(Symbol { kind: Constant })"
   is_breaking: true
   description: "Exported constant `c_button` was removed"
   before: "constant: c_button"

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: MyClass
   qualified_name: MyClass
   kind: Class
-  change_type: InterfaceImplementationRemoved
+  change_type: "Removed(InterfaceImpl { interface_name: \"Bar\" })"
   is_breaking: true
   description: "`MyClass` no longer implements `Bar`"
   before: Bar

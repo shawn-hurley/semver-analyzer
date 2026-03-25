@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: VisibilityIncreased
+  change_type: Changed(Visibility)
   is_breaking: false
   description: "Visibility of `f` was increased from Internal to Exported"
   before: Internal

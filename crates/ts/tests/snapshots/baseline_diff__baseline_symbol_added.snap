@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: greet
   qualified_name: greet
   kind: Function
-  change_type: SymbolAdded
+  change_type: "Added(Symbol { kind: Function })"
   is_breaking: false
   description: "Exported function `greet` was added"
   before: ~

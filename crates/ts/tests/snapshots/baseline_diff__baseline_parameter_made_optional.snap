@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: ParameterMadeOptional
+  change_type: "Changed(Parameter { name: \"a\" })"
   is_breaking: false
   description: "Parameter `a` of `f` was made optional"
   before: required

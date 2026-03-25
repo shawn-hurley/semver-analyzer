@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: FooProps
   qualified_name: components/Foo/Foo.d.ts.FooProps
   kind: Interface
-  change_type: SymbolRenamed
+  change_type: "Renamed { from: Symbol { kind: Interface }, to: Symbol { kind: Interface } }"
   is_breaking: true
   description: "Exported interface `FooProps` was renamed to `BarProps`"
   before: FooProps

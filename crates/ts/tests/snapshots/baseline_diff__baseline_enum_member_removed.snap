@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: Green
   qualified_name: Green
   kind: EnumMember
-  change_type: EnumMemberRemoved
+  change_type: "Removed(Member { name: \"Green\", kind: EnumMember })"
   is_breaking: true
   description: "Enum member `Green` was removed from `Color`"
   before: "enum member: Green"

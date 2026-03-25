@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: Foo
   qualified_name: pkg/dist/foo.Foo
   kind: Constant
-  change_type: SymbolRemoved
+  change_type: "Removed(Symbol { kind: Constant })"
   is_breaking: true
   description: "Exported constant `Foo` was removed"
   before: "constant: Foo"
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: default
   qualified_name: pkg/dist/foo.default
   kind: Function
-  change_type: ParameterTypeChanged
+  change_type: "Changed(Parameter { name: \"x\" })"
   is_breaking: true
   description: "Parameter `x` of `default` changed type from `string` to `number`"
   before: string

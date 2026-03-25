@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: TypeParameterConstraintChanged
+  change_type: "Changed(TypeParameter { name: \"T\" })"
   is_breaking: true
   description: "Constraint on type parameter `T` of `f` changed from `object` to `Record<string, unknown>`"
   before: object

@@ -8,6 +8,7 @@
 //! breaking changes included in the output. Each file entry has separate
 //! arrays for API and behavioral breaking changes.
 
+use super::change_subject::ChangeSubject;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -619,7 +620,7 @@ pub struct StructuralChange {
     pub qualified_name: String,
 
     /// Symbol kind (function, class, interface, etc.).
-    pub kind: String,
+    pub kind: super::surface::SymbolKind,
 
     /// What type of structural change this is.
     pub change_type: StructuralChangeType,
@@ -648,128 +649,41 @@ pub struct StructuralChange {
     pub migration_target: Option<MigrationTarget>,
 }
 
-/// Categories of structural changes.
+/// Structural change type — what happened and to what.
+///
+/// 5 lifecycle variants, each carrying a `ChangeSubject` that describes
+/// what aspect of the symbol was affected. The `before`/`after` fields on
+/// the parent `StructuralChange` carry the values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum StructuralChangeType {
-    // Symbol-level
-    SymbolRemoved,
-    SymbolAdded,
-    SymbolRenamed,
-    SymbolMovedToDeprecated,
-
-    // Parameter changes
-    ParameterAdded,
-    ParameterRemoved,
-    ParameterTypeChanged,
-    ParameterMadeRequired,
-    ParameterMadeOptional,
-    ParameterDefaultValueChanged,
-    RestParameterAdded,
-    RestParameterRemoved,
-
-    // Return type changes
-    ReturnTypeChanged,
-    MadeAsync,
-    MadeSync,
-
-    // Visibility changes
-    VisibilityReduced,
-    VisibilityIncreased,
-
-    // Generic type parameter changes
-    TypeParameterAdded,
-    TypeParameterRemoved,
-    TypeParameterReordered,
-    TypeParameterConstraintChanged,
-    TypeParameterDefaultChanged,
-
-    // Property modifier changes
-    ReadonlyAdded,
-    ReadonlyRemoved,
-    AbstractAdded,
-    AbstractRemoved,
-    StaticInstanceChanged,
-    AccessorKindChanged,
-
-    // Class hierarchy changes
-    BaseClassChanged,
-    InterfaceImplementationAdded,
-    InterfaceImplementationRemoved,
-
-    // Enum changes
-    EnumMemberAdded,
-    EnumMemberRemoved,
-    EnumMemberValueChanged,
-
-    // Interface/type changes
-    PropertyAdded,
-    PropertyRemoved,
-    PropertyRenamed,
-
-    // Union literal value changes (e.g., 'primary' | 'secondary' → 'primary' | 'danger')
-    UnionMemberRemoved,
-    UnionMemberAdded,
-
-    // Special
-    ThisParameterTypeChanged,
-
-    // Structural migration suggestions
-    /// A removed symbol has a likely replacement in the same component directory,
-    /// detected via member name overlap analysis.
-    MigrationSuggested,
+    Added(ChangeSubject),
+    Removed(ChangeSubject),
+    Changed(ChangeSubject),
+    Renamed {
+        from: ChangeSubject,
+        to: ChangeSubject,
+    },
+    Relocated {
+        from: ChangeSubject,
+        to: ChangeSubject,
+    },
 }
 
 impl StructuralChangeType {
-    /// Map internal change type to v2 harness API change type.
+    /// Map to the v2 harness API change type for report output.
     pub fn to_api_change_type(&self) -> ApiChangeType {
         match self {
-            Self::SymbolRemoved
-            | Self::ParameterRemoved
-            | Self::RestParameterRemoved
-            | Self::PropertyRemoved
-            | Self::EnumMemberRemoved
-            | Self::InterfaceImplementationRemoved => ApiChangeType::Removed,
-
-            Self::SymbolRenamed | Self::SymbolMovedToDeprecated | Self::PropertyRenamed => {
-                ApiChangeType::Renamed
-            }
-
-            Self::ParameterAdded
-            | Self::ParameterMadeRequired
-            | Self::ParameterMadeOptional
-            | Self::ParameterDefaultValueChanged
-            | Self::RestParameterAdded
-            | Self::MadeAsync
-            | Self::MadeSync
-            | Self::TypeParameterAdded
-            | Self::TypeParameterRemoved
-            | Self::TypeParameterReordered
-            | Self::TypeParameterConstraintChanged
-            | Self::TypeParameterDefaultChanged
-            | Self::BaseClassChanged
-            | Self::InterfaceImplementationAdded
-            | Self::AbstractAdded
-            | Self::AbstractRemoved
-            | Self::StaticInstanceChanged
-            | Self::AccessorKindChanged
-            | Self::ReadonlyAdded
-            | Self::ReadonlyRemoved
-            | Self::ThisParameterTypeChanged
-            | Self::PropertyAdded
-            | Self::EnumMemberAdded
-            | Self::EnumMemberValueChanged => ApiChangeType::SignatureChanged,
-
-            Self::ParameterTypeChanged
-            | Self::ReturnTypeChanged
-            | Self::UnionMemberRemoved
-            | Self::UnionMemberAdded => ApiChangeType::TypeChanged,
-
-            Self::VisibilityReduced | Self::VisibilityIncreased => ApiChangeType::VisibilityChanged,
-
-            Self::SymbolAdded => ApiChangeType::SignatureChanged,
-
-            Self::MigrationSuggested => ApiChangeType::Removed,
+            Self::Added(_) => ApiChangeType::SignatureChanged,
+            Self::Removed(_) => ApiChangeType::Removed,
+            Self::Changed(subject) => match subject {
+                ChangeSubject::Visibility => ApiChangeType::VisibilityChanged,
+                ChangeSubject::ReturnType
+                | ChangeSubject::Parameter { .. }
+                | ChangeSubject::UnionValue { .. } => ApiChangeType::TypeChanged,
+                _ => ApiChangeType::SignatureChanged,
+            },
+            Self::Renamed { .. } => ApiChangeType::Renamed,
+            Self::Relocated { .. } => ApiChangeType::Renamed,
         }
     }
 }

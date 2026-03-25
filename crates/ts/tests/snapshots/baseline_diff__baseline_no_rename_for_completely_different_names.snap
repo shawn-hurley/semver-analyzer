@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: x
   qualified_name: x
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"x\", kind: Property })"
   is_breaking: true
   description: "property `x` was removed from `Props`"
   before: "property: x: string"
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: processDataHandler
   qualified_name: processDataHandler
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"processDataHandler\", kind: Property })"
   is_breaking: true
   description: "property `processDataHandler` was added to `Props`"
   before: ~

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: ParameterRemoved
+  change_type: "Removed(Parameter { name: \"b\" })"
   is_breaking: true
   description: "Parameter `b` was removed from `f`"
   before: "b: number"

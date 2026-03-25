@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: age
   qualified_name: age
   kind: Property
-  change_type: PropertyAdded
+  change_type: "Added(Member { name: \"age\", kind: Property })"
   is_breaking: true
   description: "property `age` was added to `Options`"
   before: ~

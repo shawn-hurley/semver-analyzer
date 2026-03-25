@@ -29,7 +29,7 @@ impl From<&StructuralChange> for NormalizedChange {
         NormalizedChange {
             symbol: c.symbol.clone(),
             qualified_name: c.qualified_name.clone(),
-            kind: c.kind.clone(),
+            kind: format!("{:?}", c.kind),
             change_type: format!("{:?}", c.change_type),
             is_breaking: c.is_breaking,
             description: c.description.clone(),

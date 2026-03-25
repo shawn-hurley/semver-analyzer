@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: Red
   qualified_name: Red
   kind: EnumMember
-  change_type: EnumMemberValueChanged
+  change_type: "Changed(Member { name: \"Red\", kind: EnumMember })"
   is_breaking: true
   description: "Value of enum member `Color.Red` changed from `0` to `1`"
   before: "0"

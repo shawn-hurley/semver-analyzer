@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: RestParameterRemoved
+  change_type: "Removed(Parameter { name: \"args\" })"
   is_breaking: true
   description: "Rest parameter `args` was removed from `f`"
   before: "...args: unknown[]"

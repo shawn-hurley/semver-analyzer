@@ -6,7 +6,7 @@
 
 use crate::traits::LanguageSemantics;
 use crate::types::{
-    Parameter, Signature, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
+    ChangeSubject, Parameter, Signature, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -54,7 +54,7 @@ fn diff_visibility(
     if new_rank < old_rank {
         changes.push(change(
             old,
-            StructuralChangeType::VisibilityReduced,
+            StructuralChangeType::Changed(ChangeSubject::Visibility),
             Some(format!("{:?}", old.visibility)),
             Some(format!("{:?}", new.visibility)),
             format!(
@@ -66,7 +66,7 @@ fn diff_visibility(
     } else {
         changes.push(change(
             old,
-            StructuralChangeType::VisibilityIncreased,
+            StructuralChangeType::Changed(ChangeSubject::Visibility),
             Some(format!("{:?}", old.visibility)),
             Some(format!("{:?}", new.visibility)),
             format!(
@@ -85,7 +85,9 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     if !old.is_readonly && new.is_readonly {
         changes.push(change(
             old,
-            StructuralChangeType::ReadonlyAdded,
+            StructuralChangeType::Added(ChangeSubject::Modifier {
+                modifier: "readonly".into(),
+            }),
             Some("mutable".into()),
             Some("readonly".into()),
             format!("`{}` was made readonly", old.name),
@@ -94,7 +96,9 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     } else if old.is_readonly && !new.is_readonly {
         changes.push(change(
             old,
-            StructuralChangeType::ReadonlyRemoved,
+            StructuralChangeType::Removed(ChangeSubject::Modifier {
+                modifier: "readonly".into(),
+            }),
             Some("readonly".into()),
             Some("mutable".into()),
             format!("`{}` is no longer readonly", old.name),
@@ -106,7 +110,9 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     if !old.is_abstract && new.is_abstract {
         changes.push(change(
             old,
-            StructuralChangeType::AbstractAdded,
+            StructuralChangeType::Added(ChangeSubject::Modifier {
+                modifier: "abstract".into(),
+            }),
             Some("concrete".into()),
             Some("abstract".into()),
             format!("`{}` was made abstract", old.name),
@@ -115,7 +121,9 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     } else if old.is_abstract && !new.is_abstract {
         changes.push(change(
             old,
-            StructuralChangeType::AbstractRemoved,
+            StructuralChangeType::Removed(ChangeSubject::Modifier {
+                modifier: "abstract".into(),
+            }),
             Some("abstract".into()),
             Some("concrete".into()),
             format!("`{}` is no longer abstract", old.name),
@@ -132,7 +140,9 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
         };
         changes.push(change(
             old,
-            StructuralChangeType::StaticInstanceChanged,
+            StructuralChangeType::Changed(ChangeSubject::Modifier {
+                modifier: "static".into(),
+            }),
             Some(before.into()),
             Some(after.into()),
             format!("`{}` changed from {} to {} member", old.name, before, after),
@@ -144,7 +154,9 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     if old.accessor_kind != new.accessor_kind {
         changes.push(change(
             old,
-            StructuralChangeType::AccessorKindChanged,
+            StructuralChangeType::Changed(ChangeSubject::Modifier {
+                modifier: "accessor".into(),
+            }),
             Some(format!("{:?}", old.accessor_kind)),
             Some(format!("{:?}", new.accessor_kind)),
             format!(
@@ -163,7 +175,7 @@ fn diff_hierarchy(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     if old.extends != new.extends {
         changes.push(change(
             old,
-            StructuralChangeType::BaseClassChanged,
+            StructuralChangeType::Changed(ChangeSubject::BaseClass),
             old.extends.clone(),
             new.extends.clone(),
             format!(
@@ -185,7 +197,9 @@ fn diff_hierarchy(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     for added in new_impls.difference(&old_impls) {
         changes.push(change(
             old,
-            StructuralChangeType::InterfaceImplementationAdded,
+            StructuralChangeType::Added(ChangeSubject::InterfaceImpl {
+                interface_name: added.to_string(),
+            }),
             None,
             Some(added.to_string()),
             format!("`{}` now implements `{}`", old.name, added),
@@ -196,7 +210,9 @@ fn diff_hierarchy(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
     for removed in old_impls.difference(&new_impls) {
         changes.push(change(
             old,
-            StructuralChangeType::InterfaceImplementationRemoved,
+            StructuralChangeType::Removed(ChangeSubject::InterfaceImpl {
+                interface_name: removed.to_string(),
+            }),
             Some(removed.to_string()),
             None,
             format!("`{}` no longer implements `{}`", old.name, removed),
@@ -223,7 +239,7 @@ fn diff_signatures(
             // Signature was removed — symbol changed kind (e.g., function → variable)
             changes.push(change(
                 old,
-                StructuralChangeType::ReturnTypeChanged,
+                StructuralChangeType::Changed(ChangeSubject::ReturnType),
                 Some("(has signature)".into()),
                 Some("(no signature)".into()),
                 format!("`{}` no longer has a callable signature", old.name),
@@ -267,7 +283,9 @@ fn diff_parameters(
         if old_p.type_annotation != new_p.type_annotation {
             changes.push(change(
                 sym,
-                StructuralChangeType::ParameterTypeChanged,
+                StructuralChangeType::Changed(ChangeSubject::Parameter {
+                    name: old_p.name.clone(),
+                }),
                 old_p.type_annotation.clone(),
                 new_p.type_annotation.clone(),
                 format!(
@@ -290,7 +308,9 @@ fn diff_parameters(
         if old_p.optional && !new_p.optional {
             changes.push(change(
                 sym,
-                StructuralChangeType::ParameterMadeRequired,
+                StructuralChangeType::Changed(ChangeSubject::Parameter {
+                    name: old_p.name.clone(),
+                }),
                 Some("optional".into()),
                 Some("required".into()),
                 format!(
@@ -302,7 +322,9 @@ fn diff_parameters(
         } else if !old_p.optional && new_p.optional {
             changes.push(change(
                 sym,
-                StructuralChangeType::ParameterMadeOptional,
+                StructuralChangeType::Changed(ChangeSubject::Parameter {
+                    name: old_p.name.clone(),
+                }),
                 Some("required".into()),
                 Some("optional".into()),
                 format!(
@@ -317,7 +339,9 @@ fn diff_parameters(
         if old_p.default_value != new_p.default_value && old_p.has_default && new_p.has_default {
             changes.push(change(
                 sym,
-                StructuralChangeType::ParameterDefaultValueChanged,
+                StructuralChangeType::Changed(ChangeSubject::Parameter {
+                    name: old_p.name.clone(),
+                }),
                 old_p.default_value.clone(),
                 new_p.default_value.clone(),
                 format!(
@@ -334,7 +358,9 @@ fn diff_parameters(
         let p = old_non_rest[i];
         changes.push(change(
             sym,
-            StructuralChangeType::ParameterRemoved,
+            StructuralChangeType::Removed(ChangeSubject::Parameter {
+                name: p.name.clone(),
+            }),
             Some(param_summary(p)),
             None,
             format!("Parameter `{}` was removed from `{}`", p.name, sym.name),
@@ -348,7 +374,9 @@ fn diff_parameters(
         let is_breaking = !p.optional && !p.has_default;
         changes.push(change(
             sym,
-            StructuralChangeType::ParameterAdded,
+            StructuralChangeType::Added(ChangeSubject::Parameter {
+                name: p.name.clone(),
+            }),
             None,
             Some(param_summary(p)),
             format!(
@@ -367,7 +395,9 @@ fn diff_parameters(
             if old_r.type_annotation != new_r.type_annotation {
                 changes.push(change(
                     sym,
-                    StructuralChangeType::ParameterTypeChanged,
+                    StructuralChangeType::Changed(ChangeSubject::Parameter {
+                        name: old_r.name.clone(),
+                    }),
                     old_r.type_annotation.clone(),
                     new_r.type_annotation.clone(),
                     format!(
@@ -381,7 +411,9 @@ fn diff_parameters(
         (None, Some(new_r)) => {
             changes.push(change(
                 sym,
-                StructuralChangeType::RestParameterAdded,
+                StructuralChangeType::Added(ChangeSubject::Parameter {
+                    name: new_r.name.clone(),
+                }),
                 None,
                 Some(param_summary(new_r)),
                 format!(
@@ -394,7 +426,9 @@ fn diff_parameters(
         (Some(old_r), None) => {
             changes.push(change(
                 sym,
-                StructuralChangeType::RestParameterRemoved,
+                StructuralChangeType::Removed(ChangeSubject::Parameter {
+                    name: old_r.name.clone(),
+                }),
                 Some(param_summary(old_r)),
                 None,
                 format!(
@@ -430,7 +464,7 @@ fn diff_return_type(
     if !old_is_promise && new_is_promise {
         changes.push(change(
             sym,
-            StructuralChangeType::MadeAsync,
+            StructuralChangeType::Changed(ChangeSubject::ReturnType),
             old_sig.return_type.clone(),
             new_sig.return_type.clone(),
             format!(
@@ -442,7 +476,7 @@ fn diff_return_type(
     } else if old_is_promise && !new_is_promise {
         changes.push(change(
             sym,
-            StructuralChangeType::MadeSync,
+            StructuralChangeType::Changed(ChangeSubject::ReturnType),
             old_sig.return_type.clone(),
             new_sig.return_type.clone(),
             format!("`{}` was made sync (Promise wrapper removed)", sym.name),
@@ -451,7 +485,7 @@ fn diff_return_type(
     } else {
         changes.push(change(
             sym,
-            StructuralChangeType::ReturnTypeChanged,
+            StructuralChangeType::Changed(ChangeSubject::ReturnType),
             old_sig.return_type.clone(),
             new_sig.return_type.clone(),
             format!(
@@ -500,7 +534,9 @@ fn diff_type_parameters(
             if old_sorted == new_sorted && old_names != new_names {
                 changes.push(change(
                     sym,
-                    StructuralChangeType::TypeParameterReordered,
+                    StructuralChangeType::Changed(ChangeSubject::TypeParameter {
+                        name: old_tp.name.clone(),
+                    }),
                     Some(format!("<{}>", old_names.join(", "))),
                     Some(format!("<{}>", new_names.join(", "))),
                     format!("Type parameters of `{}` were reordered", sym.name),
@@ -514,7 +550,9 @@ fn diff_type_parameters(
         if old_tp.constraint != new_tp.constraint {
             changes.push(change(
                 sym,
-                StructuralChangeType::TypeParameterConstraintChanged,
+                StructuralChangeType::Changed(ChangeSubject::TypeParameter {
+                    name: old_tp.name.clone(),
+                }),
                 old_tp.constraint.clone(),
                 new_tp.constraint.clone(),
                 format!(
@@ -532,7 +570,9 @@ fn diff_type_parameters(
         if old_tp.default != new_tp.default {
             changes.push(change(
                 sym,
-                StructuralChangeType::TypeParameterDefaultChanged,
+                StructuralChangeType::Changed(ChangeSubject::TypeParameter {
+                    name: old_tp.name.clone(),
+                }),
                 old_tp.default.clone(),
                 new_tp.default.clone(),
                 format!(
@@ -548,7 +588,9 @@ fn diff_type_parameters(
     for i in common_len..old_tps.len() {
         changes.push(change(
             sym,
-            StructuralChangeType::TypeParameterRemoved,
+            StructuralChangeType::Removed(ChangeSubject::TypeParameter {
+                name: old_tps[i].name.clone(),
+            }),
             Some(type_param_summary(&old_tps[i])),
             None,
             format!(
@@ -565,7 +607,9 @@ fn diff_type_parameters(
         let is_breaking = tp.default.is_none();
         changes.push(change(
             sym,
-            StructuralChangeType::TypeParameterAdded,
+            StructuralChangeType::Added(ChangeSubject::TypeParameter {
+                name: tp.name.clone(),
+            }),
             None,
             Some(type_param_summary(tp)),
             format!(
@@ -635,8 +679,17 @@ pub(super) fn diff_members(
         changes.push(StructuralChange {
             symbol: rm.old.name.clone(),
             qualified_name: format!("{}.{}", old.qualified_name, rm.old.name),
-            kind: format!("{:?}", rm.old.kind),
-            change_type: StructuralChangeType::PropertyRenamed,
+            kind: rm.old.kind,
+            change_type: StructuralChangeType::Renamed {
+                from: ChangeSubject::Member {
+                    name: rm.old.name.clone(),
+                    kind: rm.old.kind,
+                },
+                to: ChangeSubject::Member {
+                    name: rm.new.name.clone(),
+                    kind: rm.new.kind,
+                },
+            },
             before: Some(rm.old.name.clone()),
             after: Some(rm.new.name.clone()),
             description: format!(
@@ -659,7 +712,10 @@ pub(super) fn diff_members(
         }
         let (change_type, description, is_breaking) = match old.kind {
             SymbolKind::Enum => (
-                StructuralChangeType::EnumMemberRemoved,
+                StructuralChangeType::Removed(ChangeSubject::Member {
+                    name: member.name.clone(),
+                    kind: SymbolKind::EnumMember,
+                }),
                 format!(
                     "Enum member `{}` was removed from `{}`",
                     member.name, old.name
@@ -667,7 +723,10 @@ pub(super) fn diff_members(
                 true,
             ),
             _ => (
-                StructuralChangeType::PropertyRemoved,
+                StructuralChangeType::Removed(ChangeSubject::Member {
+                    name: member.name.clone(),
+                    kind: member.kind,
+                }),
                 format!(
                     "{} `{}` was removed from `{}`",
                     kind_label(member.kind),
@@ -695,11 +754,17 @@ pub(super) fn diff_members(
         let is_breaking = semantics.is_member_addition_breaking(new, member);
         let (change_type, description) = match new.kind {
             SymbolKind::Enum => (
-                StructuralChangeType::EnumMemberAdded,
+                StructuralChangeType::Added(ChangeSubject::Member {
+                    name: member.name.clone(),
+                    kind: SymbolKind::EnumMember,
+                }),
                 format!("Enum member `{}` was added to `{}`", member.name, new.name),
             ),
             _ => (
-                StructuralChangeType::PropertyAdded,
+                StructuralChangeType::Added(ChangeSubject::Member {
+                    name: member.name.clone(),
+                    kind: member.kind,
+                }),
                 format!(
                     "{} `{}` was added to `{}`",
                     kind_label(member.kind),
@@ -812,8 +877,10 @@ fn diff_union_literals(
         changes.push(StructuralChange {
             symbol: format!("{}.{}", sym.name, prop_name),
             qualified_name: format!("{}.{}", sym.qualified_name, prop_name),
-            kind: "property_value".to_string(),
-            change_type: StructuralChangeType::UnionMemberRemoved,
+            kind: SymbolKind::Property,
+            change_type: StructuralChangeType::Removed(ChangeSubject::UnionValue {
+                value: removed.clone(),
+            }),
             before: Some(format!("'{}'", removed)),
             after: None,
             description: format!(
@@ -831,8 +898,10 @@ fn diff_union_literals(
         changes.push(StructuralChange {
             symbol: format!("{}.{}", sym.name, prop_name),
             qualified_name: format!("{}.{}", sym.qualified_name, prop_name),
-            kind: "property_value".to_string(),
-            change_type: StructuralChangeType::UnionMemberAdded,
+            kind: SymbolKind::Property,
+            change_type: StructuralChangeType::Added(ChangeSubject::UnionValue {
+                value: added.clone(),
+            }),
             before: None,
             after: Some(format!("'{}'", added)),
             description: format!(
@@ -864,7 +933,10 @@ fn diff_enum_member_value(
     if old_val != new_val {
         changes.push(change(
             old_member,
-            StructuralChangeType::EnumMemberValueChanged,
+            StructuralChangeType::Changed(ChangeSubject::Member {
+                name: old_member.name.clone(),
+                kind: SymbolKind::EnumMember,
+            }),
             old_val.map(|s| s.to_string()),
             new_val.map(|s| s.to_string()),
             format!(

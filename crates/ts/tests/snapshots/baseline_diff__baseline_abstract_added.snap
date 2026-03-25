@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: validate
   qualified_name: validate
   kind: Method
-  change_type: AbstractAdded
+  change_type: "Added(Modifier { modifier: \"abstract\" })"
   is_breaking: true
   description: "`validate` was made abstract"
   before: concrete

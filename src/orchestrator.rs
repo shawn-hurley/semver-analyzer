@@ -840,7 +840,7 @@ fn infer_rename_patterns(
     to_ref: &str,
 ) -> Option<semver_analyzer_core::InferredRenamePatterns> {
     use semver_analyzer_core::{
-        InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
+        ChangeSubject, InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
         InferredRenamePatterns, StructuralChangeType, SymbolKind,
     };
     use std::collections::{HashMap, HashSet};
@@ -865,8 +865,8 @@ fn infer_rename_patterns(
             .collect::<Vec<_>>()
             .join("/");
 
-        match change.change_type {
-            StructuralChangeType::SymbolRemoved => {
+        match &change.change_type {
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. }) => {
                 // Check if it's a constant/variable (no members = standalone export)
                 if !change.symbol.contains('.') {
                     removed_constants
@@ -875,7 +875,7 @@ fn infer_rename_patterns(
                         .push(&change.symbol);
                 }
             }
-            StructuralChangeType::SymbolAdded => {
+            StructuralChangeType::Added(ChangeSubject::Symbol { .. }) => {
                 if !change.symbol.contains('.') {
                     added_constants
                         .entry(pkg)
@@ -1026,9 +1026,9 @@ fn infer_rename_patterns(
     let removed_interfaces: Vec<(&str, Vec<String>)> = structural_changes
         .iter()
         .filter(|c| {
-            c.change_type == StructuralChangeType::SymbolRemoved
+            matches!(c.change_type, StructuralChangeType::Removed(ChangeSubject::Symbol { .. }))
                 && c.migration_target.is_none()
-                && (c.kind == "Interface" || c.kind == "Class")
+                && matches!(c.kind, SymbolKind::Interface | SymbolKind::Class)
                 && !c.symbol.contains('.')
         })
         .filter_map(|c| {
@@ -1046,8 +1046,8 @@ fn infer_rename_patterns(
     let added_interfaces: Vec<(&str, Vec<String>)> = structural_changes
         .iter()
         .filter(|c| {
-            c.change_type == StructuralChangeType::SymbolAdded
-                && (c.kind == "Interface" || c.kind == "Class")
+            matches!(c.change_type, StructuralChangeType::Added(ChangeSubject::Symbol { .. }))
+                && matches!(c.kind, SymbolKind::Interface | SymbolKind::Class)
                 && !c.symbol.contains('.')
         })
         .filter_map(|c| {

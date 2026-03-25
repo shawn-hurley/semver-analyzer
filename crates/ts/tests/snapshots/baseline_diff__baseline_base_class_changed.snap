@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: MyClass
   qualified_name: MyClass
   kind: Class
-  change_type: BaseClassChanged
+  change_type: Changed(BaseClass)
   is_breaking: true
   description: "`MyClass` base class changed from BaseA to BaseB"
   before: BaseA

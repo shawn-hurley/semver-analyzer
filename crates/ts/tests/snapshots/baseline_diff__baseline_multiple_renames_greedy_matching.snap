@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: isExpanded
   qualified_name: Props.isExpanded
   kind: Property
-  change_type: PropertyRenamed
+  change_type: "Renamed { from: Member { name: \"isExpanded\", kind: Property }, to: Member { name: \"isOpened\", kind: Property } }"
   is_breaking: true
   description: "property `isExpanded` was renamed to `isOpened` in `Props`"
   before: isExpanded
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: isActive
   qualified_name: Props.isActive
   kind: Property
-  change_type: PropertyRenamed
+  change_type: "Renamed { from: Member { name: \"isActive\", kind: Property }, to: Member { name: \"isClicked\", kind: Property } }"
   is_breaking: true
   description: "property `isActive` was renamed to `isClicked` in `Props`"
   before: isActive

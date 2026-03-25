@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: ModalHeaderProps
   qualified_name: components/Modal/ModalHeader.d.ts.ModalHeaderProps
   kind: Interface
-  change_type: SymbolAdded
+  change_type: "Added(Symbol { kind: Interface })"
   is_breaking: false
   description: "Exported interface `ModalHeaderProps` was added"
   before: ~
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: title
   qualified_name: components/Modal/Modal.d.ts.ModalProps.title
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"title\", kind: Property })"
   is_breaking: true
   description: "property `title` was removed from `ModalProps`"
   before: "property: title"
@@ -23,7 +23,7 @@ expression: "diff(&old, &new)"
 - symbol: actions
   qualified_name: components/Modal/Modal.d.ts.ModalProps.actions
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"actions\", kind: Property })"
   is_breaking: true
   description: "property `actions` was removed from `ModalProps`"
   before: "property: actions"
@@ -32,7 +32,7 @@ expression: "diff(&old, &new)"
 - symbol: description
   qualified_name: components/Modal/Modal.d.ts.ModalProps.description
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"description\", kind: Property })"
   is_breaking: true
   description: "property `description` was removed from `ModalProps`"
   before: "property: description"
@@ -41,7 +41,7 @@ expression: "diff(&old, &new)"
 - symbol: footer
   qualified_name: components/Modal/Modal.d.ts.ModalProps.footer
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"footer\", kind: Property })"
   is_breaking: true
   description: "property `footer` was removed from `ModalProps`"
   before: "property: footer"
@@ -50,7 +50,7 @@ expression: "diff(&old, &new)"
 - symbol: header
   qualified_name: components/Modal/Modal.d.ts.ModalProps.header
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"header\", kind: Property })"
   is_breaking: true
   description: "property `header` was removed from `ModalProps`"
   before: "property: header"
@@ -59,7 +59,7 @@ expression: "diff(&old, &new)"
 - symbol: help
   qualified_name: components/Modal/Modal.d.ts.ModalProps.help
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"help\", kind: Property })"
   is_breaking: true
   description: "property `help` was removed from `ModalProps`"
   before: "property: help"
@@ -68,7 +68,7 @@ expression: "diff(&old, &new)"
 - symbol: titleIconVariant
   qualified_name: components/Modal/Modal.d.ts.ModalProps.titleIconVariant
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"titleIconVariant\", kind: Property })"
   is_breaking: true
   description: "property `titleIconVariant` was removed from `ModalProps`"
   before: "property: titleIconVariant"
@@ -77,7 +77,7 @@ expression: "diff(&old, &new)"
 - symbol: showClose
   qualified_name: components/Modal/Modal.d.ts.ModalProps.showClose
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"showClose\", kind: Property })"
   is_breaking: true
   description: "property `showClose` was removed from `ModalProps`"
   before: "property: showClose"

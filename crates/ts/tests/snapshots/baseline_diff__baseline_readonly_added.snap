@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: prop
   qualified_name: prop
   kind: Property
-  change_type: ReadonlyAdded
+  change_type: "Added(Modifier { modifier: \"readonly\" })"
   is_breaking: true
   description: "`prop` was made readonly"
   before: mutable

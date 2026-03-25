@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: chipGroupContentRef
   qualified_name: ToolbarContextProps.chipGroupContentRef
   kind: Property
-  change_type: PropertyRenamed
+  change_type: "Renamed { from: Member { name: \"chipGroupContentRef\", kind: Property }, to: Member { name: \"labelGroupContentRef\", kind: Property } }"
   is_breaking: true
   description: "property `chipGroupContentRef` was renamed to `labelGroupContentRef` in `ToolbarContextProps`"
   before: chipGroupContentRef

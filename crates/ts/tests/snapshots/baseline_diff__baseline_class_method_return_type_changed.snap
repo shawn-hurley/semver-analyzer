@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: getUser
   qualified_name: getUser
   kind: Method
-  change_type: MadeAsync
+  change_type: Changed(ReturnType)
   is_breaking: true
   description: "`getUser` was made async (return type wrapped in Promise)"
   before: User

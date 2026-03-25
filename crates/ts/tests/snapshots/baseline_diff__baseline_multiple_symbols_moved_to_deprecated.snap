@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: Chip
   qualified_name: pkg/dist/esm/components/Chip/Chip.Chip
   kind: Constant
-  change_type: SymbolMovedToDeprecated
+  change_type: "Relocated { from: Symbol { kind: Constant }, to: Symbol { kind: Constant } }"
   is_breaking: true
   description: "constant `Chip` moved to deprecated exports"
   before: pkg/dist/esm/components/Chip/Chip.Chip
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: ChipGroup
   qualified_name: pkg/dist/esm/components/Chip/ChipGroup.ChipGroup
   kind: Constant
-  change_type: SymbolMovedToDeprecated
+  change_type: "Relocated { from: Symbol { kind: Constant }, to: Symbol { kind: Constant } }"
   is_breaking: true
   description: "constant `ChipGroup` moved to deprecated exports"
   before: pkg/dist/esm/components/Chip/ChipGroup.ChipGroup
@@ -23,7 +23,7 @@ expression: "diff(&old, &new)"
 - symbol: ChipProps
   qualified_name: pkg/dist/esm/components/Chip/ChipProps.ChipProps
   kind: Constant
-  change_type: SymbolMovedToDeprecated
+  change_type: "Relocated { from: Symbol { kind: Constant }, to: Symbol { kind: Constant } }"
   is_breaking: true
   description: "constant `ChipProps` moved to deprecated exports"
   before: pkg/dist/esm/components/Chip/ChipProps.ChipProps

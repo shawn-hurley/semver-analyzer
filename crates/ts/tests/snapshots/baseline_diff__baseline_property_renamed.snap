@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: isActive
   qualified_name: ButtonProps.isActive
   kind: Property
-  change_type: PropertyRenamed
+  change_type: "Renamed { from: Member { name: \"isActive\", kind: Property }, to: Member { name: \"isClicked\", kind: Property } }"
   is_breaking: true
   description: "property `isActive` was renamed to `isClicked` in `ButtonProps`"
   before: isActive

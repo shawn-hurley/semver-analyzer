@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: TypeParameterAdded
+  change_type: "Added(TypeParameter { name: \"U\" })"
   is_breaking: false
   description: "Optional (has default) type parameter `U` was added to `f`"
   before: ~

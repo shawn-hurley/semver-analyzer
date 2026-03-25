@@ -872,7 +872,7 @@ fn build_package_summaries(
     llm_api_changes: &[orchestrator::LlmApiChangeEntry],
 ) -> Vec<semver_analyzer_core::PackageChanges> {
     use semver_analyzer_core::{
-        AddedComponent, ComponentStatus, ComponentSummary,
+        AddedComponent, ChangeSubject, ComponentStatus, ComponentSummary,
         ConstantGroup, PackageChanges, PropertySummary, RemovalDisposition, RemovedProperty,
         StructuralChangeType, SymbolKind, TypeChange,
     };
@@ -987,9 +987,8 @@ fn build_package_summaries(
         // Also check if the interface itself was removed/renamed at the top level
         let self_change = top_level_changes.iter().find(|c| {
             c.qualified_name == old_sym.qualified_name
-                && (c.change_type == StructuralChangeType::SymbolRemoved
-                    || c.change_type == StructuralChangeType::MigrationSuggested
-                    || c.change_type == StructuralChangeType::SymbolRenamed)
+                && (matches!(c.change_type, StructuralChangeType::Removed(ChangeSubject::Symbol { .. }))
+                    || matches!(c.change_type, StructuralChangeType::Renamed { from: ChangeSubject::Symbol { .. }, .. }))
         });
 
         // Skip if no changes at all
@@ -1015,9 +1014,8 @@ fn build_package_summaries(
 
         if let Some(changes) = member_changes {
             for change in changes {
-                match change.change_type {
-                    StructuralChangeType::PropertyRemoved
-                    | StructuralChangeType::EnumMemberRemoved => {
+                match &change.change_type {
+                    StructuralChangeType::Removed(ChangeSubject::Member { .. }) => {
                         removed += 1;
                         // Look up LLM-provided removal disposition
                         let lookup_key = format!("{}.{}", interface_name, change.symbol);
@@ -1054,13 +1052,13 @@ fn build_package_summaries(
                             removal_disposition: disposition,
                         });
                     }
-                    StructuralChangeType::PropertyRenamed => {
+                    StructuralChangeType::Renamed { from: ChangeSubject::Member { .. }, .. } => {
                         renamed += 1;
                     }
-                    StructuralChangeType::ParameterTypeChanged
-                    | StructuralChangeType::ReturnTypeChanged
-                    | StructuralChangeType::UnionMemberRemoved
-                    | StructuralChangeType::UnionMemberAdded => {
+                    StructuralChangeType::Changed(ChangeSubject::Parameter { .. })
+                    | StructuralChangeType::Changed(ChangeSubject::ReturnType)
+                    | StructuralChangeType::Removed(ChangeSubject::UnionValue { .. })
+                    | StructuralChangeType::Added(ChangeSubject::UnionValue { .. }) => {
                         type_changed += 1;
                         type_changes.push(TypeChange {
                             property: change.symbol.clone(),
@@ -1068,8 +1066,7 @@ fn build_package_summaries(
                             after: change.after.clone(),
                         });
                     }
-                    StructuralChangeType::PropertyAdded
-                    | StructuralChangeType::EnumMemberAdded => {
+                    StructuralChangeType::Added(ChangeSubject::Member { .. }) => {
                         added += 1;
                     }
                     _ => {
@@ -1115,13 +1112,14 @@ fn build_package_summaries(
             ComponentStatus::Modified
         };
 
-        // Get migration target from self or any MigrationSuggested change
+        // Get migration target from self or any Removed(Symbol) change with migration_target
         let migration_target = self_change
             .and_then(|c| c.migration_target.clone())
             .or_else(|| {
                 top_level_changes.iter().find_map(|c| {
                     if c.qualified_name == old_sym.qualified_name
-                        && c.change_type == StructuralChangeType::MigrationSuggested
+                        && matches!(c.change_type, StructuralChangeType::Removed(ChangeSubject::Symbol { .. }))
+                        && c.migration_target.is_some()
                     {
                         c.migration_target.clone()
                     } else {
@@ -1216,8 +1214,8 @@ fn build_package_summaries(
         if !change.is_breaking {
             continue;
         }
-        // Only constants (kind stored as Debug string)
-        if change.kind != "Constant" && change.kind != "Variable" {
+        // Only constants
+        if change.kind != SymbolKind::Constant && change.kind != SymbolKind::Variable {
             continue;
         }
         // Skip dotted symbols (those are interface members handled above)
@@ -1355,7 +1353,7 @@ fn discover_child_components(
     removed_properties: &[semver_analyzer_core::RemovedProperty],
 ) -> Vec<semver_analyzer_core::ChildComponent> {
     use semver_analyzer_core::{
-        ChildComponent, ChildComponentStatus, RemovalDisposition, StructuralChangeType,
+        ChangeSubject, ChildComponent, ChildComponentStatus, RemovalDisposition, StructuralChangeType,
     };
     use std::collections::{BTreeMap, HashSet};
 
@@ -1437,7 +1435,7 @@ fn discover_child_components(
         // Determine if this is new: either not in old surface or promoted
         let is_new = !old_qnames.contains(sym.qualified_name.as_str());
         let is_promoted = structural_changes.iter().any(|c| {
-            c.change_type == StructuralChangeType::SymbolRenamed
+            matches!(c.change_type, StructuralChangeType::Renamed { from: ChangeSubject::Symbol { .. }, .. })
                 && c.symbol == *name
                 && c.after
                     .as_ref()
@@ -1687,7 +1685,7 @@ fn collect_added_files(repo: &Path, from_ref: &str, to_ref: &str) -> Vec<std::pa
 
 /// Convert an internal StructuralChange to a v2-format ApiChange.
 fn structural_to_api_change(sc: &StructuralChange) -> ApiChange {
-    let kind = symbol_kind_to_api_kind(&sc.kind);
+    let kind = symbol_kind_to_api_kind(sc.kind);
     let change = sc.change_type.to_api_change_type();
 
     // Build the v2 symbol name: `ComponentName.propName` format.
@@ -1708,19 +1706,23 @@ fn structural_to_api_change(sc: &StructuralChange) -> ApiChange {
     }
 }
 
-/// Map internal symbol kind string to v2 ApiChangeKind.
-fn symbol_kind_to_api_kind(kind: &str) -> ApiChangeKind {
+/// Map internal SymbolKind to v2 ApiChangeKind.
+fn symbol_kind_to_api_kind(kind: semver_analyzer_core::SymbolKind) -> ApiChangeKind {
+    use semver_analyzer_core::SymbolKind;
     match kind {
-        "Function" => ApiChangeKind::Function,
-        "Method" => ApiChangeKind::Method,
-        "Class" => ApiChangeKind::Class,
-        "Interface" => ApiChangeKind::Interface,
-        "TypeAlias" => ApiChangeKind::TypeAlias,
-        "Constant" | "Variable" => ApiChangeKind::Constant,
-        "Enum" => ApiChangeKind::TypeAlias, // v2 uses type_alias for enums
-        "Property" => ApiChangeKind::Property,
-        "Namespace" => ApiChangeKind::ModuleExport,
-        _ => ApiChangeKind::Property,
+        SymbolKind::Function => ApiChangeKind::Function,
+        SymbolKind::Method => ApiChangeKind::Method,
+        SymbolKind::Class => ApiChangeKind::Class,
+        SymbolKind::Interface => ApiChangeKind::Interface,
+        SymbolKind::TypeAlias => ApiChangeKind::TypeAlias,
+        SymbolKind::Constant | SymbolKind::Variable => ApiChangeKind::Constant,
+        SymbolKind::Enum => ApiChangeKind::TypeAlias, // v2 uses type_alias for enums
+        SymbolKind::Property => ApiChangeKind::Property,
+        SymbolKind::Namespace => ApiChangeKind::ModuleExport,
+        SymbolKind::Struct => ApiChangeKind::Class,
+        SymbolKind::EnumMember => ApiChangeKind::Property,
+        SymbolKind::Constructor => ApiChangeKind::Method,
+        SymbolKind::GetAccessor | SymbolKind::SetAccessor => ApiChangeKind::Property,
     }
 }
 
@@ -2278,12 +2280,13 @@ mod tests {
 
     #[test]
     fn build_report_counts_breaking() {
+        use semver_analyzer_core::{ChangeSubject, SymbolKind};
         let changes = vec![
             StructuralChange {
                 symbol: "foo".into(),
                 qualified_name: "test.foo".into(),
-                kind: "Function".into(),
-                change_type: StructuralChangeType::SymbolRemoved,
+                kind: SymbolKind::Function,
+                change_type: StructuralChangeType::Removed(ChangeSubject::Symbol { kind: SymbolKind::Function }),
                 before: None,
                 after: None,
                 description: "removed".into(),
@@ -2294,8 +2297,8 @@ mod tests {
             StructuralChange {
                 symbol: "bar".into(),
                 qualified_name: "test.bar".into(),
-                kind: "Function".into(),
-                change_type: StructuralChangeType::SymbolAdded,
+                kind: SymbolKind::Function,
+                change_type: StructuralChangeType::Added(ChangeSubject::Symbol { kind: SymbolKind::Function }),
                 before: None,
                 after: None,
                 description: "added".into(),
@@ -2671,8 +2674,8 @@ mod tests {
             symbol: "IconProps".to_string(),
             qualified_name: "packages/react-core/src/components/EmptyState/EmptyStateIcon.IconProps"
                 .to_string(),
-            kind: "Interface".to_string(),
-            change_type: StructuralChangeType::SymbolRemoved,
+            kind: SymbolKind::Interface,
+            change_type: StructuralChangeType::Removed(semver_analyzer_core::ChangeSubject::Symbol { kind: SymbolKind::Interface }),
             before: Some("IconProps".to_string()),
             after: None,
             description: "IconProps was removed".to_string(),
@@ -2764,8 +2767,8 @@ mod tests {
         let structural_changes = vec![StructuralChange {
             symbol: "FooProps".to_string(),
             qualified_name: "src/components/Foo/Foo.FooProps".to_string(),
-            kind: "Interface".to_string(),
-            change_type: StructuralChangeType::SymbolRemoved,
+            kind: SymbolKind::Interface,
+            change_type: StructuralChangeType::Removed(semver_analyzer_core::ChangeSubject::Symbol { kind: SymbolKind::Interface }),
             before: Some("FooProps".to_string()),
             after: None,
             description: "FooProps was removed".to_string(),

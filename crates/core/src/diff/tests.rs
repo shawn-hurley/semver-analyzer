@@ -60,22 +60,24 @@ fn surface(symbols: Vec<Symbol>) -> ApiSurface {
 
 fn find_change<'a>(
     changes: &'a [StructuralChange],
-    ct: StructuralChangeType,
+    predicate: impl Fn(&StructuralChangeType) -> bool,
 ) -> &'a StructuralChange {
     changes
         .iter()
-        .find(|c| c.change_type == ct)
+        .find(|c| predicate(&c.change_type))
         .unwrap_or_else(|| {
             panic!(
-                "Change {:?} not found in: {:?}",
-                ct,
+                "No matching change found in: {:?}",
                 changes.iter().map(|c| &c.change_type).collect::<Vec<_>>()
             )
         })
 }
 
-fn has_change(changes: &[StructuralChange], ct: StructuralChangeType) -> bool {
-    changes.iter().any(|c| c.change_type == ct)
+fn has_change(
+    changes: &[StructuralChange],
+    predicate: impl Fn(&StructuralChangeType) -> bool,
+) -> bool {
+    changes.iter().any(|c| predicate(&c.change_type))
 }
 
 // ── Symbol-level ─────────────────────────────────────────────────
@@ -86,7 +88,12 @@ fn detect_symbol_removed() {
     let new = surface(vec![]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::SymbolRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+        )
+    });
     assert_eq!(c.symbol, "greet");
     assert!(c.is_breaking);
 }
@@ -97,7 +104,12 @@ fn detect_symbol_added() {
     let new = surface(vec![func("greet", vec![param("name", "string")], "void")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::SymbolAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Symbol { .. })
+        )
+    });
     assert_eq!(c.symbol, "greet");
     assert!(!c.is_breaking);
 }
@@ -121,7 +133,12 @@ fn detect_required_parameter_added() {
     )]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ParameterAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(c.is_breaking);
     assert!(c.description.contains("Required"));
 }
@@ -136,7 +153,12 @@ fn detect_optional_parameter_added() {
     )]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ParameterAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(!c.is_breaking);
     assert!(c.description.contains("Optional"));
 }
@@ -151,7 +173,12 @@ fn detect_parameter_removed() {
     let new = surface(vec![func("f", vec![param("a", "string")], "void")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ParameterRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -161,7 +188,12 @@ fn detect_parameter_type_changed() {
     let new = surface(vec![func("f", vec![param("a", "number")], "void")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ParameterTypeChanged);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Changed(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(c.is_breaking);
     assert_eq!(c.before.as_deref(), Some("string"));
     assert_eq!(c.after.as_deref(), Some("number"));
@@ -173,10 +205,10 @@ fn detect_parameter_made_required() {
     let new = surface(vec![func("f", vec![param("a", "string")], "void")]);
     let changes = diff_surfaces(&old, &new);
 
-    assert!(has_change(
-        &changes,
-        StructuralChangeType::ParameterMadeRequired
-    ));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Changed(ChangeSubject::Parameter { .. })
+    )));
 }
 
 #[test]
@@ -185,7 +217,12 @@ fn detect_parameter_made_optional() {
     let new = surface(vec![func("f", vec![opt_param("a", "string")], "void")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ParameterMadeOptional);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Changed(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(!c.is_breaking);
 }
 
@@ -199,7 +236,12 @@ fn detect_rest_parameter_added() {
     )]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::RestParameterAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(!c.is_breaking);
 }
 
@@ -213,7 +255,12 @@ fn detect_rest_parameter_removed() {
     let new = surface(vec![func("f", vec![param("a", "string")], "void")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::RestParameterRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Parameter { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -225,7 +272,9 @@ fn detect_return_type_changed() {
     let new = surface(vec![func("f", vec![], "number")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ReturnTypeChanged);
+    let c = find_change(&changes, |ct| {
+        matches!(ct, StructuralChangeType::Changed(ChangeSubject::ReturnType))
+    });
     assert!(c.is_breaking);
 }
 
@@ -235,7 +284,9 @@ fn detect_made_async() {
     let new = surface(vec![func("f", vec![], "Promise<string>")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::MadeAsync);
+    let c = find_change(&changes, |ct| {
+        matches!(ct, StructuralChangeType::Changed(ChangeSubject::ReturnType))
+    });
     assert!(c.is_breaking);
 }
 
@@ -245,7 +296,9 @@ fn detect_made_sync() {
     let new = surface(vec![func("f", vec![], "string")]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::MadeSync);
+    let c = find_change(&changes, |ct| {
+        matches!(ct, StructuralChangeType::Changed(ChangeSubject::ReturnType))
+    });
     assert!(c.is_breaking);
 }
 
@@ -265,7 +318,9 @@ fn detect_visibility_reduced() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::VisibilityReduced);
+    let c = find_change(&changes, |ct| {
+        matches!(ct, StructuralChangeType::Changed(ChangeSubject::Visibility))
+    });
     assert!(c.is_breaking);
 }
 
@@ -283,7 +338,9 @@ fn detect_visibility_increased() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::VisibilityIncreased);
+    let c = find_change(&changes, |ct| {
+        matches!(ct, StructuralChangeType::Changed(ChangeSubject::Visibility))
+    });
     assert!(!c.is_breaking);
 }
 
@@ -299,7 +356,12 @@ fn detect_readonly_added() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ReadonlyAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Modifier { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -313,7 +375,12 @@ fn detect_readonly_removed() {
     let new = surface(vec![sym("prop", SymbolKind::Property)]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::ReadonlyRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Modifier { .. })
+        )
+    });
     assert!(!c.is_breaking);
 }
 
@@ -327,7 +394,10 @@ fn detect_abstract_added() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    assert!(has_change(&changes, StructuralChangeType::AbstractAdded));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Added(ChangeSubject::Modifier { .. })
+    )));
 }
 
 #[test]
@@ -340,7 +410,12 @@ fn detect_static_instance_changed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::StaticInstanceChanged);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Changed(ChangeSubject::Modifier { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -360,7 +435,9 @@ fn detect_base_class_changed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::BaseClassChanged);
+    let c = find_change(&changes, |ct| {
+        matches!(ct, StructuralChangeType::Changed(ChangeSubject::BaseClass))
+    });
     assert!(c.is_breaking);
 }
 
@@ -378,7 +455,12 @@ fn detect_interface_added() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::InterfaceImplementationAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::InterfaceImpl { .. })
+        )
+    });
     assert!(!c.is_breaking);
 }
 
@@ -396,10 +478,12 @@ fn detect_interface_removed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(
-        &changes,
-        StructuralChangeType::InterfaceImplementationRemoved,
-    );
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::InterfaceImpl { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -434,7 +518,12 @@ fn detect_type_parameter_added_required() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::TypeParameterAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::TypeParameter { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -467,7 +556,12 @@ fn detect_type_parameter_added_with_default() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::TypeParameterAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::TypeParameter { .. })
+        )
+    });
     assert!(!c.is_breaking);
 }
 
@@ -500,7 +594,12 @@ fn detect_type_parameter_removed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::TypeParameterRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::TypeParameter { .. })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -526,10 +625,10 @@ fn detect_type_parameter_constraint_changed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    assert!(has_change(
-        &changes,
-        StructuralChangeType::TypeParameterConstraintChanged
-    ));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Changed(ChangeSubject::TypeParameter { .. })
+    )));
 }
 
 // ── Enum member changes ──────────────────────────────────────────
@@ -569,7 +668,13 @@ fn detect_enum_member_added() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    assert!(has_change(&changes, StructuralChangeType::EnumMemberAdded));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Added(ChangeSubject::Member {
+            kind: SymbolKind::EnumMember,
+            ..
+        })
+    )));
 }
 
 #[test]
@@ -589,7 +694,15 @@ fn detect_enum_member_removed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::EnumMemberRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Member {
+                kind: SymbolKind::EnumMember,
+                ..
+            })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -617,7 +730,15 @@ fn detect_enum_member_value_changed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::EnumMemberValueChanged);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Changed(ChangeSubject::Member {
+                kind: SymbolKind::EnumMember,
+                ..
+            })
+        )
+    });
     assert!(c.is_breaking);
 }
 
@@ -640,7 +761,12 @@ fn detect_interface_property_removed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::PropertyRemoved);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Member { .. })
+        )
+    });
     assert!(c.is_breaking);
     assert_eq!(c.symbol, "age");
 }
@@ -662,7 +788,12 @@ fn detect_interface_property_added() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    let c = find_change(&changes, StructuralChangeType::PropertyAdded);
+    let c = find_change(&changes, |ct| {
+        matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Member { .. })
+        )
+    });
     assert_eq!(c.symbol, "age");
     // New required property on interface is breaking
     assert!(c.is_breaking);
@@ -694,7 +825,10 @@ fn detect_class_method_return_type_changed() {
     }]);
     let changes = diff_surfaces(&old, &new);
 
-    assert!(has_change(&changes, StructuralChangeType::MadeAsync));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Changed(ChangeSubject::ReturnType)
+    )));
 }
 
 // ── Rename detection ────────────────────────────────────────────
@@ -727,7 +861,15 @@ fn detect_property_renamed() {
 
     let rename = changes
         .iter()
-        .find(|c| c.change_type == StructuralChangeType::PropertyRenamed)
+        .find(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Member { .. },
+                    ..
+                }
+            )
+        })
         .expect("Should detect rename");
     assert_eq!(rename.before.as_deref(), Some("isActive"));
     assert_eq!(rename.after.as_deref(), Some("isClicked"));
@@ -736,16 +878,17 @@ fn detect_property_renamed() {
 
     // Should NOT also have PropertyRemoved or PropertyAdded for these
     assert!(
-        !changes
-            .iter()
-            .any(|c| c.change_type == StructuralChangeType::PropertyRemoved
-                && c.symbol == "isActive"),
+        !changes.iter().any(|c| matches!(
+            c.change_type,
+            StructuralChangeType::Removed(ChangeSubject::Member { .. })
+        ) && c.symbol == "isActive"),
         "Renamed prop should not also appear as removed"
     );
     assert!(
-        !changes.iter().any(
-            |c| c.change_type == StructuralChangeType::PropertyAdded && c.symbol == "isClicked"
-        ),
+        !changes.iter().any(|c| matches!(
+            c.change_type,
+            StructuralChangeType::Added(ChangeSubject::Member { .. })
+        ) && c.symbol == "isClicked"),
         "Renamed prop should not also appear as added"
     );
 }
@@ -777,7 +920,13 @@ fn detect_property_renamed_with_suffix_match() {
     let changes = diff_surfaces(&old, &new);
 
     assert!(
-        has_change(&changes, StructuralChangeType::PropertyRenamed),
+        has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Renamed {
+                from: ChangeSubject::Member { .. },
+                ..
+            }
+        )),
         "Should detect rename via suffix similarity"
     );
 }
@@ -812,9 +961,21 @@ fn no_rename_for_different_types() {
     let changes = diff_surfaces(&old, &new);
 
     // Should be remove + add, not rename
-    assert!(has_change(&changes, StructuralChangeType::PropertyRemoved));
-    assert!(has_change(&changes, StructuralChangeType::PropertyAdded));
-    assert!(!has_change(&changes, StructuralChangeType::PropertyRenamed));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Removed(ChangeSubject::Member { .. })
+    )));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Added(ChangeSubject::Member { .. })
+    )));
+    assert!(!has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Renamed {
+            from: ChangeSubject::Member { .. },
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -845,7 +1006,13 @@ fn no_rename_for_completely_different_names() {
 
     // "x" and "processDataHandler" share no meaningful similarity
     // Should be remove + add
-    assert!(!has_change(&changes, StructuralChangeType::PropertyRenamed));
+    assert!(!has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Renamed {
+            from: ChangeSubject::Member { .. },
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -865,7 +1032,15 @@ fn detect_symbol_renamed_top_level() {
 
     let rename = changes
         .iter()
-        .find(|c| c.change_type == StructuralChangeType::SymbolRenamed)
+        .find(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
         .expect("Should detect top-level symbol rename");
     assert_eq!(rename.before.as_deref(), Some("ChipGroup"));
     assert_eq!(rename.after.as_deref(), Some("LabelGroup"));
@@ -899,17 +1074,31 @@ fn multiple_renames_greedy_matching() {
 
     let renames: Vec<_> = changes
         .iter()
-        .filter(|c| c.change_type == StructuralChangeType::PropertyRenamed)
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Member { .. },
+                    ..
+                }
+            )
+        })
         .collect();
     assert_eq!(renames.len(), 2, "Should detect both renames");
 
     // No removes or adds should remain
     assert!(
-        !has_change(&changes, StructuralChangeType::PropertyRemoved),
+        !has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Member { .. })
+        )),
         "All removed props should be matched as renames"
     );
     assert!(
-        !has_change(&changes, StructuralChangeType::PropertyAdded),
+        !has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Member { .. })
+        )),
         "All added props should be matched as renames"
     );
 }
@@ -1023,8 +1212,16 @@ fn star_reexport_filtered_but_real_symbols_still_diff() {
     // oldFunc should be removed (or renamed to newFunc), newFunc added (or part of rename)
     // Since they have same type (void, 0 params), rename detection might match them
     let has_removal_or_rename = changes.iter().any(|c| {
-        c.change_type == StructuralChangeType::SymbolRemoved
-            || c.change_type == StructuralChangeType::SymbolRenamed
+        matches!(
+            c.change_type,
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+        ) || matches!(
+            c.change_type,
+            StructuralChangeType::Renamed {
+                from: ChangeSubject::Symbol { .. },
+                ..
+            }
+        )
     });
     assert!(
         has_removal_or_rename,
@@ -1044,7 +1241,10 @@ fn named_namespace_reexport_not_filtered() {
     let changes = diff_surfaces(&old, &new);
 
     assert!(
-        has_change(&changes, StructuralChangeType::SymbolRemoved),
+        has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+        )),
         "Named namespace re-exports should still be tracked"
     );
     assert_eq!(changes[0].symbol, "utils");
@@ -1067,7 +1267,7 @@ fn detect_moved_to_deprecated() {
 
     let moved = changes
         .iter()
-        .find(|c| c.change_type == StructuralChangeType::SymbolMovedToDeprecated)
+        .find(|c| matches!(&c.change_type, StructuralChangeType::Relocated { .. }))
         .expect("Should detect moved to deprecated");
     assert_eq!(moved.symbol, "Chip");
     assert!(moved.is_breaking);
@@ -1075,11 +1275,17 @@ fn detect_moved_to_deprecated() {
 
     // Should NOT appear as removed or added
     assert!(
-        !has_change(&changes, StructuralChangeType::SymbolRemoved),
+        !has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+        )),
         "Relocated symbol should not also appear as removed"
     );
     assert!(
-        !has_change(&changes, StructuralChangeType::SymbolAdded),
+        !has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Added(ChangeSubject::Symbol { .. })
+        )),
         "Relocated symbol should not also appear as added"
     );
 }
@@ -1112,18 +1318,29 @@ fn detect_moved_to_deprecated_with_member_changes() {
 
     // Should detect the deprecation move
     assert!(
-        has_change(&changes, StructuralChangeType::SymbolMovedToDeprecated),
+        has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Relocated { .. }
+        )),
         "Should detect move to deprecated"
     );
 
     // Should ALSO detect the member removal
     assert!(
-        has_change(&changes, StructuralChangeType::PropertyRemoved),
+        has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Member { .. })
+        )),
         "Should detect property removal within deprecated move"
     );
     let prop_removed = changes
         .iter()
-        .find(|c| c.change_type == StructuralChangeType::PropertyRemoved)
+        .find(|c| {
+            matches!(
+                c.change_type,
+                StructuralChangeType::Removed(ChangeSubject::Member { .. })
+            )
+        })
         .unwrap();
     assert_eq!(prop_removed.symbol, "isActive");
 }
@@ -1142,7 +1359,10 @@ fn detect_moved_from_next_to_deprecated() {
     let changes = diff_surfaces(&old, &new);
 
     assert!(
-        has_change(&changes, StructuralChangeType::SymbolMovedToDeprecated),
+        has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Relocated { .. }
+        )),
         "next/ → deprecated/ should be detected as moved to deprecated"
     );
 }
@@ -1167,7 +1387,10 @@ fn promoted_from_deprecated_not_breaking() {
     );
 
     // Should not be marked as removed
-    assert!(!has_change(&changes, StructuralChangeType::SymbolRemoved));
+    assert!(!has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+    )));
 }
 
 #[test]
@@ -1187,16 +1410,30 @@ fn relocation_does_not_interfere_with_rename_detection() {
     let changes = diff_surfaces(&old, &new);
 
     // Chip should be moved to deprecated
-    assert!(has_change(
-        &changes,
-        StructuralChangeType::SymbolMovedToDeprecated
-    ));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Relocated { .. }
+    )));
 
     // OldWidget → NewWidget should be detected as rename
-    assert!(has_change(&changes, StructuralChangeType::SymbolRenamed));
+    assert!(has_change(&changes, |ct| matches!(
+        ct,
+        StructuralChangeType::Renamed {
+            from: ChangeSubject::Symbol { .. },
+            ..
+        }
+    )));
     let rename = changes
         .iter()
-        .find(|c| c.change_type == StructuralChangeType::SymbolRenamed)
+        .find(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
         .unwrap();
     assert_eq!(rename.before.as_deref(), Some("OldWidget"));
     assert_eq!(rename.after.as_deref(), Some("NewWidget"));
@@ -1225,11 +1462,14 @@ fn multiple_symbols_moved_to_deprecated() {
 
     let moved_count = changes
         .iter()
-        .filter(|c| c.change_type == StructuralChangeType::SymbolMovedToDeprecated)
+        .filter(|c| matches!(&c.change_type, StructuralChangeType::Relocated { .. }))
         .count();
     assert_eq!(moved_count, 3, "All three should be detected as moved");
     assert!(
-        !has_change(&changes, StructuralChangeType::SymbolRemoved),
+        !has_change(&changes, |ct| matches!(
+            ct,
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+        )),
         "None should be reported as removed"
     );
 }
@@ -1252,18 +1492,21 @@ fn dedup_default_export_removal() {
 
     // Named removal should be present
     assert!(
-        changes
-            .iter()
-            .any(|c| c.symbol == "c_button"
-                && c.change_type == StructuralChangeType::SymbolRemoved),
+        changes.iter().any(|c| c.symbol == "c_button"
+            && matches!(
+                c.change_type,
+                StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+            )),
         "Named export removal should be present"
     );
 
     // Default removal should be suppressed
     assert!(
-        !changes
-            .iter()
-            .any(|c| c.symbol == "default" && c.change_type == StructuralChangeType::SymbolRemoved),
+        !changes.iter().any(|c| c.symbol == "default"
+            && matches!(
+                c.change_type,
+                StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+            )),
         "Default export removal should be deduplicated"
     );
 }
@@ -1282,15 +1525,19 @@ fn dedup_default_export_addition() {
     let changes = diff_surfaces(&old, &new);
 
     assert!(
-        changes
-            .iter()
-            .any(|c| c.symbol == "c_button" && c.change_type == StructuralChangeType::SymbolAdded),
+        changes.iter().any(|c| c.symbol == "c_button"
+            && matches!(
+                c.change_type,
+                StructuralChangeType::Added(ChangeSubject::Symbol { .. })
+            )),
         "Named export addition should be present"
     );
     assert!(
-        !changes
-            .iter()
-            .any(|c| c.symbol == "default" && c.change_type == StructuralChangeType::SymbolAdded),
+        !changes.iter().any(|c| c.symbol == "default"
+            && matches!(
+                c.change_type,
+                StructuralChangeType::Added(ChangeSubject::Symbol { .. })
+            )),
         "Default export addition should be deduplicated"
     );
 }
@@ -1306,9 +1553,11 @@ fn keep_default_when_no_named_sibling() {
     let changes = diff_surfaces(&old, &new);
 
     assert!(
-        changes
-            .iter()
-            .any(|c| c.symbol == "default" && c.change_type == StructuralChangeType::SymbolRemoved),
+        changes.iter().any(|c| c.symbol == "default"
+            && matches!(
+                c.change_type,
+                StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+            )),
         "Default-only export should NOT be suppressed"
     );
 }
@@ -1332,14 +1581,19 @@ fn keep_default_when_different_change_type() {
     let changes = diff_surfaces(&old, &new);
 
     // Named is removed
-    assert!(changes
-        .iter()
-        .any(|c| c.symbol == "Foo" && c.change_type == StructuralChangeType::SymbolRemoved));
+    assert!(changes.iter().any(|c| c.symbol == "Foo"
+        && matches!(
+            c.change_type,
+            StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+        )));
 
     // Default has a type change — different change_type from the removal, so keep it
     assert!(
         changes.iter().any(|c| c.symbol == "default"
-            && c.change_type == StructuralChangeType::ParameterTypeChanged),
+            && matches!(
+                c.change_type,
+                StructuralChangeType::Changed(ChangeSubject::Parameter { .. })
+            )),
         "Default with different change type should be kept"
     );
 }
@@ -1407,7 +1661,15 @@ fn no_op_rename_is_skipped() {
     // Should NOT have a SymbolRenamed change
     let renames: Vec<_> = changes
         .iter()
-        .filter(|c| c.change_type == StructuralChangeType::SymbolRenamed)
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
         .collect();
     assert!(
         renames.is_empty(),
@@ -1443,7 +1705,15 @@ fn real_rename_is_detected() {
 
     let renames: Vec<_> = changes
         .iter()
-        .filter(|c| c.change_type == StructuralChangeType::SymbolRenamed)
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
         .collect();
     assert!(
         !renames.is_empty(),

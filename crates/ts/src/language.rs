@@ -485,13 +485,16 @@ mod tests {
 
     #[test]
     fn dedup_default_keeps_named_removes_default() {
+        use semver_analyzer_core::ChangeSubject;
         let ts = TypeScript;
         let mut changes = vec![
             StructuralChange {
                 symbol: "c_button".into(),
                 qualified_name: "pkg/dist/c_button.c_button".into(),
-                kind: "Constant".into(),
-                change_type: StructuralChangeType::SymbolRemoved,
+                kind: SymbolKind::Constant,
+                change_type: StructuralChangeType::Removed(ChangeSubject::Symbol {
+                    kind: SymbolKind::Constant,
+                }),
                 before: None,
                 after: None,
                 description: "removed".into(),
@@ -502,8 +505,10 @@ mod tests {
             StructuralChange {
                 symbol: "default".into(),
                 qualified_name: "pkg/dist/c_button.default".into(),
-                kind: "Constant".into(),
-                change_type: StructuralChangeType::SymbolRemoved,
+                kind: SymbolKind::Constant,
+                change_type: StructuralChangeType::Removed(ChangeSubject::Symbol {
+                    kind: SymbolKind::Constant,
+                }),
                 before: None,
                 after: None,
                 description: "removed".into(),

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: age
   qualified_name: age
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"age\", kind: Property })"
   is_breaking: true
   description: "property `age` was removed from `Options`"
   before: "property: age"

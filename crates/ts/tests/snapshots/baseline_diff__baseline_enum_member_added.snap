@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: Green
   qualified_name: Green
   kind: EnumMember
-  change_type: EnumMemberAdded
+  change_type: "Added(Member { name: \"Green\", kind: EnumMember })"
   is_breaking: false
   description: "Enum member `Green` was added to `Color`"
   before: ~

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: ChipProps
   qualified_name: pkg/dist/esm/components/Chip/Chip.ChipProps
   kind: Interface
-  change_type: SymbolMovedToDeprecated
+  change_type: "Relocated { from: Symbol { kind: Interface }, to: Symbol { kind: Interface } }"
   is_breaking: true
   description: "interface `ChipProps` moved to deprecated exports"
   before: pkg/dist/esm/components/Chip/Chip.ChipProps
@@ -14,7 +14,7 @@ expression: "diff(&old, &new)"
 - symbol: isActive
   qualified_name: isActive
   kind: Property
-  change_type: PropertyRemoved
+  change_type: "Removed(Member { name: \"isActive\", kind: Property })"
   is_breaking: true
   description: "property `isActive` was removed from `ChipProps`"
   before: "property: isActive: boolean"

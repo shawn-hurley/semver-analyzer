@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: greet
   qualified_name: greet
   kind: Function
-  change_type: SymbolRemoved
+  change_type: "Removed(Symbol { kind: Function })"
   is_breaking: true
   description: "Exported function `greet` was removed"
   before: "function: greet: void"

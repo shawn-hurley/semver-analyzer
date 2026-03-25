@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// (`symbol`, `qualified_name`). The `ChangeSubject` adds the specific
 /// sub-element context -- "it was the `email` parameter" or "it was the
 /// `readonly` modifier."
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChangeSubject {
     /// The symbol itself (added, removed, renamed, relocated).
@@ -52,33 +52,10 @@ pub enum ChangeSubject {
     UnionValue { value: String },
 }
 
-/// Collapsed structural change type (target architecture).
-///
-/// 5 variants instead of 37. The `ChangeSubject` carried inside each
-/// variant describes what was affected. `before`/`after` on the parent
-/// `StructuralChange` carry the values.
-///
-/// Named `V2` to coexist with the current `StructuralChangeType` until
-/// Phase 4 completes the migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum StructuralChangeTypeV2 {
-    Added(ChangeSubject),
-    Removed(ChangeSubject),
-    Changed(ChangeSubject),
-    Renamed {
-        from: ChangeSubject,
-        to: ChangeSubject,
-    },
-    Relocated {
-        from: ChangeSubject,
-        to: ChangeSubject,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::report::StructuralChangeType;
 
     #[test]
     fn change_subject_serialization_round_trip() {
@@ -116,17 +93,17 @@ mod tests {
     }
 
     #[test]
-    fn change_type_v2_serialization_round_trip() {
+    fn change_type_serialization_round_trip() {
         let types = vec![
-            StructuralChangeTypeV2::Added(ChangeSubject::Symbol {
+            StructuralChangeType::Added(ChangeSubject::Symbol {
                 kind: SymbolKind::Interface,
             }),
-            StructuralChangeTypeV2::Removed(ChangeSubject::Member {
+            StructuralChangeType::Removed(ChangeSubject::Member {
                 name: "variant".into(),
                 kind: SymbolKind::Property,
             }),
-            StructuralChangeTypeV2::Changed(ChangeSubject::ReturnType),
-            StructuralChangeTypeV2::Renamed {
+            StructuralChangeType::Changed(ChangeSubject::ReturnType),
+            StructuralChangeType::Renamed {
                 from: ChangeSubject::Symbol {
                     kind: SymbolKind::Class,
                 },
@@ -134,7 +111,7 @@ mod tests {
                     kind: SymbolKind::Struct,
                 },
             },
-            StructuralChangeTypeV2::Relocated {
+            StructuralChangeType::Relocated {
                 from: ChangeSubject::Symbol {
                     kind: SymbolKind::Function,
                 },
@@ -146,7 +123,7 @@ mod tests {
 
         for ct in &types {
             let json = serde_json::to_string(ct).unwrap();
-            let roundtrip: StructuralChangeTypeV2 = serde_json::from_str(&json).unwrap();
+            let roundtrip: StructuralChangeType = serde_json::from_str(&json).unwrap();
             assert_eq!(ct, &roundtrip, "Round-trip failed for {:?}", ct);
         }
     }

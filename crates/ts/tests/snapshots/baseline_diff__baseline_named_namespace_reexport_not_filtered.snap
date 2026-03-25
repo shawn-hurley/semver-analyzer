@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: utils
   qualified_name: index.utils
   kind: Namespace
-  change_type: SymbolRemoved
+  change_type: "Removed(Symbol { kind: Namespace })"
   is_breaking: true
   description: "Exported namespace `utils` was removed"
   before: "namespace: utils"

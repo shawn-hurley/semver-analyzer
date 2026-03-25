@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: Chip
   qualified_name: pkg/dist/esm/components/Chip/Chip.Chip
   kind: Variable
-  change_type: SymbolMovedToDeprecated
+  change_type: "Relocated { from: Symbol { kind: Variable }, to: Symbol { kind: Variable } }"
   is_breaking: true
   description: "variable `Chip` moved to deprecated exports"
   before: pkg/dist/esm/components/Chip/Chip.Chip

@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: f
   qualified_name: f
   kind: Function
-  change_type: MadeSync
+  change_type: Changed(ReturnType)
   is_breaking: true
   description: "`f` was made sync (Promise wrapper removed)"
   before: Promise<string>

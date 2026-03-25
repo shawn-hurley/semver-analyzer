@@ -5,7 +5,7 @@ expression: "diff(&old, &new)"
 - symbol: MyClass
   qualified_name: MyClass
   kind: Class
-  change_type: InterfaceImplementationAdded
+  change_type: "Added(InterfaceImpl { interface_name: \"Bar\" })"
   is_breaking: false
   description: "`MyClass` now implements `Bar`"
   before: ~
