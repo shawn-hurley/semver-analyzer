@@ -29,7 +29,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use semver_analyzer_core::{CallGraphBuilder, Caller, Reference, Visibility};
+use semver_analyzer_core::{Caller, Reference, Visibility};
 use std::path::Path;
 
 /// TypeScript same-file call graph builder.
@@ -44,15 +44,15 @@ impl TsCallGraphBuilder {
     }
 }
 
-impl CallGraphBuilder for TsCallGraphBuilder {
-    fn find_callers(&self, file: &Path, symbol_name: &str) -> Result<Vec<Caller>> {
+impl TsCallGraphBuilder {
+    pub fn find_callers(&self, file: &Path, symbol_name: &str) -> Result<Vec<Caller>> {
         let source = std::fs::read_to_string(file)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", file.display(), e))?;
 
         find_callers_in_source(&source, file, symbol_name)
     }
 
-    fn find_references(&self, file: &Path, symbol_name: &str) -> Result<Vec<Reference>> {
+    pub fn find_references(&self, file: &Path, symbol_name: &str) -> Result<Vec<Reference>> {
         let source = std::fs::read_to_string(file)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", file.display(), e))?;
 

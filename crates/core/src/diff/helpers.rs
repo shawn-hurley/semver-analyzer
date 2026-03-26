@@ -30,6 +30,7 @@ pub(super) fn change(
         symbol: sym.name.clone(),
         qualified_name: sym.qualified_name.clone(),
         kind: sym.kind,
+        package: sym.package.clone(),
         change_type,
         before,
         after,

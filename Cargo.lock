@@ -919,6 +919,7 @@ dependencies = [
  "clap",
  "regex",
  "semver-analyzer-core",
+ "semver-analyzer-konveyor-core",
  "semver-analyzer-llm",
  "semver-analyzer-ts",
  "serde",
@@ -939,6 +940,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "semver-analyzer-konveyor-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "semver-analyzer-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "semver-analyzer-llm"
 version = "0.1.0"
 dependencies = [
@@ -954,6 +968,7 @@ name = "semver-analyzer-ts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "insta",
  "oxc_allocator",
  "oxc_ast",
@@ -961,8 +976,10 @@ dependencies = [
  "oxc_span",
  "regex",
  "semver-analyzer-core",
+ "semver-analyzer-konveyor-core",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "thiserror",
 ]

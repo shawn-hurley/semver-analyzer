@@ -24,7 +24,7 @@ mod spec_compare;
 use anyhow::Result;
 pub use invoke::{
     FileApiChange, FileBehavioralChange, LlmCompositionChange, LlmConstantRenamePattern,
-    LlmExpectedChild, LlmInterfaceRenameMapping, LlmRemovalDisposition, LlmSuffixRename,
+    LlmInterfaceRenameMapping, LlmSuffixRename,
 };
 use semver_analyzer_core::{
     BehaviorAnalyzer, BreakingVerdict, ChangedFunction, FunctionSpec, TestDiff,
@@ -132,7 +132,7 @@ impl LlmBehaviorAnalyzer {
         family_name: &str,
         files_content: &str,
         related_components: Option<&str>,
-    ) -> Result<std::collections::HashMap<String, Vec<LlmExpectedChild>>> {
+    ) -> Result<std::collections::HashMap<String, Vec<semver_analyzer_core::ExpectedChild>>> {
         let prompt = prompts::build_hierarchy_inference_prompt(
             family_name,
             files_content,

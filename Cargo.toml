@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/ts", "crates/llm"]
+members = ["crates/core", "crates/ts", "crates/llm", "crates/konveyor-core"]
 resolver = "2"
 
 [package]
@@ -12,6 +12,7 @@ description = "Deterministic semantic breaking change analyzer for TypeScript/Ja
 semver-analyzer-core = { path = "crates/core" }
 semver-analyzer-ts = { path = "crates/ts" }
 semver-analyzer-llm = { path = "crates/llm" }
+semver-analyzer-konveyor-core = { path = "crates/konveyor-core" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

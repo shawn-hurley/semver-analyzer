@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::{SymbolKind, Visibility};
+use crate::traits::Language;
 
 // ── Changed Function (DiffParser output) ────────────────────────────────
 
@@ -170,6 +171,22 @@ pub struct SideEffect {
     pub condition: Option<String>,
 }
 
+// ── Evidence Type ───────────────────────────────────────────────────────
+
+/// How a behavioral change was detected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceType {
+    /// Detected from test assertion changes.
+    TestDelta,
+    /// Detected by LLM file-level analysis.
+    LlmAnalysis,
+    /// Detected by deterministic body analysis (JSX diff, CSS scan, etc.).
+    BodyAnalysis,
+    /// Propagated through call graph from another break.
+    CallGraphPropagation,
+}
+
 // ── Behavioral Break (BU pipeline output) ───────────────────────────────
 
 /// A detected behavioral breaking change.
@@ -178,11 +195,11 @@ pub struct SideEffect {
 /// the root cause (potentially a private function), the call path,
 /// and the evidence that supports the finding.
 ///
-/// Language-agnostic: uses string fields for evidence and category
-/// instead of language-specific enum types (those live in the
-/// language crate, e.g. `TsEvidence` / `TsCategory` in `crates/ts`).
+/// Generic over `L: Language` so the category field carries the
+/// language's typed `Category` enum rather than a stringly-typed label.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BehavioralBreak {
+#[serde(bound = "")]
+pub struct BehavioralBreak<L: Language> {
     /// The affected PUBLIC symbol's qualified name.
     /// This is the symbol consumers interact with.
     pub symbol: String,
@@ -207,13 +224,37 @@ pub struct BehavioralBreak {
     /// Human-readable description of the behavioral change.
     pub description: String,
 
-    /// Category label as string (was Option<BehavioralCategory>).
-    /// Language-specific category rendered as a string for display.
+    /// Language-specific behavioral category (e.g., `TsCategory::DomStructure`).
+    /// Set directly by deterministic analysis (JSX diff, CSS scan).
+    /// For LLM-produced string labels, deserialized via serde.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category_label: Option<String>,
+    pub category: Option<L::Category>,
+
+    /// How this behavioral change was detected.
+    pub evidence_type: EvidenceType,
+
+    /// Whether this change only affects internal implementation (not public API).
+    /// Set by LLM analysis when the change is contained within a component's internals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_internal_only: Option<bool>,
 }
 
 // ── Call Graph Types ────────────────────────────────────────────────────
+
+/// A single result from deterministic body analysis.
+///
+/// Produced by `BodyAnalysisSemantics::analyze_changed_body` during BU Phase 1.
+/// Each result represents a behavioral change detected without LLM assistance
+/// (e.g., JSX diff, CSS variable scanning for TypeScript).
+#[derive(Debug, Clone)]
+pub struct BodyAnalysisResult {
+    /// Human-readable description of the behavioral change.
+    pub description: String,
+    /// Category label string in the language's serde format (deserialized via serde).
+    pub category_label: Option<String>,
+    /// Confidence score (0.0 to 1.0).
+    pub confidence: f64,
+}
 
 /// A function that calls another function (used for call graph walking).
 #[derive(Debug, Clone)]
@@ -356,7 +397,9 @@ mod tests {
 
     #[test]
     fn behavioral_break_with_call_path() {
-        let brk = BehavioralBreak {
+        use crate::test_support::TestLang;
+
+        let brk: BehavioralBreak<TestLang> = BehavioralBreak {
             symbol: "createUser".into(),
             caused_by: "_normalizeEmail".into(),
             call_path: vec![
@@ -367,7 +410,9 @@ mod tests {
             evidence_description: "LlmOnly: postcondition changed".into(),
             confidence: 0.55,
             description: "Email normalization now strips + aliases".into(),
-            category_label: None,
+            category: None,
+            evidence_type: EvidenceType::LlmAnalysis,
+            is_internal_only: None,
         };
 
         assert_eq!(brk.call_path.len(), 3);

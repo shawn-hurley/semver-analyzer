@@ -21,6 +21,7 @@
 //!    b. Broadcast qualified_name          c. If not found: analyze
 //! ```
 
+use crate::traits::Language;
 use crate::types::{ApiSurface, BehavioralBreak, StructuralChange};
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -34,16 +35,19 @@ const BROADCAST_CAPACITY: usize = 4096;
 
 /// Concurrent shared state between TD and BU pipelines.
 ///
+/// Generic over `L: Language` so that `BehavioralBreak<L>` carries
+/// typed category data instead of stringly-typed labels.
+///
 /// Thread-safe: all fields use concurrent data structures.
 /// Wrapped in `Arc` for sharing between async tasks.
-pub struct SharedFindings {
+pub struct SharedFindings<L: Language> {
     /// Structural breaks found by TD. Keyed by qualified_name.
     /// TD inserts, BU checks before analyzing each function.
     structural_breaks: DashMap<String, StructuralChange>,
 
     /// Behavioral breaks found by BU. Keyed by qualified_name.
     /// BU inserts after spec inference confirms a behavioral change.
-    behavioral_breaks: DashMap<String, BehavioralBreak>,
+    behavioral_breaks: DashMap<String, BehavioralBreak<L>>,
 
     /// Broadcast sender: TD sends qualified names here as it finds
     /// structural breaks. BU subscribes and drains pending messages
@@ -61,7 +65,7 @@ pub struct SharedFindings {
     new_surface: tokio::sync::OnceCell<ApiSurface>,
 }
 
-impl SharedFindings {
+impl<L: Language> SharedFindings<L> {
     /// Create new shared state with an empty broadcast channel.
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -128,7 +132,7 @@ impl SharedFindings {
     }
 
     /// Insert a behavioral break found by BU.
-    pub fn insert_behavioral_break(&self, brk: BehavioralBreak) {
+    pub fn insert_behavioral_break(&self, brk: BehavioralBreak<L>) {
         self.behavioral_breaks.insert(brk.symbol.clone(), brk);
     }
 
@@ -140,7 +144,7 @@ impl SharedFindings {
     }
 
     /// Get all behavioral breaks (for merge step).
-    pub fn behavioral_breaks(&self) -> &DashMap<String, BehavioralBreak> {
+    pub fn behavioral_breaks(&self) -> &DashMap<String, BehavioralBreak<L>> {
         &self.behavioral_breaks
     }
 
@@ -187,7 +191,7 @@ impl SharedFindings {
     }
 }
 
-impl Default for SharedFindings {
+impl<L: Language> Default for SharedFindings<L> {
     fn default() -> Self {
         Self::new()
     }
@@ -256,8 +260,8 @@ impl BuReceiver {
 ///
 /// Combines both the broadcast skip set AND the DashMap fallback.
 /// This is the recommended way for BU to check before analyzing a function.
-pub fn should_skip_for_bu(
-    shared: &SharedFindings,
+pub fn should_skip_for_bu<L: Language>(
+    shared: &SharedFindings<L>,
     receiver: &mut BuReceiver,
     qualified_name: &str,
 ) -> bool {
@@ -267,6 +271,7 @@ pub fn should_skip_for_bu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestLang;
     use crate::types::{ChangeSubject, StructuralChangeType, SymbolKind};
     use std::sync::Arc;
 
@@ -275,6 +280,7 @@ mod tests {
             symbol: name.to_string(),
             qualified_name: name.to_string(),
             kind: SymbolKind::Function,
+            package: None,
             change_type: StructuralChangeType::Removed(ChangeSubject::Symbol { kind: SymbolKind::Function }),
             before: None,
             after: None,
@@ -285,7 +291,7 @@ mod tests {
         }
     }
 
-    fn make_behavioral_break(name: &str) -> BehavioralBreak {
+    fn make_behavioral_break(name: &str) -> BehavioralBreak<TestLang> {
         BehavioralBreak {
             symbol: name.to_string(),
             caused_by: name.to_string(),
@@ -293,13 +299,15 @@ mod tests {
             evidence_description: "TestDelta: test assertions changed".to_string(),
             confidence: 0.95,
             description: format!("{} behavior changed", name),
-            category_label: None,
+            category: None,
+            evidence_type: crate::types::EvidenceType::TestDelta,
+            is_internal_only: None,
         }
     }
 
     #[test]
     fn shared_findings_basic_operations() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
 
         // Initially empty
         assert_eq!(shared.structural_break_count(), 0);
@@ -318,7 +326,7 @@ mod tests {
 
     #[test]
     fn shared_findings_batch_insert() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
 
         let changes = vec![
             make_structural_change("a"),
@@ -335,7 +343,7 @@ mod tests {
 
     #[test]
     fn broadcast_receiver_skip_set() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
         let mut receiver = shared.subscribe_to_td();
 
         // Insert a structural break (also broadcasts)
@@ -352,7 +360,7 @@ mod tests {
 
     #[test]
     fn broadcast_multiple_messages() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
         let mut receiver = shared.subscribe_to_td();
 
         // Insert several structural breaks
@@ -369,7 +377,7 @@ mod tests {
 
     #[test]
     fn should_skip_combines_broadcast_and_dashmap() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
 
         // Insert BEFORE subscribing — won't appear in broadcast
         shared.insert_structural_break(make_structural_change("early"));
@@ -387,7 +395,7 @@ mod tests {
 
     #[test]
     fn structural_break_names() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
         shared.insert_structural_break(make_structural_change("x"));
         shared.insert_structural_break(make_structural_change("y"));
 
@@ -398,14 +406,14 @@ mod tests {
 
     #[test]
     fn surface_try_get_before_set() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
         assert!(shared.try_get_old_surface().is_none());
         assert!(shared.try_get_new_surface().is_none());
     }
 
     #[test]
     fn surface_set_and_get() {
-        let shared = SharedFindings::new();
+        let shared: SharedFindings<TestLang> = SharedFindings::new();
 
         let surface = ApiSurface {
             symbols: vec![],
@@ -417,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn surface_async_get() {
-        let shared = Arc::new(SharedFindings::new());
+        let shared: Arc<SharedFindings<TestLang>> = Arc::new(SharedFindings::new());
 
         let surface = ApiSurface {
             symbols: vec![],
@@ -432,7 +440,7 @@ mod tests {
     fn concurrent_inserts() {
         use std::thread;
 
-        let shared = Arc::new(SharedFindings::new());
+        let shared: Arc<SharedFindings<TestLang>> = Arc::new(SharedFindings::new());
         let mut handles = Vec::new();
 
         // Spawn 10 threads, each inserting 100 structural breaks

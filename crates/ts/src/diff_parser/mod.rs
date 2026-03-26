@@ -18,7 +18,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use semver_analyzer_core::{ChangedFunction, DiffParser, SymbolKind, Visibility};
+use semver_analyzer_core::{ChangedFunction, SymbolKind, Visibility};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,8 +34,8 @@ impl TsDiffParser {
     }
 }
 
-impl DiffParser for TsDiffParser {
-    fn parse_changed_functions(
+impl TsDiffParser {
+    pub fn parse_changed_functions(
         &self,
         repo: &Path,
         from_ref: &str,

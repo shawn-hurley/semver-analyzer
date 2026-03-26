@@ -12,15 +12,14 @@ pub mod css_scan;
 pub mod diff_parser;
 pub mod extract;
 pub mod jsx_diff;
+pub mod konveyor;
 pub mod language;
 pub mod manifest;
+pub mod report;
 pub mod test_analyzer;
 pub mod worktree;
 
 // Re-export key types for convenience
-pub use call_graph::TsCallGraphBuilder;
-pub use diff_parser::TsDiffParser;
 pub use extract::OxcExtractor;
 pub use language::{TsCategory, TsEvidence, TsManifestChangeType, TsReportData, TypeScript};
-pub use test_analyzer::TsTestAnalyzer;
 pub use worktree::WorktreeGuard;

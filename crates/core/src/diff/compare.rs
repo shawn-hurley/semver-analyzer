@@ -680,6 +680,7 @@ pub(super) fn diff_members(
             symbol: rm.old.name.clone(),
             qualified_name: format!("{}.{}", old.qualified_name, rm.old.name),
             kind: rm.old.kind,
+            package: rm.old.package.clone(),
             change_type: StructuralChangeType::Renamed {
                 from: ChangeSubject::Member {
                     name: rm.old.name.clone(),
@@ -878,6 +879,7 @@ fn diff_union_literals(
             symbol: format!("{}.{}", sym.name, prop_name),
             qualified_name: format!("{}.{}", sym.qualified_name, prop_name),
             kind: SymbolKind::Property,
+            package: sym.package.clone(),
             change_type: StructuralChangeType::Removed(ChangeSubject::UnionValue {
                 value: removed.clone(),
             }),
@@ -899,6 +901,7 @@ fn diff_union_literals(
             symbol: format!("{}.{}", sym.name, prop_name),
             qualified_name: format!("{}.{}", sym.qualified_name, prop_name),
             kind: SymbolKind::Property,
+            package: sym.package.clone(),
             change_type: StructuralChangeType::Added(ChangeSubject::UnionValue {
                 value: added.clone(),
             }),

@@ -124,6 +124,7 @@ pub fn diff_surfaces_with_semantics(
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
                     kind: reloc.old.kind,
+                    package: reloc.old.package.clone(),
                     change_type: StructuralChangeType::Relocated {
                         from: ChangeSubject::Symbol {
                             kind: reloc.old.kind,
@@ -149,6 +150,7 @@ pub fn diff_surfaces_with_semantics(
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
                     kind: reloc.old.kind,
+                    package: reloc.old.package.clone(),
                     change_type: StructuralChangeType::Added(ChangeSubject::Symbol {
                         kind: reloc.old.kind,
                     }),
@@ -169,6 +171,7 @@ pub fn diff_surfaces_with_semantics(
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
                     kind: reloc.old.kind,
+                    package: reloc.old.package.clone(),
                     change_type: StructuralChangeType::Renamed {
                         from: ChangeSubject::Symbol { kind: reloc.old.kind },
                         to: ChangeSubject::Symbol { kind: reloc.new.kind },
@@ -190,6 +193,7 @@ pub fn diff_surfaces_with_semantics(
                     symbol: reloc.old.name.clone(),
                     qualified_name: reloc.old.qualified_name.clone(),
                     kind: reloc.old.kind,
+                    package: reloc.old.package.clone(),
                     change_type: StructuralChangeType::Renamed {
                         from: ChangeSubject::Symbol {
                             kind: reloc.old.kind,
@@ -264,6 +268,7 @@ pub fn diff_surfaces_with_semantics(
             symbol: rm.old.name.clone(),
             qualified_name: rm.old.qualified_name.clone(),
             kind: rm.old.kind,
+            package: rm.old.package.clone(),
             change_type: StructuralChangeType::Renamed {
                 from: ChangeSubject::Symbol { kind: rm.old.kind },
                 to: ChangeSubject::Symbol { kind: rm.new.kind },
@@ -294,6 +299,7 @@ pub fn diff_surfaces_with_semantics(
             symbol: sym.name.clone(),
             qualified_name: sym.qualified_name.clone(),
             kind: sym.kind,
+            package: sym.package.clone(),
             change_type: StructuralChangeType::Removed(ChangeSubject::Symbol { kind: sym.kind }),
             before: Some(symbol_summary(sym)),
             after: None,
@@ -319,6 +325,7 @@ pub fn diff_surfaces_with_semantics(
             symbol: sym.name.clone(),
             qualified_name: sym.qualified_name.clone(),
             kind: sym.kind,
+            package: sym.package.clone(),
             change_type: StructuralChangeType::Added(ChangeSubject::Symbol { kind: sym.kind }),
             before: None,
             after: Some(symbol_summary(sym)),

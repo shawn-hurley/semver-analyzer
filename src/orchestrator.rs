@@ -20,30 +20,47 @@
 
 use anyhow::{Context, Result};
 use semver_analyzer_core::{
-    BehavioralBreak, BehavioralChange, BehavioralChangeKind, CallGraphBuilder,
-    DiffParser, SharedFindings, TestAnalyzer, Visibility,
+    ApiSurface, BehavioralBreak, BehavioralChange,
+    ChangeSubject, ChangedFunction, CompositionPatternChange,
+    ExpectedChild, HierarchyDelta, InferenceMetadata,
+    InferredConstantPattern, InferredInterfaceMapping, InferredRenamePatterns,
+    Language, LlmApiChange, ManifestChange,
+    SharedFindings, StructuralChange, StructuralChangeType,
+    SymbolKind, Visibility,
+    diff_surfaces_with_semantics, should_skip_for_bu,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
-use semver_analyzer_ts::{OxcExtractor, TsCallGraphBuilder, TsCategory, TsDiffParser, TsTestAnalyzer, TypeScript};
-use std::collections::HashSet;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Run the full concurrent TD+BU analysis pipeline.
+/// Bundles a language implementation with its analysis components.
 ///
-/// Returns structural changes, behavioral breaks, and package.json changes.
-/// The caller (`cmd_analyze`) assembles these into the final report.
-pub async fn run_concurrent_analysis(
-    repo: &Path,
-    from_ref: &str,
-    to_ref: &str,
-    no_llm: bool,
-    _llm_command: Option<&str>,
-    build_command: Option<&str>,
-    llm_all_files: bool,
-) -> Result<AnalysisResult> {
-    let shared = Arc::new(SharedFindings::new());
+/// Constructed once per analysis run. The `run()` method executes the
+/// full concurrent TD+BU pipeline.
+pub struct Analyzer<L: Language> {
+    pub lang: Arc<L>,
+}
+
+impl<L: Language> Analyzer<L> {
+    /// Run the full concurrent TD+BU analysis pipeline.
+    ///
+    /// Returns structural changes, behavioral breaks, and manifest changes.
+    /// The caller (`cmd_analyze`) assembles these into the final report.
+    pub async fn run(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        no_llm: bool,
+        _llm_command: Option<&str>,
+        build_command: Option<&str>,
+        llm_all_files: bool,
+    ) -> Result<AnalysisResult<L>> {
+    let shared = Arc::new(SharedFindings::<L>::new());
 
     // Clone values for the async tasks
     let repo_td = repo.to_path_buf();
@@ -57,15 +74,34 @@ pub async fn run_concurrent_analysis(
     let shared_td = shared.clone();
     let shared_bu = shared.clone();
 
+    // Clone Arcs for spawn_blocking closures
+    let lang_td = self.lang.clone();
+    let lang_bu = self.lang.clone();
+
     // Run TD and BU Phase 1 (test-based analysis) concurrently
     let (td_result, bu_phase1_result) = tokio::join!(
         // TD: Extract API surfaces and compute structural diff
         tokio::task::spawn_blocking(move || {
-            run_td(&repo_td, &from_td, &to_td, build_cmd.as_deref(), &shared_td)
+            Self::run_td(
+                lang_td.as_ref(),
+                &repo_td,
+                &from_td,
+                &to_td,
+                build_cmd.as_deref(),
+                &shared_td,
+            )
         }),
         // BU Phase 1: Parse diff, analyze tests, walk call graph (no LLM)
         tokio::task::spawn_blocking(move || {
-            run_bu_phase1(&repo_bu, &from_bu, &to_bu, llm_cmd, llm_all_files, &shared_bu)
+            Self::run_bu_phase1(
+                lang_bu.as_ref(),
+                &repo_bu,
+                &from_bu,
+                &to_bu,
+                llm_cmd,
+                llm_all_files,
+                &shared_bu,
+            )
         }),
     );
 
@@ -82,7 +118,7 @@ pub async fn run_concurrent_analysis(
     //
     // Uses LLM to discover systematic rename patterns for constants and
     // interfaces. Requires TD results (structural changes) and API surfaces.
-    let empty_surface = semver_analyzer_core::ApiSurface { symbols: vec![] };
+    let empty_surface = ApiSurface { symbols: vec![] };
     let inferred_rename_patterns = if !no_llm {
         let old_surf = shared.try_get_old_surface().unwrap_or(&empty_surface);
         let new_surf = shared.try_get_new_surface().unwrap_or(&empty_surface);
@@ -90,7 +126,8 @@ pub async fn run_concurrent_analysis(
             .llm_command
             .as_deref()
             .unwrap_or("goose run --no-session -q -t");
-        infer_rename_patterns(
+        Self::infer_rename_patterns(
+            self.lang.as_ref(),
             &td.structural_changes,
             old_surf,
             new_surf,
@@ -104,10 +141,10 @@ pub async fn run_concurrent_analysis(
 
     // BU Phase 2: Concurrent LLM file analysis (async, 5 at a time)
     let mut llm_stats = LlmPhaseStats::default();
-    let mut composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)> = vec![];
-    let llm_api_entries = Arc::new(std::sync::Mutex::new(Vec::<LlmApiChangeEntry>::new()));
+    let mut composition_changes: Vec<(String, Vec<CompositionPatternChange>)> = vec![];
+    let llm_api_entries = Arc::new(Mutex::new(Vec::<LlmApiChange>::new()));
     if !no_llm && !phase1.files_for_llm.is_empty() {
-        let (stats, comp) = run_bu_phase2_llm(
+        let (stats, comp) = Self::run_bu_phase2_llm(
             repo,
             from_ref,
             to_ref,
@@ -122,7 +159,7 @@ pub async fn run_concurrent_analysis(
     }
 
     // Merge results
-    let behavioral_changes = merge_behavioral_breaks(&shared);
+    let behavioral_changes = Self::merge_behavioral_breaks(self.lang.as_ref(), &shared);
     let llm_api_changes = match Arc::try_unwrap(llm_api_entries) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().unwrap().clone(),
@@ -152,11 +189,11 @@ pub async fn run_concurrent_analysis(
     let old_surface = shared
         .try_get_old_surface()
         .cloned()
-        .unwrap_or_else(|| semver_analyzer_core::ApiSurface { symbols: vec![] });
+        .unwrap_or_else(|| ApiSurface { symbols: vec![] });
     let new_surface = shared
         .try_get_new_surface()
         .cloned()
-        .unwrap_or_else(|| semver_analyzer_core::ApiSurface { symbols: vec![] });
+        .unwrap_or_else(|| ApiSurface { symbols: vec![] });
 
     // ── Hierarchy Inference Phase ──────────────────────────────────────
     //
@@ -169,7 +206,8 @@ pub async fn run_concurrent_analysis(
             .llm_command
             .as_deref()
             .unwrap_or("goose run --no-session -q -t");
-        infer_and_diff_hierarchies(
+        Self::infer_and_diff_hierarchies(
+            self.lang.as_ref(),
             repo,
             from_ref,
             to_ref,
@@ -180,7 +218,7 @@ pub async fn run_concurrent_analysis(
         )
         .await
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), HashMap::new())
     };
 
     Ok(AnalysisResult {
@@ -188,8 +226,6 @@ pub async fn run_concurrent_analysis(
         behavioral_changes,
         manifest_changes: td.manifest_changes,
         llm_api_changes,
-        td_stats: td.stats,
-        bu_stats,
         old_surface,
         new_surface,
         inferred_rename_patterns,
@@ -198,50 +234,10 @@ pub async fn run_concurrent_analysis(
         new_hierarchies,
     })
 }
+} // end impl Analyzer<L> (public API)
 
-/// Results from the full analysis pipeline.
-pub struct AnalysisResult {
-    pub structural_changes: Vec<semver_analyzer_core::StructuralChange>,
-    pub behavioral_changes: Vec<BehavioralChange<TypeScript>>,
-    pub manifest_changes: Vec<semver_analyzer_core::ManifestChange<TypeScript>>,
-    /// API type-level changes detected by LLM (interface extends, optionality, etc.)
-    pub llm_api_changes: Vec<LlmApiChangeEntry>,
-    pub td_stats: TdStats,
-    pub bu_stats: BuStats,
-    /// Full API surface at the old ref (for build_report aggregation).
-    /// Not serialized into the report — used only during report building
-    /// to compute component summaries, removal ratios, etc.
-    pub old_surface: semver_analyzer_core::ApiSurface,
-    /// Full API surface at the new ref (for build_report aggregation).
-    pub new_surface: semver_analyzer_core::ApiSurface,
-    /// LLM-inferred rename patterns (None when --no-llm).
-    pub inferred_rename_patterns: Option<semver_analyzer_core::InferredRenamePatterns>,
-    /// Composition pattern changes from test/example diffs.
-    /// Keyed by source file path (the component these patterns are about).
-    pub composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>,
-    /// Component hierarchy deltas computed from LLM hierarchy inference on
-    /// both old and new versions. Each delta describes how a component's
-    /// expected children changed between versions.
-    pub hierarchy_deltas: Vec<semver_analyzer_core::HierarchyDelta>,
-    /// Full new-version hierarchy from LLM inference. Maps component name
-    /// to expected children. Used to populate `expected_children` on all
-    /// ComponentSummary entries, not just those with deltas.
-    pub new_hierarchies:
-        std::collections::HashMap<String, std::collections::HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>>,
-}
-
-/// An API change detected by the LLM during file-level analysis.
-#[derive(Debug, Clone)]
-pub struct LlmApiChangeEntry {
-    pub file_path: String,
-    pub symbol: String,
-    pub change: String,
-    pub description: String,
-    /// LLM-determined disposition for removed props.
-    pub removal_disposition: Option<semver_analyzer_llm::invoke::LlmRemovalDisposition>,
-    /// HTML element the component renders.
-    pub renders_element: Option<String>,
-}
+/// Re-export `AnalysisResult` from core as the orchestrator's output type.
+pub use semver_analyzer_core::AnalysisResult;
 
 /// Stats from the TD pipeline.
 pub struct TdStats {
@@ -265,7 +261,7 @@ pub struct BuStats {
 struct LlmFileTask {
     file_path: String,
     diff_content: String,
-    functions: Vec<semver_analyzer_core::ChangedFunction>,
+    functions: Vec<ChangedFunction>,
     /// Git diff of the associated test file (if any test assertions changed).
     /// Included so the LLM can detect composition pattern changes from tests.
     test_diff: Option<String>,
@@ -288,25 +284,26 @@ struct LlmPhaseStats {
 
 // ── TD Pipeline ─────────────────────────────────────────────────────────
 
-struct TdResult {
-    structural_changes: Vec<semver_analyzer_core::StructuralChange>,
-    manifest_changes: Vec<semver_analyzer_core::ManifestChange<TypeScript>>,
+struct TdResult<L: Language> {
+    structural_changes: Vec<StructuralChange>,
+    manifest_changes: Vec<ManifestChange<L>>,
     stats: TdStats,
 }
 
+impl<L: Language> Analyzer<L> {
+
 fn run_td(
+    lang: &L,
     repo: &Path,
     from_ref: &str,
     to_ref: &str,
-    build_command: Option<&str>,
-    shared: &SharedFindings,
-) -> Result<TdResult> {
-    let extractor = OxcExtractor::new();
-
+    _build_command: Option<&str>,
+    shared: &SharedFindings<L>,
+) -> Result<TdResult<L>> {
     // Step 1: Extract API surface at old ref
     eprintln!("[TD] Extracting API surface at {} ...", from_ref);
-    let old_surface = extractor
-        .extract_at_ref(repo, from_ref, build_command)
+    let old_surface = lang
+        .extract(repo, from_ref)
         .with_context(|| format!("Failed to extract API surface at ref {}", from_ref))?;
     let old_count = old_surface.symbols.len();
     eprintln!("[TD]   {} symbols extracted", old_count);
@@ -316,18 +313,18 @@ fn run_td(
 
     // Step 2: Extract API surface at new ref
     eprintln!("[TD] Extracting API surface at {} ...", to_ref);
-    let new_surface = extractor
-        .extract_at_ref(repo, to_ref, build_command)
+    let new_surface = lang
+        .extract(repo, to_ref)
         .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?;
     let new_count = new_surface.symbols.len();
     eprintln!("[TD]   {} symbols extracted", new_count);
 
     shared.set_new_surface(new_surface.clone());
 
-    // Step 3: Structural diff
+    // Step 3: Structural diff (using language-specific semantics)
     eprintln!("[TD] Computing structural diff ...");
     let structural_changes =
-        semver_analyzer_core::diff::diff_surfaces(&old_surface, &new_surface);
+        diff_surfaces_with_semantics(&old_surface, &new_surface, lang);
     let breaking = structural_changes.iter().filter(|c| c.is_breaking).count();
     eprintln!(
         "[TD]   {} structural changes ({} breaking)",
@@ -343,8 +340,19 @@ fn run_td(
         .collect();
     shared.insert_structural_breaks(breaking_changes);
 
-    // Step 4: Package.json diff
-    let manifest_changes = diff_package_json(repo, from_ref, to_ref);
+    // Step 4: Manifest diff (language-specific)
+    let mut manifest_changes = Vec::new();
+    for manifest_file in L::MANIFEST_FILES {
+        let old_content = read_git_file(repo, from_ref, manifest_file);
+        let new_content = read_git_file(repo, to_ref, manifest_file);
+        match (old_content, new_content) {
+            (Some(old_str), Some(new_str)) => {
+                let changes = L::diff_manifest_content(&old_str, &new_str);
+                manifest_changes.extend(changes);
+            }
+            _ => {}
+        }
+    }
 
     let total_changes = structural_changes.len();
 
@@ -366,20 +374,17 @@ fn run_td(
 ///
 /// Returns test-based behavioral breaks and a list of files prepared for LLM analysis.
 fn run_bu_phase1(
+    lang: &L,
     repo: &Path,
     from_ref: &str,
     to_ref: &str,
     llm_command: Option<String>,
     llm_all_files: bool,
-    shared: &SharedFindings,
+    shared: &SharedFindings<L>,
 ) -> Result<BuPhase1Result> {
-    let diff_parser = TsDiffParser::new();
-    let test_analyzer = TsTestAnalyzer::new();
-    let call_graph = TsCallGraphBuilder::new();
-
     // Step 1: Parse git diff to find all changed functions
     eprintln!("[BU] Parsing changed functions ...");
-    let changed_fns = diff_parser
+    let changed_fns = lang
         .parse_changed_functions(repo, from_ref, to_ref)
         .context("Failed to parse changed functions")?;
     eprintln!("[BU]   {} changed functions found", changed_fns.len());
@@ -398,7 +403,7 @@ fn run_bu_phase1(
 
     // ── Test-based analysis (per-function, no LLM) ──────────────────
     for func in &changed_fns {
-        if semver_analyzer_core::shared::should_skip_for_bu(
+        if should_skip_for_bu(
             shared,
             &mut receiver,
             &func.qualified_name,
@@ -411,12 +416,12 @@ fn run_bu_phase1(
             continue;
         }
 
-        let test_files = test_analyzer
+        let test_files = lang
             .find_tests(repo, &func.file)
             .unwrap_or_default();
 
         let test_diff = test_files.iter().find_map(|tf| {
-            test_analyzer
+            lang
                 .diff_test_assertions(repo, tf, from_ref, to_ref)
                 .ok()
                 .filter(|td| td.has_assertion_changes)
@@ -434,14 +439,16 @@ fn run_bu_phase1(
                 td.added_assertions.len(),
                 td.full_diff.lines().count(),
             );
-            let brk = BehavioralBreak {
+            let brk = BehavioralBreak::<L> {
                 symbol: func.qualified_name.clone(),
                 caused_by: func.qualified_name.clone(),
                 call_path: vec![func.name.clone()],
                 evidence_description,
                 confidence: 0.95,
                 description,
-                category_label: None, // Test-delta: category inferred later or by JSX differ
+                category: None, // Test-delta: category inferred later or by body analyzer
+                evidence_type: semver_analyzer_core::EvidenceType::TestDelta,
+                is_internal_only: None,
             };
             stats.test_behavioral_breaks += 1;
 
@@ -450,8 +457,8 @@ fn run_bu_phase1(
             } else {
                 let source_file = repo.join(&func.file);
                 if source_file.exists() {
-                    let propagated = walk_up_call_graph(
-                        &call_graph,
+                    let propagated = Self::walk_up_call_graph(
+                        lang,
                         &source_file,
                         &func.name,
                         &func.qualified_name,
@@ -464,95 +471,60 @@ fn run_bu_phase1(
         }
     }
 
-    // ── JSX diff analysis (per-function, deterministic, no LLM) ─────
-    let mut jsx_change_count = 0;
-    for func in &changed_fns {
-        // Skip functions without JSX or without both bodies
-        if func.old_body.is_empty()
-            || func.new_body.is_empty()
-            || !semver_analyzer_ts::jsx_diff::body_contains_jsx(&func.old_body)
-            || !semver_analyzer_ts::jsx_diff::body_contains_jsx(&func.new_body)
-        {
-            continue;
-        }
-
-        // Only analyze exported functions (these are the component render outputs consumers see)
-        if func.visibility != Visibility::Exported && func.visibility != Visibility::Public {
-            continue;
-        }
-
-        let jsx_changes = semver_analyzer_ts::jsx_diff::diff_jsx_bodies(
-            &func.old_body,
-            &func.new_body,
-            &func.name,
-            &func.file,
-        );
-
-        for jsx_change in jsx_changes {
-            // Check if TD already found this symbol (avoid duplicates)
-            if semver_analyzer_core::shared::should_skip_for_bu(
-                shared,
-                &mut receiver,
-                &func.qualified_name,
-            ) {
+    // ── Deterministic body analysis (per-function, no LLM) ──────────
+    // Delegates to the language's body analyzer (e.g., JSX diff + CSS scan
+    // for TypeScript) if available.
+    let mut body_change_count = 0;
+    if let Some(body_analyzer) = lang.body_analyzer() {
+        for func in &changed_fns {
+            if func.old_body.is_empty() || func.new_body.is_empty() {
+                continue;
+            }
+            if func.visibility != Visibility::Exported && func.visibility != Visibility::Public {
                 continue;
             }
 
-            let brk = BehavioralBreak {
-                symbol: func.qualified_name.clone(),
-                caused_by: func.qualified_name.clone(),
-                call_path: vec![func.name.clone()],
-                evidence_description: jsx_change.description.clone(),
-                confidence: 0.90,
-                description: jsx_change.description,
-                category_label: Some(ts_category_label(&jsx_change.category).to_string()),
-            };
-            shared.insert_behavioral_break(brk);
-            jsx_change_count += 1;
+            let results = body_analyzer.analyze_changed_body(
+                &func.old_body,
+                &func.new_body,
+                &func.name,
+                &func.file.to_string_lossy(),
+            );
+            for result in results {
+                // Check if TD already found this symbol (avoid duplicates)
+                if should_skip_for_bu(
+                    shared,
+                    &mut receiver,
+                    &func.qualified_name,
+                ) {
+                    continue;
+                }
+
+                let category: Option<L::Category> = result
+                    .category_label
+                    .as_deref()
+                    .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+                let brk = BehavioralBreak::<L> {
+                    symbol: func.qualified_name.clone(),
+                    caused_by: func.qualified_name.clone(),
+                    call_path: vec![func.name.clone()],
+                    evidence_description: result.description.clone(),
+                    confidence: result.confidence,
+                    description: result.description,
+                    category,
+                    evidence_type: semver_analyzer_core::EvidenceType::BodyAnalysis,
+                    is_internal_only: None,
+                };
+                shared.insert_behavioral_break(brk);
+                body_change_count += 1;
+            }
         }
     }
 
-    // ── CSS variable/class scanning (per-function, deterministic) ────
-    let mut css_change_count = 0;
-    for func in &changed_fns {
-        if func.old_body.is_empty() || func.new_body.is_empty() {
-            continue;
-        }
-        if func.visibility != Visibility::Exported && func.visibility != Visibility::Public {
-            continue;
-        }
-        if !semver_analyzer_ts::css_scan::body_contains_css_refs(&func.old_body)
-            && !semver_analyzer_ts::css_scan::body_contains_css_refs(&func.new_body)
-        {
-            continue;
-        }
-
-        let css_changes = semver_analyzer_ts::css_scan::diff_css_references(
-            &func.old_body,
-            &func.new_body,
-            &func.name,
-            &func.file,
-        );
-
-        for css_change in css_changes {
-            let brk = BehavioralBreak {
-                symbol: func.qualified_name.clone(),
-                caused_by: func.qualified_name.clone(),
-                call_path: vec![func.name.clone()],
-                evidence_description: css_change.description.clone(),
-                confidence: 0.90,
-                description: css_change.description,
-                category_label: Some(ts_category_label(&css_change.category).to_string()),
-            };
-            shared.insert_behavioral_break(brk);
-            css_change_count += 1;
-        }
-    }
-
-    if jsx_change_count > 0 || css_change_count > 0 {
+    if body_change_count > 0 {
         eprintln!(
-            "  BU Phase 1: {} JSX + {} CSS changes detected deterministically",
-            jsx_change_count, css_change_count,
+            "  BU Phase 1: {} body-level changes detected deterministically",
+            body_change_count,
         );
     }
 
@@ -561,8 +533,8 @@ fn run_bu_phase1(
 
     if llm_command.is_some() {
         // Group functions by file
-        let mut by_file: std::collections::BTreeMap<String, Vec<&semver_analyzer_core::ChangedFunction>> =
-            std::collections::BTreeMap::new();
+        let mut by_file: BTreeMap<String, Vec<&ChangedFunction>> =
+            BTreeMap::new();
         for func in &changed_fns {
             if func.old_body.is_empty() || func.new_body.is_empty() {
                 continue;
@@ -582,17 +554,14 @@ fn run_bu_phase1(
                     return false;
                 }
 
-                let basename = Path::new(path)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if basename == "index.ts" || basename == "index.tsx" || basename == "index.js" {
+                // Use language-specific exclusion rules
+                if L::should_exclude_from_analysis(Path::new(path)) {
                     return false;
                 }
 
                 if !llm_all_files {
-                    let source_path = std::path::Path::new(path);
-                    let test_files = test_analyzer
+                    let source_path = Path::new(path);
+                    let test_files = lang
                         .find_tests(repo, source_path)
                         .unwrap_or_default();
 
@@ -601,7 +570,7 @@ fn run_bu_phase1(
                     }
 
                     let any_test_changed = test_files.iter().any(|tf| {
-                        test_analyzer
+                        lang
                             .diff_test_assertions(repo, tf, from_ref, to_ref)
                             .ok()
                             .map(|td| !td.full_diff.is_empty())
@@ -632,7 +601,7 @@ fn run_bu_phase1(
 
         // Pre-fetch git diffs for each file
         for (file_path, funcs) in filtered {
-            let diff_output = std::process::Command::new("git")
+            let diff_output = Command::new("git")
                 .args([
                     "-C",
                     &repo.to_string_lossy(),
@@ -653,17 +622,17 @@ fn run_bu_phase1(
                 continue;
             }
 
-            let owned_funcs: Vec<semver_analyzer_core::ChangedFunction> =
+            let owned_funcs: Vec<ChangedFunction> =
                 funcs.iter().map(|f| (*f).clone()).collect();
 
             // Fetch associated test file diff for composition pattern detection
             let test_diff = {
-                let source_path = std::path::Path::new(&file_path);
-                let test_files = test_analyzer
+                let source_path = Path::new(&file_path);
+                let test_files = lang
                     .find_tests(repo, source_path)
                     .unwrap_or_default();
                 test_files.iter().find_map(|tf| {
-                    let td = test_analyzer
+                    let td = lang
                         .diff_test_assertions(repo, tf, from_ref, to_ref)
                         .ok()?;
                     if td.full_diff.is_empty() {
@@ -689,22 +658,26 @@ fn run_bu_phase1(
         // If the file changed AND has changed tests, include it for LLM
         // analysis with an empty functions list.
         if !llm_all_files {
-            let already_included: std::collections::HashSet<String> = files_for_llm
+            let already_included: HashSet<String> = files_for_llm
                 .iter()
                 .map(|t| t.file_path.clone())
                 .collect();
 
-            let all_changed_output = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    &repo.to_string_lossy(),
-                    "diff",
-                    "--name-only",
-                    &format!("{}..{}", from_ref, to_ref),
-                    "--",
-                    "*.ts",
-                    "*.tsx",
-                ])
+            // Build git diff --name-only args with language-specific patterns
+            let mut git_args = vec![
+                "-C".to_string(),
+                repo.to_string_lossy().to_string(),
+                "diff".to_string(),
+                "--name-only".to_string(),
+                format!("{}..{}", from_ref, to_ref),
+                "--".to_string(),
+            ];
+            for pattern in L::SOURCE_FILE_PATTERNS {
+                git_args.push(pattern.to_string());
+            }
+
+            let all_changed_output = Command::new("git")
+                .args(&git_args)
                 .output();
 
             if let Ok(output) = all_changed_output {
@@ -720,27 +693,14 @@ fn run_bu_phase1(
                         continue;
                     }
 
-                    // Skip test files, .d.ts, index files, dist/ build output
-                    let basename = Path::new(&file_path)
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if basename == "index.ts"
-                        || basename == "index.tsx"
-                        || basename == "index.js"
-                        || basename.ends_with(".d.ts")
-                        || basename.contains(".test.")
-                        || basename.contains(".spec.")
-                        || file_path.contains("__tests__")
-                        || file_path.contains("/dist/")
-                        || file_path.starts_with("dist/")
-                    {
+                    // Use language-specific exclusion rules
+                    if L::should_exclude_from_analysis(Path::new(&file_path)) {
                         continue;
                     }
 
                     // Must have changed tests
-                    let source_path = std::path::Path::new(&file_path);
-                    let test_files = test_analyzer
+                    let source_path = Path::new(&file_path);
+                    let test_files = lang
                         .find_tests(repo, source_path)
                         .unwrap_or_default();
 
@@ -749,7 +709,7 @@ fn run_bu_phase1(
                     }
 
                     let any_test_changed = test_files.iter().any(|tf| {
-                        test_analyzer
+                        lang
                             .diff_test_assertions(repo, tf, from_ref, to_ref)
                             .ok()
                             .map(|td| !td.full_diff.is_empty())
@@ -761,7 +721,7 @@ fn run_bu_phase1(
                     }
 
                     // Get the diff
-                    let diff_output = std::process::Command::new("git")
+                    let diff_output = Command::new("git")
                         .args([
                             "-C",
                             &repo.to_string_lossy(),
@@ -784,12 +744,12 @@ fn run_bu_phase1(
 
                     // Fetch test diff for these extra files too
                     let test_diff_content = {
-                        let source_path = std::path::Path::new(&file_path);
-                        let test_files = test_analyzer
+                        let source_path = Path::new(&file_path);
+                        let test_files = lang
                             .find_tests(repo, source_path)
                             .unwrap_or_default();
                         test_files.iter().find_map(|tf| {
-                            let td = test_analyzer
+                            let td = lang
                                 .diff_test_assertions(repo, tf, from_ref, to_ref)
                                 .ok()?;
                             if td.full_diff.is_empty() {
@@ -831,21 +791,19 @@ fn run_bu_phase1(
 /// Infer rename patterns for constants and interfaces using LLM.
 ///
 /// Called between the TD and BU phases. Makes up to 2 LLM calls:
-/// 1. Constant rename patterns (when >50 removed + >50 added constants)
-/// 2. Interface rename mappings (when >2 unmapped removed interfaces)
+/// 1. Constant rename patterns (when enough removed + added constants)
+/// 2. Interface rename mappings (when enough unmapped removed interfaces)
 fn infer_rename_patterns(
-    structural_changes: &[semver_analyzer_core::StructuralChange],
-    old_surface: &semver_analyzer_core::ApiSurface,
-    new_surface: &semver_analyzer_core::ApiSurface,
+    lang: &L,
+    structural_changes: &[StructuralChange],
+    old_surface: &ApiSurface,
+    new_surface: &ApiSurface,
     llm_command: &str,
     from_ref: &str,
     to_ref: &str,
-) -> Option<semver_analyzer_core::InferredRenamePatterns> {
-    use semver_analyzer_core::{
-        ChangeSubject, InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
-        InferredRenamePatterns, StructuralChangeType, SymbolKind,
-    };
-    use std::collections::{HashMap, HashSet};
+) -> Option<InferredRenamePatterns> {
+
+    let renames = lang.renames()?;
 
     let mut llm_calls = 0;
     let mut constant_patterns = Vec::new();
@@ -859,43 +817,38 @@ fn infer_rename_patterns(
     let mut added_constants: HashMap<String, Vec<&str>> = HashMap::new();
 
     for change in structural_changes {
-        // Extract package from qualified name (e.g., "packages/react-tokens/src/...")
         let pkg = change
-            .qualified_name
-            .split('/')
-            .take(2)
-            .collect::<Vec<_>>()
-            .join("/");
+            .package
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
 
         match &change.change_type {
             StructuralChangeType::Removed(ChangeSubject::Symbol { .. }) => {
-                // Check if it's a constant/variable (no members = standalone export)
-                if !change.symbol.contains('.') {
-                    removed_constants
-                        .entry(pkg)
-                        .or_default()
-                        .push(&change.symbol);
-                }
+                removed_constants
+                    .entry(pkg)
+                    .or_default()
+                    .push(&change.symbol);
             }
             StructuralChangeType::Added(ChangeSubject::Symbol { .. }) => {
-                if !change.symbol.contains('.') {
-                    added_constants
-                        .entry(pkg)
-                        .or_default()
-                        .push(&change.symbol);
-                }
+                added_constants
+                    .entry(pkg)
+                    .or_default()
+                    .push(&change.symbol);
             }
             _ => {}
         }
     }
 
+    let min_removed_constants = renames.min_removed_for_constant_inference();
+
     // Check each package for constant rename inference trigger
     for (pkg, removed) in &removed_constants {
         let added = match added_constants.get(pkg) {
-            Some(a) if a.len() > 50 => a,
+            Some(a) if a.len() > min_removed_constants => a,
             _ => continue,
         };
-        if removed.len() < 50 {
+        if removed.len() < min_removed_constants {
             continue;
         }
 
@@ -906,50 +859,14 @@ fn infer_rename_patterns(
             added.len()
         );
 
-        // Sample: prioritize directional suffixes for better pattern discovery
-        let directional_suffixes = [
-            "Top", "Bottom", "Left", "Right", "Width", "Height",
-            "MaxWidth", "MaxHeight", "MinWidth", "MinHeight",
-        ];
-        let mut removed_sample: Vec<&str> = removed
-            .iter()
-            .filter(|s| directional_suffixes.iter().any(|d| s.ends_with(d)))
-            .take(20)
-            .copied()
-            .collect();
-        // Fill remaining with random samples
-        for s in removed.iter() {
-            if removed_sample.len() >= 30 {
-                break;
-            }
-            if !removed_sample.contains(s) {
-                removed_sample.push(s);
-            }
-        }
+        // Sample using language-specific strategy
+        let removed_sample = renames.sample_removed_constants(removed, added);
+        let added_sample = renames.sample_added_constants(removed, added);
 
-        let mut added_sample: Vec<&str> = added
-            .iter()
-            .filter(|s| {
-                ["BlockStart", "BlockEnd", "InlineStart", "InlineEnd", "InlineSize", "BlockSize"]
-                    .iter()
-                    .any(|d| s.contains(d))
-            })
-            .take(20)
-            .copied()
-            .collect();
-        for s in added.iter() {
-            if added_sample.len() >= 30 {
-                break;
-            }
-            if !added_sample.contains(s) {
-                added_sample.push(s);
-            }
-        }
+        // Use the package name directly (already set by extractor)
+        let pkg_name = pkg.to_string();
 
-        // Resolve package name from directory
-        let pkg_name = pkg.replace("packages/", "@patternfly/");
-
-        let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(llm_command);
+        let analyzer = LlmBehaviorAnalyzer::new(llm_command);
         match analyzer.infer_constant_renames(
             &removed_sample,
             &added_sample,
@@ -1024,14 +941,15 @@ fn infer_rename_patterns(
 
     // ── Call 2: Interface/component rename mappings ───────────────
 
+    let min_removed_interfaces = renames.min_removed_for_interface_inference();
+
     // Find removed interfaces with no migration_target
     let removed_interfaces: Vec<(&str, Vec<String>)> = structural_changes
         .iter()
         .filter(|c| {
             matches!(c.change_type, StructuralChangeType::Removed(ChangeSubject::Symbol { .. }))
                 && c.migration_target.is_none()
-                && matches!(c.kind, SymbolKind::Interface | SymbolKind::Class)
-                && !c.symbol.contains('.')
+                && L::RENAMEABLE_SYMBOL_KINDS.contains(&c.kind)
         })
         .filter_map(|c| {
             // Look up member names from old surface
@@ -1049,8 +967,7 @@ fn infer_rename_patterns(
         .iter()
         .filter(|c| {
             matches!(c.change_type, StructuralChangeType::Added(ChangeSubject::Symbol { .. }))
-                && matches!(c.kind, SymbolKind::Interface | SymbolKind::Class)
-                && !c.symbol.contains('.')
+                && L::RENAMEABLE_SYMBOL_KINDS.contains(&c.kind)
         })
         .filter_map(|c| {
             let sym = new_surface
@@ -1062,7 +979,7 @@ fn infer_rename_patterns(
         })
         .collect();
 
-    if removed_interfaces.len() > 2 && !added_interfaces.is_empty() {
+    if removed_interfaces.len() > min_removed_interfaces && !added_interfaces.is_empty() {
         eprintln!(
             "  Rename inference: {} removed interfaces + {} added — inferring mappings",
             removed_interfaces.len(),
@@ -1081,11 +998,19 @@ fn infer_rename_patterns(
             .map(|(n, m)| (*n, m.as_slice()))
             .collect();
 
-        let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(llm_command);
+        // Use the first package's name for context (already a display name from extractor)
+        let first_pkg = removed_constants
+            .keys()
+            .next()
+            .or_else(|| added_constants.keys().next())
+            .cloned()
+            .unwrap_or_default();
+
+        let analyzer = LlmBehaviorAnalyzer::new(llm_command);
         match analyzer.infer_interface_renames(
             &removed_capped,
             &added_capped,
-            "@patternfly/react-core", // TODO: determine from package context
+            &first_pkg,
             from_ref,
             to_ref,
         ) {
@@ -1179,9 +1104,9 @@ async fn run_bu_phase2_llm(
     _to_ref: &str,
     llm_command: &Option<String>,
     files: &[LlmFileTask],
-    shared: &Arc<SharedFindings>,
-    llm_api_entries: &Arc<std::sync::Mutex<Vec<LlmApiChangeEntry>>>,
-) -> (LlmPhaseStats, Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>) {
+    shared: &Arc<SharedFindings<L>>,
+    llm_api_entries: &Arc<Mutex<Vec<LlmApiChange>>>,
+) -> (LlmPhaseStats, Vec<(String, Vec<CompositionPatternChange>)>) {
     let cmd = match llm_command {
         Some(c) => c.clone(),
         None => return (LlmPhaseStats::default(), vec![]),
@@ -1194,8 +1119,8 @@ async fn run_bu_phase2_llm(
     let llm_breaks = Arc::new(AtomicUsize::new(0));
     let llm_api_count = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
-    let composition_entries: Arc<std::sync::Mutex<Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let composition_entries: Arc<Mutex<Vec<(String, Vec<CompositionPatternChange>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
 
     eprintln!("[BU] Starting LLM analysis ({} concurrent)...", concurrency);
 
@@ -1242,10 +1167,10 @@ async fn run_bu_phase2_llm(
 
                     // Store composition pattern changes
                     if !comp_changes.is_empty() {
-                        let mapped: Vec<semver_analyzer_core::CompositionPatternChange> =
+                        let mapped: Vec<CompositionPatternChange> =
                             comp_changes
                                 .into_iter()
-                                .map(|c| semver_analyzer_core::CompositionPatternChange {
+                                .map(|c| CompositionPatternChange {
                                     component: c.component,
                                     old_parent: c.old_parent,
                                     new_parent: c.new_parent,
@@ -1259,22 +1184,19 @@ async fn run_bu_phase2_llm(
 
                     for change in beh_changes {
                         breaks.fetch_add(1, Ordering::Relaxed);
-                        let category_label = change.category.as_deref().and_then(|s| {
-                            parse_behavioral_category(s).map(|_| s.to_string())
-                        });
-                        // Encode is_internal_only into evidence_description for downstream extraction
-                        let mut evidence_description = format!("LLM behavioral analysis: {}", change.description);
-                        if change.is_internal_only == Some(true) {
-                            evidence_description.push_str(" [__is_internal_only__]");
-                        }
-                        let brk = BehavioralBreak {
+                        let category: Option<L::Category> = change.category.as_deref()
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+                        let evidence_description = format!("LLM behavioral analysis: {}", change.description);
+                        let brk = BehavioralBreak::<L> {
                             symbol: format!("{}::{}", file_path, change.symbol),
                             caused_by: format!("{}::{}", file_path, change.symbol),
                             call_path: vec![change.symbol.clone()],
                             evidence_description,
                             confidence: 0.70,
                             description: change.description,
-                            category_label,
+                            category,
+                            evidence_type: semver_analyzer_core::EvidenceType::LlmAnalysis,
+                            is_internal_only: change.is_internal_only,
                         };
                         shared_ref.insert_behavioral_break(brk);
                     }
@@ -1282,7 +1204,7 @@ async fn run_bu_phase2_llm(
                     for change in api_changes {
                         api_count.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut entries) = api_entries.lock() {
-                            entries.push(LlmApiChangeEntry {
+                            entries.push(LlmApiChange {
                                 file_path: file_path.clone(),
                                 symbol: change.symbol,
                                 change: change.change,
@@ -1341,12 +1263,12 @@ async fn run_bu_phase2_llm(
 ///
 /// Uses a visited set for cycle detection.
 fn walk_up_call_graph(
-    call_graph: &impl CallGraphBuilder,
+    lang: &L,
     source_file: &Path,
     symbol_name: &str,
     qualified_name: &str,
-    original_break: &BehavioralBreak,
-    shared: &SharedFindings,
+    original_break: &BehavioralBreak<L>,
+    shared: &SharedFindings<L>,
 ) -> usize {
     let mut propagated = 0;
     let mut to_check = vec![(symbol_name.to_string(), qualified_name.to_string())];
@@ -1357,7 +1279,7 @@ fn walk_up_call_graph(
             continue; // Cycle detection
         }
 
-        let callers = match call_graph.find_callers(source_file, &current_name) {
+        let callers = match lang.find_callers(source_file, &current_name) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -1382,7 +1304,7 @@ fn walk_up_call_graph(
                     .to_string();
                 call_path.insert(0, caller_name);
 
-                shared.insert_behavioral_break(BehavioralBreak {
+                shared.insert_behavioral_break(BehavioralBreak::<L> {
                     symbol: caller.qualified_name.clone(),
                     caused_by: original_break.caused_by.clone(),
                     call_path,
@@ -1392,7 +1314,9 @@ fn walk_up_call_graph(
                         "Behavioral change in {} propagated through call chain",
                         original_break.caused_by
                     ),
-                    category_label: original_break.category_label.clone(), // Propagate parent's category
+                    category: original_break.category.clone(), // Propagate parent's category
+                    evidence_type: semver_analyzer_core::EvidenceType::CallGraphPropagation,
+                    is_internal_only: original_break.is_internal_only,
                 });
                 propagated += 1;
             } else {
@@ -1414,15 +1338,13 @@ fn walk_up_call_graph(
 // ── Report Merging ──────────────────────────────────────────────────────
 
 /// Convert behavioral breaks from SharedFindings into v2 BehavioralChange entries.
-fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange<TypeScript>> {
+fn merge_behavioral_breaks(lang: &L, shared: &SharedFindings<L>) -> Vec<BehavioralChange<L>> {
     shared
         .behavioral_breaks()
         .iter()
         .map(|entry| {
             let brk = entry.value();
 
-            // Extract file path from the qualified name (e.g.,
-            // "packages/react-core/.../Modal.tsx::Modal" → file is the part before "::")
             let source_file = if brk.symbol.contains("::") {
                 let parts: Vec<&str> = brk.symbol.splitn(2, "::").collect();
                 Some(parts[0].to_string())
@@ -1430,43 +1352,20 @@ fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange<Type
                 None
             };
 
-            // Determine kind from evidence_description
-            let evidence_desc = &brk.evidence_description;
-            let kind = if evidence_desc.starts_with("LLM behavioral analysis") {
-                BehavioralChangeKind::Class // LLM file-level analysis = component-level
-            } else if evidence_desc.starts_with("Test assertion changes") {
-                BehavioralChangeKind::Function
-            } else {
-                // JSX diff, CSS scan, or other deterministic evidence = component-level
-                BehavioralChangeKind::Class
-            };
-
-            // Preserve evidence type from the BU pipeline
-            let evidence_type = Some(if evidence_desc.starts_with("Test assertion changes") {
-                "TestDelta".to_string()
-            } else if evidence_desc.starts_with("LLM behavioral analysis") {
-                "LlmOnly".to_string()
-            } else {
-                "JsxDiff".to_string()
+            let kind = lang.behavioral_change_kind(&brk.evidence_type);
+            let evidence_type = Some(match &brk.evidence_type {
+                semver_analyzer_core::EvidenceType::TestDelta => "TestDelta".to_string(),
+                semver_analyzer_core::EvidenceType::LlmAnalysis => "LlmOnly".to_string(),
+                semver_analyzer_core::EvidenceType::BodyAnalysis => "BodyAnalysis".to_string(),
+                semver_analyzer_core::EvidenceType::CallGraphPropagation => "CallGraphPropagation".to_string(),
             });
-
-            // Extract component names referenced in the description
-            let referenced_components = extract_component_refs(&brk.description);
-
-            // Extract is_internal_only from evidence_description (encoded by the LLM ingestion)
-            let is_internal_only = if evidence_desc.contains("__is_internal_only__") {
-                Some(true)
-            } else {
-                None
-            };
-
-            // Parse category_label string into TsCategory
-            let category: Option<TsCategory> = brk.category_label.as_deref().and_then(parse_behavioral_category);
+            let referenced_components = lang.extract_referenced_symbols(&brk.description);
+            let is_internal_only = brk.is_internal_only;
 
             BehavioralChange {
-                symbol: extract_display_name(&brk.symbol),
+                symbol: lang.display_name(&brk.symbol),
                 kind,
-                category,
+                category: brk.category.clone(),
                 description: brk.description.clone(),
                 source_file,
                 confidence: Some(brk.confidence),
@@ -1478,147 +1377,13 @@ fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange<Type
         .collect()
 }
 
-/// Extract PascalCase component name references from a behavioral change description.
-///
-/// Looks for patterns like `<ComponentName>`, `ComponentName component`, or
-/// backtick-quoted PascalCase identifiers. Returns deduplicated component names.
-fn extract_component_refs(description: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+} // end impl Analyzer<L> (private methods, part 1)
 
-    // Pattern 1: JSX-style <ComponentName> or <ComponentName ...>
-    let mut remaining = description;
-    while let Some(start) = remaining.find('<') {
-        let after_lt = &remaining[start + 1..];
-        // Find the end of the tag name (space, >, or /)
-        let end = after_lt
-            .find(|c: char| c == '>' || c == ' ' || c == '/')
-            .unwrap_or(after_lt.len());
-        let name = &after_lt[..end];
-        // Must be PascalCase (starts with uppercase, has lowercase)
-        if !name.is_empty()
-            && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
-            && name.chars().all(|c| c.is_ascii_alphanumeric())
-            && name.chars().any(|c| c.is_ascii_lowercase())
-        {
-            if seen.insert(name.to_string()) {
-                refs.push(name.to_string());
-            }
-        }
-        remaining = &remaining[start + 1..];
-    }
-
-    // Pattern 2: backtick-quoted PascalCase identifiers like `Modal`
-    let mut remaining = description;
-    while let Some(start) = remaining.find('`') {
-        let after_tick = &remaining[start + 1..];
-        if let Some(end) = after_tick.find('`') {
-            let name = &after_tick[..end];
-            if !name.is_empty()
-                && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
-                && name.chars().all(|c| c.is_ascii_alphanumeric())
-                && name.chars().any(|c| c.is_ascii_lowercase())
-                && !name.contains(' ')
-            {
-                if seen.insert(name.to_string()) {
-                    refs.push(name.to_string());
-                }
-            }
-            remaining = &after_tick[end + 1..];
-        } else {
-            break;
-        }
-    }
-
-    refs
-}
-
-/// Extract a human-readable display name from a qualified name.
-///
-/// `src/api/users.ts::createUser` → `createUser`
-/// `src/service.ts::Service::validate` → `Service.validate`
-fn extract_display_name(qualified_name: &str) -> String {
-    // Split on `::` to get file prefix and symbol parts
-    let parts: Vec<&str> = qualified_name.split("::").collect();
-    match parts.len() {
-        0 | 1 => qualified_name.to_string(),
-        2 => parts[1].to_string(),
-        _ => {
-            // class::method → Class.method
-            parts[1..].join(".")
-        }
-    }
-}
-
-// ── Package.json Helper (moved from main.rs) ────────────────────────────
-
-fn diff_package_json(
-    repo: &Path,
-    from_ref: &str,
-    to_ref: &str,
-) -> Vec<semver_analyzer_core::ManifestChange<TypeScript>> {
-    let old_json = read_git_file(repo, from_ref, "package.json");
-    let new_json = read_git_file(repo, to_ref, "package.json");
-
-    match (old_json, new_json) {
-        (Some(old_str), Some(new_str)) => {
-            let old: serde_json::Value = match serde_json::from_str(&old_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!(
-                        "[TD]   Warning: could not parse package.json at {}: {}",
-                        from_ref, e
-                    );
-                    return Vec::new();
-                }
-            };
-            let new: serde_json::Value = match serde_json::from_str(&new_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!(
-                        "[TD]   Warning: could not parse package.json at {}: {}",
-                        to_ref, e
-                    );
-                    return Vec::new();
-                }
-            };
-            semver_analyzer_ts::manifest::diff_manifests(&old, &new)
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Parse a behavioral category string from an LLM response into the enum.
-fn parse_behavioral_category(s: &str) -> Option<TsCategory> {
-    match s.trim().to_lowercase().replace('-', "_").as_str() {
-        "dom_structure" | "dom" | "render" => Some(TsCategory::DomStructure),
-        "css_class" | "css" => Some(TsCategory::CssClass),
-        "css_variable" | "css_var" => Some(TsCategory::CssVariable),
-        "accessibility" | "a11y" => Some(TsCategory::Accessibility),
-        "default_value" | "default" => Some(TsCategory::DefaultValue),
-        "logic_change" | "logic" | "side_effect" => Some(TsCategory::LogicChange),
-        "data_attribute" | "data" | "ouia" => Some(TsCategory::DataAttribute),
-        "render_output" | "visual" => Some(TsCategory::RenderOutput),
-        _ => None,
-    }
-}
-
-/// Convert a TsCategory to a snake_case string label.
-fn ts_category_label(cat: &TsCategory) -> &'static str {
-    match cat {
-        TsCategory::DomStructure => "dom_structure",
-        TsCategory::CssClass => "css_class",
-        TsCategory::CssVariable => "css_variable",
-        TsCategory::Accessibility => "accessibility",
-        TsCategory::DefaultValue => "default_value",
-        TsCategory::LogicChange => "logic_change",
-        TsCategory::DataAttribute => "data_attribute",
-        TsCategory::RenderOutput => "render_output",
-    }
-}
+// extract_component_refs and extract_display_name moved to Language trait methods
+// (TypeScript impl: extract_referenced_symbols and display_name)
 
 fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .args(["show", &format!("{}:{}", git_ref, file_path)])
         .current_dir(repo)
         .output()
@@ -1631,426 +1396,115 @@ fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> 
     }
 }
 
-// ── Cross-Family Context Detection ──────────────────────────────────────
-//
-// Detects when components in one family import React context from another
-// family (e.g., Masthead imports PageContext from Page). This indicates
-// cross-family composition relationships that should be included in the
-// hierarchy LLM call so the LLM can determine if a provider family's
-// component is an expected child of a consumer family's component.
-
-/// A cross-family context relationship detected from imports.
-#[derive(Debug, Clone)]
-struct ContextRelationship {
-    /// Family that consumes the context (e.g., "Masthead")
-    consumer_family: String,
-    /// Family that provides the context (e.g., "Page")
-    provider_family: String,
-    /// The context symbol imported (e.g., "PageContext")
-    context_name: String,
-}
-
-/// Scan component source files for cross-directory context imports.
-///
-/// Returns a list of relationships where one family imports a React context
-/// from another family's directory.
-fn detect_cross_family_context(repo: &Path, git_ref: &str) -> Vec<ContextRelationship> {
-    use regex::Regex;
-
-    let output = match std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", git_ref])
-        .current_dir(repo)
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return Vec::new(),
-    };
-
-    // Match: import { SomeContext } from '../OtherFamily/...'
-    // Captures the context name and the other family directory
-    let re = Regex::new(
-        r"import\s+\{[^}]*?(\w*Context\w*)[^}]*\}\s+from\s+'\.\./([\w]+)/",
-    )
-    .unwrap();
-
-    let mut relationships = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for file_path in output.lines() {
-        // Only scan component .tsx/.ts files
-        if (!file_path.ends_with(".tsx") && !file_path.ends_with(".ts"))
-            || file_path.contains("__tests__")
-            || file_path.contains("/examples/")
-            || file_path.contains("/deprecated/")
-            || file_path.contains("/stories/")
-        {
-            continue;
-        }
-
-        // Must be in a components directory
-        if !file_path.contains("/components/") {
-            continue;
-        }
-
-        // Extract this file's family directory
-        let consumer_family = match extract_family_from_path(file_path) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        // Read the file and scan for cross-family context imports
-        let content = match read_git_file(repo, git_ref, file_path) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        for cap in re.captures_iter(&content) {
-            let context_name = cap[1].to_string();
-            let provider_family = cap[2].to_string();
-
-            // Skip same-family imports
-            if provider_family == consumer_family {
-                continue;
-            }
-
-            let key = (
-                consumer_family.clone(),
-                provider_family.clone(),
-                context_name.clone(),
-            );
-            if seen.insert(key) {
-                relationships.push(ContextRelationship {
-                    consumer_family: consumer_family.clone(),
-                    provider_family: provider_family.clone(),
-                    context_name,
-                });
-            }
-        }
-    }
-
-    if !relationships.is_empty() {
-        eprintln!("[Context] Detected {} cross-family context relationships:", relationships.len());
-        for rel in &relationships {
-            eprintln!("  {} ← {} ({})", rel.consumer_family, rel.provider_family, rel.context_name);
-        }
-    }
-
-    relationships
-}
-
-/// Extract the component family directory name from a file path.
-/// e.g., "packages/react-core/src/components/Masthead/Masthead.tsx" → "Masthead"
-fn extract_family_from_path(path: &str) -> Option<String> {
-    // Find the last "/components/X/" segment
-    let parts: Vec<&str> = path.split('/').collect();
-    for (i, part) in parts.iter().enumerate() {
-        if *part == "components" && i + 1 < parts.len() && i + 2 < parts.len() {
-            return Some(parts[i + 1].to_string());
-        }
-    }
-    None
-}
-
-/// Read provider family component signatures for inclusion in the
-/// consumer family's hierarchy LLM call.
-///
-/// Extracts only export signatures and interface definitions — not full
-/// source — to keep the context lean. Only includes components that use
-/// the specified context names.
-fn read_family_signatures(
-    repo: &Path,
-    git_ref: &str,
-    family_dir: &str,
-    context_names: &[String],
-) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", git_ref])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let all_files = String::from_utf8_lossy(&output.stdout);
-    let mut content = String::new();
-
-    for line in all_files.lines() {
-        if !line.ends_with(".tsx") && !line.ends_with(".ts") {
-            continue;
-        }
-        if line.contains("__tests__")
-            || line.contains("/examples/")
-            || line.contains("/deprecated/")
-            || line.contains("/stories/")
-            || line.contains("index.ts")
-        {
-            continue;
-        }
-
-        // Check if this file is in the target family directory
-        let file_family = match extract_family_from_path(line) {
-            Some(f) => f,
-            None => continue,
-        };
-        if file_family != family_dir {
-            continue;
-        }
-
-        let file_content = match read_git_file(repo, git_ref, line) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Check if this file uses any of the relevant context names
-        let uses_context = context_names
-            .iter()
-            .any(|ctx| file_content.contains(ctx));
-
-        if !uses_context {
-            continue;
-        }
-
-        // Include the full source for related components. These files are
-        // typically small (20-50 lines) and the JSX render body contains
-        // critical information about what the component renders — e.g.,
-        // PageToggleButton renders a <Button> with aria-expanded and
-        // sidebar toggle, which tells the LLM it belongs in MastheadToggle.
-        content.push_str(&format!(
-            "\n--- Related: {} (uses {}) ---\n",
-            line,
-            context_names.join(", "),
-        ));
-        content.push_str(&file_content);
-        content.push('\n');
-    }
-
-    if content.is_empty() {
-        None
-    } else {
-        Some(content)
-    }
-}
-
 // ── Component Hierarchy Inference ────────────────────────────────────────
 //
 // Infers the component parent-child hierarchy for both versions by giving
 // the LLM each component family's source code, then diffs the hierarchies
 // to produce HierarchyDelta entries.
 
-/// Identify component family directories that qualify for hierarchy inference.
-///
-/// A family qualifies when:
-///  1. It has 2+ exported `.tsx` component files in the directory.
-///  2. At least one component in the family has breaking changes.
-fn find_qualifying_families(
-    repo: &Path,
-    git_ref: &str,
-    structural_changes: &[semver_analyzer_core::StructuralChange],
-    surface: &semver_analyzer_core::ApiSurface,
-) -> Vec<String> {
-    use std::collections::{HashMap, HashSet};
-
-    // Collect directories with breaking changes
-    let changed_dirs: HashSet<String> = structural_changes
-        .iter()
-        .filter(|c| c.is_breaking)
-        .filter_map(|c| {
-            c.qualified_name
-                .rsplit_once('/')
-                .map(|(dir, _)| dir.rsplit_once('/').map(|(_, d)| d.to_string()))
-                .flatten()
-        })
-        .collect();
-
-    // Group surface symbols by component directory
-    let mut dir_components: HashMap<String, HashSet<String>> = HashMap::new();
-    for sym in &surface.symbols {
-        // Only count component-like exported symbols
-        match sym.kind {
-            semver_analyzer_core::SymbolKind::Variable
-            | semver_analyzer_core::SymbolKind::Class
-            | semver_analyzer_core::SymbolKind::Function
-            | semver_analyzer_core::SymbolKind::Constant => {}
-            _ => continue,
-        }
-        if !sym.name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-            continue;
-        }
-        // Extract component directory from qualified name
-        // e.g., "packages/react-core/src/components/Dropdown/Dropdown.DropdownProps" → "Dropdown"
-        if let Some((dir_path, _)) = sym.qualified_name.rsplit_once('/') {
-            if let Some((_, dir_name)) = dir_path.rsplit_once('/') {
-                dir_components
-                    .entry(dir_name.to_string())
-                    .or_default()
-                    .insert(sym.name.clone());
-            }
-        }
-    }
-
-    // Filter to families with 2+ components AND breaking changes
-    let result: Vec<String> = dir_components
-        .into_iter()
-        .filter(|(dir, components)| components.len() >= 2 && changed_dirs.contains(dir))
-        .map(|(dir, _)| dir)
-        .collect();
-
-    eprintln!(
-        "[Hierarchy] {} qualifying families",
-        result.len(),
-    );
-
-    result
-}
-
-/// Read all source files for a component family from a git ref.
-///
-/// Returns concatenated file contents with file path separators,
-/// ready for the LLM prompt.
-fn read_family_files(repo: &Path, git_ref: &str, family_dir: &str) -> Option<String> {
-    // List all files in the component directory at this git ref
-    let output = std::process::Command::new("git")
-        .args([
-            "ls-tree",
-            "-r",
-            "--name-only",
-            git_ref,
-        ])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let all_files = String::from_utf8_lossy(&output.stdout);
-
-    // Find files matching this family directory pattern
-    // Look in both main and next/deprecated paths for component directories
-    let mut family_files: Vec<String> = Vec::new();
-    for line in all_files.lines() {
-        // Match patterns like:
-        //   packages/*/src/components/{family_dir}/*.tsx
-        //   packages/*/src/next/components/{family_dir}/*.tsx
-        if !line.ends_with(".tsx") && !line.ends_with(".ts") {
-            continue;
-        }
-        // Skip test, example, story files
-        if line.contains("__tests__")
-            || line.contains("__mocks__")
-            || line.contains("__snapshots__")
-            || line.contains("/stories/")
-        {
-            continue;
-        }
-        // Check if this file is in the family directory
-        let parts: Vec<&str> = line.rsplitn(2, '/').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let dir = parts[1];
-        let is_family_dir = dir.ends_with(&format!("/{}", family_dir))
-            || dir.ends_with(&format!("/components/{}", family_dir))
-            || dir.ends_with(&format!("/next/components/{}", family_dir));
-        if !is_family_dir {
-            continue;
-        }
-
-        family_files.push(line.to_string());
-    }
-
-    if family_files.is_empty() {
-        return None;
-    }
-
-    // Read each file and concatenate
-    let mut content = String::new();
-    // Include up to 2 example files if they exist
-    let mut example_files: Vec<String> = Vec::new();
-    let mut source_files: Vec<String> = Vec::new();
-
-    for file_path in &family_files {
-        if file_path.contains("/examples/") {
-            example_files.push(file_path.clone());
-        } else {
-            source_files.push(file_path.clone());
-        }
-    }
-
-    // Read source files first
-    for file_path in &source_files {
-        if let Some(file_content) = read_git_file(repo, git_ref, file_path) {
-            content.push_str(&format!("\n--- File: {} ---\n", file_path));
-            content.push_str(&file_content);
-            content.push('\n');
-        }
-    }
-
-    // Include first 2 example files (sorted for determinism)
-    example_files.sort();
-    for file_path in example_files.iter().take(2) {
-        if let Some(file_content) = read_git_file(repo, git_ref, file_path) {
-            content.push_str(&format!("\n--- Example: {} ---\n", file_path));
-            content.push_str(&file_content);
-            content.push('\n');
-        }
-    }
-
-    if content.is_empty() {
-        None
-    } else {
-        Some(content)
-    }
-}
+impl<L: Language> Analyzer<L> {
 
 /// Infer hierarchies for both versions and compute deltas.
 async fn infer_and_diff_hierarchies(
+    lang: &L,
     repo: &Path,
     from_ref: &str,
     to_ref: &str,
     llm_command: &str,
-    structural_changes: &[semver_analyzer_core::StructuralChange],
-    old_surface: &semver_analyzer_core::ApiSurface,
-    new_surface: &semver_analyzer_core::ApiSurface,
+    structural_changes: &[StructuralChange],
+    old_surface: &ApiSurface,
+    new_surface: &ApiSurface,
 ) -> (
-    Vec<semver_analyzer_core::HierarchyDelta>,
-    std::collections::HashMap<String, std::collections::HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>>,
+    Vec<HierarchyDelta>,
+    HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 ) {
-    use semver_analyzer_core::{ExpectedChild, FamilyHierarchy, HierarchyDelta};
-    use std::collections::{HashMap, HashSet};
 
-    // Find families to analyze (from new surface, filtered to those with breaking changes)
-    let families = find_qualifying_families(repo, to_ref, structural_changes, new_surface);
+    let hierarchy = match lang.hierarchy() {
+        Some(h) => h,
+        None => return (Vec::new(), HashMap::new()),
+    };
+
+    // Find families to analyze: group symbols by family, filter to those with
+    // breaking changes and enough components.
+    let families = {
+        let changed_dirs: HashSet<String> = structural_changes
+            .iter()
+            .filter(|c| c.is_breaking)
+            .filter_map(|c| {
+                let sym = new_surface
+                    .symbols
+                    .iter()
+                    .find(|s| s.qualified_name == c.qualified_name)
+                    .or_else(|| {
+                        old_surface
+                            .symbols
+                            .iter()
+                            .find(|s| s.qualified_name == c.qualified_name)
+                    });
+                sym.and_then(|s| {
+                    hierarchy.family_name_from_symbols(&[s])
+                })
+            })
+            .collect();
+
+        // Group new surface symbols by family
+        let mut family_components: HashMap<String, HashSet<String>> = HashMap::new();
+        for sym in &new_surface.symbols {
+            match sym.kind {
+                SymbolKind::Variable
+                | SymbolKind::Class
+                | SymbolKind::Function
+                | SymbolKind::Constant => {}
+                _ => continue,
+            }
+            if !sym.name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(family_name) = hierarchy.family_name_from_symbols(&[sym]) {
+                family_components
+                    .entry(family_name)
+                    .or_default()
+                    .insert(sym.name.clone());
+            }
+        }
+
+        let min_components = hierarchy.min_components_for_hierarchy();
+        let result: Vec<String> = family_components
+            .into_iter()
+            .filter(|(dir, components)| {
+                components.len() >= min_components && changed_dirs.contains(dir)
+            })
+            .map(|(dir, _)| dir)
+            .collect();
+
+        eprintln!("[Hierarchy] {} qualifying families", result.len());
+        result
+    };
 
     if families.is_empty() {
         return (Vec::new(), HashMap::new());
     }
 
-    // Detect cross-family context relationships for the new version.
-    // This tells us which families share React context and should include
-    // related component signatures in their hierarchy LLM calls.
-    let context_rels = detect_cross_family_context(repo, to_ref);
+    // Detect cross-family relationships and prepare related signatures
+    let context_rels = hierarchy.cross_family_relationships(repo, to_ref);
 
-    // Build lookup: consumer_family → [(provider_family, [context_names])]
+    // Build lookup: consumer_family → [(provider_family, [relationship_names])]
     let mut context_providers: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
-    for rel in &context_rels {
+    for (consumer, provider, rel_name) in &context_rels {
         context_providers
-            .entry(rel.consumer_family.clone())
+            .entry(consumer.clone())
             .or_default()
-            .entry(rel.provider_family.clone())
+            .entry(provider.clone())
             .or_default()
-            .push(rel.context_name.clone());
+            .push(rel_name.clone());
     }
 
     // Pre-read related component signatures for each consumer family
     let mut related_signatures: HashMap<String, String> = HashMap::new();
     for (consumer, providers) in &context_providers {
         let mut combined = String::new();
-        for (provider, ctx_names) in providers {
-            if let Some(sigs) = read_family_signatures(repo, to_ref, provider, ctx_names) {
+        for (provider, rel_names) in providers {
+            if let Some(sigs) = hierarchy.related_family_content(repo, to_ref, provider, rel_names) {
                 combined.push_str(&sigs);
             }
         }
@@ -2074,6 +1528,11 @@ async fn infer_and_diff_hierarchies(
     let mut handles = Vec::new();
 
     for family in &families {
+        // Pre-compute file paths before spawning — hierarchy is a reference
+        // that can't cross the 'static boundary of tokio::spawn.
+        let old_paths = hierarchy.family_source_paths(repo, from_ref, family);
+        let new_paths = hierarchy.family_source_paths(repo, to_ref, family);
+
         let sem = semaphore.clone();
         let done = completed.clone();
         let repo = repo.to_path_buf();
@@ -2090,9 +1549,37 @@ async fn infer_and_diff_hierarchies(
             eprintln!("[Hierarchy] [{}/{}] {}{}", idx, total, family,
                 if related.is_some() { " (+ cross-family context)" } else { "" });
 
-            // Read family source from both refs
-            let old_content = read_family_files(&repo, &from_ref, &family);
-            let new_content = read_family_files(&repo, &to_ref, &family);
+            let old_content = {
+                if old_paths.is_empty() {
+                    None
+                } else {
+                    let mut content = String::new();
+                    for file_path in &old_paths {
+                        if let Some(file_content) = read_git_file(&repo, &from_ref, file_path) {
+                            content.push_str(&format!("\n--- File: {} ---\n", file_path));
+                            content.push_str(&file_content);
+                            content.push('\n');
+                        }
+                    }
+                    if content.is_empty() { None } else { Some(content) }
+                }
+            };
+
+            let new_content = {
+                if new_paths.is_empty() {
+                    None
+                } else {
+                    let mut content = String::new();
+                    for file_path in &new_paths {
+                        if let Some(file_content) = read_git_file(&repo, &to_ref, file_path) {
+                            content.push_str(&format!("\n--- File: {} ---\n", file_path));
+                            content.push_str(&file_content);
+                            content.push('\n');
+                        }
+                    }
+                    if content.is_empty() { None } else { Some(content) }
+                }
+            };
 
             // Infer old hierarchy (if family existed in old version)
             // Old version doesn't get related signatures — conformance is
@@ -2102,7 +1589,7 @@ async fn infer_and_diff_hierarchies(
                     let analyzer_cmd = llm_cmd.clone();
                     let family_name = family.clone();
                     move || {
-                        let a = semver_analyzer_llm::LlmBehaviorAnalyzer::new(&analyzer_cmd);
+                        let a = LlmBehaviorAnalyzer::new(&analyzer_cmd);
                         match a.infer_component_hierarchy(&family_name, &content, None) {
                             Ok(h) => Some(h),
                             Err(e) => {
@@ -2132,7 +1619,7 @@ async fn infer_and_diff_hierarchies(
                     let related_sigs = related;
                     move || {
                         let analyzer =
-                            semver_analyzer_llm::LlmBehaviorAnalyzer::new(&llm_cmd);
+                            LlmBehaviorAnalyzer::new(&llm_cmd);
                         match analyzer.infer_component_hierarchy(
                             &family_name,
                             &content,
@@ -2178,9 +1665,9 @@ async fn infer_and_diff_hierarchies(
     }
 
     // Collect results
-    let mut all_old: HashMap<String, HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>> =
+    let mut all_old: HashMap<String, HashMap<String, Vec<ExpectedChild>>> =
         HashMap::new();
-    let mut all_new: HashMap<String, HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>> =
+    let mut all_new: HashMap<String, HashMap<String, Vec<ExpectedChild>>> =
         HashMap::new();
 
     for handle in handles {
@@ -2253,36 +1740,7 @@ async fn infer_and_diff_hierarchies(
     (deltas, all_new)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+} // end impl Analyzer<L> (private methods, part 2)
 
-    #[test]
-    fn extract_display_name_simple() {
-        assert_eq!(
-            extract_display_name("src/api/users.ts::createUser"),
-            "createUser"
-        );
-    }
-
-    #[test]
-    fn extract_display_name_class_method() {
-        assert_eq!(
-            extract_display_name("src/service.ts::Service::validate"),
-            "Service.validate"
-        );
-    }
-
-    #[test]
-    fn extract_display_name_no_separator() {
-        assert_eq!(extract_display_name("createUser"), "createUser");
-    }
-
-    #[test]
-    fn extract_display_name_file_only() {
-        assert_eq!(
-            extract_display_name("src/utils.ts::helper"),
-            "helper"
-        );
-    }
-}
+// Tests for extract_display_name and extract_component_refs moved to
+// TypeScript Language trait impl tests (crates/ts/src/language.rs).

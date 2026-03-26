@@ -6,6 +6,7 @@ description = "TypeScript/JavaScript support for the semver-analyzer"
 
 [dependencies]
 semver-analyzer-core = { path = "../core" }
+semver-analyzer-konveyor-core = { path = "../konveyor-core" }
 
 # OXC - JavaScript/TypeScript toolchain
 oxc_parser = "0.116"
@@ -21,8 +22,14 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 
-# Regex for test assertion detection
+# Regex for test assertion detection and konveyor patterns
 regex = "1"
+
+# YAML output (for Konveyor rules)
+serde_yaml = "0.9"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"

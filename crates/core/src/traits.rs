@@ -7,116 +7,19 @@
 //!
 //! | Trait | Used by | Per-language? |
 //! |---|---|---|
-//! | `ApiExtractor` | TD | Yes |
-//! | `DiffParser` | BU | Yes |
-//! | `CallGraphBuilder` | BU + impact | Yes |
-//! | `TestAnalyzer` | BU | Yes (test conventions differ) |
+//! | `Language` | TD + BU | Yes (unified analysis pipeline) |
 //! | `BehaviorAnalyzer` | BU | No (language-agnostic, LLM-based) |
 
 use crate::types::{
-    ApiSurface, BreakingVerdict, Caller, ChangedFunction, FunctionSpec, Reference,
-    StructuralChange, Symbol, TestDiff, TestFile, Visibility,
+    ApiSurface, BehavioralChangeKind, BodyAnalysisResult, BreakingVerdict, Caller, ChangedFunction,
+    EvidenceType, FunctionSpec, Reference, StructuralChange, Symbol, SymbolKind, TestDiff,
+    TestFile, Visibility,
 };
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::path::Path;
-
-// ── TD Traits ───────────────────────────────────────────────────────────
-
-/// Extract the public API surface from source code at a git ref.
-/// Used by TD (Top-Down) pipeline.
-///
-/// Each language provides its own implementation:
-/// - TypeScript/JS: `tsc --declaration` + OXC parsing of `.d.ts` files
-/// - Python (future): tree-sitter-python + `__all__` exports
-/// - Go (future): tree-sitter-go + capitalized identifiers
-/// - Rust (future): rustdoc JSON
-pub trait ApiExtractor {
-    /// Extract the public API surface from source code at a specific git ref.
-    ///
-    /// The implementation is responsible for:
-    /// 1. Checking out the ref (via git worktree or similar)
-    /// 2. Running any required build steps (e.g., `tsc --declaration`)
-    /// 3. Parsing the output to populate an `ApiSurface`
-    /// 4. Canonicalizing types so string comparison works
-    /// 5. Cleaning up temporary files
-    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface>;
-}
-
-// ── BU Traits (language-specific) ───────────────────────────────────────
-
-/// Parse a git diff and extract all changed functions (public AND private).
-/// Used by BU (Bottom-Up) pipeline.
-///
-/// Each language provides its own implementation because function
-/// extraction requires language-specific AST parsing.
-pub trait DiffParser {
-    /// Parse the diff between two git refs and identify all functions
-    /// whose bodies changed.
-    ///
-    /// The implementation:
-    /// 1. Runs `git diff --name-status from_ref..to_ref` for changed files
-    /// 2. For each changed source file, gets both versions via `git show`
-    /// 3. Parses both versions with the language's parser (OXC for TS)
-    /// 4. Walks both ASTs to extract function declarations with bodies
-    /// 5. Matches functions by qualified name and compares bodies
-    /// 6. Returns ALL changed functions (public AND private)
-    fn parse_changed_functions(
-        &self,
-        repo: &Path,
-        from_ref: &str,
-        to_ref: &str,
-    ) -> Result<Vec<ChangedFunction>>;
-}
-
-/// Build call graphs and find references.
-///
-/// BU uses `find_callers()` to walk UP from changed private functions.
-/// Impact analysis uses `find_references()` to find dependents of broken
-/// public symbols across the entire project.
-pub trait CallGraphBuilder {
-    /// Given a function, find what calls it (callers, not callees).
-    ///
-    /// For private (non-exported) functions, callers are always in the
-    /// same file — per-file scope analysis handles this directly.
-    /// No cross-file search is needed for the walk-UP path.
-    ///
-    /// Includes HOF heuristic detection: if the symbol is passed as an
-    /// argument to a higher-order function (e.g., `arr.map(symbol)`,
-    /// `emitter.on('event', symbol)`, `setTimeout(symbol)`), the
-    /// enclosing function is treated as a caller.
-    fn find_callers(&self, file: &Path, symbol_name: &str) -> Result<Vec<Caller>>;
-
-    /// Given a public symbol, find all references to it across the
-    /// project. Used for impact analysis after TD+BU merge.
-    ///
-    /// Uses the reverse import index:
-    /// 1. Look up (source_file, symbol_name) in the import index
-    /// 2. For each import site, report the importing file, local binding,
-    ///    and call sites
-    /// 3. Follow re-export chains (A re-exports from B re-exports from C)
-    fn find_references(&self, file: &Path, symbol_name: &str) -> Result<Vec<Reference>>;
-}
-
-/// Find and analyze tests associated with a changed function.
-/// Used by BU before LLM, to detect behavioral changes from test diffs.
-pub trait TestAnalyzer {
-    /// Given a source file, find its associated test file(s) by convention.
-    /// e.g., `foo.ts` → `foo.test.ts`, `foo.spec.ts`, `__tests__/foo.ts`
-    fn find_tests(&self, repo: &Path, source_file: &Path) -> Result<Vec<TestFile>>;
-
-    /// Diff the test file between two refs. Returns changed assertion lines
-    /// as raw text diffs (Option B approach — no framework-specific parsing).
-    fn diff_test_assertions(
-        &self,
-        repo: &Path,
-        test_file: &TestFile,
-        from_ref: &str,
-        to_ref: &str,
-    ) -> Result<TestDiff>;
-}
 
 // ── BU Traits (language-agnostic, LLM-based) ───────────────────────────
 
@@ -248,6 +151,169 @@ pub trait LanguageSemantics {
     /// TypeScript: dedup default export changes.
     /// Most languages: no-op.
     fn post_process(&self, _changes: &mut Vec<StructuralChange>) {}
+
+    /// If this language supports component hierarchy inference (e.g., React,
+    /// Vue, Django templates), return the hierarchy semantics implementation.
+    ///
+    /// The orchestrator uses this to prepare data for LLM hierarchy inference.
+    /// The trait is NOT responsible for LLM calls or prompt construction.
+    fn hierarchy(&self) -> Option<&dyn HierarchySemantics> {
+        None
+    }
+
+    /// If this language supports LLM-based rename inference (e.g., CSS
+    /// physical→logical property renames, interface rename mappings),
+    /// return the rename semantics implementation.
+    ///
+    /// The orchestrator uses this to prepare data for LLM rename inference.
+    /// The trait is NOT responsible for LLM calls or prompt construction.
+    fn renames(&self) -> Option<&dyn RenameSemantics> {
+        None
+    }
+
+    /// If this language has deterministic body-level analysis (e.g., JSX diff,
+    /// CSS variable scanning for TypeScript), return the body analysis
+    /// implementation.
+    ///
+    /// The orchestrator calls this during BU Phase 1 to detect behavioral
+    /// breaks from function body changes without LLM assistance.
+    fn body_analyzer(&self) -> Option<&dyn BodyAnalysisSemantics> {
+        None
+    }
+}
+
+// ── Optional capability traits ──────────────────────────────────────────
+//
+// These traits represent optional analysis capabilities that some languages
+// support. They are accessed via optional accessors on `LanguageSemantics`.
+// The orchestrator checks for their presence and conditionally runs the
+// corresponding analysis steps.
+
+/// Deterministic data preparation for component hierarchy inference.
+///
+/// Languages with component composition models (React, Vue, Django, etc.)
+/// implement this to tell the orchestrator what files belong to a component
+/// family and how families relate to each other.
+///
+/// The orchestrator uses `same_family` for symbol grouping, then these
+/// methods for data preparation. The LLM call itself stays in the orchestrator.
+///
+/// TODO: Reconsider — the methods that take repo/git_ref currently require
+/// language impls to know about git. A future refactor should have the
+/// orchestrator own all git plumbing and pass content to pure-logic methods.
+pub trait HierarchySemantics {
+    /// Get file paths belonging to a component family directory.
+    ///
+    /// Given a family name (e.g., "Dropdown"), returns relative paths to
+    /// all source files in that family. Used to read content for the LLM prompt.
+    fn family_source_paths(&self, repo: &Path, git_ref: &str, family_name: &str) -> Vec<String>;
+
+    /// Get a human-readable family name from a group of symbols.
+    ///
+    /// TypeScript/React: extracts the component directory name
+    /// (e.g., "Dropdown" from "packages/react-core/src/components/Dropdown/...")
+    fn family_name_from_symbols(&self, symbols: &[&Symbol]) -> Option<String>;
+
+    /// Detect cross-family relationships (e.g., React context imports).
+    ///
+    /// Returns pairs of (consumer_family, provider_family, relationship_name).
+    /// Used to include related component signatures in the LLM prompt.
+    fn cross_family_relationships(
+        &self,
+        repo: &Path,
+        git_ref: &str,
+    ) -> Vec<(String, String, String)>;
+
+    /// Read related component signatures for cross-family context.
+    ///
+    /// Given a provider family and the context/relationship names that
+    /// link it to a consumer, returns relevant source content to include
+    /// in the LLM prompt.
+    fn related_family_content(
+        &self,
+        repo: &Path,
+        git_ref: &str,
+        family_name: &str,
+        relationship_names: &[String],
+    ) -> Option<String>;
+
+    /// Minimum number of exported components for a family to qualify
+    /// for hierarchy inference. Default: 2.
+    fn min_components_for_hierarchy(&self) -> usize {
+        2
+    }
+}
+
+/// Deterministic data preparation for LLM-based rename inference.
+///
+/// Languages that benefit from LLM-detected rename patterns (e.g., CSS
+/// physical→logical property renames, interface rename mappings) implement
+/// this to prepare the data for the LLM call.
+///
+/// The orchestrator calls these methods to build LLM inputs. The LLM call
+/// itself and prompt construction stay in the orchestrator/LLM crate.
+pub trait RenameSemantics {
+    /// Sample removed constants for rename pattern inference.
+    ///
+    /// Default implementation returns the first 30. Language impls can
+    /// prioritize certain suffixes/patterns for better LLM pattern discovery.
+    fn sample_removed_constants<'a>(
+        &self,
+        removed: &[&'a str],
+        _added: &[&'a str],
+    ) -> Vec<&'a str> {
+        removed.iter().take(30).copied().collect()
+    }
+
+    /// Sample added constants for rename pattern inference.
+    ///
+    /// Default implementation returns the first 30.
+    fn sample_added_constants<'a>(&self, _removed: &[&'a str], added: &[&'a str]) -> Vec<&'a str> {
+        added.iter().take(30).copied().collect()
+    }
+
+    /// Minimum count of removed constants to trigger rename inference.
+    /// Default: 50.
+    fn min_removed_for_constant_inference(&self) -> usize {
+        50
+    }
+
+    /// Minimum count of removed interfaces to trigger interface rename
+    /// inference. Default: 2.
+    fn min_removed_for_interface_inference(&self) -> usize {
+        2
+    }
+}
+
+/// Deterministic body-level analysis for behavioral change detection.
+///
+/// Languages with framework-specific body patterns (e.g., JSX diff and CSS
+/// variable scanning for TypeScript/React) implement this to detect
+/// behavioral breaks from function body changes without LLM assistance.
+///
+/// The orchestrator calls `analyze_changed_body` during BU Phase 1 for each
+/// changed function that passes visibility filtering.
+///
+/// The `category_label` field on results uses the serde serialization format
+/// of the language's `Category` type. At the call site, the orchestrator
+/// deserializes this into `L::Category` via serde.
+pub trait BodyAnalysisSemantics {
+    /// Run deterministic analysis on a changed function's body.
+    ///
+    /// Returns a list of (description, category_label) pairs representing
+    /// behavioral breaks detected. The category_label is the string form
+    /// of the language's Category enum (e.g., "dom_structure" for
+    /// `TsCategory::DomStructure`).
+    ///
+    /// TypeScript: runs JSX diff + CSS variable scanning.
+    /// Other languages: may check annotation changes, decorator changes, etc.
+    fn analyze_changed_body(
+        &self,
+        old_body: &str,
+        new_body: &str,
+        func_name: &str,
+        file_path: &str,
+    ) -> Vec<BodyAnalysisResult>;
 }
 
 /// Language-specific human-readable descriptions for changes.
@@ -288,8 +354,134 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
     /// Language-specific report data.
     type ReportData: Debug + Clone + Serialize + DeserializeOwned + Send + Sync;
 
+    // ── Constants ────────────────────────────────────────────────────
+
+    /// Symbol kinds that represent type definitions eligible for rename inference.
+    /// TypeScript: `&[SymbolKind::Interface, SymbolKind::Class]`
+    /// Go: `&[SymbolKind::Struct, SymbolKind::Interface]`
+    const RENAMEABLE_SYMBOL_KINDS: &'static [SymbolKind];
+
     /// Language identifier for serialization dispatch.
-    fn name() -> &'static str;
+    const NAME: &'static str;
+
+    /// Manifest file path(s) for this language's package system.
+    ///
+    /// TypeScript: `&["package.json"]`
+    /// Go: `&["go.mod"]`
+    /// Java: `&["pom.xml"]` or `&["build.gradle"]`
+    ///
+    /// TODO: Reconsider — the orchestrator currently reads these files via git
+    /// and passes content to `diff_manifest_content`. A future refactor should
+    /// unify all git plumbing in the orchestrator so language impls are pure
+    /// content processors.
+    const MANIFEST_FILES: &'static [&'static str];
+
+    /// Source file glob patterns for `git diff --name-only` filtering.
+    ///
+    /// TypeScript: `&["*.ts", "*.tsx"]`
+    /// Go: `&["*.go"]`
+    /// Java: `&["*.java"]`
+    ///
+    /// TODO: Same reconsideration as MANIFEST_FILES.
+    const SOURCE_FILE_PATTERNS: &'static [&'static str];
+
+    // ── Analysis pipeline methods ───────────────────────────────────
+
+    /// Extract the public API surface from source code at a git ref.
+    ///
+    /// The implementation is responsible for checking out the ref,
+    /// running any required build steps, parsing the output, and
+    /// cleaning up temporary files.
+    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface>;
+
+    /// Parse the diff between two git refs and identify all functions
+    /// whose bodies changed (public AND private).
+    fn parse_changed_functions(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+    ) -> Result<Vec<ChangedFunction>>;
+
+    /// Given a function, find what calls it (callers, not callees).
+    fn find_callers(&self, file: &Path, symbol_name: &str) -> Result<Vec<Caller>>;
+
+    /// Given a public symbol, find all references to it across the project.
+    fn find_references(&self, file: &Path, symbol_name: &str) -> Result<Vec<Reference>>;
+
+    /// Given a source file, find its associated test file(s) by convention.
+    fn find_tests(&self, repo: &Path, source_file: &Path) -> Result<Vec<TestFile>>;
+
+    /// Diff the test file between two refs. Returns changed assertion lines.
+    fn diff_test_assertions(
+        &self,
+        repo: &Path,
+        test_file: &TestFile,
+        from_ref: &str,
+        to_ref: &str,
+    ) -> Result<TestDiff>;
+
+    // ── Methods ─────────────────────────────────────────────────────
+
+    /// Diff manifest content between two versions.
+    ///
+    /// The orchestrator reads the manifest file(s) at both refs and passes
+    /// the raw content here. The language interprets the format and determines
+    /// what changed and whether it's breaking.
+    ///
+    /// TODO: Reconsider — same as above re: git plumbing ownership.
+    fn diff_manifest_content(old: &str, new: &str) -> Vec<crate::types::ManifestChange<Self>>
+    where
+        Self: Sized;
+
+    /// Whether a file path should be excluded from BU analysis.
+    ///
+    /// Filters out test files, build artifacts, index/barrel files, etc.
+    /// TypeScript: excludes `index.ts`, `.d.ts`, `.test.`, `.spec.`,
+    /// `__tests__/`, `dist/`
+    ///
+    /// TODO: Same reconsideration as above.
+    fn should_exclude_from_analysis(path: &Path) -> bool;
+
+    /// Build the language-specific report from analysis results.
+    ///
+    /// This is the primary report-building entry point. The Language owns
+    /// the entire report construction — language-agnostic structure (grouping
+    /// changes by file, counting breaks) AND language-specific enrichment
+    /// (component detection, hierarchy, child components, etc.).
+    ///
+    /// The result is dropped into a `ReportEnvelope` by the caller.
+    fn build_report(
+        results: &crate::types::AnalysisResult<Self>,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+    ) -> crate::types::AnalysisReport<Self>
+    where
+        Self: Sized;
+
+    // ── Behavioral change methods ───────────────────────────────
+
+    /// Determine the behavioral change kind from the evidence type.
+    /// TypeScript: LLM/body analysis → Class (component-level), test delta → Function
+    /// Default: always Function
+    fn behavioral_change_kind(&self, _evidence_type: &EvidenceType) -> BehavioralChangeKind {
+        BehavioralChangeKind::Function
+    }
+
+    /// Extract symbol references from a behavioral change description.
+    /// TypeScript: extracts PascalCase component names (e.g., `<Modal>`, `` `Button` ``)
+    /// Default: empty vec
+    fn extract_referenced_symbols(&self, _description: &str) -> Vec<String> {
+        vec![]
+    }
+
+    /// Format a qualified name for display in reports.
+    /// TypeScript: `src/Modal.tsx::Modal` → `Modal`
+    /// Default: return the qualified name as-is
+    fn display_name(&self, qualified_name: &str) -> String {
+        qualified_name.to_string()
+    }
 }
 
 // ── Convenience functions (TD) ──────────────────────────────────────────

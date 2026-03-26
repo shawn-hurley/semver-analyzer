@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// `Language` implementation to deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportEnvelope {
-    /// Which language produced this report. Matches `L::name()`.
+    /// Which language produced this report. Matches `L::NAME`.
     pub language: String,
 
     /// Tool version that produced this report.
@@ -40,14 +40,14 @@ pub struct ReportEnvelope {
 impl ReportEnvelope {
     /// Deserialize the language-specific report section.
     ///
-    /// Returns an error if `L::name()` doesn't match `self.language`
+    /// Returns an error if `L::NAME` doesn't match `self.language`
     /// or if deserialization fails.
     pub fn language_report<L: Language>(&self) -> anyhow::Result<LanguageReport<L>> {
-        if L::name() != self.language {
+        if L::NAME != self.language {
             anyhow::bail!(
                 "Report was produced by '{}' but requested as '{}'",
                 self.language,
-                L::name()
+                L::NAME
             );
         }
         Ok(serde_json::from_value(self.language_report.clone())?)
@@ -125,6 +125,8 @@ pub struct LanguageManifestChange<L: Language> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     // ── Dummy Language impl for testing ──────────────────────────
@@ -184,8 +186,107 @@ mod tests {
         type ManifestChangeType = TestManifest;
         type Evidence = TestEvidence;
         type ReportData = TestReportData;
-        fn name() -> &'static str {
-            "test"
+        const RENAMEABLE_SYMBOL_KINDS: &'static [crate::types::SymbolKind] = &[];
+        const NAME: &'static str = "test";
+        const MANIFEST_FILES: &'static [&'static str] = &[];
+        const SOURCE_FILE_PATTERNS: &'static [&'static str] = &[];
+
+        fn extract(
+            &self,
+            _repo: &Path,
+            _git_ref: &str,
+        ) -> anyhow::Result<crate::types::ApiSurface> {
+            Ok(crate::types::ApiSurface { symbols: vec![] })
+        }
+        fn parse_changed_functions(
+            &self,
+            _repo: &Path,
+            _from_ref: &str,
+            _to_ref: &str,
+        ) -> anyhow::Result<Vec<crate::types::ChangedFunction>> {
+            Ok(vec![])
+        }
+        fn find_callers(
+            &self,
+            _file: &Path,
+            _symbol_name: &str,
+        ) -> anyhow::Result<Vec<crate::types::Caller>> {
+            Ok(vec![])
+        }
+        fn find_references(
+            &self,
+            _file: &Path,
+            _symbol_name: &str,
+        ) -> anyhow::Result<Vec<crate::types::Reference>> {
+            Ok(vec![])
+        }
+        fn find_tests(
+            &self,
+            _repo: &Path,
+            _source_file: &Path,
+        ) -> anyhow::Result<Vec<crate::types::TestFile>> {
+            Ok(vec![])
+        }
+        fn diff_test_assertions(
+            &self,
+            _repo: &Path,
+            _test_file: &crate::types::TestFile,
+            _from_ref: &str,
+            _to_ref: &str,
+        ) -> anyhow::Result<crate::types::TestDiff> {
+            Ok(crate::types::TestDiff {
+                test_file: std::path::PathBuf::new(),
+                removed_assertions: vec![],
+                added_assertions: vec![],
+                has_assertion_changes: false,
+                full_diff: String::new(),
+            })
+        }
+
+        fn diff_manifest_content(
+            _old: &str,
+            _new: &str,
+        ) -> Vec<crate::types::ManifestChange<Self>> {
+            vec![]
+        }
+        fn should_exclude_from_analysis(_path: &Path) -> bool {
+            false
+        }
+        fn build_report(
+            _results: &crate::types::AnalysisResult<Self>,
+            _repo: &Path,
+            _from_ref: &str,
+            _to_ref: &str,
+        ) -> crate::types::AnalysisReport<Self> {
+            crate::types::AnalysisReport {
+                repository: std::path::PathBuf::new(),
+                comparison: crate::types::Comparison {
+                    from_ref: String::new(),
+                    to_ref: String::new(),
+                    from_sha: String::new(),
+                    to_sha: String::new(),
+                    commit_count: 0,
+                    analysis_timestamp: String::new(),
+                },
+                summary: crate::types::Summary {
+                    total_breaking_changes: 0,
+                    breaking_api_changes: 0,
+                    breaking_behavioral_changes: 0,
+                    files_with_breaking_changes: 0,
+                },
+                changes: vec![],
+                manifest_changes: vec![],
+                added_files: vec![],
+                packages: vec![],
+                member_renames: std::collections::HashMap::new(),
+                inferred_rename_patterns: None,
+                hierarchy_deltas: vec![],
+                metadata: crate::types::AnalysisMetadata {
+                    call_graph_analysis: String::new(),
+                    tool_version: String::new(),
+                    llm_usage: None,
+                },
+            }
         }
     }
 

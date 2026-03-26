@@ -22,7 +22,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use semver_analyzer_core::{TestAnalyzer, TestConvention, TestDiff, TestFile};
+use semver_analyzer_core::{TestConvention, TestDiff, TestFile};
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
@@ -39,12 +39,12 @@ impl TsTestAnalyzer {
     }
 }
 
-impl TestAnalyzer for TsTestAnalyzer {
-    fn find_tests(&self, repo: &Path, source_file: &Path) -> Result<Vec<TestFile>> {
+impl TsTestAnalyzer {
+    pub fn find_tests(&self, repo: &Path, source_file: &Path) -> Result<Vec<TestFile>> {
         find_test_files(repo, source_file)
     }
 
-    fn diff_test_assertions(
+    pub fn diff_test_assertions(
         &self,
         repo: &Path,
         test_file: &TestFile,

@@ -8,7 +8,6 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
-use semver_analyzer_core::ApiExtractor;
 use semver_analyzer_core::{
     AccessorKind, ApiSurface, Parameter, Signature, Symbol, SymbolKind, TypeParameter, Visibility,
 };
@@ -84,6 +83,16 @@ impl OxcExtractor {
             let mapped = remap_dist_to_src(relative);
             symbols.extend(self.extract_from_source_with_globals(source, &mapped, &global_imports));
         }
+
+        // Phase 3: Set package name based on file path
+        for sym in &mut symbols {
+            let path_str = sym.file.to_string_lossy();
+            let parts: Vec<&str> = path_str.split('/').collect();
+            if parts.len() >= 2 && parts[0] == "packages" {
+                sym.package = Some(format!("@patternfly/{}", parts[1]));
+            }
+        }
+
         Ok(ApiSurface { symbols })
     }
 
@@ -161,12 +170,6 @@ impl OxcExtractor {
 
         // Extract from the generated .d.ts files
         self.extract_from_dir(guard.path())
-    }
-}
-
-impl ApiExtractor for OxcExtractor {
-    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface> {
-        self.extract_at_ref(repo, git_ref, None)
     }
 }
 

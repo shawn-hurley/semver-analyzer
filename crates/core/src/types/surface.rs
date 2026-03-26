@@ -32,6 +32,13 @@ pub struct Symbol {
     /// Source file containing this symbol.
     pub file: PathBuf,
 
+    /// Canonical package/module name this symbol belongs to.
+    /// Set by the language's extractor during extraction.
+    /// TypeScript: "@patternfly/react-tokens" (npm package name)
+    /// Go: "github.com/org/repo/internal/auth" (module path)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+
     /// Line number in the source file (1-indexed).
     pub line: usize,
 
@@ -94,6 +101,7 @@ impl Symbol {
             kind,
             visibility,
             file: file.into(),
+            package: None,
             line,
             signature: None,
             extends: None,

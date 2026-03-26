@@ -491,6 +491,7 @@ pub struct ExpectedChild {
     /// Component name (e.g., "DropdownList").
     pub name: String,
     /// Whether this child is required or optional.
+    #[serde(default)]
     pub required: bool,
 }
 
@@ -598,6 +599,10 @@ pub struct StructuralChange {
 
     /// Symbol kind (function, class, interface, etc.).
     pub kind: super::surface::SymbolKind,
+
+    /// Package this symbol belongs to (propagated from Symbol).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
 
     /// What type of structural change this is.
     pub change_type: StructuralChangeType,
@@ -820,6 +825,19 @@ pub struct InferredInterfaceMapping {
     pub member_overlap_ratio: f64,
 }
 
+/// An API change detected by LLM file-level analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmApiChange {
+    pub file_path: String,
+    pub symbol: String,
+    pub change: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal_disposition: Option<RemovalDisposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renders_element: Option<String>,
+}
+
 /// Statistics about the LLM rename inference run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InferenceMetadata {
@@ -829,4 +847,27 @@ pub struct InferenceMetadata {
     pub constant_hit_rate: f64,
     /// Number of interface rename mappings found.
     pub interface_mappings_found: usize,
+}
+
+// ── Pipeline result type ──────────────────────────────────────────────
+
+use super::surface::ApiSurface;
+
+/// Results from the full analysis pipeline.
+///
+/// Produced by the orchestrator, consumed by `Language::build_report()`
+/// to construct the language-specific report.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct AnalysisResult<L: Language> {
+    pub structural_changes: Vec<StructuralChange>,
+    pub behavioral_changes: Vec<BehavioralChange<L>>,
+    pub manifest_changes: Vec<ManifestChange<L>>,
+    pub llm_api_changes: Vec<LlmApiChange>,
+    pub old_surface: ApiSurface,
+    pub new_surface: ApiSurface,
+    pub inferred_rename_patterns: Option<InferredRenamePatterns>,
+    pub composition_changes: Vec<(String, Vec<CompositionPatternChange>)>,
+    pub hierarchy_deltas: Vec<HierarchyDelta>,
+    pub new_hierarchies: HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 }

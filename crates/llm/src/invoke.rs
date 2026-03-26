@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use semver_analyzer_core::{BreakingVerdict, FunctionSpec};
+use semver_analyzer_core::{BreakingVerdict, ExpectedChild, FunctionSpec, RemovalDisposition};
 use serde::Deserialize;
 use std::process::Command;
 use std::sync::LazyLock;
@@ -178,29 +178,10 @@ pub struct FileApiChange {
     pub description: String,
     /// Why a removed prop was removed and where its functionality went.
     #[serde(default)]
-    pub removal_disposition: Option<LlmRemovalDisposition>,
+    pub removal_disposition: Option<RemovalDisposition>,
     /// HTML element the component renders (e.g., "ol", "div").
     #[serde(default)]
     pub renders_element: Option<String>,
-}
-
-/// LLM-provided disposition for a removed prop.
-/// Deserialized from the LLM's JSON response.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LlmRemovalDisposition {
-    /// Prop moved to a child component.
-    MovedToChild {
-        target_component: String,
-        /// "prop" or "children"
-        mechanism: String,
-    },
-    /// Replaced by a different prop on the same component.
-    ReplacedByProp { new_prop: String },
-    /// Functionality is now automatic.
-    MadeAutomatic,
-    /// Truly removed with no replacement.
-    TrulyRemoved,
 }
 
 fn default_change() -> String {
@@ -433,14 +414,6 @@ pub fn parse_interface_rename_response(response: &str) -> Result<Vec<LlmInterfac
 
 // ── Hierarchy inference response parsing ─────────────────────────────
 
-/// An expected child from the LLM hierarchy response.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LlmExpectedChild {
-    pub name: String,
-    #[serde(default)]
-    pub required: bool,
-}
-
 /// The top-level LLM hierarchy response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmHierarchyResponse {
@@ -451,7 +424,7 @@ pub struct LlmHierarchyResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmComponentHierarchy {
     #[serde(default)]
-    pub expected_children: Vec<LlmExpectedChild>,
+    pub expected_children: Vec<ExpectedChild>,
 }
 
 // ── CSS Suffix Rename Response Parsing ───────────────────────────────────
@@ -487,7 +460,7 @@ pub fn parse_suffix_rename_response(response: &str) -> Result<Vec<LlmSuffixRenam
 /// Returns a map of component name → expected children.
 pub fn parse_hierarchy_response(
     response: &str,
-) -> Result<std::collections::HashMap<String, Vec<LlmExpectedChild>>> {
+) -> Result<std::collections::HashMap<String, Vec<ExpectedChild>>> {
     let json_str =
         extract_json(response).with_context(|| "No JSON found in hierarchy inference response")?;
     let parsed: LlmHierarchyResponse = serde_json::from_str(&json_str).with_context(|| {
@@ -721,7 +694,7 @@ The function validates email addresses."#;
             .as_ref()
             .expect("Should have disposition");
         match disp {
-            LlmRemovalDisposition::MovedToChild {
+            RemovalDisposition::MovedToChild {
                 target_component,
                 mechanism,
             } => {
@@ -754,7 +727,7 @@ The function validates email addresses."#;
         let (_beh, api) = parse_file_behavioral_response(response).unwrap();
         let disp = api[0].removal_disposition.as_ref().unwrap();
         match disp {
-            LlmRemovalDisposition::MovedToChild {
+            RemovalDisposition::MovedToChild {
                 target_component,
                 mechanism,
             } => {
@@ -786,7 +759,7 @@ The function validates email addresses."#;
         let (_beh, api) = parse_file_behavioral_response(response).unwrap();
         let disp = api[0].removal_disposition.as_ref().unwrap();
         match disp {
-            LlmRemovalDisposition::ReplacedByProp { new_prop } => {
+            RemovalDisposition::ReplacedByProp { new_prop } => {
                 assert_eq!(new_prop, "isPlain");
             }
             _ => panic!("Expected ReplacedByProp, got {:?}", disp),
@@ -810,7 +783,7 @@ The function validates email addresses."#;
 ```"#;
         let (_beh, api) = parse_file_behavioral_response(response).unwrap();
         let disp = api[0].removal_disposition.as_ref().unwrap();
-        assert!(matches!(disp, LlmRemovalDisposition::TrulyRemoved));
+        assert!(matches!(disp, RemovalDisposition::TrulyRemoved));
     }
 
     #[test]
@@ -830,7 +803,7 @@ The function validates email addresses."#;
 ```"#;
         let (_beh, api) = parse_file_behavioral_response(response).unwrap();
         let disp = api[0].removal_disposition.as_ref().unwrap();
-        assert!(matches!(disp, LlmRemovalDisposition::MadeAutomatic));
+        assert!(matches!(disp, RemovalDisposition::MadeAutomatic));
     }
 
     #[test]
