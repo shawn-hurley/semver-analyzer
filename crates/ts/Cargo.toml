@@ -33,6 +33,7 @@ serde_yaml = "0.9"
 
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

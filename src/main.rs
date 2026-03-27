@@ -1,17 +1,22 @@
 mod cli;
 mod orchestrator;
+mod progress;
 
 use semver_analyzer_ts::konveyor;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::HashMap;
-use std::fs::{read_to_string, write};
+use std::fs::{self, read_to_string};
 use std::path::Path;
 use std::sync::Arc;
 
+use tracing::{debug, info, info_span, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
 use cli::{AnalyzeLanguage, Cli, Command, ExtractLanguage, KonveyorLanguage};
-use semver_analyzer_core::cli::DiffArgs;
+use progress::ProgressReporter;
+use semver_analyzer_core::cli::{DiffArgs, LoggingArgs};
 use semver_analyzer_core::diff::diff_surfaces;
 use semver_analyzer_core::traits::Language;
 use semver_analyzer_core::{
@@ -27,58 +32,108 @@ use semver_analyzer_ts::TypeScript;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Initialise progress reporter + tracing subscriber
+    let reporter = ProgressReporter::new();
+    init_tracing(cli.logging_args(), &reporter);
+
     match cli.command {
         Command::Extract { language } => match language {
-            ExtractLanguage::Typescript(args) => cmd_extract_ts(args)?,
+            ExtractLanguage::Typescript(args) => cmd_extract_ts(args, &reporter)?,
         },
 
-        Command::Diff(args) => cmd_diff(args)?,
+        Command::Diff(args) => cmd_diff(args, &reporter)?,
 
         Command::Analyze { language } => match language {
-            AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args).await?,
+            AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args, &reporter).await?,
         },
 
         Command::Konveyor { language } => match language {
-            KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args).await?,
+            KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args, &reporter).await?,
         },
 
         Command::Serve => {
-            eprintln!("MCP server not yet implemented");
+            warn!("MCP server not yet implemented");
         }
     }
 
     Ok(())
 }
 
+// ─── Tracing initialisation ────────────────────────────────────────────
+
+fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) {
+    // Stderr: only warnings and errors reach the console.
+    // All user-facing progress is handled by progress bars and
+    // reporter.println() — tracing events would just bury them.
+    let stderr_layer = fmt::layer()
+        .with_writer(reporter.make_writer())
+        .with_target(false)
+        .without_time()
+        .with_filter(EnvFilter::new("warn"));
+
+    let registry = tracing_subscriber::registry().with(stderr_layer);
+
+    if let Some(ref path) = logging.log_file {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        // File: full detail at --log-level (default: info)
+        let file_filter = EnvFilter::try_new(&logging.log_level)
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let file = fs::File::create(path).expect("cannot open log file");
+        let file_layer = fmt::layer()
+            .with_writer(file)
+            .with_ansi(false)
+            .with_filter(file_filter);
+
+        registry.with(file_layer).init();
+    } else {
+        registry.init();
+    }
+}
+
 // ─── Extract command (TypeScript) ───────────────────────────────────────
 
-fn cmd_extract_ts(args: TsExtractArgs) -> Result<()> {
+fn cmd_extract_ts(args: TsExtractArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span = info_span!("extract", repo = %args.common.repo.display(), git_ref = %args.common.git_ref).entered();
     let common = &args.common;
-    eprintln!(
+
+    let phase = reporter.start_phase(&format!(
         "Extracting API surface from {} at ref {}",
         common.repo.display(),
         common.git_ref
-    );
+    ));
 
     let ts = TypeScript::new(args.build_command);
     let surface = ts
         .extract(&common.repo, &common.git_ref)
         .context("Failed to extract API surface")?;
 
-    eprintln!(
-        "Extracted {} symbols from {} files",
-        surface.symbols.len(),
-        count_unique_files(&surface)
+    let sym_count = surface.symbols.len();
+    let file_count = count_unique_files(&surface);
+    phase.finish_with_detail(
+        "Extracted API surface",
+        &format!("{} symbols from {} files", sym_count, file_count),
     );
+    info!(symbols = sym_count, files = file_count, "extraction complete");
 
-    write_json_output(&surface, common.output.as_deref())?;
+    write_json_output(&surface, common.output.as_deref(), reporter)?;
     Ok(())
 }
 
 // ─── Diff command (language-agnostic) ───────────────────────────────────
 
-fn cmd_diff(args: DiffArgs) -> Result<()> {
-    eprintln!("Diffing {} vs {}", args.from.display(), args.to.display());
+fn cmd_diff(args: DiffArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span = info_span!("diff", from = %args.from.display(), to = %args.to.display()).entered();
+
+    let phase = reporter.start_phase(&format!(
+        "Diffing {} vs {}",
+        args.from.display(),
+        args.to.display()
+    ));
 
     let old_json = read_to_string(&args.from)
         .with_context(|| format!("Failed to read {}", args.from.display()))?;
@@ -94,29 +149,30 @@ fn cmd_diff(args: DiffArgs) -> Result<()> {
 
     let breaking = changes.iter().filter(|c| c.is_breaking).count();
     let non_breaking = changes.len() - breaking;
-    eprintln!(
-        "Found {} changes ({} breaking, {} non-breaking)",
-        changes.len(),
-        breaking,
-        non_breaking
+    phase.finish_with_detail(
+        "Diff complete",
+        &format!("{} changes ({} breaking, {} non-breaking)", changes.len(), breaking, non_breaking),
     );
+    info!(total = changes.len(), breaking, non_breaking, "diff complete");
 
-    write_json_output(&changes, args.output.as_deref())?;
+    write_json_output(&changes, args.output.as_deref(), reporter)?;
     Ok(())
 }
 
 // ─── Analyze command (TypeScript) ───────────────────────────────────────
 
-async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
+async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span = info_span!("analyze", repo = %args.common.repo.display(), from = %args.common.from, to = %args.common.to).entered();
     let common = &args.common;
-    eprintln!(
+
+    reporter.println(&format!(
         "Analyzing {} from {} to {}",
         common.repo.display(),
         common.from,
         common.to
-    );
+    ));
     if common.no_llm {
-        eprintln!("Mode: static analysis only (--no-llm)");
+        reporter.println("Mode: static analysis only (--no-llm)");
     }
 
     let analyzer = orchestrator::Analyzer {
@@ -131,6 +187,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
             common.llm_command.as_deref(),
             None, // build_command already on TypeScript
             common.llm_all_files,
+            reporter,
         )
         .await?;
 
@@ -141,16 +198,23 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
         .filter(|c| c.is_breaking)
         .count();
     if !result.manifest_changes.is_empty() {
-        eprintln!(
-            "[TD]   {} manifest changes ({} breaking)",
+        info!(
+            total = result.manifest_changes.len(),
+            breaking = manifest_breaking,
+            "manifest changes"
+        );
+        reporter.println(&format!(
+            "  [TD] {} manifest changes ({} breaking)",
             result.manifest_changes.len(),
             manifest_breaking
-        );
+        ));
     }
 
     // Build report (includes composition changes + hierarchy enrichment)
+    let phase = reporter.start_phase("Building analysis report");
     let mut report =
         <TypeScript as Language>::build_report(&result, &common.repo, &common.from, &common.to);
+    phase.finish("Report built");
 
     // ── Infer CSS suffix renames via LLM ─────────────────────────────
     if !common.no_llm {
@@ -158,10 +222,15 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
             let (removed_suffixes, added_suffixes) =
                 konveyor::extract_suffix_inventory(&report);
             if !removed_suffixes.is_empty() && !added_suffixes.is_empty() {
-                eprintln!(
-                    "[Suffix] Extracted {} removed, {} added suffixes from token diffs",
+                let suffix_phase = reporter.start_phase(&format!(
+                    "[Suffix] Inferring CSS suffix renames ({} removed, {} added)",
                     removed_suffixes.len(),
                     added_suffixes.len()
+                ));
+                debug!(
+                    removed = removed_suffixes.len(),
+                    added = added_suffixes.len(),
+                    "extracted suffix inventory"
                 );
 
                 let suffix_result = tokio::task::spawn_blocking({
@@ -181,14 +250,11 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
 
                 match suffix_result {
                     Ok(Ok(renames)) if !renames.is_empty() => {
-                        eprintln!(
-                            "[Suffix] LLM identified {} CSS suffix renames:",
-                            renames.len()
-                        );
+                        info!(count = renames.len(), "LLM identified CSS suffix renames");
                         let suffix_map: HashMap<String, String> = renames
                             .iter()
                             .map(|r| {
-                                eprintln!("  {} → {}", r.from, r.to);
+                                debug!(from = %r.from, to = %r.to, "suffix rename");
                                 (r.from.clone(), r.to.clone())
                             })
                             .collect();
@@ -197,21 +263,25 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
                             konveyor::apply_suffix_renames(&report, &suffix_map);
 
                         if !member_renames.is_empty() {
-                            eprintln!(
-                                "[Suffix] Applied suffix mappings: {} member renames",
-                                member_renames.len()
-                            );
+                            info!(count = member_renames.len(), "applied suffix member renames");
                             report.member_renames = member_renames;
                         }
+                        suffix_phase.finish_with_detail(
+                            "[Suffix] Inference complete",
+                            &format!("{} renames", renames.len()),
+                        );
                     }
                     Ok(Ok(_)) => {
-                        eprintln!("[Suffix] LLM returned no suffix renames");
+                        info!("LLM returned no suffix renames");
+                        suffix_phase.finish("[Suffix] No renames found");
                     }
                     Ok(Err(e)) => {
-                        eprintln!("[Suffix] WARN: LLM suffix inference failed: {}", e);
+                        warn!(%e, "LLM suffix inference failed");
+                        suffix_phase.finish("[Suffix] Inference failed");
                     }
                     Err(e) => {
-                        eprintln!("[Suffix] WARN: spawn_blocking failed: {}", e);
+                        warn!(%e, "spawn_blocking failed for suffix inference");
+                        suffix_phase.finish("[Suffix] Inference failed");
                     }
                 }
             }
@@ -219,28 +289,36 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs) -> Result<()> {
     }
 
     let total_breaking = report.summary.total_breaking_changes;
-    eprintln!();
+    reporter.println("");
     if total_breaking == 0 {
-        eprintln!("No breaking changes detected.");
+        reporter.println("No breaking changes detected.");
+        info!("no breaking changes detected");
     } else {
-        eprintln!(
+        reporter.println(&format!(
             "BREAKING: {} total breaking change(s) detected.",
             total_breaking
-        );
-        eprintln!(
+        ));
+        reporter.println(&format!(
             "  {} API changes, {} behavioral changes",
             report.summary.breaking_api_changes,
             report.summary.breaking_behavioral_changes
+        ));
+        info!(
+            total = total_breaking,
+            api = report.summary.breaking_api_changes,
+            behavioral = report.summary.breaking_behavioral_changes,
+            "breaking changes detected"
         );
     }
 
-    write_json_output(&report, common.output.as_deref())?;
+    write_json_output(&report, common.output.as_deref(), reporter)?;
     Ok(())
 }
 
 // ─── Konveyor command (TypeScript) ──────────────────────────────────────
 
-async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
+async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span = info_span!("konveyor").entered();
     let common = &args.common;
 
     let mut rename_patterns = if let Some(ref path) = common.rename_patterns {
@@ -250,7 +328,8 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
     };
 
     let mut report = if let Some(ref report_path) = common.from_report {
-        eprintln!("Loading report from {}", report_path.display());
+        info!(path = %report_path.display(), "loading report from file");
+        reporter.println(&format!("Loading report from {}", report_path.display()));
         let json = read_to_string(report_path)
             .with_context(|| format!("Failed to read {}", report_path.display()))?;
         let report: AnalysisReport<TypeScript> = serde_json::from_str(&json).with_context(
@@ -271,9 +350,9 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
             .as_ref()
             .context("--to is required when --from-report is not provided")?;
 
-        eprintln!("Analyzing {} from {} to {}", repo.display(), from, to);
+        reporter.println(&format!("Analyzing {} from {} to {}", repo.display(), from, to));
         if common.no_llm {
-            eprintln!("Mode: static analysis only (--no-llm)");
+            reporter.println("Mode: static analysis only (--no-llm)");
         }
 
         let analyzer = orchestrator::Analyzer {
@@ -288,6 +367,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
                 common.llm_command.as_deref(),
                 None, // build_command already on TypeScript
                 common.llm_all_files,
+                reporter,
             )
             .await?;
 
@@ -302,18 +382,23 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
         .collect();
 
     // Analyze token members
+    let phase = reporter.start_phase("Analyzing token members");
     let (covered_symbols, mut member_renames) =
         konveyor::analyze_token_members(&report, &rename_patterns);
     for (k, v) in &report.member_renames {
         member_renames.entry(k.clone()).or_insert_with(|| v.clone());
     }
     if !covered_symbols.is_empty() {
-        eprintln!(
-            "Found {} token member keys covered by parent objects, {} member renames",
-            covered_symbols.len(),
-            member_renames.len()
+        info!(
+            covered = covered_symbols.len(),
+            renames = member_renames.len(),
+            "token member analysis"
         );
     }
+    phase.finish_with_detail(
+        "Token members analyzed",
+        &format!("{} covered, {} renames", covered_symbols.len(), member_renames.len()),
+    );
 
     // Store member renames into the report
     if !member_renames.is_empty() {
@@ -345,14 +430,15 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
             rename_patterns.add_pattern(&pat.match_regex, &pat.replace);
         }
         if !inferred.constant_patterns.is_empty() {
-            eprintln!(
-                "Merged {} LLM-inferred constant rename patterns into rename_patterns",
-                inferred.constant_patterns.len()
+            info!(
+                count = inferred.constant_patterns.len(),
+                "merged LLM-inferred constant rename patterns"
             );
         }
     }
 
     // Generate rules
+    let rule_phase = reporter.start_phase("Generating Konveyor rules");
     let raw_rules = konveyor::generate_rules(
         &report,
         &args.file_pattern,
@@ -369,10 +455,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
         filtered_rules
     } else {
         let (consolidated, _id_mapping) = konveyor::consolidate_rules(filtered_rules);
-        eprintln!(
-            "Consolidated {} rules → {} rules",
-            raw_count,
-            consolidated.len()
+        info!(
+            raw = raw_count,
+            consolidated = consolidated.len(),
+            "rule consolidation"
         );
         consolidated
     };
@@ -393,8 +479,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
     let fix_guidance =
         konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
     let rule_count = all_rules.len();
+    rule_phase.finish_with_detail("Rules generated", &format!("{} rules", rule_count));
 
     // Write output
+    let write_phase = reporter.start_phase("Writing output files");
     konveyor::write_ruleset_dir(
         &common.output_dir,
         &args.ruleset_name,
@@ -413,43 +501,52 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs) -> Result<()> {
         strategies.extend(conformance_strategies);
         konveyor::write_fix_strategies(&fix_dir, &strategies)?;
     }
+    write_phase.finish("Output written");
 
-    eprintln!(
-        "Generated {} Konveyor rules in {}",
+    // Summary
+    reporter.println(&format!(
+        "\nGenerated {} Konveyor rules in {}",
         rule_count,
         common.output_dir.display()
-    );
-    eprintln!(
+    ));
+    reporter.println(&format!(
         "  Ruleset:  {}/ruleset.yaml",
         common.output_dir.display()
-    );
-    eprintln!(
+    ));
+    reporter.println(&format!(
         "  Rules:    {}/breaking-changes.yaml",
         common.output_dir.display()
-    );
+    ));
     if !conformance_rules.is_empty() {
-        eprintln!(
+        reporter.println(&format!(
             "  Conformance: {}/conformance-rules.yaml ({} rules)",
             common.output_dir.display(),
             conformance_rules.len(),
-        );
+        ));
     }
-    eprintln!("  Fixes:    {}/fix-guidance.yaml", fix_dir.display());
-    eprintln!(
+    reporter.println(&format!("  Fixes:    {}/fix-guidance.yaml", fix_dir.display()));
+    reporter.println(&format!(
         "  Strategies: {}/fix-strategies.json ({} entries)",
         fix_dir.display(),
         strategies.len()
-    );
-    eprintln!(
+    ));
+    reporter.println(&format!(
         "  Summary:  {} auto-fixable, {} need review, {} manual only",
         fix_guidance.summary.auto_fixable,
         fix_guidance.summary.needs_review,
         fix_guidance.summary.manual_only,
-    );
-    eprintln!();
-    eprintln!(
-        "Use with: konveyor-analyzer --rules {}",
+    ));
+    reporter.println(&format!(
+        "\nUse with: konveyor-analyzer --rules {}",
         common.output_dir.display()
+    ));
+
+    info!(
+        rule_count,
+        auto_fixable = fix_guidance.summary.auto_fixable,
+        needs_review = fix_guidance.summary.needs_review,
+        manual_only = fix_guidance.summary.manual_only,
+        "konveyor generation complete"
     );
 
     Ok(())
@@ -522,12 +619,17 @@ fn count_change_types(structural_changes: &[StructuralChange]) -> ChangeTypeCoun
 
 // ─── Output helpers ─────────────────────────────────────────────────────
 
-fn write_json_output(value: &impl serde::Serialize, output: Option<&Path>) -> Result<()> {
+fn write_json_output(
+    value: &impl serde::Serialize,
+    output: Option<&Path>,
+    reporter: &ProgressReporter,
+) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     if let Some(path) = output {
-        write(path, &json)
+        std::fs::write(path, &json)
             .with_context(|| format!("Failed to write output to {}", path.display()))?;
-        eprintln!("Output written to {}", path.display());
+        reporter.println(&format!("Output written to {}", path.display()));
+        info!(path = %path.display(), "output written");
     } else {
         println!("{}", json);
     }

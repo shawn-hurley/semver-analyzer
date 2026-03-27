@@ -16,3 +16,4 @@ anyhow = "1"
 
 # Regex for JSON extraction from LLM output
 regex = "1"
+tracing = "0.1"

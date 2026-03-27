@@ -88,7 +88,7 @@ impl WorktreeGuard {
 
         // If user provided a build command, run it instead of tsc
         if let Some(cmd) = build_command {
-            eprintln!("  Running user-provided build command...");
+            tracing::info!("Running user-provided build command");
             tsc::run_project_build(&worktree_path, Some(cmd))?;
             return Ok(guard);
         }
@@ -100,8 +100,10 @@ impl WorktreeGuard {
             }
             Ok(tsc::TscOutcome::Partial { succeeded, failed }) => {
                 // Partial success — try project build for better coverage
-                eprintln!(
-                    "  tsc partial: {succeeded} succeeded, {failed} failed. Trying project build..."
+                tracing::warn!(
+                    succeeded = succeeded,
+                    failed = failed,
+                    "tsc partial success, trying project build"
                 );
                 match tsc::run_project_build(&worktree_path, None) {
                     Ok(()) => {
@@ -109,22 +111,20 @@ impl WorktreeGuard {
                     }
                     Err(e) => {
                         // Project build also failed — proceed with partial tsc output
-                        eprintln!("  Project build fallback failed: {e}");
-                        eprintln!("  Proceeding with partial tsc output ({succeeded} packages)");
+                        tracing::warn!(error = %e, succeeded = succeeded, "Project build fallback failed, proceeding with partial tsc output");
                     }
                 }
             }
             Err(e) => {
                 // Total tsc failure — try project build as last resort
-                eprintln!("  tsc failed completely: {e}");
-                eprintln!("  Trying project build as fallback...");
+                tracing::warn!(error = %e, "tsc failed completely, trying project build as fallback");
                 match tsc::run_project_build(&worktree_path, None) {
                     Ok(()) => {
                         // Project build succeeded
                     }
                     Err(build_err) => {
                         // Both tsc and project build failed
-                        eprintln!("  Project build also failed: {build_err}");
+                        tracing::warn!(error = %build_err, "Project build also failed");
                         return Err(e);
                     }
                 }
@@ -188,7 +188,7 @@ impl WorktreeGuard {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let path = entry.path();
-                eprintln!("Cleaning up stale worktree: {}", path.display());
+                tracing::info!(path = %path.display(), "Cleaning up stale worktree");
                 if remove_worktree(repo, &path).is_ok() {
                     cleaned += 1;
                 } else {
@@ -215,9 +215,10 @@ impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         if self.created {
             if let Err(e) = remove_worktree(&self.repo_root, &self.worktree_path) {
-                eprintln!(
-                    "Warning: failed to remove worktree {}: {e}",
-                    self.worktree_path.display()
+                tracing::warn!(
+                    path = %self.worktree_path.display(),
+                    error = %e,
+                    "Failed to remove worktree"
                 );
                 // Last resort: force remove the directory
                 let _ = std::fs::remove_dir_all(&self.worktree_path);

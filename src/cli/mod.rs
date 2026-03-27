@@ -1,7 +1,7 @@
 //! CLI argument parsing and command dispatch.
 
 use clap::{Parser, Subcommand};
-use semver_analyzer_core::cli::DiffArgs;
+use semver_analyzer_core::cli::{DiffArgs, LoggingArgs};
 use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 
 /// Semantic Breaking Change Analyzer
@@ -13,6 +13,32 @@ use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Extract `LoggingArgs` from whichever command variant is active.
+    pub fn logging_args(&self) -> &LoggingArgs {
+        match &self.command {
+            Command::Analyze { language } => match language {
+                AnalyzeLanguage::Typescript(args) => &args.common.logging,
+            },
+            Command::Extract { language } => match language {
+                ExtractLanguage::Typescript(args) => &args.common.logging,
+            },
+            Command::Diff(args) => &args.logging,
+            Command::Konveyor { language } => match language {
+                KonveyorLanguage::Typescript(args) => &args.common.logging,
+            },
+            Command::Serve => {
+                // Serve has no logging args yet; return a static default.
+                static DEFAULT: std::sync::OnceLock<LoggingArgs> = std::sync::OnceLock::new();
+                DEFAULT.get_or_init(|| LoggingArgs {
+                    log_file: None,
+                    log_level: "info".to_string(),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

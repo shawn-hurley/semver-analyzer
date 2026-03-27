@@ -25,6 +25,7 @@ use crate::traits::Language;
 use crate::types::{ApiSurface, BehavioralBreak, StructuralChange};
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Broadcast channel capacity. Sized for typical project API surfaces.
@@ -59,10 +60,12 @@ pub struct SharedFindings<L: Language> {
     td_broadcast_tx: broadcast::Sender<String>,
 
     /// API surface from the OLD ref (set by TD after extraction).
-    old_surface: tokio::sync::OnceCell<ApiSurface>,
+    /// Stored as `Arc` so consumers can cheaply share the surface
+    /// across concurrent tasks without deep-cloning.
+    old_surface: tokio::sync::OnceCell<Arc<ApiSurface>>,
 
     /// API surface from the NEW ref (set by TD after extraction).
-    new_surface: tokio::sync::OnceCell<ApiSurface>,
+    new_surface: tokio::sync::OnceCell<Arc<ApiSurface>>,
 }
 
 impl<L: Language> SharedFindings<L> {
@@ -100,12 +103,13 @@ impl<L: Language> SharedFindings<L> {
     }
 
     /// Set the old API surface (called by TD after extraction).
-    pub fn set_old_surface(&self, surface: ApiSurface) {
+    /// Accepts an `Arc` so the caller can retain a cheap handle.
+    pub fn set_old_surface(&self, surface: Arc<ApiSurface>) {
         let _ = self.old_surface.set(surface);
     }
 
     /// Set the new API surface (called by TD after extraction).
-    pub fn set_new_surface(&self, surface: ApiSurface) {
+    pub fn set_new_surface(&self, surface: Arc<ApiSurface>) {
         let _ = self.new_surface.set(surface);
     }
 
@@ -149,26 +153,28 @@ impl<L: Language> SharedFindings<L> {
     }
 
     /// Get the old API surface (blocks if TD hasn't set it yet).
-    pub async fn get_old_surface(&self) -> &ApiSurface {
+    pub async fn get_old_surface(&self) -> &Arc<ApiSurface> {
         self.old_surface.get_or_init(|| async {
             panic!("TD must set old_surface before BU reads it")
         }).await
     }
 
     /// Get the new API surface (blocks if TD hasn't set it yet).
-    pub async fn get_new_surface(&self) -> &ApiSurface {
+    pub async fn get_new_surface(&self) -> &Arc<ApiSurface> {
         self.new_surface.get_or_init(|| async {
             panic!("TD must set new_surface before BU reads it")
         }).await
     }
 
     /// Try to get the old surface without blocking (returns None if not set yet).
-    pub fn try_get_old_surface(&self) -> Option<&ApiSurface> {
+    /// Returns a reference to the `Arc` — clone the Arc (cheap) if you need
+    /// ownership, or borrow through it with `&**arc`.
+    pub fn try_get_old_surface(&self) -> Option<&Arc<ApiSurface>> {
         self.old_surface.get()
     }
 
     /// Try to get the new surface without blocking (returns None if not set yet).
-    pub fn try_get_new_surface(&self) -> Option<&ApiSurface> {
+    pub fn try_get_new_surface(&self) -> Option<&Arc<ApiSurface>> {
         self.new_surface.get()
     }
 
@@ -231,10 +237,9 @@ impl BuReceiver {
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                     // Channel lagged — some messages were dropped.
                     // This is fine because we also check the DashMap directly.
-                    eprintln!(
-                        "BU broadcast receiver lagged by {} messages; \
-                         falling back to DashMap checks",
-                        n
+                    tracing::warn!(
+                        lagged_messages = n,
+                        "BU broadcast receiver lagged; falling back to DashMap checks"
                     );
                     break;
                 }
@@ -415,9 +420,9 @@ mod tests {
     fn surface_set_and_get() {
         let shared: SharedFindings<TestLang> = SharedFindings::new();
 
-        let surface = ApiSurface {
+        let surface = Arc::new(ApiSurface {
             symbols: vec![],
-        };
+        });
         shared.set_old_surface(surface);
         assert!(shared.try_get_old_surface().is_some());
         assert_eq!(shared.try_get_old_surface().unwrap().symbols.len(), 0);
@@ -427,9 +432,9 @@ mod tests {
     async fn surface_async_get() {
         let shared: Arc<SharedFindings<TestLang>> = Arc::new(SharedFindings::new());
 
-        let surface = ApiSurface {
+        let surface = Arc::new(ApiSurface {
             symbols: vec![],
-        };
+        });
         shared.set_new_surface(surface);
 
         let result = shared.get_new_surface().await;

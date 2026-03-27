@@ -20,3 +20,4 @@ regex = "1"
 
 # Chrono for timestamps
 chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"

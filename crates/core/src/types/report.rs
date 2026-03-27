@@ -14,6 +14,7 @@ use crate::traits::Language;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Top-level analysis report (v2 harness format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -885,12 +886,12 @@ use super::surface::ApiSurface;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct AnalysisResult<L: Language> {
-    pub structural_changes: Vec<StructuralChange>,
+    pub structural_changes: Arc<Vec<StructuralChange>>,
     pub behavioral_changes: Vec<BehavioralChange<L>>,
     pub manifest_changes: Vec<ManifestChange<L>>,
     pub llm_api_changes: Vec<LlmApiChange>,
-    pub old_surface: ApiSurface,
-    pub new_surface: ApiSurface,
+    pub old_surface: Arc<ApiSurface>,
+    pub new_surface: Arc<ApiSurface>,
     pub inferred_rename_patterns: Option<InferredRenamePatterns>,
     pub container_changes: Vec<(String, Vec<ContainerChange>)>,
     pub hierarchy_deltas: Vec<HierarchyDelta>,

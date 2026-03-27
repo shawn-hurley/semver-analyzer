@@ -33,5 +33,13 @@ serde_yaml = "0.9"
 # Regex for CSS pattern extraction in konveyor rules
 regex = "1"
 
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Progress reporting
+indicatif = "0.17"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }

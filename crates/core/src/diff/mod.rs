@@ -255,9 +255,11 @@ pub fn diff_surfaces_with_semantics(
         // src/victory/components/) without changing its export name. The
         // consumer's import statement doesn't change, so no rule is needed.
         if rm.old.name == rm.new.name {
-            eprintln!(
-                "  [trace] Skipping no-op rename: {} (moved from {} to {})",
-                rm.old.name, rm.old.qualified_name, rm.new.qualified_name
+            tracing::trace!(
+                name = %rm.old.name,
+                from = %rm.old.qualified_name,
+                to = %rm.new.qualified_name,
+                "Skipping no-op rename (moved without export name change)"
             );
             continue;
         }

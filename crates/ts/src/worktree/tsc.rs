@@ -38,29 +38,52 @@ pub fn run_tsc_declaration(
     let tsconfig_path = worktree_dir.join("tsconfig.json");
 
     if tsconfig_path.exists() {
-        // Strategy 1: Single root tsconfig — standard case
-        run_tsc_single(worktree_dir, &tsconfig_path, git_ref)?;
-        return Ok(TscOutcome::Success);
+        if is_solution_tsconfig(&tsconfig_path) {
+            // Strategy 1a: Root tsconfig has "references" — use tsc --build
+            // which handles topological ordering of project references.
+            // This is critical for monorepos where packages depend on sibling
+            // packages (e.g., react-charts → react-core).
+            tracing::info!("Root tsconfig.json has references, using tsc --build");
+            match run_tsc_build(worktree_dir, &tsconfig_path, git_ref) {
+                Ok(()) => {
+                    tracing::info!("tsc --build succeeded");
+                    return Ok(TscOutcome::Success);
+                }
+                Err(e) => {
+                    // Solution build failed — some packages may have generated
+                    // .d.ts files before the failure. Fall through to other
+                    // strategies rather than hard-failing.
+                    tracing::warn!(
+                        error = %e,
+                        "root tsc --build failed, falling through to other strategies"
+                    );
+                }
+            }
+        } else {
+            // Strategy 1b: Standard single-project tsconfig (no references)
+            run_tsc_single(worktree_dir, &tsconfig_path, git_ref)?;
+            return Ok(TscOutcome::Success);
+        }
     }
 
-    // Strategy 2: Look for solution tsconfigs with references
+    // Strategy 2: Look for solution tsconfigs in subdirectories
+    // (packages/tsconfig.json, libs/tsconfig.json, tsconfig.build.json)
     if let Some(solution) = find_solution_tsconfig(worktree_dir) {
         let display_path = solution
             .strip_prefix(worktree_dir)
             .unwrap_or(&solution)
             .display();
-        eprintln!("  Found solution tsconfig: {display_path}");
+        tracing::info!(path = %display_path, "Found solution tsconfig");
 
         match run_tsc_build(worktree_dir, &solution, git_ref) {
             Ok(()) => {
-                eprintln!("  tsc --build succeeded");
+                tracing::info!("tsc --build succeeded");
                 return Ok(TscOutcome::Success);
             }
             Err(e) => {
                 // Solution build failed — some packages may have generated .d.ts
                 // files before the failure. Log and fall through to per-package.
-                eprintln!("  tsc --build partially failed: {e}");
-                eprintln!("  Falling back to per-package tsc...");
+                tracing::warn!(error = %e, "tsc --build partially failed, falling back to per-package tsc");
             }
         }
     }
@@ -84,7 +107,7 @@ fn run_tsc_per_package(
     tsconfigs: &[PathBuf],
     git_ref: &str,
 ) -> Result<TscOutcome, WorktreeError> {
-    eprintln!("  Running tsc for {} packages...", tsconfigs.len());
+    tracing::info!(package_count = tsconfigs.len(), "Running tsc for packages");
 
     let mut successes = 0;
     let mut failures = 0;
@@ -102,16 +125,13 @@ fn run_tsc_per_package(
             Err(e) => {
                 // Log but continue — some packages may have type errors
                 // that don't prevent declaration generation for others.
-                eprintln!("  Warning: tsc failed for package {}: {}", pkg_name, e);
+                tracing::warn!(package = %pkg_name, error = %e, "tsc failed for package");
                 failures += 1;
             }
         }
     }
 
-    eprintln!(
-        "  tsc complete: {} succeeded, {} failed",
-        successes, failures
-    );
+    tracing::info!(succeeded = successes, failed = failures, "tsc complete");
 
     if successes == 0 {
         return Err(WorktreeError::TscFailed {
@@ -205,24 +225,37 @@ pub fn run_project_build(
     worktree_dir: &Path,
     build_command: Option<&str>,
 ) -> Result<(), WorktreeError> {
+    // Determine whether we need a shell to interpret the command.
+    // Compound commands (using &&, ||, ;, |, or shell expansions) must
+    // be run through `sh -c` so the shell handles chaining and quoting.
+    let needs_shell = build_command
+        .map(|c| c.contains("&&") || c.contains("||") || c.contains(';') || c.contains('|'))
+        .unwrap_or(false);
+
     let (cmd, args) = if let Some(custom) = build_command {
-        // User-provided build command: split on whitespace
-        let parts: Vec<&str> = custom.split_whitespace().collect();
-        if parts.is_empty() {
+        if custom.trim().is_empty() {
             return Err(WorktreeError::CommandFailed(
                 "Empty build command".to_string(),
             ));
         }
-        (
-            parts[0].to_string(),
-            parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        )
+
+        if needs_shell {
+            // Run compound commands through the shell
+            ("sh".to_string(), vec!["-c".to_string(), custom.to_string()])
+        } else {
+            // Simple command: split on whitespace
+            let parts: Vec<&str> = custom.split_whitespace().collect();
+            (
+                parts[0].to_string(),
+                parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        }
     } else {
         // Auto-detect: use the package manager to run `build`
         detect_build_command(worktree_dir)?
     };
 
-    eprintln!("  Running project build: {} {} ...", cmd, args.join(" "));
+    tracing::info!(command = %cmd, args = %args.join(" "), "Running project build");
 
     let output = Command::new(&cmd)
         .args(&args)
@@ -232,7 +265,7 @@ pub fn run_project_build(
         .map_err(|e| WorktreeError::CommandFailed(format!("Failed to run {cmd}: {e}")))?;
 
     if output.status.success() {
-        eprintln!("  Project build succeeded");
+        tracing::info!("Project build succeeded");
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -417,18 +450,39 @@ fn classify_tsc_error(output: &str, git_ref: &str) -> Result<(), WorktreeError> 
     // Count errors
     let error_count = count_tsc_errors(output);
 
-    // Check for import resolution failures (missing node_modules)
-    if output.contains("Cannot find module")
-        || output.contains("Could not find a declaration file for module")
-    {
-        return Err(WorktreeError::MissingDependencies {
-            git_ref: git_ref.to_string(),
-        });
-    }
-
     // Check for project reference issues
     if output.contains("Referenced project") || output.contains("--build") {
         return Err(WorktreeError::ProjectReferencesNotBuilt);
+    }
+
+    // Check for import resolution failures.
+    // Distinguish between true missing external dependencies and workspace
+    // sibling packages that haven't been built yet. Scoped package names
+    // like @org/pkg-name that appear in "Cannot find module" errors are
+    // typically workspace siblings — they're installed (symlinked) but
+    // their .d.ts output doesn't exist until they're compiled.
+    if output.contains("Cannot find module")
+        || output.contains("Could not find a declaration file for module")
+    {
+        // Heuristic: if the missing module is a scoped package (@org/...),
+        // it's likely a workspace sibling that needs to be built first.
+        let has_workspace_module = output.lines().any(|line| {
+            (line.contains("Cannot find module")
+                || line.contains("Could not find a declaration file"))
+                && line.contains("'@")
+        });
+
+        if has_workspace_module {
+            tracing::warn!(
+                git_ref = %git_ref,
+                "tsc failed: workspace sibling packages not yet built (not a missing install)"
+            );
+            return Err(WorktreeError::ProjectReferencesNotBuilt);
+        }
+
+        return Err(WorktreeError::MissingDependencies {
+            git_ref: git_ref.to_string(),
+        });
     }
 
     // Check for syntax errors that suggest version incompatibility
@@ -567,6 +621,20 @@ src/b.ts(1,1): error TS2304: Cannot find name 'y'.
             result,
             Err(WorktreeError::ProjectReferencesNotBuilt)
         ));
+    }
+
+    #[test]
+    fn classify_workspace_sibling_as_project_references() {
+        // Scoped packages like @patternfly/react-core are workspace siblings,
+        // not truly missing external deps. Should be ProjectReferencesNotBuilt.
+        let output =
+            "src/index.ts(1,1): error TS2307: Cannot find module '@patternfly/react-core'.\n";
+        let result = classify_tsc_error(output, "v6.4.1");
+        assert!(
+            matches!(result, Err(WorktreeError::ProjectReferencesNotBuilt)),
+            "Expected ProjectReferencesNotBuilt for workspace sibling, got {:?}",
+            result
+        );
     }
 
     #[test]

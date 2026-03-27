@@ -869,18 +869,14 @@ pub fn generate_rules(
                 )
             };
 
-        eprintln!(
-            "Consolidated {} children→{} composition changes on <{}>: {} (pattern={}{})",
-            migration.child_components.len(),
-            prop,
-            parent,
-            rule_id,
-            pattern,
-            if let Some(ref p) = parent_field {
-                format!(", parent={}", p)
-            } else {
-                String::new()
-            },
+        tracing::debug!(
+            children = migration.child_components.len(),
+            prop = %prop,
+            parent = %parent,
+            rule_id = %rule_id,
+            pattern = %pattern,
+            parent_field = ?parent_field,
+            "Consolidated composition changes"
         );
 
         rules.push(KonveyorRule {
@@ -947,10 +943,10 @@ pub fn generate_rules(
     }
 
     if !covered_components.is_empty() {
-        eprintln!(
-            "P0-C coverage: {} components with {} covered prop changes",
-            covered_components.len(),
-            covered_props.len(),
+        tracing::debug!(
+            components = covered_components.len(),
+            covered_props = covered_props.len(),
+            "P0-C coverage computed"
         );
     }
 
@@ -1050,9 +1046,13 @@ pub fn generate_rules(
                         .collect();
                 }
 
-                eprintln!(
-                    "Collapsed {} {} constant rules ({}) from {} into single rule: {}",
-                    cg.count, change_type_str, strategy_name, pkg.name, rule_id,
+                tracing::debug!(
+                    count = cg.count,
+                    change_type = %change_type_str,
+                    strategy = %strategy_name,
+                    package = %pkg.name,
+                    rule_id = %rule_id,
+                    "Collapsed constant rules into single rule"
                 );
 
                 rules.push(KonveyorRule {
@@ -1096,13 +1096,13 @@ pub fn generate_rules(
 
         for (key, changes) in &collapsible_groups {
             let combined_rule = build_combined_constant_rule(key, changes, &mut id_counts);
-            eprintln!(
-                "Collapsed {} {} constant rules ({}) from {} into single rule: {}",
-                changes.len(),
-                api_change_type_label(&key.change_type),
-                key.strategy,
-                key.package,
-                combined_rule.rule_id,
+            tracing::debug!(
+                count = changes.len(),
+                change_type = %api_change_type_label(&key.change_type),
+                strategy = %key.strategy,
+                package = %key.package,
+                rule_id = %combined_rule.rule_id,
+                "Collapsed constant rules into single rule (legacy path)"
             );
             rules.push(combined_rule);
             collapsed_keys.insert((
@@ -1384,9 +1384,9 @@ pub fn generate_rules(
         .map(|d| d.component.clone())
         .collect();
     if !hierarchy_covered_components.is_empty() {
-        eprintln!(
-            "Hierarchy covers {} components — P0-C will skip those",
-            hierarchy_covered_components.len(),
+        tracing::debug!(
+            count = hierarchy_covered_components.len(),
+            "Hierarchy covers components — P0-C will skip those"
         );
     }
     {
@@ -1418,9 +1418,9 @@ pub fn generate_rules(
                     // (the hierarchy-composition rule has richer data).
                     // Components NOT in the hierarchy delta set still get P0-C rules.
                     if hierarchy_covered_components.contains(&comp.name) {
-                        eprintln!(
-                            "  Skipping P0-C for {} (covered by hierarchy delta)",
-                            comp.name,
+                        tracing::debug!(
+                            component = %comp.name,
+                            "Skipping P0-C for component (covered by hierarchy delta)"
                         );
                         continue;
                     }
@@ -1707,9 +1707,9 @@ pub fn generate_rules(
         }
 
         if !suffix_renames.is_empty() {
-            eprintln!(
-                "Generating combined CSS logical property rule with {} suffix renames",
-                suffix_renames.len()
+            tracing::debug!(
+                suffix_rename_count = suffix_renames.len(),
+                "Generating combined CSS logical property rule"
             );
 
             // Build a single pattern matching all physical property suffixes
@@ -2064,9 +2064,10 @@ pub fn generate_rules(
                         let is_mandatory = !child.absorbed_members.is_empty()
                             || composition_required_components.contains(new_component);
                         if !is_mandatory {
-                            eprintln!(
-                                "Skipping optional new-sibling rule: <{}> in <{}> (no absorbed props, not composition-required)",
-                                new_component, component_name,
+                            tracing::debug!(
+                                new_component = %new_component,
+                                parent = %component_name,
+                                "Skipping optional new-sibling rule (no absorbed props, not composition-required)"
                             );
                             continue;
                         }
@@ -2101,9 +2102,10 @@ pub fn generate_rules(
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
                         });
 
-                        eprintln!(
-                            "Detected new sibling: <{}> added alongside modified <{}> (from packages data)",
-                            new_component, component_name
+                        tracing::debug!(
+                            new_component = %new_component,
+                            parent = %component_name,
+                            "Detected new sibling from packages data"
                         );
                     }
                 }
@@ -2248,9 +2250,10 @@ pub fn generate_rules(
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
                         });
 
-                        eprintln!(
-                            "Detected new sibling: <{}> added alongside modified <{}> (behavioral evidence found)",
-                            new_component, component_name
+                        tracing::debug!(
+                            new_component = %new_component,
+                            parent = %component_name,
+                            "Detected new sibling (behavioral evidence found)"
                         );
                     }
                 }
@@ -2710,9 +2713,9 @@ pub fn generate_rules(
                 }
             }
             if deduped > 0 {
-                eprintln!(
-                    "Downgraded {} behavioral rules to Manual (covered by enriched API rules)",
-                    deduped
+                tracing::debug!(
+                    count = deduped,
+                    "Downgraded behavioral rules to Manual (covered by enriched API rules)"
                 );
             }
         }
@@ -2820,14 +2823,14 @@ pub fn generate_dependency_update_rules(
     }
 
     if !rules.is_empty() {
-        eprintln!(
-            "Generated {} dependency update rules for: {}",
-            rules.len(),
-            packages_with_changes
+        tracing::debug!(
+            count = rules.len(),
+            packages = %packages_with_changes
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            "Generated dependency update rules"
         );
     }
 
@@ -3075,7 +3078,7 @@ pub fn generate_conformance_rules(report: &AnalysisReport<TypeScript>) -> Vec<Ko
     }
 
     if !rules.is_empty() {
-        eprintln!("Generated {} conformance rules", rules.len(),);
+        tracing::debug!(count = rules.len(), "Generated conformance rules");
     }
 
     rules
@@ -3136,9 +3139,8 @@ pub fn build_package_info_cache(
     }
 
     if !cache.is_empty() {
-        eprintln!(
-            "Package info cache: {:?}",
-            cache
+        tracing::debug!(
+            entries = ?cache
                 .iter()
                 .map(|(k, v)| format!(
                     "{}: {} ({})",
@@ -3146,7 +3148,8 @@ pub fn build_package_info_cache(
                     v.name,
                     v.version.as_deref().unwrap_or("?")
                 ))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            "Package info cache built"
         );
     }
 

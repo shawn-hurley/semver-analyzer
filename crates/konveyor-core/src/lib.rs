@@ -201,27 +201,33 @@ impl RenamePatterns {
             patterns.push((re, entry.replace.clone()));
         }
 
-        eprintln!(
-            "Loaded {} rename patterns from {}",
-            patterns.len(),
-            path.display()
+        tracing::info!(
+            count = patterns.len(),
+            path = %path.display(),
+            "Loaded rename patterns"
         );
         if !file.composition_rules.is_empty() {
-            eprintln!("Loaded {} composition rules", file.composition_rules.len());
+            tracing::info!(
+                count = file.composition_rules.len(),
+                "Loaded composition rules"
+            );
         }
         if !file.prop_renames.is_empty() {
-            eprintln!("Loaded {} prop renames", file.prop_renames.len());
+            tracing::info!(count = file.prop_renames.len(), "Loaded prop renames");
         }
         if !file.value_reviews.is_empty() {
-            eprintln!("Loaded {} value reviews", file.value_reviews.len());
+            tracing::info!(count = file.value_reviews.len(), "Loaded value reviews");
         }
         if !file.missing_imports.is_empty() {
-            eprintln!("Loaded {} missing import rules", file.missing_imports.len());
+            tracing::info!(
+                count = file.missing_imports.len(),
+                "Loaded missing import rules"
+            );
         }
         if !file.component_warnings.is_empty() {
-            eprintln!(
-                "Loaded {} component warnings",
-                file.component_warnings.len()
+            tracing::info!(
+                count = file.component_warnings.len(),
+                "Loaded component warnings"
             );
         }
         Ok(Self {
@@ -254,9 +260,10 @@ impl RenamePatterns {
     pub fn add_pattern(&mut self, match_regex: &str, replace: &str) {
         match regex::Regex::new(match_regex) {
             Ok(re) => self.patterns.push((re, replace.to_string())),
-            Err(e) => eprintln!(
-                "[warn] Skipping invalid inferred pattern '{}': {}",
-                match_regex, e
+            Err(e) => tracing::warn!(
+                pattern = match_regex,
+                error = %e,
+                "Skipping invalid inferred pattern"
             ),
         }
     }
@@ -842,9 +849,9 @@ pub fn suppress_redundant_token_rules(
 
     let suppressed = before_count - rules.len();
     if suppressed > 0 {
-        eprintln!(
-            "Suppressed {} redundant token removal rules (covered by parent type_changed)",
-            suppressed
+        tracing::debug!(
+            count = suppressed,
+            "Suppressed redundant token removal rules (covered by parent type_changed)"
         );
     }
 
@@ -898,9 +905,9 @@ pub fn suppress_redundant_prop_rules(rules: Vec<KonveyorRule>) -> Vec<KonveyorRu
 
     let suppressed = before_count - rules.len();
     if suppressed > 0 {
-        eprintln!(
-            "Suppressed {} redundant prop removal rules (covered by component-import-deprecated)",
-            suppressed
+        tracing::debug!(
+            count = suppressed,
+            "Suppressed redundant prop removal rules (covered by component-import-deprecated)"
         );
     }
 
@@ -970,9 +977,9 @@ pub fn suppress_redundant_prop_value_rules(rules: Vec<KonveyorRule>) -> Vec<Konv
 
     let suppressed = before_count - rules.len();
     if suppressed > 0 {
-        eprintln!(
-            "Suppressed {} redundant prop-value-change rules (covered by type-changed)",
-            suppressed
+        tracing::debug!(
+            count = suppressed,
+            "Suppressed redundant prop-value-change rules (covered by type-changed)"
         );
     }
 

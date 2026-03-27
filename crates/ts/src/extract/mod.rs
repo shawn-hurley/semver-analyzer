@@ -69,9 +69,10 @@ impl OxcExtractor {
         if !global_imports.is_empty() {
             let from_files = global_imports.len() - types_count;
             if types_count > 0 || from_files > 0 {
-                eprintln!(
-                    "  Global import map: {} from @types/*, {} from file imports",
-                    types_count, from_files
+                tracing::debug!(
+                    from_types = types_count,
+                    from_files = from_files,
+                    "Global import map built"
                 );
             }
         }
@@ -125,7 +126,7 @@ impl OxcExtractor {
 
         if !ret.errors.is_empty() {
             for err in &ret.errors {
-                eprintln!("Parse error in {}: {err}", file_path.display());
+                tracing::warn!(file = %file_path.display(), error = %err, "Parse error in .d.ts file");
             }
         }
 
@@ -240,9 +241,9 @@ fn find_dts_files(dir: &Path) -> Result<Vec<PathBuf>> {
         files.retain(|f| !excluded.iter().any(|dir| f.starts_with(dir)));
         let removed = before - files.len();
         if removed > 0 {
-            eprintln!(
-                "  Deduplicated build outputs: removed {} redundant .d.ts files",
-                removed
+            tracing::debug!(
+                removed_count = removed,
+                "Deduplicated build outputs: removed redundant .d.ts files"
             );
         }
     }
@@ -320,11 +321,11 @@ fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> Vec<PathBuf> {
 
     let excluded = original_count - filtered.len();
     if excluded > 0 {
-        eprintln!(
-            "  Entry-point filter: {} of {} .d.ts files are reachable from index ({} internal files excluded)",
-            filtered.len(),
-            original_count,
-            excluded
+        tracing::debug!(
+            reachable = filtered.len(),
+            total = original_count,
+            excluded = excluded,
+            "Entry-point filter applied to .d.ts files"
         );
     }
 

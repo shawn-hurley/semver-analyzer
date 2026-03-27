@@ -7,12 +7,32 @@
 use clap::Args;
 use std::path::PathBuf;
 
+/// Shared logging/tracing arguments available to all commands.
+///
+/// Language crates and command structs flatten this to get consistent
+/// `--log-file` and `--log-level` flags.
+#[derive(Args, Debug, Clone)]
+pub struct LoggingArgs {
+    /// Path to a log file for debug/trace output.
+    /// When set, all tracing events at the configured level are written here.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
+
+    /// Log level filter (trace, debug, info, warn, error).
+    /// Controls file output verbosity. Stderr progress display is always shown.
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+}
+
 /// Common arguments for the `analyze` command.
 ///
 /// Language crates flatten this into their own `XxxAnalyzeArgs` struct
 /// and add language-specific flags (e.g., `--build-command` for TypeScript).
 #[derive(Args, Debug, Clone)]
 pub struct CommonAnalyzeArgs {
+    #[command(flatten)]
+    pub logging: LoggingArgs,
+
     /// Path to the git repository.
     #[arg(long)]
     pub repo: PathBuf,
@@ -54,6 +74,9 @@ pub struct CommonAnalyzeArgs {
 /// Common arguments for the `extract` command.
 #[derive(Args, Debug, Clone)]
 pub struct CommonExtractArgs {
+    #[command(flatten)]
+    pub logging: LoggingArgs,
+
     /// Path to the git repository.
     #[arg(long)]
     pub repo: PathBuf,
@@ -70,6 +93,9 @@ pub struct CommonExtractArgs {
 /// Arguments for the `diff` command (language-agnostic).
 #[derive(Args, Debug, Clone)]
 pub struct DiffArgs {
+    #[command(flatten)]
+    pub logging: LoggingArgs,
+
     /// Path to the "from" API surface JSON file.
     #[arg(long)]
     pub from: PathBuf,
@@ -86,6 +112,9 @@ pub struct DiffArgs {
 /// Common arguments for the `konveyor` command.
 #[derive(Args, Debug, Clone)]
 pub struct CommonKonveyorArgs {
+    #[command(flatten)]
+    pub logging: LoggingArgs,
+
     /// Path to a pre-existing AnalysisReport JSON file.
     /// Mutually exclusive with --repo/--from/--to.
     #[arg(long, conflicts_with_all = ["repo", "from", "to"])]

@@ -26,10 +26,12 @@ use semver_analyzer_core::{
     InferredConstantPattern, InferredInterfaceMapping, InferredRenamePatterns,
     Language, LlmApiChange, ManifestChange,
     SharedFindings, StructuralChange, StructuralChangeType,
-    Visibility,
+    Symbol, Visibility,
     diff_surfaces_with_semantics, should_skip_for_bu,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
+
+use crate::progress::ProgressReporter;
 
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,6 +39,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::{debug, error, info, info_span, trace, warn};
 
 /// Maximum concurrent LLM calls for file analysis and hierarchy inference.
 const LLM_CONCURRENCY: usize = 5;
@@ -66,103 +69,182 @@ impl<L: Language> Analyzer<L> {
         llm_command: Option<&str>,
         build_command: Option<&str>,
         llm_all_files: bool,
+        progress: &ProgressReporter,
     ) -> Result<AnalysisResult<L>> {
+    let _span = info_span!("analyze_pipeline", %from_ref, %to_ref).entered();
     let shared = Arc::new(SharedFindings::<L>::new());
+    let llm_api_entries = Arc::new(Mutex::new(Vec::<LlmApiChange>::new()));
+    let llm_cmd_default = llm_command.unwrap_or("goose run --no-session -q -t");
 
-    // Clone values for the async tasks
+    // ── Stage 1: TD + (BU Phase 1 → Phase 2) concurrently ──────────
+    //
+    // TD:  Extract API surfaces + structural diff  (blocking, slow)
+    // BU:  Phase 1 (git diff + tests, fast) then immediately starts
+    //      Phase 2 (LLM file analysis) — overlaps with TD.
+
+    // Owned clones for TD's spawn_blocking
+    let lang_td = self.lang.clone();
     let repo_td = repo.to_path_buf();
-    let repo_bu = repo.to_path_buf();
     let from_td = from_ref.to_string();
     let to_td = to_ref.to_string();
+    let build_cmd = build_command.map(|s| s.to_string());
+    let shared_td = shared.clone();
+    let progress_td = progress.clone();
+
+    // Owned clones for BU's spawn_blocking (Phase 1) and async Phase 2
+    let lang_bu = self.lang.clone();
+    let repo_bu = repo.to_path_buf();
     let from_bu = from_ref.to_string();
     let to_bu = to_ref.to_string();
-    let build_cmd = build_command.map(|s| s.to_string());
     let llm_cmd = llm_command.map(|s| s.to_string());
-    let shared_td = shared.clone();
-    let shared_bu = shared.clone();
+    let shared_bu_phase1 = shared.clone();
+    let shared_bu_phase2 = shared.clone();
+    let progress_bu_phase1 = progress.clone();
+    let progress_bu_phase2 = progress.clone();
+    let llm_api_entries_bu = llm_api_entries.clone();
 
-    // Clone Arcs for spawn_blocking closures
-    let lang_td = self.lang.clone();
-    let lang_bu = self.lang.clone();
+    // Additional clones for rename/hierarchy inference (run inside TD branch)
+    let lang_rename = self.lang.clone();
+    let lang_hierarchy = self.lang.clone();
+    let repo_hierarchy = repo.to_path_buf();
+    let from_hierarchy = from_ref.to_string();
+    let to_hierarchy = to_ref.to_string();
+    let llm_cmd_rename = llm_cmd_default.to_string();
+    let llm_cmd_hierarchy = llm_cmd_default.to_string();
+    let progress_rename = progress.clone();
+    let progress_hierarchy = progress.clone();
+    let shared_inference = shared.clone();
 
-    // Run TD and BU Phase 1 (test-based analysis) concurrently
-    let (td_result, bu_phase1_result) = tokio::join!(
-        // TD: Extract API surfaces and compute structural diff
-        tokio::task::spawn_blocking(move || {
-            Self::run_td(
-                lang_td.as_ref(),
-                &repo_td,
-                &from_td,
-                &to_td,
-                build_cmd.as_deref(),
-                &shared_td,
-            )
-        }),
-        // BU Phase 1: Parse diff, analyze tests, walk call graph (no LLM)
-        tokio::task::spawn_blocking(move || {
-            Self::run_bu_phase1(
-                lang_bu.as_ref(),
-                &repo_bu,
-                &from_bu,
-                &to_bu,
-                llm_cmd,
-                llm_all_files,
-                &shared_bu,
-            )
-        }),
+    let (td_inference_result, bu_result) = tokio::join!(
+        // TD → Rename Inference + Hierarchy Inference (chained).
+        // Rename and hierarchy start as soon as TD finishes, running
+        // concurrently with BU Phase 2 LLM calls.
+        async move {
+            // TD: blocking (extract surfaces, structural diff)
+            let td = tokio::task::spawn_blocking(move || {
+                Self::run_td(
+                    lang_td.as_ref(),
+                    &repo_td,
+                    &from_td,
+                    &to_td,
+                    build_cmd.as_deref(),
+                    &shared_td,
+                    &progress_td,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("TD task panicked: {}", e))?
+            .context("TD pipeline failed")?;
+
+            // TD done — extract surfaces for inference phases (Arc clones, cheap)
+            let default_surface = Arc::new(ApiSurface::default());
+            let old_surface = shared_inference
+                .try_get_old_surface()
+                .cloned()
+                .unwrap_or_else(|| default_surface.clone());
+            let new_surface = shared_inference
+                .try_get_new_surface()
+                .cloned()
+                .unwrap_or_else(|| default_surface.clone());
+
+            // Run rename + hierarchy concurrently (overlaps with BU Phase 2)
+            let (inferred_rename_patterns, (hierarchy_deltas, new_hierarchies)) = if !no_llm {
+                // Arc clones for rename inference's spawn_blocking
+                let changes_rename = td.structural_changes.clone();
+                let old_surf_rename = old_surface.clone();
+                let new_surf_rename = new_surface.clone();
+                let from_rename = from_hierarchy.clone();
+                let to_rename = to_hierarchy.clone();
+
+                tokio::join!(
+                    // Rename inference: sync (1-2 LLM calls)
+                    async {
+                        tokio::task::spawn_blocking(move || {
+                            let _span = info_span!("rename_inference").entered();
+                            let rename_phase = progress_rename.start_phase("Inferring rename patterns");
+                            let result = Self::infer_rename_patterns(
+                                lang_rename.as_ref(),
+                                &changes_rename,
+                                &old_surf_rename,
+                                &new_surf_rename,
+                                &llm_cmd_rename,
+                                &from_rename,
+                                &to_rename,
+                            );
+                            rename_phase.finish("Rename inference complete");
+                            result
+                        })
+                        .await
+                        .unwrap_or(None)
+                    },
+
+                    // Hierarchy inference: async (N concurrent LLM calls)
+                    Self::infer_and_diff_hierarchies(
+                        lang_hierarchy.as_ref(),
+                        &repo_hierarchy,
+                        &from_hierarchy,
+                        &to_hierarchy,
+                        &llm_cmd_hierarchy,
+                        &td.structural_changes,
+                        &old_surface,
+                        &new_surface,
+                        &progress_hierarchy,
+                    ),
+                )
+            } else {
+                (None, (Vec::new(), HashMap::new()))
+            };
+
+            Ok::<_, anyhow::Error>((td, old_surface, new_surface, inferred_rename_patterns, hierarchy_deltas, new_hierarchies))
+        },
+
+        // BU: Phase 1 → Phase 2 chained (independent of TD/inference)
+        async move {
+            // Phase 1: blocking (git diff parse, test analysis, body analysis)
+            let phase1 = tokio::task::spawn_blocking(move || {
+                Self::run_bu_phase1(
+                    lang_bu.as_ref(),
+                    &repo_bu,
+                    &from_bu,
+                    &to_bu,
+                    llm_cmd,
+                    llm_all_files,
+                    &shared_bu_phase1,
+                    &progress_bu_phase1,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("BU Phase 1 panicked: {}", e))?
+            .context("BU Phase 1 pipeline failed")?;
+
+            // Phase 2: async LLM file analysis (overlaps with TD + inference)
+            let mut llm_stats = LlmPhaseStats::default();
+            let mut container_changes: Vec<(String, Vec<ContainerChange>)> = vec![];
+
+            if !no_llm && !phase1.files_for_llm.is_empty() {
+                let (stats, comp) = Self::run_bu_phase2_llm(
+                    phase1.llm_command.as_deref(),
+                    &phase1.files_for_llm,
+                    &shared_bu_phase2,
+                    &llm_api_entries_bu,
+                    &progress_bu_phase2,
+                )
+                .await;
+                llm_stats = stats;
+                container_changes = comp;
+            }
+
+            Ok::<_, anyhow::Error>((phase1.stats, llm_stats, container_changes))
+        },
     );
 
-    // Unwrap JoinHandle results, then inner Results
-    let td = td_result
-        .map_err(|e| anyhow::anyhow!("TD task panicked: {}", e))?
-        .context("TD pipeline failed")?;
+    // Unwrap results from both branches
+    let (td, old_surface, new_surface, inferred_rename_patterns, hierarchy_deltas, new_hierarchies) =
+        td_inference_result?;
 
-    let phase1 = bu_phase1_result
-        .map_err(|e| anyhow::anyhow!("BU Phase 1 task panicked: {}", e))?
-        .context("BU Phase 1 pipeline failed")?;
+    let (phase1_stats, llm_stats, container_changes) = bu_result?;
 
-    // ── Rename Inference Phase (between TD and BU Phase 2) ─────────
-    //
-    // Uses LLM to discover systematic rename patterns for constants and
-    // interfaces. Requires TD results (structural changes) and API surfaces.
-    let empty_surface = ApiSurface::default();
-    let inferred_rename_patterns = if !no_llm {
-        let old_surf = shared.try_get_old_surface().unwrap_or(&empty_surface);
-        let new_surf = shared.try_get_new_surface().unwrap_or(&empty_surface);
-        let llm_cmd = phase1
-            .llm_command
-            .as_deref()
-            .unwrap_or("goose run --no-session -q -t");
-        Self::infer_rename_patterns(
-            self.lang.as_ref(),
-            &td.structural_changes,
-            old_surf,
-            new_surf,
-            llm_cmd,
-            from_ref,
-            to_ref,
-        )
-    } else {
-        None
-    };
-
-    // BU Phase 2: Concurrent LLM file analysis (async, 5 at a time)
-    let mut llm_stats = LlmPhaseStats::default();
-    let mut container_changes: Vec<(String, Vec<ContainerChange>)> = vec![];
-    let llm_api_entries = Arc::new(Mutex::new(Vec::<LlmApiChange>::new()));
-    if !no_llm && !phase1.files_for_llm.is_empty() {
-        let (stats, comp) = Self::run_bu_phase2_llm(
-            phase1.llm_command.as_deref(),
-            &phase1.files_for_llm,
-            &shared,
-            &llm_api_entries,
-        )
-        .await;
-        llm_stats = stats;
-        container_changes = comp;
-    }
-
-    // Merge results
+    // Merge behavioral results from both pipelines
     let behavioral_changes = Self::merge_behavioral_breaks(self.lang.as_ref(), &shared);
     let llm_api_changes = match Arc::try_unwrap(llm_api_entries) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
@@ -170,60 +252,32 @@ impl<L: Language> Analyzer<L> {
     };
 
     let bu_stats = BuStats {
-        changed_function_count: phase1.stats.changed_function_count,
-        skipped_by_td: phase1.stats.skipped_by_td,
-        test_behavioral_breaks: phase1.stats.test_behavioral_breaks,
+        changed_function_count: phase1_stats.changed_function_count,
+        skipped_by_td: phase1_stats.skipped_by_td,
+        test_behavioral_breaks: phase1_stats.test_behavioral_breaks,
         llm_behavioral_breaks: llm_stats.llm_behavioral_breaks,
         llm_calls: llm_stats.llm_calls,
-        call_graph_propagated: phase1.stats.call_graph_propagated,
+        call_graph_propagated: phase1_stats.call_graph_propagated,
     };
 
-    eprintln!(
-        "[BU]   {} skipped (TD found), {} test-based breaks, {} LLM breaks ({} calls), {} LLM API, {} propagated up",
+    info!(
+        skipped_by_td = bu_stats.skipped_by_td,
+        test_breaks = bu_stats.test_behavioral_breaks,
+        llm_breaks = bu_stats.llm_behavioral_breaks,
+        llm_calls = bu_stats.llm_calls,
+        llm_api = llm_api_changes.len(),
+        propagated = bu_stats.call_graph_propagated,
+        "BU pipeline summary"
+    );
+    progress.println(&format!(
+        "  [BU] {} skipped (TD found), {} test-based breaks, {} LLM breaks ({} calls), {} LLM API, {} propagated up",
         bu_stats.skipped_by_td,
         bu_stats.test_behavioral_breaks,
         bu_stats.llm_behavioral_breaks,
         bu_stats.llm_calls,
         llm_api_changes.len(),
         bu_stats.call_graph_propagated,
-    );
-
-    // Extract API surfaces from shared state before it's dropped.
-    // These are used by build_report() to compute component summaries.
-    let old_surface = shared
-        .try_get_old_surface()
-        .cloned()
-        .unwrap_or_else(ApiSurface::default);
-    let new_surface = shared
-        .try_get_new_surface()
-        .cloned()
-        .unwrap_or_else(ApiSurface::default);
-
-    // ── Hierarchy Inference Phase ──────────────────────────────────────
-    //
-    // Infer component hierarchy for both versions by giving the LLM each
-    // component family's source code.  Then diff the hierarchies to find
-    // structural composition changes (e.g., DropdownList became a required
-    // child of Dropdown).  This replaces P0-C's heuristic-based approach.
-    let (hierarchy_deltas, new_hierarchies) = if !no_llm {
-        let llm_cmd = phase1
-            .llm_command
-            .as_deref()
-            .unwrap_or("goose run --no-session -q -t");
-        Self::infer_and_diff_hierarchies(
-            self.lang.as_ref(),
-            repo,
-            from_ref,
-            to_ref,
-            llm_cmd,
-            &td.structural_changes,
-            &old_surface,
-            &new_surface,
-        )
-        .await
-    } else {
-        (Vec::new(), HashMap::new())
-    };
+    ));
 
     Ok(AnalysisResult {
         structural_changes: td.structural_changes,
@@ -290,7 +344,7 @@ struct LlmPhaseStats {
 // ── TD Pipeline ─────────────────────────────────────────────────────────
 
 struct TdResult<L: Language> {
-    structural_changes: Vec<StructuralChange>,
+    structural_changes: Arc<Vec<StructuralChange>>,
     manifest_changes: Vec<ManifestChange<L>>,
     #[allow(dead_code)]
     stats: TdStats,
@@ -305,37 +359,58 @@ fn run_td(
     to_ref: &str,
     _build_command: Option<&str>,
     shared: &SharedFindings<L>,
+    progress: &ProgressReporter,
 ) -> Result<TdResult<L>> {
-    // Step 1: Extract API surface at old ref
-    eprintln!("[TD] Extracting API surface at {} ...", from_ref);
-    let old_surface = lang
-        .extract(repo, from_ref)
-        .with_context(|| format!("Failed to extract API surface at ref {}", from_ref))?;
-    let old_count = old_surface.symbols.len();
-    eprintln!("[TD]   {} symbols extracted", old_count);
+    let _span = info_span!("td_pipeline", %from_ref, %to_ref).entered();
 
-    // Store in shared state so BU can access if needed
+    // Step 1: Extract API surface at old ref
+    let phase = progress.start_phase(&format!("[TD] Extracting API surface at {} ...", from_ref));
+    let old_surface = {
+        let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
+        Arc::new(lang.extract(repo, from_ref)
+            .with_context(|| format!("Failed to extract API surface at ref {}", from_ref))?)
+    };
+    let old_count = old_surface.symbols.len();
+    phase.finish_with_detail(
+        &format!("[TD] Extracted API surface at {}", from_ref),
+        &format!("{} symbols", old_count),
+    );
+    info!(symbols = old_count, git_ref = %from_ref, "old surface extracted");
+
+    // Store in shared state — Arc clone is a cheap refcount bump
     shared.set_old_surface(old_surface.clone());
 
     // Step 2: Extract API surface at new ref
-    eprintln!("[TD] Extracting API surface at {} ...", to_ref);
-    let new_surface = lang
-        .extract(repo, to_ref)
-        .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?;
+    let phase = progress.start_phase(&format!("[TD] Extracting API surface at {} ...", to_ref));
+    let new_surface = {
+        let _extract_span = info_span!("extract_surface", git_ref = %to_ref).entered();
+        Arc::new(lang.extract(repo, to_ref)
+            .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?)
+    };
     let new_count = new_surface.symbols.len();
-    eprintln!("[TD]   {} symbols extracted", new_count);
+    phase.finish_with_detail(
+        &format!("[TD] Extracted API surface at {}", to_ref),
+        &format!("{} symbols", new_count),
+    );
+    info!(symbols = new_count, git_ref = %to_ref, "new surface extracted");
 
     shared.set_new_surface(new_surface.clone());
 
     // Step 3: Structural diff (using language-specific semantics)
-    eprintln!("[TD] Computing structural diff ...");
-    let structural_changes =
-        diff_surfaces_with_semantics(&old_surface, &new_surface, lang);
+    let phase = progress.start_phase("[TD] Computing structural diff ...");
+    let structural_changes = {
+        let _diff_span = info_span!("structural_diff").entered();
+        diff_surfaces_with_semantics(&old_surface, &new_surface, lang)
+    };
     let breaking = structural_changes.iter().filter(|c| c.is_breaking).count();
-    eprintln!(
-        "[TD]   {} structural changes ({} breaking)",
-        structural_changes.len(),
-        breaking
+    phase.finish_with_detail(
+        "[TD] Structural diff complete",
+        &format!("{} changes ({} breaking)", structural_changes.len(), breaking),
+    );
+    info!(
+        total = structural_changes.len(),
+        breaking,
+        "structural diff complete"
     );
 
     // Insert all breaking changes into shared state (broadcasts to BU)
@@ -347,6 +422,7 @@ fn run_td(
     shared.insert_structural_breaks(breaking_changes);
 
     // Step 4: Manifest diff (language-specific)
+    let _manifest_span = info_span!("manifest_diff").entered();
     let mut manifest_changes = Vec::new();
     for manifest_file in L::MANIFEST_FILES {
         let old_content = read_git_file(repo, from_ref, manifest_file);
@@ -360,7 +436,7 @@ fn run_td(
     let total_changes = structural_changes.len();
 
     Ok(TdResult {
-        structural_changes,
+        structural_changes: Arc::new(structural_changes),
         manifest_changes,
         stats: TdStats {
             old_symbol_count: old_count,
@@ -384,13 +460,22 @@ fn run_bu_phase1(
     llm_command: Option<String>,
     llm_all_files: bool,
     shared: &SharedFindings<L>,
+    progress: &ProgressReporter,
 ) -> Result<BuPhase1Result> {
+    let _span = info_span!("bu_pipeline_phase1").entered();
+
     // Step 1: Parse git diff to find all changed functions
-    eprintln!("[BU] Parsing changed functions ...");
-    let changed_fns = lang
-        .parse_changed_functions(repo, from_ref, to_ref)
-        .context("Failed to parse changed functions")?;
-    eprintln!("[BU]   {} changed functions found", changed_fns.len());
+    let phase = progress.start_phase("[BU] Parsing changed functions ...");
+    let changed_fns = {
+        let _parse_span = info_span!("parse_changed_functions").entered();
+        lang.parse_changed_functions(repo, from_ref, to_ref)
+            .context("Failed to parse changed functions")?
+    };
+    phase.finish_with_detail(
+        "[BU] Parsed changed functions",
+        &format!("{} found", changed_fns.len()),
+    );
+    info!(count = changed_fns.len(), "changed functions parsed");
 
     // Subscribe to TD's broadcast channel
     let mut receiver = shared.subscribe_to_td();
@@ -405,6 +490,7 @@ fn run_bu_phase1(
     };
 
     // ── Test-based analysis (per-function, no LLM) ──────────────────
+    let _test_span = info_span!("test_analysis").entered();
     for func in &changed_fns {
         if should_skip_for_bu(
             shared,
@@ -473,10 +559,12 @@ fn run_bu_phase1(
             }
         }
     }
+    drop(_test_span);
 
     // ── Deterministic body analysis (per-function, no LLM) ──────────
     // Delegates to the language's body analyzer (e.g., JSX diff + CSS scan
     // for TypeScript) if available.
+    let _body_span = info_span!("body_analysis").entered();
     let mut body_change_count = 0;
     if let Some(body_analyzer) = lang.body_analyzer() {
         for func in &changed_fns {
@@ -525,11 +613,9 @@ fn run_bu_phase1(
     }
 
     if body_change_count > 0 {
-        eprintln!(
-            "  BU Phase 1: {} body-level changes detected deterministically",
-            body_change_count,
-        );
+        info!(count = body_change_count, "body-level changes detected deterministically");
     }
+    drop(_body_span);
 
     // ── Prepare file list for LLM Phase 2 ───────────────────────────
     let mut files_for_llm = Vec::new();
@@ -547,46 +633,49 @@ fn run_bu_phase1(
         }
 
         let unfiltered_count = by_file.len();
+        // filter_map keeps the test_diff from the filter pass so we don't
+        // fetch it twice (each fetch_test_diff spawns git subprocesses).
         let filtered: Vec<_> = by_file
             .into_iter()
-            .filter(|(path, funcs)| {
+            .filter_map(|(path, funcs)| {
                 let has_exported = funcs
                     .iter()
                     .any(|f| f.visibility == Visibility::Exported || f.visibility == Visibility::Public);
                 if !has_exported {
-                    return false;
+                    return None;
                 }
 
                 // Use language-specific exclusion rules
-                if L::should_exclude_from_analysis(Path::new(path)) {
-                    return false;
+                if L::should_exclude_from_analysis(Path::new(&path)) {
+                    return None;
                 }
 
-                if !llm_all_files {
-                    if fetch_test_diff(lang, repo, Path::new(path), from_ref, to_ref).is_none() {
-                        return false;
+                let test_diff = if !llm_all_files {
+                    let td = fetch_test_diff(lang, repo, Path::new(&path), from_ref, to_ref);
+                    if td.is_none() {
+                        return None;
                     }
-                }
+                    td
+                } else {
+                    fetch_test_diff(lang, repo, Path::new(&path), from_ref, to_ref)
+                };
 
-                true
+                Some((path, funcs, test_diff))
             })
             .collect();
 
         if llm_all_files {
-            eprintln!(
-                "[BU] LLM file-level analysis: {} files (--llm-all-files)",
-                filtered.len()
-            );
+            info!(files = filtered.len(), "LLM file-level analysis (--llm-all-files)");
         } else {
-            eprintln!(
-                "[BU] LLM file-level analysis: {} files with test changes (of {} with exported functions)",
-                filtered.len(),
-                unfiltered_count
+            info!(
+                files = filtered.len(),
+                total_with_exports = unfiltered_count,
+                "LLM file-level analysis (test-change filtered)"
             );
         }
 
         // Pre-fetch git diffs for each file
-        for (file_path, funcs) in filtered {
+        for (file_path, funcs, test_diff) in filtered {
             let diff_content = match git_diff_file(repo, from_ref, to_ref, &file_path) {
                 Some(d) => d,
                 None => continue,
@@ -598,9 +687,6 @@ fn run_bu_phase1(
 
             let owned_funcs: Vec<ChangedFunction> =
                 funcs.iter().map(|f| (*f).clone()).collect();
-
-            // Fetch associated test file diff for composition pattern detection
-            let test_diff = fetch_test_diff(lang, repo, Path::new(&file_path), from_ref, to_ref);
 
             files_for_llm.push(LlmFileTask {
                 file_path,
@@ -683,9 +769,9 @@ fn run_bu_phase1(
                 }
 
                 if extra_count > 0 {
-                    eprintln!(
-                        "[BU] + {} extra files (changed + tests changed, no function body changes)",
-                        extra_count
+                    debug!(
+                        count = extra_count,
+                        "extra files included (changed + tests changed, no function body changes)"
                     );
                 }
             }
@@ -765,11 +851,11 @@ fn infer_rename_patterns(
             continue;
         }
 
-        eprintln!(
-            "  Rename inference: {} has {} removed + {} added constants — inferring patterns",
-            pkg,
-            removed.len(),
-            added.len()
+        info!(
+            package = %pkg,
+            removed = removed.len(),
+            added = added.len(),
+            "inferring constant rename patterns"
         );
 
         // Sample using language-specific strategy
@@ -779,6 +865,7 @@ fn infer_rename_patterns(
         // Use the package name directly (already set by extractor)
         let pkg_name = pkg.to_string();
 
+        let _llm_span = info_span!("llm_constant_renames", %pkg_name).entered();
         let analyzer = LlmBehaviorAnalyzer::new(llm_command);
         match analyzer.infer_constant_renames(
             &removed_sample,
@@ -798,9 +885,10 @@ fn infer_rename_patterns(
                     let re = match Regex::new(&llm_pat.match_regex) {
                         Ok(r) => r,
                         Err(e) => {
-                            eprintln!(
-                                "    [warn] Invalid regex from LLM: '{}': {}",
-                                llm_pat.match_regex, e
+                            warn!(
+                                regex = %llm_pat.match_regex,
+                                error = %e,
+                                "invalid regex from LLM"
                             );
                             continue;
                         }
@@ -820,9 +908,11 @@ fn infer_rename_patterns(
                     }
 
                     if hits > 0 {
-                        eprintln!(
-                            "    Pattern '{}' → '{}' matched {} constants",
-                            llm_pat.match_regex, llm_pat.replace, hits
+                        debug!(
+                            pattern = %llm_pat.match_regex,
+                            replace = %llm_pat.replace,
+                            hits,
+                            "rename pattern matched"
                         );
                         total_hits += hits;
                         constant_patterns.push(InferredConstantPattern {
@@ -839,15 +929,15 @@ fn infer_rename_patterns(
                 } else {
                     0.0
                 };
-                eprintln!(
-                    "    Constant rename inference: {}/{} mapped ({:.0}%)",
-                    total_hits,
-                    total_removed,
-                    constant_hit_rate * 100.0
+                info!(
+                    mapped = total_hits,
+                    total = total_removed,
+                    hit_rate_pct = format_args!("{:.0}", constant_hit_rate * 100.0),
+                    "constant rename inference complete"
                 );
             }
             Err(e) => {
-                eprintln!("  [warn] Constant rename inference failed: {}", e);
+                warn!(%e, "constant rename inference failed");
             }
         }
     }
@@ -855,6 +945,19 @@ fn infer_rename_patterns(
     // ── Call 2: Interface/component rename mappings ───────────────
 
     let min_removed_interfaces = renames.min_removed_for_interface_inference();
+
+    // Build O(1) lookup indexes by qualified_name — avoids O(n) linear
+    // scans per structural change when the symbol lists are large.
+    let old_by_qname: HashMap<&str, &Symbol> = old_surface
+        .symbols
+        .iter()
+        .map(|s| (s.qualified_name.as_str(), s))
+        .collect();
+    let new_by_qname: HashMap<&str, &Symbol> = new_surface
+        .symbols
+        .iter()
+        .map(|s| (s.qualified_name.as_str(), s))
+        .collect();
 
     // Find removed interfaces with no migration_target
     let removed_interfaces: Vec<(&str, Vec<String>)> = structural_changes
@@ -865,11 +968,7 @@ fn infer_rename_patterns(
                 && L::RENAMEABLE_SYMBOL_KINDS.contains(&c.kind)
         })
         .filter_map(|c| {
-            // Look up member names from old surface
-            let sym = old_surface
-                .symbols
-                .iter()
-                .find(|s| s.qualified_name == c.qualified_name)?;
+            let sym = old_by_qname.get(c.qualified_name.as_str())?;
             let members: Vec<String> = sym.members.iter().map(|m| m.name.clone()).collect();
             Some((c.symbol.as_str(), members))
         })
@@ -883,20 +982,17 @@ fn infer_rename_patterns(
                 && L::RENAMEABLE_SYMBOL_KINDS.contains(&c.kind)
         })
         .filter_map(|c| {
-            let sym = new_surface
-                .symbols
-                .iter()
-                .find(|s| s.qualified_name == c.qualified_name)?;
+            let sym = new_by_qname.get(c.qualified_name.as_str())?;
             let members: Vec<String> = sym.members.iter().map(|m| m.name.clone()).collect();
             Some((c.symbol.as_str(), members))
         })
         .collect();
 
     if removed_interfaces.len() > min_removed_interfaces && !added_interfaces.is_empty() {
-        eprintln!(
-            "  Rename inference: {} removed interfaces + {} added — inferring mappings",
-            removed_interfaces.len(),
-            added_interfaces.len()
+        info!(
+            removed = removed_interfaces.len(),
+            added = added_interfaces.len(),
+            "inferring interface rename mappings"
         );
 
         // Cap to keep the prompt manageable
@@ -919,6 +1015,7 @@ fn infer_rename_patterns(
             .cloned()
             .unwrap_or_default();
 
+        let _llm_span = info_span!("llm_interface_renames").entered();
         let analyzer = LlmBehaviorAnalyzer::new(llm_command);
         match analyzer.infer_interface_renames(
             &removed_capped,
@@ -937,16 +1034,16 @@ fn infer_rename_patterns(
                 for mapping in mappings {
                     // Validate: both names must exist in the removed/added lists
                     if !removed_names.contains(mapping.old_name.as_str()) {
-                        eprintln!(
-                            "    [warn] LLM mapping old_name '{}' not in removed list, skipping",
-                            mapping.old_name
+                        warn!(
+                            old_name = %mapping.old_name,
+                            "LLM mapping old_name not in removed list, skipping"
                         );
                         continue;
                     }
                     if !added_names.contains(mapping.new_name.as_str()) {
-                        eprintln!(
-                            "    [warn] LLM mapping new_name '{}' not in added list, skipping",
-                            mapping.new_name
+                        warn!(
+                            new_name = %mapping.new_name,
+                            "LLM mapping new_name not in added list, skipping"
                         );
                         continue;
                     }
@@ -969,13 +1066,13 @@ fn infer_rename_patterns(
                         overlap as f64 / old_members.len() as f64
                     };
 
-                    eprintln!(
-                        "    Mapping '{}' → '{}' (confidence: {}, overlap: {:.0}%, reason: {})",
-                        mapping.old_name,
-                        mapping.new_name,
-                        mapping.confidence,
-                        overlap_ratio * 100.0,
-                        mapping.reason
+                    trace!(
+                        old = %mapping.old_name,
+                        new = %mapping.new_name,
+                        confidence = mapping.confidence,
+                        overlap_pct = format_args!("{:.0}", overlap_ratio * 100.0),
+                        reason = %mapping.reason,
+                        "interface rename mapping"
                     );
 
                     interface_mappings.push(InferredInterfaceMapping {
@@ -988,7 +1085,7 @@ fn infer_rename_patterns(
                 }
             }
             Err(e) => {
-                eprintln!("  [warn] Interface rename inference failed: {}", e);
+                warn!(%e, "interface rename inference failed");
             }
         }
     }
@@ -1012,12 +1109,15 @@ fn infer_rename_patterns(
 /// BU Phase 2: Concurrent LLM file analysis.
 ///
 /// Runs up to `concurrency` LLM calls in parallel using tokio tasks.
+/// Displays a progress bar showing overall completion.
     async fn run_bu_phase2_llm(
     llm_command: Option<&str>,
     files: &[LlmFileTask],
     shared: &Arc<SharedFindings<L>>,
     llm_api_entries: &Arc<Mutex<Vec<LlmApiChange>>>,
+    progress: &ProgressReporter,
 ) -> (LlmPhaseStats, Vec<(String, Vec<ContainerChange>)>) {
+    let _span = info_span!("bu_pipeline_phase2", file_count = files.len()).entered();
     let cmd = match llm_command {
         Some(c) => c.to_string(),
         None => return (LlmPhaseStats::default(), vec![]),
@@ -1028,11 +1128,11 @@ fn infer_rename_patterns(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let llm_calls = Arc::new(AtomicUsize::new(0));
     let llm_breaks = Arc::new(AtomicUsize::new(0));
-    let completed = Arc::new(AtomicUsize::new(0));
     let composition_entries: Arc<Mutex<Vec<(String, Vec<ContainerChange>)>>> =
         Arc::new(Mutex::new(Vec::new()));
 
-    eprintln!("[BU] Starting LLM analysis ({} concurrent)...", concurrency);
+    info!(total, concurrency, "starting LLM file analysis");
+    let bar = progress.start_counted("[BU] LLM Analysis", total as u64);
 
     let mut handles = Vec::with_capacity(total);
 
@@ -1043,7 +1143,6 @@ fn infer_rename_patterns(
         let calls = llm_calls.clone();
         let breaks = llm_breaks.clone();
         let comp_entries = composition_entries.clone();
-        let done = completed.clone();
         let cmd = cmd.clone();
         let file_path = task.file_path.clone();
         let diff_content = task.diff_content.clone();
@@ -1052,13 +1151,12 @@ fn infer_rename_patterns(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
-            let idx = done.fetch_add(1, Ordering::Relaxed) + 1;
-            let label = format!("[BU] [{}/{}]", idx, total);
 
-            eprintln!("{} START {}", label, file_path);
+            debug!(file = %file_path, "LLM analysis started");
 
             // Run the LLM call in a blocking task since it spawns a child process
             let result = tokio::task::spawn_blocking(move || {
+                let _llm_span = info_span!("llm_file_analysis", %file_path).entered();
                 let analyzer = LlmBehaviorAnalyzer::new(&cmd);
                 analyzer.analyze_file_diff(&file_path, &diff_content, &functions, test_diff.as_deref())
                     .map(|result| (file_path, result))
@@ -1122,19 +1220,19 @@ fn infer_rename_patterns(
                         }
                     }
 
-                    match (beh_count, api_cnt, comp_cnt) {
-                        (0, 0, 0) => eprintln!("{} DONE  (no breaks)", label),
-                        (b, 0, 0) => eprintln!("{} DONE  ({} behavioral)", label, b),
-                        (0, a, 0) => eprintln!("{} DONE  ({} API)", label, a),
-                        (b, a, 0) => eprintln!("{} DONE  ({} behavioral, {} API)", label, b, a),
-                        (b, a, c) => eprintln!("{} DONE  ({} behavioral, {} API, {} composition)", label, b, a, c),
-                    }
+                    debug!(
+                        file = %file_path,
+                        behavioral = beh_count,
+                        api = api_cnt,
+                        composition = comp_cnt,
+                        "LLM analysis complete"
+                    );
                 }
                 Ok(Err(e)) => {
-                    eprintln!("{} ERROR ({})", label, e);
+                    error!(%e, "LLM analysis error");
                 }
                 Err(e) => {
-                    eprintln!("{} PANIC ({})", label, e);
+                    error!(%e, "LLM analysis panicked");
                 }
             }
         });
@@ -1142,10 +1240,12 @@ fn infer_rename_patterns(
         handles.push(handle);
     }
 
-    // Wait for all tasks
+    // Wait for all tasks, incrementing the progress bar
     for handle in handles {
         let _ = handle.await;
+        bar.inc();
     }
+    bar.finish();
 
     let comp_results = match Arc::try_unwrap(composition_entries) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
@@ -1344,10 +1444,12 @@ async fn infer_and_diff_hierarchies(
     structural_changes: &[StructuralChange],
     old_surface: &ApiSurface,
     new_surface: &ApiSurface,
+    progress: &ProgressReporter,
 ) -> (
     Vec<HierarchyDelta>,
     HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 ) {
+    let _span = info_span!("hierarchy_inference").entered();
 
     let hierarchy = match lang.hierarchy() {
         Some(h) => h,
@@ -1357,20 +1459,25 @@ async fn infer_and_diff_hierarchies(
     // Find families to analyze: group symbols by family, filter to those with
     // breaking changes and enough components.
     let families = {
+        // O(1) lookup indexes to avoid linear scans per structural change
+        let new_by_qname: HashMap<&str, &Symbol> = new_surface
+            .symbols
+            .iter()
+            .map(|s| (s.qualified_name.as_str(), s))
+            .collect();
+        let old_by_qname: HashMap<&str, &Symbol> = old_surface
+            .symbols
+            .iter()
+            .map(|s| (s.qualified_name.as_str(), s))
+            .collect();
+
         let changed_dirs: HashSet<String> = structural_changes
             .iter()
             .filter(|c| c.is_breaking)
             .filter_map(|c| {
-                let sym = new_surface
-                    .symbols
-                    .iter()
-                    .find(|s| s.qualified_name == c.qualified_name)
-                    .or_else(|| {
-                        old_surface
-                            .symbols
-                            .iter()
-                            .find(|s| s.qualified_name == c.qualified_name)
-                    });
+                let sym = new_by_qname
+                    .get(c.qualified_name.as_str())
+                    .or_else(|| old_by_qname.get(c.qualified_name.as_str()));
                 sym.and_then(|s| {
                     hierarchy.family_name_from_symbols(&[s])
                 })
@@ -1400,7 +1507,7 @@ async fn infer_and_diff_hierarchies(
             .map(|(dir, _)| dir)
             .collect();
 
-        eprintln!("[Hierarchy] {} qualifying families", result.len());
+        info!(count = result.len(), "qualifying hierarchy families");
         result
     };
 
@@ -1436,16 +1543,16 @@ async fn infer_and_diff_hierarchies(
         }
     }
 
-    eprintln!(
-        "[Hierarchy] Analyzing {} component families for both versions ({} with cross-family context)...",
-        families.len(),
-        related_signatures.len(),
+    info!(
+        families = families.len(),
+        cross_family = related_signatures.len(),
+        "analyzing component hierarchy for both versions"
     );
+
+    let bar = progress.start_counted("[Hierarchy] Inference", families.len() as u64);
 
     // Run LLM calls concurrently
     let semaphore = Arc::new(tokio::sync::Semaphore::new(LLM_CONCURRENCY));
-    let completed = Arc::new(AtomicUsize::new(0));
-    let total = families.len();
 
     // For each family, infer hierarchy for BOTH old and new refs
     let mut handles = Vec::new();
@@ -1457,20 +1564,22 @@ async fn infer_and_diff_hierarchies(
         let new_paths = hierarchy.family_source_paths(repo, to_ref, family);
 
         let sem = semaphore.clone();
-        let done = completed.clone();
         let repo = repo.to_path_buf();
         let from_ref = from_ref.to_string();
         let to_ref = to_ref.to_string();
         let llm_cmd = llm_command.to_string();
         let family = family.clone();
         let related = related_signatures.get(&family).cloned();
+        let has_context = related.is_some();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
-            let idx = done.fetch_add(1, Ordering::Relaxed) + 1;
 
-            eprintln!("[Hierarchy] [{}/{}] {}{}", idx, total, family,
-                if related.is_some() { " (+ cross-family context)" } else { "" });
+            debug!(
+                family = %family,
+                cross_family = has_context,
+                "inferring hierarchy"
+            );
 
             let old_content = {
                 if old_paths.is_empty() {
@@ -1512,13 +1621,15 @@ async fn infer_and_diff_hierarchies(
                     let analyzer_cmd = llm_cmd.clone();
                     let family_name = family.clone();
                     move || {
+                        let _span = info_span!("llm_hierarchy", %family_name, version = "old").entered();
                         let a = LlmBehaviorAnalyzer::new(&analyzer_cmd);
                         match a.infer_component_hierarchy(&family_name, &content, None) {
                             Ok(h) => Some(h),
                             Err(e) => {
-                                eprintln!(
-                                    "[Hierarchy] WARN: {} old hierarchy failed: {}",
-                                    family_name, e
+                                warn!(
+                                    family = %family_name,
+                                    %e,
+                                    "old hierarchy inference failed"
                                 );
                                 None
                             }
@@ -1541,6 +1652,7 @@ async fn infer_and_diff_hierarchies(
                     let family_name = family.clone();
                     let related_sigs = related;
                     move || {
+                        let _span = info_span!("llm_hierarchy", %family_name, version = "new").entered();
                         let analyzer =
                             LlmBehaviorAnalyzer::new(&llm_cmd);
                         match analyzer.infer_component_hierarchy(
@@ -1550,9 +1662,10 @@ async fn infer_and_diff_hierarchies(
                         ) {
                             Ok(h) => Some(h),
                             Err(e) => {
-                                eprintln!(
-                                    "[Hierarchy] WARN: {} new hierarchy failed: {} — retrying...",
-                                    family_name, e
+                                warn!(
+                                    family = %family_name,
+                                    %e,
+                                    "new hierarchy failed, retrying"
                                 );
                                 // Retry once
                                 match analyzer.infer_component_hierarchy(
@@ -1562,9 +1675,10 @@ async fn infer_and_diff_hierarchies(
                                 ) {
                                     Ok(h) => Some(h),
                                     Err(e2) => {
-                                        eprintln!(
-                                            "[Hierarchy] WARN: {} new hierarchy retry also failed: {}",
-                                            family_name, e2
+                                        error!(
+                                            family = %family_name,
+                                            %e2,
+                                            "new hierarchy retry also failed"
                                         );
                                         None
                                     }
@@ -1597,14 +1711,18 @@ async fn infer_and_diff_hierarchies(
         if let Ok((family, old_h, new_h)) = handle.await {
             let old_count: usize = old_h.values().map(|v| v.len()).sum();
             let new_count: usize = new_h.values().map(|v| v.len()).sum();
-            eprintln!(
-                "[Hierarchy]   {}: old={} children, new={} children",
-                family, old_count, new_count
+            debug!(
+                family = %family,
+                old_children = old_count,
+                new_children = new_count,
+                "hierarchy inferred"
             );
             all_old.insert(family.clone(), old_h);
             all_new.insert(family, new_h);
         }
+        bar.inc();
     }
+    bar.finish();
 
     // Compute deltas
     let mut deltas = Vec::new();
@@ -1647,15 +1765,13 @@ async fn infer_and_diff_hierarchies(
 
     }
 
-    eprintln!(
-        "[Hierarchy] {} hierarchy deltas detected across {} families",
-        deltas.len(),
-        all_new.len()
+    info!(
+        deltas = deltas.len(),
+        families = all_new.len(),
+        "hierarchy deltas detected"
     );
 
     (deltas, all_new)
 }
 
 } // end impl Analyzer<L> (private methods, part 2)
-
-

@@ -1087,11 +1087,11 @@ fn enrich_hierarchy_deltas(
                 }
 
                 if !mapped_children.is_empty() {
-                    eprintln!(
-                        "[Hierarchy] Inferred expected_children for {} from {} extends chain: {:?}",
-                        comp.name,
-                        base_component,
-                        mapped_children.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    tracing::debug!(
+                        component = %comp.name,
+                        base = %base_component,
+                        children = ?mapped_children.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                        "Inferred expected_children from extends chain"
                     );
                     inferred.push((comp.name.clone(), mapped_children));
                     inferred_count += 1;
@@ -1115,9 +1115,9 @@ fn enrich_hierarchy_deltas(
         }
 
         if inferred_count > 0 {
-            eprintln!(
-                "[Hierarchy] Inferred expected_children for {} components via extends chain fallback",
-                inferred_count,
+            tracing::debug!(
+                count = inferred_count,
+                "Inferred expected_children via extends chain fallback"
             );
         }
     }
@@ -1130,10 +1130,10 @@ fn enrich_hierarchy_deltas(
         .iter()
         .map(|d| d.migrated_members.len())
         .sum();
-    eprintln!(
-        "[Hierarchy] Enriched {} deltas with {} migrated members, populated expected_children",
-        report.hierarchy_deltas.len(),
-        total_migrated,
+    tracing::debug!(
+        deltas = report.hierarchy_deltas.len(),
+        migrated_members = total_migrated,
+        "Enriched hierarchy deltas and populated expected_children"
     );
 }
 
@@ -1257,12 +1257,12 @@ fn collect_added_files(repo: &Path, from_ref: &str, to_ref: &str) -> Vec<PathBuf
                 })
                 .collect();
             if !files.is_empty() {
-                eprintln!("Found {} added source files between refs", files.len());
+                tracing::debug!(count = files.len(), "Found added source files between refs");
             }
             files
         }
         Err(e) => {
-            eprintln!("Warning: could not enumerate added files: {}", e);
+            tracing::warn!(error = %e, "Could not enumerate added files");
             Vec::new()
         }
     }
@@ -1389,16 +1389,17 @@ mod tests {
     use semver_analyzer_core::{
         ApiSurface, BehavioralChange, BehavioralChangeKind, Symbol, SymbolKind, Visibility,
     };
+    use std::sync::Arc;
 
     #[test]
     fn build_report_empty() {
         let results = AnalysisResult {
-            structural_changes: vec![],
+            structural_changes: Arc::new(vec![]),
             behavioral_changes: vec![],
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface: ApiSurface::default(),
-            new_surface: ApiSurface::default(),
+            old_surface: Arc::new(ApiSurface::default()),
+            new_surface: Arc::new(ApiSurface::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
             hierarchy_deltas: vec![],
@@ -1454,12 +1455,12 @@ mod tests {
         }];
 
         let results = AnalysisResult {
-            structural_changes: changes,
+            structural_changes: Arc::new(changes),
             behavioral_changes: vec![],
             manifest_changes: manifest,
             llm_api_changes: vec![],
-            old_surface: ApiSurface::default(),
-            new_surface: ApiSurface::default(),
+            old_surface: Arc::new(ApiSurface::default()),
+            new_surface: Arc::new(ApiSurface::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
             hierarchy_deltas: vec![],
@@ -1489,12 +1490,12 @@ mod tests {
         }];
 
         let results = AnalysisResult {
-            structural_changes: vec![],
+            structural_changes: Arc::new(vec![]),
             behavioral_changes: behavioral,
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface: ApiSurface::default(),
-            new_surface: ApiSurface::default(),
+            old_surface: Arc::new(ApiSurface::default()),
+            new_surface: Arc::new(ApiSurface::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
             hierarchy_deltas: vec![],
@@ -1566,12 +1567,12 @@ mod tests {
         }];
 
         let results = AnalysisResult {
-            structural_changes,
+            structural_changes: Arc::new(structural_changes),
             behavioral_changes: vec![],
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface,
-            new_surface,
+            old_surface: Arc::new(old_surface),
+            new_surface: Arc::new(new_surface),
             inferred_rename_patterns: None,
             container_changes: vec![],
             hierarchy_deltas: vec![],
@@ -1674,12 +1675,12 @@ mod tests {
         }];
 
         let results = AnalysisResult {
-            structural_changes,
+            structural_changes: Arc::new(structural_changes),
             behavioral_changes: vec![],
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface,
-            new_surface,
+            old_surface: Arc::new(old_surface),
+            new_surface: Arc::new(new_surface),
             inferred_rename_patterns: None,
             container_changes: vec![],
             hierarchy_deltas: vec![],
