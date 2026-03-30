@@ -4,6 +4,11 @@
 //! independent of internal enum variant names. This representation
 //! survives the refactoring from 37 StructuralChangeType variants
 //! to 5 + ChangeSubject.
+//!
+//! Each integration test file is compiled as a separate binary and only
+//! uses a subset of these helpers, so the compiler warns about "unused"
+//! items per-binary even though every item is used by at least one test.
+#![allow(dead_code)]
 
 use semver_analyzer_core::*;
 use semver_analyzer_ts::jsx_diff::JsxChange;
