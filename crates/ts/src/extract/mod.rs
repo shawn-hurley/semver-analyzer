@@ -98,8 +98,9 @@ impl OxcExtractor {
             let parts: Vec<&str> = path_str.split('/').collect();
             if parts.len() >= 2 && parts[0] == "packages" {
                 let dir_name = parts[1].to_string();
-                if !pkg_name_cache.contains_key(&dir_name) {
-                    let pkg_json_path = dir.join("packages").join(&dir_name).join("package.json");
+                if let std::collections::hash_map::Entry::Vacant(e) = pkg_name_cache.entry(dir_name)
+                {
+                    let pkg_json_path = dir.join("packages").join(e.key()).join("package.json");
                     let npm_name = std::fs::read_to_string(&pkg_json_path)
                         .ok()
                         .and_then(|content| {
@@ -107,7 +108,7 @@ impl OxcExtractor {
                         })
                         .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()));
                     if let Some(name) = npm_name {
-                        pkg_name_cache.insert(dir_name, name);
+                        e.insert(name);
                     }
                 }
             }
