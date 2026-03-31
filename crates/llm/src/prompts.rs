@@ -829,11 +829,14 @@ Analyze the `{family_name}` component family and determine the expected parent-c
 {files_content}{related_section}
 
 ## Rules:
-- For each **exported** component, list what other components from this family (or related components listed above) that CONSUMERS must provide as direct JSX children
+- For each **exported** component, list what other components from this family (or related components listed above) that CONSUMERS provide as direct JSX children
 - A child is "required" if the parent needs it to function, "optional" otherwise
 - CRITICAL: If a parent component WRAPS children in another component internally (e.g., `return <div><SomeWrapper>{{children}}</SomeWrapper></div>` or `{{hasWrapper ? <SomeWrapper>{{children}}</SomeWrapper> : children}}`), that wrapper is an INTERNAL implementation detail. Do NOT list it as an expected child. The consumer passes `children` to the parent and the parent handles the wrapping automatically.
 - This rule applies even if the wrapper component is exported from index.ts.
-- Only include components that consumers must explicitly add in their JSX
+- CRITICAL: If a component is received via a NAMED PROP (e.g., `header`, `icon`, `toggle`, `footer`) and rendered internally, it is NOT a direct JSX child. Set mechanism to "prop" and specify the prop name. Only set mechanism to "child" for components that consumers place directly between opening and closing JSX tags: `<Parent><Child /></Parent>`.
+  Example prop-passed: `<FormFieldGroup header={{<FormFieldGroupHeader />}} />` → mechanism: "prop", propName: "header"
+  Example child-passed: `<Modal><ModalBody>...</ModalBody></Modal>` → mechanism: "child"
+- Only include components that consumers must explicitly add in their JSX (as children or prop values)
 - Exclude: internally-rendered components, base components from other families, HTML elements, the component itself
 
 ## Output format — respond with ONLY this JSON, no other text:
@@ -842,7 +845,8 @@ Analyze the `{family_name}` component family and determine the expected parent-c
   "components": {{
     "<ComponentName>": {{
       "expected_children": [
-        {{ "name": "<ChildComponentName>", "required": true }}
+        {{ "name": "<ChildComponentName>", "required": true, "mechanism": "child" }},
+        {{ "name": "<PropPassedComponent>", "required": false, "mechanism": "prop", "propName": "header" }}
       ]
     }}
   }}

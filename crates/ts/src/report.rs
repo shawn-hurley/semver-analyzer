@@ -1101,6 +1101,8 @@ fn enrich_hierarchy_deltas(
                         mapped_children.push(ExpectedChild {
                             name: wrapper_name.to_string(),
                             required: base_child.required,
+                            mechanism: base_child.mechanism.clone(),
+                            prop_name: base_child.prop_name.clone(),
                         });
                     } else if let Some(sub_children) = comp_children.get(&base_child.name) {
                         for sub in sub_children {

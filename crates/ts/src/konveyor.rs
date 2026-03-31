@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use crate::{TsCategory, TsManifestChangeType, TypeScript};
 use semver_analyzer_core::{
     AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange,
-    ChildComponentStatus, ComponentStatus, ComponentSummary, FileChanges, ManifestChange,
-    MigratedMember, RemovalDisposition, RemovedMember,
+    ChildComponentStatus, ComponentStatus, ComponentSummary, ExpectedChild, FileChanges,
+    ManifestChange, MigratedMember, RemovalDisposition, RemovedMember,
 };
 
 // Re-export all types and functions from semver-analyzer-konveyor-core.
@@ -2225,28 +2225,31 @@ pub fn generate_rules(
         }
         msg.push_str(".\n\n");
 
-        // List ALL expected children from the full new-version hierarchy,
-        // not just delta-added ones. This ensures the rule describes the
-        // complete composition structure (e.g., Dropdown → DropdownList
-        // even if DropdownList existed in both versions).
+        // List expected children from the full new-version hierarchy,
+        // separating prop-passed components from direct JSX children,
+        // and migration-required children from recommended ones.
         let all_expected = comp_summary
             .map(|c| &c.expected_children)
             .filter(|ec| !ec.is_empty());
 
         if let Some(expected_children) = all_expected {
-            let child_names: Vec<&str> =
-                expected_children.iter().map(|c| c.name.as_str()).collect();
-            msg.push_str(&format!(
-                "The ONLY expected children of <{}> are: {}. \
-                 Replace any other children with the appropriate component listed below:\n",
-                component,
-                child_names.join(", "),
-            ));
-            for child in expected_children {
-                // Drop the required/optional distinction — in a migration
-                // context every listed child is part of the migration path.
-                // The prop instructions convey what needs to happen.
+            // Separate prop-passed components (e.g., header={<FormFieldGroupHeader />})
+            // from direct JSX children (e.g., <Modal><ModalBody>...</ModalBody></Modal>)
+            let direct_children: Vec<&ExpectedChild> = expected_children
+                .iter()
+                .filter(|c| c.mechanism != "prop")
+                .collect();
+            let prop_children: Vec<&ExpectedChild> = expected_children
+                .iter()
+                .filter(|c| c.mechanism == "prop")
+                .collect();
 
+            // For each direct child, determine if it absorbs removed props
+            // (making it migration-required) or is just a recommended wrapper.
+            let mut migration_required: Vec<(&ExpectedChild, Vec<String>)> = Vec::new();
+            let mut recommended: Vec<(&ExpectedChild, Vec<String>)> = Vec::new();
+
+            for child in &direct_children {
                 // Find props that migrated to this child
                 let child_migrated: Vec<&MigratedMember> = delta
                     .migrated_members
@@ -2273,8 +2276,6 @@ pub fn generate_rules(
                         }
                     })
                     .collect();
-
-                msg.push_str(&format!("  <{}> —", child.name));
 
                 let mut prop_instructions: Vec<String> = Vec::new();
                 let mut seen_props: BTreeSet<String> = BTreeSet::new();
@@ -2306,15 +2307,12 @@ pub fn generate_rules(
                 }
 
                 // Check if the added child has notable new (added) props from
-                // the report's API changes. This covers cases like
-                // PageToggleButton.isHamburgerButton where the child component
-                // is brand new and has no migrated/removed props — only added ones.
+                // the report's API changes.
                 for fc in &report.changes {
                     for ac in &fc.breaking_api_changes {
                         if ac.change == ApiChangeType::SignatureChanged
                             && ac.description.contains("was added")
                         {
-                            // Symbol format: "ComponentName.propName"
                             if let Some(prop_name) =
                                 ac.symbol.strip_prefix(&format!("{}.", child.name))
                             {
@@ -2351,12 +2349,80 @@ pub fn generate_rules(
                     }
                 }
 
-                if prop_instructions.is_empty() {
-                    msg.push_str(" wrap content inside this component\n");
+                // A child is migration-required only if it absorbs removed
+                // parent props. Children that merely have their own new props
+                // (add prop:) are recommended, not required.
+                let has_absorbed = prop_instructions
+                    .iter()
+                    .any(|i| !i.starts_with("add prop:") && !i.starts_with("note:"));
+                if has_absorbed {
+                    migration_required.push((child, prop_instructions));
+                } else if !prop_instructions.is_empty() {
+                    // Child has new props but didn't absorb parent props
+                    recommended.push((child, prop_instructions));
                 } else {
-                    msg.push_str(&format!(" {}\n", prop_instructions.join(", ")));
+                    recommended.push((
+                        child,
+                        vec!["wrap content inside this component".to_string()],
+                    ));
                 }
             }
+
+            // Emit migration-required children — these absorb removed props
+            if !migration_required.is_empty() {
+                let absorbed_prop_names: Vec<String> = migration_required
+                    .iter()
+                    .flat_map(|(_, instructions)| instructions.iter())
+                    .filter(|i| !i.starts_with("add prop:") && !i.starts_with("note:"))
+                    .cloned()
+                    .collect();
+                if !absorbed_prop_names.is_empty() {
+                    msg.push_str(&format!(
+                        "IF you use any of the following removed props ({}), \
+                         you MUST add the corresponding child component to absorb them:\n",
+                        absorbed_prop_names.join(", "),
+                    ));
+                } else {
+                    msg.push_str(
+                        "The following child components absorb functionality \
+                         from this component:\n",
+                    );
+                }
+                for (child, instructions) in &migration_required {
+                    msg.push_str(&format!(
+                        "  <{}> — {}\n",
+                        child.name,
+                        instructions.join(", "),
+                    ));
+                }
+                msg.push('\n');
+            }
+
+            // Emit recommended children — no removed props, just composition guidance
+            if !recommended.is_empty() {
+                let rec_names: Vec<&str> =
+                    recommended.iter().map(|(c, _)| c.name.as_str()).collect();
+                msg.push_str(&format!(
+                    "Recommended child components: {}. \
+                     These are typically used for proper layout but are not \
+                     strictly required — custom components and other content \
+                     are also valid children.\n",
+                    rec_names.join(", "),
+                ));
+            }
+
+            // Emit prop-passed components — these are NOT direct children
+            if !prop_children.is_empty() {
+                msg.push('\n');
+                for child in &prop_children {
+                    let prop = child.prop_name.as_deref().unwrap_or("(unknown prop)");
+                    msg.push_str(&format!(
+                        "Note: <{}> is passed via the `{}` prop, NOT as a direct child.\n",
+                        child.name, prop,
+                    ));
+                }
+            }
+
             msg.push('\n');
         }
 
@@ -2471,11 +2537,14 @@ pub fn generate_rules(
             msg.push('\n');
         }
 
-        // Include behavioral changes if present
+        // Include behavioral changes if present (deduplicated)
         if !behavioral_changes.is_empty() {
             msg.push_str("Behavioral changes:\n");
+            let mut seen_descriptions = BTreeSet::new();
             for bc in &behavioral_changes {
-                msg.push_str(&format!("  - {}\n", bc.description));
+                if seen_descriptions.insert(bc.description.clone()) {
+                    msg.push_str(&format!("  - {}\n", bc.description));
+                }
             }
             msg.push('\n');
         }
@@ -2531,6 +2600,40 @@ pub fn generate_rules(
             }
         }
 
+        // Build a targeted `when` clause. If we know which props were
+        // removed/migrated, trigger only on files that actually use one of
+        // those props on this component (JSX_PROP). Otherwise fall back to
+        // matching any JSX usage of the component (JSX_COMPONENT).
+        let mut trigger_props: BTreeSet<String> = BTreeSet::new();
+        for rp in &removed_props {
+            trigger_props.insert(rp.name.clone());
+        }
+        for mp in &delta.migrated_members {
+            trigger_props.insert(mp.member_name.clone());
+        }
+
+        let (location, pattern, component_filter) = if !trigger_props.is_empty() {
+            let prop_pattern = format!(
+                "^({})$",
+                trigger_props
+                    .iter()
+                    .map(|p| regex_escape(p))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+            (
+                "JSX_PROP".to_string(),
+                prop_pattern,
+                Some(format!("^{}$", regex_escape(component))),
+            )
+        } else {
+            (
+                "JSX_COMPONENT".to_string(),
+                format!("^{}$", regex_escape(component)),
+                None,
+            )
+        };
+
         rules.push(KonveyorRule {
             rule_id,
             labels: vec![
@@ -2548,9 +2651,9 @@ pub fn generate_rules(
             links: Vec::new(),
             when: KonveyorCondition::FrontendReferenced {
                 referenced: FrontendReferencedFields {
-                    pattern: format!("^{}$", regex_escape(component)),
-                    location: "IMPORT".to_string(),
-                    component: None,
+                    pattern,
+                    location,
+                    component: component_filter,
                     parent: None,
                     value: None,
                     from: from_pkg,
@@ -2938,8 +3041,24 @@ pub fn generate_conformance_rules(report: &AnalysisReport<TypeScript>) -> Vec<Ko
             let base_id = format!("conformance-{}-expected-children", sanitize_id(&comp.name),);
             let rule_id = unique_id(base_id, &mut id_counts);
 
-            let children_list: Vec<String> = comp
+            // Separate direct children from prop-passed components
+            let direct_children: Vec<&ExpectedChild> = comp
                 .expected_children
+                .iter()
+                .filter(|c| c.mechanism != "prop")
+                .collect();
+            let prop_children: Vec<&ExpectedChild> = comp
+                .expected_children
+                .iter()
+                .filter(|c| c.mechanism == "prop")
+                .collect();
+
+            // Skip if no direct children (only prop-passed components)
+            if direct_children.is_empty() && prop_children.is_empty() {
+                continue;
+            }
+
+            let children_list: Vec<String> = direct_children
                 .iter()
                 .map(|ec| {
                     let req = if ec.required {
@@ -2951,24 +3070,34 @@ pub fn generate_conformance_rules(report: &AnalysisReport<TypeScript>) -> Vec<Ko
                 })
                 .collect();
 
-            let example_children: String = comp
-                .expected_children
+            let example_children: String = direct_children
                 .iter()
                 .map(|ec| format!("    <{}> ... </{}>", ec.name, ec.name))
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let msg = format!(
-                "CONFORMANCE: <{}> expects these child components:\n{}\n\n\
-                 Review your usage to ensure child components match the expected\n\
-                 composition pattern.\n\n\
-                 Expected structure:\n  <{}>\n{}\n  </{}>",
+            let mut msg = format!(
+                "CONFORMANCE: <{}> typically uses these child components:\n{}\n\n\
+                 Review your usage. These are recommended for proper layout \
+                 but <{}> accepts any React content as children — custom \
+                 components and other content are also valid.\n\n\
+                 Typical structure:\n  <{}>\n{}\n  </{}>",
                 comp.name,
                 children_list.join("\n"),
+                comp.name,
                 comp.name,
                 example_children,
                 comp.name,
             );
+
+            // Add notes about prop-passed components
+            for pc in &prop_children {
+                let prop = pc.prop_name.as_deref().unwrap_or("(unknown prop)");
+                msg.push_str(&format!(
+                    "\n\nNote: <{}> is passed via the `{}` prop, NOT as a direct child.",
+                    pc.name, prop,
+                ));
+            }
 
             rules.push(KonveyorRule {
                 rule_id,
@@ -8943,14 +9072,8 @@ mod tests {
                 behavioral_changes: vec![],
                 child_components: vec![],
                 expected_children: vec![
-                    ExpectedChild {
-                        name: "DropdownList".to_string(),
-                        required: true,
-                    },
-                    ExpectedChild {
-                        name: "DropdownGroup".to_string(),
-                        required: false,
-                    },
+                    ExpectedChild::new("DropdownList", true),
+                    ExpectedChild::new("DropdownGroup", false),
                 ],
                 source_files: vec![],
             }],
@@ -8962,10 +9085,7 @@ mod tests {
         // and DropdownItem moved from Dropdown to DropdownList
         report.hierarchy_deltas = vec![HierarchyDelta {
             component: "Dropdown".to_string(),
-            added_children: vec![ExpectedChild {
-                name: "DropdownList".to_string(),
-                required: true,
-            }],
+            added_children: vec![ExpectedChild::new("DropdownList", true)],
             removed_children: vec!["DropdownItem".to_string()],
             migrated_members: vec![],
         }];
@@ -9012,11 +9132,11 @@ mod tests {
             "Message should mention DropdownItem was removed as direct child"
         );
 
-        // Should match on Dropdown IMPORT
+        // No removed props in this test, so should fall back to JSX_COMPONENT
         match &rule.when {
             KonveyorCondition::FrontendReferenced { referenced } => {
                 assert_eq!(referenced.pattern, "^Dropdown$");
-                assert_eq!(referenced.location, "IMPORT");
+                assert_eq!(referenced.location, "JSX_COMPONENT");
                 assert_eq!(referenced.from.as_deref(), Some("@patternfly/react-core"),);
             }
             other => panic!("Expected FrontendReferenced, got {:?}", other),
@@ -9045,18 +9165,9 @@ mod tests {
                 behavioral_changes: vec![],
                 child_components: vec![],
                 expected_children: vec![
-                    ExpectedChild {
-                        name: "ModalHeader".to_string(),
-                        required: false,
-                    },
-                    ExpectedChild {
-                        name: "ModalBody".to_string(),
-                        required: true,
-                    },
-                    ExpectedChild {
-                        name: "ModalFooter".to_string(),
-                        required: false,
-                    },
+                    ExpectedChild::new("ModalHeader", false),
+                    ExpectedChild::new("ModalBody", true),
+                    ExpectedChild::new("ModalFooter", false),
                 ],
                 source_files: vec![],
             }],
@@ -9067,18 +9178,9 @@ mod tests {
         report.hierarchy_deltas = vec![HierarchyDelta {
             component: "Modal".to_string(),
             added_children: vec![
-                ExpectedChild {
-                    name: "ModalHeader".to_string(),
-                    required: false,
-                },
-                ExpectedChild {
-                    name: "ModalBody".to_string(),
-                    required: true,
-                },
-                ExpectedChild {
-                    name: "ModalFooter".to_string(),
-                    required: false,
-                },
+                ExpectedChild::new("ModalHeader", false),
+                ExpectedChild::new("ModalBody", true),
+                ExpectedChild::new("ModalFooter", false),
             ],
             removed_children: vec![],
             migrated_members: vec![
@@ -9177,10 +9279,7 @@ mod tests {
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![],
-                expected_children: vec![ExpectedChild {
-                    name: "PageToggleButton".to_string(),
-                    required: false,
-                }],
+                expected_children: vec![ExpectedChild::new("PageToggleButton", false)],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -9233,14 +9332,8 @@ mod tests {
                 behavioral_changes: vec![],
                 child_components: vec![],
                 expected_children: vec![
-                    ExpectedChild {
-                        name: "ModalHeader".to_string(),
-                        required: false,
-                    },
-                    ExpectedChild {
-                        name: "ModalBody".to_string(),
-                        required: true,
-                    },
+                    ExpectedChild::new("ModalHeader", false),
+                    ExpectedChild::new("ModalBody", true),
                 ],
                 source_files: vec![],
             }],
@@ -9250,10 +9343,7 @@ mod tests {
         // Modal HAS a hierarchy delta — conformance should be skipped
         report.hierarchy_deltas = vec![HierarchyDelta {
             component: "Modal".to_string(),
-            added_children: vec![ExpectedChild {
-                name: "ModalHeader".to_string(),
-                required: false,
-            }],
+            added_children: vec![ExpectedChild::new("ModalHeader", false)],
             removed_children: vec![],
             migrated_members: vec![],
         }];
@@ -9441,6 +9531,371 @@ mod tests {
         assert_eq!(
             strat.strategy, "RemoveProp",
             "MovedToRelatedType should stay RemoveProp (handled by hierarchy rule)"
+        );
+    }
+
+    // ── Hierarchy rule message: classification & dedup ─────────────────
+
+    #[test]
+    fn test_hierarchy_children_with_only_new_props_are_recommended_not_required() {
+        // ToolbarGroup pattern: children have new props (gap, columnGap, etc.)
+        // but DON'T absorb any removed parent props. These should be
+        // "recommended", not "migration required".
+        let changes = vec![];
+        let mut report = make_report(changes, vec![]);
+
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![ComponentSummary {
+                name: "ToolbarGroup".to_string(),
+                definition_name: "ToolbarGroupProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary {
+                    total: 11,
+                    removed: 2,
+                    ..Default::default()
+                },
+                removed_members: vec![
+                    RemovedMember {
+                        name: "spacer".to_string(),
+                        old_type: None,
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "spaceItems".to_string(),
+                        old_type: None,
+                        removal_disposition: None,
+                    },
+                ],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild::new("ToolbarItem", false),
+                    ExpectedChild::new("ToolbarFilter", false),
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "ToolbarGroup".to_string(),
+            added_children: vec![
+                ExpectedChild::new("ToolbarItem", false),
+                ExpectedChild::new("ToolbarFilter", false),
+            ],
+            removed_children: vec![],
+            migrated_members: vec![], // No props migrated to children
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(hierarchy_rules.len(), 1);
+        let rule = hierarchy_rules[0];
+
+        // Should NOT contain "IF you use any of the following removed props"
+        // because no children absorbed parent props
+        assert!(
+            !rule.message.contains("IF you use any of the following"),
+            "Should not have migration-required section when no props are absorbed. Message:\n{}",
+            rule.message,
+        );
+
+        // Should contain "Recommended child components"
+        assert!(
+            rule.message.contains("Recommended child components"),
+            "Children with no absorbed props should be recommended. Message:\n{}",
+            rule.message,
+        );
+
+        // Should still trigger via JSX_PROP on the removed props
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(referenced.location, "JSX_PROP");
+                assert!(
+                    referenced.pattern.contains("spacer"),
+                    "Should trigger on removed props. Pattern: {}",
+                    referenced.pattern,
+                );
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hierarchy_children_absorbing_props_are_migration_required() {
+        // Modal pattern: ModalHeader absorbs title/description from Modal.
+        // ModalHeader should be migration-required, ModalBody should be recommended.
+        let changes = vec![];
+        let mut report = make_report(changes, vec![]);
+
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                definition_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild::new("ModalHeader", false),
+                    ExpectedChild::new("ModalBody", true),
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "Modal".to_string(),
+            added_children: vec![
+                ExpectedChild::new("ModalHeader", false),
+                ExpectedChild::new("ModalBody", true),
+            ],
+            removed_children: vec![],
+            migrated_members: vec![MigratedMember {
+                member_name: "title".to_string(),
+                target_child: "ModalHeader".to_string(),
+                target_member_name: None,
+            }],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(hierarchy_rules.len(), 1);
+        let rule = hierarchy_rules[0];
+
+        // Should contain migration-required section for ModalHeader
+        assert!(
+            rule.message.contains("IF you use any of the following"),
+            "Should have migration-required section for ModalHeader. Message:\n{}",
+            rule.message,
+        );
+        assert!(
+            rule.message.contains("pass title as prop"),
+            "Should mention title migration. Message:\n{}",
+            rule.message,
+        );
+
+        // ModalBody should be recommended, not required
+        assert!(
+            rule.message.contains("Recommended child components")
+                && rule.message.contains("ModalBody"),
+            "ModalBody should be in recommended section. Message:\n{}",
+            rule.message,
+        );
+    }
+
+    #[test]
+    fn test_hierarchy_behavioral_changes_are_deduplicated() {
+        // When a component has duplicate behavioral changes, the message
+        // should only include each unique description once.
+        let changes = vec![];
+        let mut report = make_report(changes, vec![]);
+
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                definition_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![
+                    make_behavioral(
+                        "Modal",
+                        Some(TsCategory::Accessibility),
+                        "aria-labelledby attribute added to <Modal>",
+                    ),
+                    make_behavioral(
+                        "Modal",
+                        Some(TsCategory::Accessibility),
+                        "aria-labelledby attribute added to <Modal>",
+                    ),
+                    make_behavioral(
+                        "Modal",
+                        Some(TsCategory::Accessibility),
+                        "aria-labelledby attribute added to <Modal>",
+                    ),
+                    make_behavioral(
+                        "Modal",
+                        Some(TsCategory::Accessibility),
+                        "aria-describedby value changed on <Modal>",
+                    ),
+                ],
+                child_components: vec![],
+                expected_children: vec![ExpectedChild::new("ModalBody", true)],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "Modal".to_string(),
+            added_children: vec![ExpectedChild::new("ModalBody", true)],
+            removed_children: vec![],
+            migrated_members: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(hierarchy_rules.len(), 1);
+        let rule = hierarchy_rules[0];
+
+        // Count occurrences of the duplicated description
+        let count = rule
+            .message
+            .matches("aria-labelledby attribute added to <Modal>")
+            .count();
+        assert_eq!(
+            count, 1,
+            "Duplicate behavioral changes should be deduplicated. Found {} occurrences in:\n{}",
+            count, rule.message,
+        );
+
+        // The unique change should still be present
+        assert!(
+            rule.message
+                .contains("aria-describedby value changed on <Modal>"),
+            "Unique behavioral changes should be preserved. Message:\n{}",
+            rule.message,
+        );
+    }
+
+    #[test]
+    fn test_hierarchy_prop_passed_children_excluded_from_direct_children() {
+        // FormFieldGroup pattern: FormFieldGroupHeader is passed via the
+        // `header` prop, not as a direct child. It should NOT appear in
+        // the migration-required or recommended sections.
+        let changes = vec![];
+        let mut report = make_report(changes, vec![]);
+
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![ComponentSummary {
+                name: "FormFieldGroup".to_string(),
+                definition_name: "FormFieldGroupProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild::new_prop("FormFieldGroupHeader", false, "header"),
+                    ExpectedChild::new("FormGroup", false),
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "FormFieldGroup".to_string(),
+            added_children: vec![ExpectedChild::new("FormGroup", false)],
+            removed_children: vec![],
+            migrated_members: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(hierarchy_rules.len(), 1);
+        let rule = hierarchy_rules[0];
+
+        // FormFieldGroupHeader should be noted as prop-passed, not as a direct child
+        assert!(
+            rule.message.contains("passed via the `header` prop"),
+            "Prop-passed components should be noted. Message:\n{}",
+            rule.message,
+        );
+
+        // FormGroup should be in recommended section
+        assert!(
+            rule.message.contains("Recommended child components")
+                && rule.message.contains("FormGroup"),
+            "Direct children should be in recommended section. Message:\n{}",
+            rule.message,
         );
     }
 }

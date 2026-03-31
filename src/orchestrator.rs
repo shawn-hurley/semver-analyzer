@@ -1161,17 +1161,39 @@ impl<L: Language> Analyzer<L> {
                 debug!(file = %file_path, "LLM analysis started");
 
                 // Run the LLM call in a blocking task since it spawns a child process
-                let result = tokio::task::spawn_blocking(move || {
-                    let _llm_span = info_span!("llm_file_analysis", %file_path).entered();
-                    let analyzer = LlmBehaviorAnalyzer::new(&cmd);
-                    analyzer
-                        .analyze_file_diff(
+                // Run with retry: if the first attempt fails (e.g., truncated
+                // JSON response), retry once before giving up.
+                let result = tokio::task::spawn_blocking({
+                    let file_path = file_path.clone();
+                    move || {
+                        let _llm_span = info_span!("llm_file_analysis", %file_path).entered();
+                        let analyzer = LlmBehaviorAnalyzer::new(&cmd);
+                        let first = analyzer.analyze_file_diff(
                             &file_path,
                             &diff_content,
                             &functions,
                             test_diff.as_deref(),
-                        )
-                        .map(|result| (file_path, result))
+                        );
+                        match first {
+                            Ok(result) => Ok((file_path, result)),
+                            Err(e) => {
+                                warn!(
+                                    file = %file_path,
+                                    %e,
+                                    "LLM analysis failed, retrying"
+                                );
+                                // Retry once
+                                analyzer
+                                    .analyze_file_diff(
+                                        &file_path,
+                                        &diff_content,
+                                        &functions,
+                                        test_diff.as_deref(),
+                                    )
+                                    .map(|result| (file_path, result))
+                            }
+                        }
+                    }
                 })
                 .await;
 
@@ -1244,7 +1266,7 @@ impl<L: Language> Analyzer<L> {
                         );
                     }
                     Ok(Err(e)) => {
-                        error!(%e, "LLM analysis error");
+                        error!(file = %file_path, %e, "LLM analysis failed after retry");
                     }
                     Err(e) => {
                         error!(%e, "LLM analysis panicked");
@@ -1775,6 +1797,8 @@ impl<L: Language> Analyzer<L> {
                     .map(|c| ExpectedChild {
                         name: c.name.clone(),
                         required: c.required,
+                        mechanism: c.mechanism.clone(),
+                        prop_name: c.prop_name.clone(),
                     })
                     .collect();
 

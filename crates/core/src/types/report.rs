@@ -513,6 +513,40 @@ pub struct ExpectedChild {
     /// Whether this child is required or optional.
     #[serde(default)]
     pub required: bool,
+    /// How this component is passed to the parent:
+    /// - "child": direct JSX child (`<Parent><Child /></Parent>`)
+    /// - "prop": via a named prop (`<Parent header={<Child />} />`)
+    #[serde(default = "default_mechanism")]
+    pub mechanism: String,
+    /// When mechanism is "prop", the name of the prop (e.g., "header").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prop_name: Option<String>,
+}
+
+fn default_mechanism() -> String {
+    "child".to_string()
+}
+
+impl ExpectedChild {
+    /// Create an ExpectedChild with mechanism="child" and no prop_name.
+    pub fn new(name: impl Into<String>, required: bool) -> Self {
+        Self {
+            name: name.into(),
+            required,
+            mechanism: "child".to_string(),
+            prop_name: None,
+        }
+    }
+
+    /// Create a prop-passed ExpectedChild.
+    pub fn new_prop(name: impl Into<String>, required: bool, prop_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            required,
+            mechanism: "prop".to_string(),
+            prop_name: Some(prop_name.into()),
+        }
+    }
 }
 
 /// A change in the component hierarchy between versions, computed by diffing
