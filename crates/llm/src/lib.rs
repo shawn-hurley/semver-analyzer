@@ -59,6 +59,25 @@ impl LlmBehaviorAnalyzer {
         self.timeout_secs = timeout_secs;
         self
     }
+
+    /// Run an LLM command with debug logging.
+    fn run_llm(&self, prompt: &str) -> Result<String> {
+        tracing::debug!(prompt_bytes = prompt.len(), "sending LLM prompt");
+        let result = invoke::run_llm_command(&self.llm_command, prompt, self.timeout_secs);
+        match &result {
+            Ok(response) => {
+                tracing::debug!(
+                    response_bytes = response.len(),
+                    response_tail = %&response[response.len().saturating_sub(200)..],
+                    "LLM response received"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(%e, "LLM command failed");
+            }
+        }
+        result
+    }
 }
 
 impl LlmBehaviorAnalyzer {
@@ -86,7 +105,7 @@ impl LlmBehaviorAnalyzer {
             changed_functions,
             test_diff,
         );
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         let (beh, api) = invoke::parse_file_behavioral_response(&response)?;
         let comp = invoke::parse_composition_from_file_response(&response).unwrap_or_default();
         Ok((beh, api, comp))
@@ -99,7 +118,7 @@ impl LlmBehaviorAnalyzer {
         diff_content: &str,
     ) -> Result<Vec<LlmCompositionChange>> {
         let prompt = prompts::build_composition_pattern_prompt(file_path, diff_content);
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_composition_pattern_response(&response)
     }
 
@@ -119,7 +138,7 @@ impl LlmBehaviorAnalyzer {
             from_ref,
             to_ref,
         );
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_constant_rename_response(&response)
     }
 
@@ -138,7 +157,7 @@ impl LlmBehaviorAnalyzer {
             files_content,
             related_components,
         );
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_hierarchy_response(&response)
     }
 
@@ -153,7 +172,7 @@ impl LlmBehaviorAnalyzer {
         added_suffixes: &[&str],
     ) -> Result<Vec<invoke::LlmSuffixRename>> {
         let prompt = prompts::build_suffix_rename_prompt(removed_suffixes, added_suffixes);
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_suffix_rename_response(&response)
     }
 
@@ -168,7 +187,7 @@ impl LlmBehaviorAnalyzer {
     ) -> Result<Vec<LlmInterfaceRenameMapping>> {
         let prompt =
             prompts::build_interface_rename_prompt(removed, added, package_name, from_ref, to_ref);
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_interface_rename_response(&response)
     }
 }
@@ -176,7 +195,7 @@ impl LlmBehaviorAnalyzer {
 impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
     fn infer_spec(&self, function_body: &str, signature: &str) -> Result<FunctionSpec> {
         let prompt = prompts::build_spec_inference_prompt(function_body, signature);
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_function_spec(&response)
     }
 
@@ -188,7 +207,7 @@ impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
     ) -> Result<FunctionSpec> {
         let prompt =
             prompts::build_spec_inference_with_test_prompt(function_body, signature, test_context);
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_function_spec(&response)
     }
 
@@ -207,7 +226,7 @@ impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
         // Tier 2: LLM fallback for notes diffs and ambiguous cases
         if !old.notes.is_empty() || !new.notes.is_empty() {
             let prompt = prompts::build_spec_comparison_prompt(old, new);
-            let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+            let response = self.run_llm(&prompt)?;
             return invoke::parse_breaking_verdict(&response);
         }
 
@@ -228,7 +247,7 @@ impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
             callee_name,
             evidence_description,
         );
-        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        let response = self.run_llm(&prompt)?;
         invoke::parse_propagation_result(&response)
     }
 }

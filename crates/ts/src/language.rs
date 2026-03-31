@@ -408,15 +408,20 @@ impl HierarchySemantics for TypeScript {
             {
                 continue;
             }
-            // Check if this file is in the family directory
+            // Check if this file is in the family directory.
+            // Exclude `next/` and `deprecated/` staging directories — these
+            // contain preview or compat copies of components that would confuse
+            // hierarchy inference by showing two versions of the same component.
+            if line.contains("/next/components/") || line.contains("/deprecated/components/") {
+                continue;
+            }
             let parts: Vec<&str> = line.rsplitn(2, '/').collect();
             if parts.len() < 2 {
                 continue;
             }
             let dir = parts[1];
             let is_family_dir = dir.ends_with(&format!("/{}", family_name))
-                || dir.ends_with(&format!("/components/{}", family_name))
-                || dir.ends_with(&format!("/next/components/{}", family_name));
+                || dir.ends_with(&format!("/components/{}", family_name));
             if is_family_dir {
                 source_files.push(line.to_string());
             }

@@ -117,6 +117,18 @@ pub struct Symbol {
     /// Child members (methods, properties, enum variants).
     /// Only populated for Class, Interface, and Enum kinds.
     pub members: Vec<Symbol>,
+
+    // -- JSX render tree (for React components) --
+    /// Components from the same package that this component renders internally
+    /// in its JSX return tree. Determined by parsing the `.tsx` source file.
+    ///
+    /// Used for hierarchy inference: components in the same family that do NOT
+    /// appear in this list are likely consumer-provided children.
+    ///
+    /// Only populated for Function/Variable/Constant symbols that represent
+    /// React components with JSX render functions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendered_components: Vec<String>,
 }
 
 impl Symbol {
@@ -147,6 +159,7 @@ impl Symbol {
             is_static: false,
             accessor_kind: None,
             members: Vec::new(),
+            rendered_components: Vec::new(),
         }
     }
 }

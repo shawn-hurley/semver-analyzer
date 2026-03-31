@@ -58,7 +58,11 @@ pub fn run_llm_command(command: &str, prompt: &str, timeout_secs: u64) -> Result
                 if stdout.trim().is_empty() {
                     anyhow::bail!("LLM command returned empty output");
                 }
-                return Ok(stdout);
+                // Goose truncates large stdout and writes the full output
+                // to a temp file, e.g.:
+                //   ... (57 more lines → /tmp/goose-xxx.txt)
+                // Detect this and read the temp file to get the full response.
+                return Ok(resolve_goose_overflow(&stdout));
             }
             Ok(None) => {
                 // Still running
@@ -73,6 +77,44 @@ pub fn run_llm_command(command: &str, prompt: &str, timeout_secs: u64) -> Result
             }
         }
     }
+}
+
+/// Goose CLI truncates large outputs to stdout and saves the full text to a
+/// temp file. The truncation marker looks like:
+///   `... (57 more lines → /var/folders/.../goose-XxYz.txt)`
+/// This function detects the marker, reads the overflow file, and reconstructs
+/// the full response by replacing the truncation line with the file contents.
+fn resolve_goose_overflow(stdout: &str) -> String {
+    // Pattern: "... (N more lines → <path>)"
+    // The marker is always on a line by itself, near the end of stdout.
+    static OVERFLOW_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\.\.\. \(\d+ more lines → (.+)\)\s*$").unwrap());
+
+    let Some(caps) = OVERFLOW_RE.captures(stdout) else {
+        return stdout.to_string();
+    };
+
+    let overflow_path = caps.get(1).unwrap().as_str();
+    let overflow_content = match std::fs::read_to_string(overflow_path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(
+                path = overflow_path,
+                %e,
+                "failed to read goose overflow file, using truncated stdout"
+            );
+            return stdout.to_string();
+        }
+    };
+
+    // The overflow file contains the FULL response (without code fences).
+    // Use it directly since it's complete.
+    tracing::debug!(
+        path = overflow_path,
+        overflow_lines = overflow_content.lines().count(),
+        "resolved goose overflow file"
+    );
+    overflow_content
 }
 
 /// Parse a `FunctionSpec` from LLM output.

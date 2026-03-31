@@ -1571,7 +1571,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
+                    rendered_components: vec![],
                 }],
+                rendered_components: vec![],
             }],
         };
 
@@ -1659,7 +1661,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
+                    rendered_components: vec![],
                 }],
+                rendered_components: vec![],
             }
         }
 
@@ -1754,6 +1758,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
+                rendered_components: vec![],
             }
         }
 
@@ -1814,6 +1819,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
+                rendered_components: vec![],
             }
         }
 
@@ -1870,6 +1876,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
+                rendered_components: vec![],
             }
         }
 
@@ -1958,6 +1965,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
+                rendered_components: vec![],
             }
         }
 
@@ -2158,7 +2166,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
+                    rendered_components: vec![],
                 }],
+                rendered_components: vec![],
             }],
         };
 
@@ -2182,6 +2192,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
+                rendered_components: vec![],
             }],
         };
 

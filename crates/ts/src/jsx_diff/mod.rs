@@ -97,6 +97,86 @@ fn extract_jsx_info(body: &str) -> JsxInfo {
     info
 }
 
+/// Extract the names of React components rendered in a function body's JSX tree.
+///
+/// Parses the function body as TSX, walks all JSX elements, and returns
+/// all uppercase tag names (React components). Lowercase tags (`div`, `span`)
+/// are HTML elements and are excluded.
+///
+/// This is the JSX language spec: uppercase tags are always component
+/// references, lowercase are always HTML elements. This is enforced by
+/// React at runtime.
+///
+/// The results are stored on the `Symbol` as raw data. Filtering against
+/// family/package exports happens later during hierarchy computation.
+pub fn extract_rendered_components(body: &str) -> Vec<String> {
+    let info = extract_jsx_info(body);
+    let mut components: Vec<String> = info
+        .element_tags
+        .keys()
+        .filter(|tag| tag.starts_with(|c: char| c.is_uppercase()))
+        .cloned()
+        .collect();
+    components.sort();
+    components
+}
+
+/// Extract internally rendered components from a full `.tsx` source file.
+///
+/// Parses the entire source file, walks all function bodies for JSX elements,
+/// and returns all uppercase tag names (React components) found in any
+/// render tree in the file.
+///
+/// This is a file-level operation -- it aggregates across all function bodies
+/// in the file. For a component file like `Dropdown.tsx`, this captures
+/// everything the component renders internally.
+pub fn extract_rendered_components_from_source(source: &str) -> Vec<String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::tsx();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+
+    let mut info = JsxInfo::default();
+    walk_statements(&parsed.program.body, source, &mut info);
+
+    let mut components: Vec<String> = info
+        .element_tags
+        .keys()
+        .filter(|tag| tag.starts_with(|c: char| c.is_uppercase()))
+        .cloned()
+        .collect();
+    components.sort();
+    components.dedup();
+    components
+}
+
+/// Walk a declaration (inner content of export statements).
+fn walk_declaration<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut JsxInfo) {
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(body) = &f.body {
+                walk_statements(&body.statements, source, info);
+            }
+        }
+        Declaration::VariableDeclaration(var_decl) => {
+            for declarator in &var_decl.declarations {
+                if let Some(init) = &declarator.init {
+                    walk_expression(init, source, info);
+                }
+            }
+        }
+        Declaration::ClassDeclaration(cls) => {
+            for item in &cls.body.body {
+                if let oxc_ast::ast::ClassElement::MethodDefinition(method) = item {
+                    if let Some(body) = &method.value.body {
+                        walk_statements(&body.statements, source, info);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Walk statements to find JSX elements.
 fn walk_statements<'a>(stmts: &'a [Statement<'a>], source: &str, info: &mut JsxInfo) {
     for stmt in stmts {
@@ -124,6 +204,17 @@ fn walk_statement<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut JsxInfo)
                 if let Some(init) = &declarator.init {
                     walk_expression(init, source, info);
                 }
+            }
+        }
+        // Handle export declarations — unwrap to the inner declaration/expression
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(decl) = &export.declaration {
+                walk_declaration(decl, source, info);
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            if let Some(expr) = export.declaration.as_expression() {
+                walk_expression(expr, source, info);
             }
         }
         Statement::IfStatement(if_stmt) => {
@@ -229,6 +320,15 @@ fn visit_jsx_element<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut JsxInf
                 } else if attr_name.starts_with("data-") {
                     info.data_attrs
                         .insert((tag_name.clone(), attr_name), attr_value);
+                }
+            }
+
+            // Walk JSX elements rendered inside attribute expressions
+            // (e.g., menu={<Menu>...</Menu>}). These are internally
+            // rendered components, not consumer-provided children.
+            if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
+                if let Some(expr) = container.expression.as_expression() {
+                    walk_expression(expr, source, info);
                 }
             }
         }
@@ -996,5 +1096,259 @@ mod tests {
         assert!(!is_css_class_name("("));
         assert!(!is_css_class_name(""));
         assert!(!is_css_class_name("x")); // too short
+    }
+
+    // ── extract_rendered_components tests ────────────────────────────
+
+    #[test]
+    fn test_rendered_components_dropdown() {
+        // Dropdown renders Menu/MenuContent internally.
+        // Consumers pass DropdownList/DropdownGroup/DropdownItem as children.
+        let body = r#"{
+            return (
+                <Menu>
+                    <MenuContent>
+                        {children}
+                    </MenuContent>
+                </Menu>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.contains(&"Menu".to_string()));
+        assert!(rendered.contains(&"MenuContent".to_string()));
+        // Consumer children are NOT in the internal render tree
+        assert!(!rendered.contains(&"DropdownList".to_string()));
+        assert!(!rendered.contains(&"DropdownItem".to_string()));
+    }
+
+    #[test]
+    fn test_rendered_components_modal() {
+        // Modal renders ModalContent internally.
+        // Consumers pass ModalHeader/ModalBody/ModalFooter as children.
+        let body = r#"{
+            return (
+                <ModalContent isOpen={isOpen} className={className}>
+                    {children}
+                </ModalContent>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.contains(&"ModalContent".to_string()));
+        assert!(!rendered.contains(&"ModalHeader".to_string()));
+        assert!(!rendered.contains(&"ModalBody".to_string()));
+        assert!(!rendered.contains(&"ModalFooter".to_string()));
+    }
+
+    #[test]
+    fn test_rendered_components_formfieldgroup_prop_passed() {
+        // FormFieldGroup renders header via a prop, not as a JSX child.
+        // Only HTML elements (div) in the render tree — no components.
+        let body = r#"{
+            return (
+                <div className={styles.formFieldGroup}>
+                    {header && header}
+                    <div className={styles.formFieldGroupBody}>
+                        {children}
+                    </div>
+                </div>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(
+            rendered.is_empty(),
+            "Expected no components, got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_rendered_components_filters_html_elements() {
+        let body = r#"{
+            return (
+                <div className="wrapper">
+                    <span>{label}</span>
+                    <Button onClick={onClick}>
+                        <Icon />
+                    </Button>
+                </div>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.contains(&"Button".to_string()));
+        assert!(rendered.contains(&"Icon".to_string()));
+        assert!(!rendered.contains(&"div".to_string()));
+        assert!(!rendered.contains(&"span".to_string()));
+    }
+
+    #[test]
+    fn test_rendered_components_conditional() {
+        let body = r#"{
+            return (
+                <div>
+                    {isLoading ? <Spinner /> : <Content>{children}</Content>}
+                </div>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.contains(&"Spinner".to_string()));
+        assert!(rendered.contains(&"Content".to_string()));
+    }
+
+    #[test]
+    fn test_rendered_components_logical_and() {
+        let body = r#"{
+            return (
+                <div>
+                    {showHeader && <PageHeader />}
+                    <PageBody>{children}</PageBody>
+                </div>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.contains(&"PageHeader".to_string()));
+        assert!(rendered.contains(&"PageBody".to_string()));
+    }
+
+    #[test]
+    fn test_rendered_components_empty_body() {
+        let body = r#"{ return null; }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn test_rendered_components_prop_expression() {
+        // Components inside prop expressions (menu={<Menu>...}) are internal
+        let body = r#"{
+            return (
+                <MenuContainer
+                    menu={
+                        <Menu ref={menuRef} onSelect={onSelectHandler}>
+                            <MenuContent>{children}</MenuContent>
+                        </Menu>
+                    }
+                    toggle={toggle}
+                    toggleRef={toggleRef}
+                >
+                </MenuContainer>
+            );
+        }"#;
+        let rendered = extract_rendered_components(body);
+        assert!(rendered.contains(&"MenuContainer".to_string()));
+        assert!(
+            rendered.contains(&"Menu".to_string()),
+            "Menu should be detected in prop expression. Rendered: {:?}",
+            rendered,
+        );
+        assert!(rendered.contains(&"MenuContent".to_string()));
+    }
+
+    // ── extract_rendered_components_from_source tests ────────────────
+
+    #[test]
+    fn test_from_source_simple_component() {
+        let source = r#"
+            import * as React from 'react';
+            import { MenuList } from '../Menu';
+
+            export const DropdownList = ({ children, className, ...props }) => (
+                <MenuList className={className} {...props}>
+                    {children}
+                </MenuList>
+            );
+        "#;
+        let rendered = extract_rendered_components_from_source(source);
+        assert!(rendered.contains(&"MenuList".to_string()));
+        assert!(!rendered.contains(&"DropdownItem".to_string()));
+    }
+
+    #[test]
+    fn test_from_source_v5_emptystate() {
+        // v5 EmptyState just passes children through — no components rendered
+        let source = r#"
+            import * as React from 'react';
+            import { css } from '@patternfly/react-styles';
+            import styles from '@patternfly/react-styles/css/components/EmptyState/empty-state';
+
+            export const EmptyState = ({ children, className, variant, isFullHeight, ...props }) => (
+                <div
+                    className={css(styles.emptyState, className)}
+                    {...props}
+                >
+                    <div className={css(styles.emptyStateContent)}>{children}</div>
+                </div>
+            );
+        "#;
+        let rendered = extract_rendered_components_from_source(source);
+        // v5 EmptyState renders no React components internally
+        assert!(
+            rendered.is_empty(),
+            "Expected no components, got: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_from_source_v6_emptystate() {
+        // v6 EmptyState renders EmptyStateHeader internally
+        let source = r#"
+            import * as React from 'react';
+            import { EmptyStateHeader } from './EmptyStateHeader';
+            import { EmptyStateFooter } from './EmptyStateFooter';
+
+            export const EmptyState = ({
+                children, className, icon, titleText, headingLevel, status, ...props
+            }) => {
+                return (
+                    <div className={className} {...props}>
+                        <div>
+                            <EmptyStateHeader icon={icon} titleText={titleText} headingLevel={headingLevel} />
+                            {children}
+                        </div>
+                    </div>
+                );
+            };
+        "#;
+        let rendered = extract_rendered_components_from_source(source);
+        assert!(
+            rendered.contains(&"EmptyStateHeader".to_string()),
+            "v6 EmptyState should render EmptyStateHeader internally. Got: {:?}",
+            rendered,
+        );
+    }
+
+    #[test]
+    fn test_from_source_hierarchy_delta() {
+        // Simulate computing hierarchy delta between v5 and v6
+        let v5_source = r#"
+            export const EmptyState = ({ children, ...props }) => (
+                <div {...props}><div>{children}</div></div>
+            );
+        "#;
+        let v6_source = r#"
+            import { EmptyStateHeader } from './EmptyStateHeader';
+            export const EmptyState = ({ children, icon, titleText, ...props }) => (
+                <div {...props}>
+                    <EmptyStateHeader icon={icon} titleText={titleText} />
+                    {children}
+                </div>
+            );
+        "#;
+
+        let v5_rendered = extract_rendered_components_from_source(v5_source);
+        let v6_rendered = extract_rendered_components_from_source(v6_source);
+
+        // v5: no components rendered internally
+        assert!(v5_rendered.is_empty());
+        // v6: EmptyStateHeader rendered internally
+        assert!(v6_rendered.contains(&"EmptyStateHeader".to_string()));
+
+        // Delta: EmptyStateHeader was ADDED to internal render tree
+        // This means it MOVED from consumer-child to internal
+        let added_internal: Vec<&String> = v6_rendered
+            .iter()
+            .filter(|c| !v5_rendered.contains(c))
+            .collect();
+        assert_eq!(added_internal, vec!["EmptyStateHeader"]);
     }
 }
