@@ -564,6 +564,18 @@ pub struct HierarchyDelta {
     /// Members removed from this type that now exist on a child type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrated_members: Vec<MigratedMember>,
+    /// The import path this delta applies to. When set, the rule should
+    /// trigger on imports from this specific path (e.g.,
+    /// `@patternfly/react-core/deprecated`). When `None`, the delta
+    /// applies to the main module import path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_package: Option<String>,
+    /// Migration target data for deprecated→main transitions. When
+    /// present, indicates this delta describes a migration from a
+    /// deprecated module to a replacement in the main module, with
+    /// prop mapping and overlap information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_target: Option<MigrationTarget>,
 }
 
 /// A member that migrated from a parent type to a child type.

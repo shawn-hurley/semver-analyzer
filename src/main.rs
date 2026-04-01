@@ -490,6 +490,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
 
     let rules = konveyor::suppress_redundant_prop_rules(rules);
     let rules = konveyor::suppress_redundant_prop_value_rules(rules);
+    let rules = konveyor::merge_duplicate_conditions(rules);
 
     let mut strategies = konveyor::extract_fix_strategies(&rules);
 
@@ -512,14 +513,15 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let fix_dir = konveyor::write_fix_guidance_dir(&common.output_dir, &fix_guidance)?;
     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
 
-    // Generate conformance rules
-    let conformance_rules = konveyor::generate_conformance_rules(&report);
-    if !conformance_rules.is_empty() {
-        let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
-        konveyor::write_conformance_rules(&common.output_dir, &conformance_rules)?;
-        strategies.extend(conformance_strategies);
-        konveyor::write_fix_strategies(&fix_dir, &strategies)?;
-    }
+    // Conformance rules are disabled for now — they add noise during
+    // the migration phase. Re-enable once migration rules are solid.
+    // let conformance_rules = konveyor::generate_conformance_rules(&report);
+    // if !conformance_rules.is_empty() {
+    //     let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
+    //     konveyor::write_conformance_rules(&common.output_dir, &conformance_rules)?;
+    //     strategies.extend(conformance_strategies);
+    //     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
+    // }
     write_phase.finish("Output written");
 
     // Summary
@@ -536,13 +538,14 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         "  Rules:    {}/breaking-changes.yaml",
         common.output_dir.display()
     ));
-    if !conformance_rules.is_empty() {
-        reporter.println(&format!(
-            "  Conformance: {}/conformance-rules.yaml ({} rules)",
-            common.output_dir.display(),
-            conformance_rules.len(),
-        ));
-    }
+    // Conformance rules disabled (see above)
+    // if !conformance_rules.is_empty() {
+    //     reporter.println(&format!(
+    //         "  Conformance: {}/conformance-rules.yaml ({} rules)",
+    //         common.output_dir.display(),
+    //         conformance_rules.len(),
+    //     ));
+    // }
     reporter.println(&format!(
         "  Fixes:    {}/fix-guidance.yaml",
         fix_dir.display()

@@ -15,9 +15,9 @@ use semver_analyzer_core::{
     ApiChangeType, ApiSurface, BehavioralChange, ChangeSubject, ChildComponent,
     ChildComponentStatus, Comparison, ComponentStatus, ComponentSummary, ConstantGroup,
     ExpectedChild, FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange,
-    ManifestChange, MemberSummary, MigratedMember, PackageChanges, RemovalDisposition,
-    RemovedMember, StructuralChange, StructuralChangeType, SuffixRename, Summary, Symbol,
-    SymbolKind, TypeChange,
+    ManifestChange, MemberSummary, MigratedMember, MigrationTarget, PackageChanges,
+    RemovalDisposition, RemovedMember, StructuralChange, StructuralChangeType, SuffixRename,
+    Summary, Symbol, SymbolKind, TypeChange,
 };
 
 use crate::TypeScript;
@@ -536,6 +536,47 @@ fn build_package_summaries(
                         None
                     }
                 })
+            })
+            // Fallback: inherit migration_target from the companion Props
+            // interface. In React/TS, component symbols (Variable/Constant)
+            // like `DropdownItem` are not processed by `detect_migrations`
+            // (which only handles Interface/Class/Enum). But the companion
+            // `DropdownItemProps` interface IS processed and may have a
+            // migration_target pointing to the replacement in the main module.
+            //
+            // This links deprecated component removals to their main module
+            // replacements without modifying the language-agnostic migration
+            // detection engine.
+            .or_else(|| {
+                let props_name = format!("{}Props", component_name);
+                top_level_changes.iter().find_map(|c| {
+                    if c.symbol == props_name && c.migration_target.is_some() {
+                        let props_target = c.migration_target.as_ref().unwrap();
+                        // Adapt the Props migration target for the component:
+                        // - replacement_symbol: strip "Props" suffix
+                        // - removed/replacement names: use component name
+                        let replacement_component = props_target
+                            .replacement_symbol
+                            .strip_suffix("Props")
+                            .unwrap_or(&props_target.replacement_symbol)
+                            .to_string();
+                        Some(MigrationTarget {
+                            removed_symbol: component_name.clone(),
+                            removed_qualified_name: old_sym.qualified_name.clone(),
+                            removed_package: props_target.removed_package.clone(),
+                            replacement_symbol: replacement_component,
+                            replacement_qualified_name: props_target
+                                .replacement_qualified_name
+                                .replace("Props", ""),
+                            replacement_package: props_target.replacement_package.clone(),
+                            matching_members: props_target.matching_members.clone(),
+                            removed_only_members: props_target.removed_only_members.clone(),
+                            overlap_ratio: props_target.overlap_ratio,
+                        })
+                    } else {
+                        None
+                    }
+                })
             });
 
         let component_behavioral: Vec<BehavioralChange<TypeScript>> = behavioral_changes
@@ -608,6 +649,34 @@ fn build_package_summaries(
     }
 
     // ── Step 5: Build constant groups ────────────────────────────────
+    //
+    // Exclude symbols that have a migration_target (either directly or via
+    // their companion Props interface). These get their own per-component
+    // rules with specific migration guidance instead of being lumped into
+    // the bulk "N constants removed" group.
+    let symbols_with_migration: HashSet<String> = {
+        // Collect symbol names that have migration_target directly
+        let mut set: HashSet<String> = structural_changes
+            .iter()
+            .filter(|c| c.migration_target.is_some())
+            .map(|c| c.symbol.clone())
+            .collect();
+
+        // Also collect component names whose companion Props has a migration_target.
+        // e.g., if DropdownItemProps has migration_target, add "DropdownItem".
+        let props_with_migration: Vec<String> = structural_changes
+            .iter()
+            .filter(|c| {
+                c.migration_target.is_some()
+                    && c.symbol.ends_with("Props")
+                    && matches!(c.kind, SymbolKind::Interface)
+            })
+            .filter_map(|c| c.symbol.strip_suffix("Props").map(|s| s.to_string()))
+            .collect();
+        set.extend(props_with_migration);
+        set
+    };
+
     let mut constant_groups: HashMap<(String, ApiChangeType), Vec<String>> = HashMap::new();
 
     for change in structural_changes {
@@ -615,6 +684,10 @@ fn build_package_summaries(
             continue;
         }
         if change.kind != SymbolKind::Constant && change.kind != SymbolKind::Variable {
+            continue;
+        }
+        // Skip symbols that have migration guidance — they get per-component rules.
+        if symbols_with_migration.contains(&change.symbol) {
             continue;
         }
         let after_file = change
@@ -1147,6 +1220,179 @@ fn enrich_hierarchy_deltas(
         }
     }
 
+    // ── Deprecated→main migration deltas ────────────────────────
+    //
+    // For component families that were removed from the deprecated module
+    // and have replacements in the main module, create hierarchy deltas
+    // that guide the migration. These deltas have `source_package` set
+    // to the deprecated import path and include:
+    // - The new composition structure (from main module expected_children)
+    // - Prop mapping (from migration_target on the companion Props interface)
+    // - Removed symbols with no replacement
+    {
+        // Collect deprecated components that have migration_target
+        let mut deprecated_families: HashMap<String, Vec<&ComponentSummary<TypeScript>>> =
+            HashMap::new();
+
+        for pkg in &report.packages {
+            for comp in &pkg.type_summaries {
+                if comp.migration_target.is_none() {
+                    continue;
+                }
+                let mt = comp.migration_target.as_ref().unwrap();
+                // Only deprecated→main: the removed qualified_name must contain /deprecated/
+                if !mt.removed_qualified_name.contains("/deprecated/") {
+                    continue;
+                }
+                // Group by family: derive from qualified_name directory
+                let family = mt
+                    .removed_qualified_name
+                    .rsplit('/')
+                    .nth(1) // Get the parent directory name (e.g., "Dropdown")
+                    .unwrap_or(&comp.name)
+                    .to_string();
+
+                deprecated_families.entry(family).or_default().push(comp);
+            }
+        }
+
+        for (family, deprecated_comps) in &deprecated_families {
+            // Find the ComponentSummary that has expected_children for
+            // the new composition structure. This is the main module's entry
+            // (or the sole entry when deprecated inherits expected_children).
+            let main_comp = report
+                .packages
+                .iter()
+                .flat_map(|pkg| &pkg.type_summaries)
+                .find(|c| c.name == *family && !c.expected_children.is_empty());
+
+            // Build added_children from the main module's expected_children
+            let new_children: Vec<ExpectedChild> = main_comp
+                .map(|mc| mc.expected_children.clone())
+                .unwrap_or_default();
+
+            // Find the best migration_target (highest overlap) for the delta
+            let best_mt = deprecated_comps
+                .iter()
+                .filter_map(|c| c.migration_target.as_ref())
+                .max_by(|a, b| {
+                    a.overlap_ratio
+                        .partial_cmp(&b.overlap_ratio)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .cloned();
+
+            // Build migrated_members from all Props migration_targets in the family
+            let mut migrated: Vec<MigratedMember> = Vec::new();
+            for comp in deprecated_comps {
+                if let Some(ref mt) = comp.migration_target {
+                    let target_name = mt
+                        .replacement_symbol
+                        .strip_suffix("Props")
+                        .unwrap_or(&mt.replacement_symbol);
+                    for mm in &mt.matching_members {
+                        migrated.push(MigratedMember {
+                            member_name: mm.old_name.clone(),
+                            target_child: target_name.to_string(),
+                            target_member_name: if mm.old_name != mm.new_name {
+                                Some(mm.new_name.clone())
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+            }
+
+            // Collect removed symbols with no replacement from the deprecated
+            // family's file changes. These are the old components (DropdownToggle,
+            // KebabToggle, DropdownSeparator, etc.) that don't exist in the new API.
+            let deprecated_dir = format!("/deprecated/components/{}/", family);
+            let mut removed_no_replacement: Vec<String> = Vec::new();
+            for fc in &report.changes {
+                let file_str = fc.file.to_string_lossy();
+                if !file_str.contains(&deprecated_dir) {
+                    continue;
+                }
+                for api in &fc.breaking_api_changes {
+                    if api.change != ApiChangeType::Removed {
+                        continue;
+                    }
+                    if api.migration_target.is_some() {
+                        continue;
+                    }
+                    // Only component-level removals (not Properties)
+                    if api.symbol.contains('.') {
+                        continue;
+                    }
+                    // Skip Props interfaces — we only want component names
+                    if api.symbol.ends_with("Props") {
+                        continue;
+                    }
+                    removed_no_replacement.push(api.symbol.clone());
+                }
+            }
+            removed_no_replacement.sort();
+            removed_no_replacement.dedup();
+
+            // Filter out symbols that exist in the new API composition tree.
+            // e.g., DropdownItem appears in DropdownList's expected_children,
+            // so it's NOT "removed with no replacement" — it's migrated to
+            // the new composition structure.
+            {
+                let mut new_api_names: HashSet<String> = HashSet::new();
+                // Collect names from all expected_children recursively
+                let mut queue: Vec<String> = new_children.iter().map(|c| c.name.clone()).collect();
+                while let Some(name) = queue.pop() {
+                    if !new_api_names.insert(name.clone()) {
+                        continue; // Already visited — prevent cycles
+                    }
+                    // Look up this component's expected_children
+                    for pkg in report.packages.iter() {
+                        for comp in &pkg.type_summaries {
+                            if comp.name == name {
+                                for ec in &comp.expected_children {
+                                    queue.push(ec.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also include the family component itself
+                new_api_names.insert(family.clone());
+
+                removed_no_replacement.retain(|name| !new_api_names.contains(name));
+            }
+
+            // Derive the deprecated import path
+            let deprecated_pkg = best_mt
+                .as_ref()
+                .and_then(|mt| mt.removed_package.as_ref())
+                .map(|pkg| format!("{}/deprecated", pkg))
+                .unwrap_or_else(|| "@patternfly/react-core/deprecated".to_string());
+
+            if !new_children.is_empty() || !removed_no_replacement.is_empty() {
+                tracing::info!(
+                    family = %family,
+                    new_children = new_children.len(),
+                    migrated_props = migrated.len(),
+                    removed_symbols = removed_no_replacement.len(),
+                    deprecated_pkg = %deprecated_pkg,
+                    "created deprecated→main hierarchy delta"
+                );
+
+                deltas.push(HierarchyDelta {
+                    component: family.clone(),
+                    added_children: new_children,
+                    removed_children: removed_no_replacement,
+                    migrated_members: migrated,
+                    source_package: Some(deprecated_pkg),
+                    migration_target: best_mt,
+                });
+            }
+        }
+    }
+
     // Store deltas on the report
     report.hierarchy_deltas = deltas;
 
@@ -1412,7 +1658,8 @@ mod tests {
     use super::*;
     use crate::TsManifestChangeType;
     use semver_analyzer_core::{
-        ApiSurface, BehavioralChange, BehavioralChangeKind, Symbol, SymbolKind, Visibility,
+        ApiSurface, BehavioralChange, BehavioralChangeKind, MemberMapping, Symbol, SymbolKind,
+        Visibility,
     };
     use std::sync::Arc;
 
@@ -2223,6 +2470,273 @@ mod tests {
         assert_eq!(
             packages[0].name, "@patternfly/react-core",
             "Package name should be the scoped npm name from Symbol.package, not the bare directory name"
+        );
+    }
+
+    // ─── Deprecated→main hierarchy delta tests ───────────────────
+
+    fn make_test_report(
+        type_summaries: Vec<ComponentSummary<TypeScript>>,
+        file_changes: Vec<FileChanges<TypeScript>>,
+    ) -> AnalysisReport<TypeScript> {
+        AnalysisReport {
+            repository: PathBuf::from("/tmp/repo"),
+            comparison: semver_analyzer_core::Comparison {
+                from_ref: "v5.0.0".to_string(),
+                to_ref: "v6.0.0".to_string(),
+                from_sha: "aaa".to_string(),
+                to_sha: "bbb".to_string(),
+                commit_count: 1,
+                analysis_timestamp: "now".to_string(),
+            },
+            summary: semver_analyzer_core::Summary {
+                total_breaking_changes: 0,
+                breaking_api_changes: 0,
+                breaking_behavioral_changes: 0,
+                files_with_breaking_changes: 0,
+            },
+            changes: file_changes,
+            packages: vec![semver_analyzer_core::PackageChanges {
+                name: "@patternfly/react-core".to_string(),
+                old_version: None,
+                new_version: None,
+                type_summaries,
+                constants: vec![],
+                added_exports: vec![],
+            }],
+            manifest_changes: vec![],
+            added_files: vec![],
+            member_renames: HashMap::new(),
+            inferred_rename_patterns: None,
+            hierarchy_deltas: vec![],
+            metadata: semver_analyzer_core::AnalysisMetadata {
+                call_graph_analysis: "none".to_string(),
+                tool_version: "test".to_string(),
+                llm_usage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn deprecated_to_main_hierarchy_delta_created() {
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "Dropdown".to_string(),
+                definition_name: "DropdownProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary {
+                    total: 18,
+                    removed: 0,
+                    renamed: 0,
+                    type_changed: 2,
+                    added: 3,
+                    removal_ratio: 0.0,
+                },
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: Some(MigrationTarget {
+                    removed_symbol: "Dropdown".to_string(),
+                    removed_qualified_name:
+                        "packages/react-core/src/deprecated/components/Dropdown/Dropdown.DropdownProps"
+                            .to_string(),
+                    removed_package: Some("@patternfly/react-core".to_string()),
+                    replacement_symbol: "Dropdown".to_string(),
+                    replacement_qualified_name:
+                        "packages/react-core/src/components/Dropdown/Dropdown.DropdownProps"
+                            .to_string(),
+                    replacement_package: Some("@patternfly/react-core".to_string()),
+                    matching_members: vec![
+                        MemberMapping {
+                            old_name: "className".to_string(),
+                            new_name: "className".to_string(),
+                        },
+                        MemberMapping {
+                            old_name: "isOpen".to_string(),
+                            new_name: "isOpen".to_string(),
+                        },
+                    ],
+                    removed_only_members: vec!["dropdownItems".to_string()],
+                    overlap_ratio: 0.43,
+                }),
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild::new("DropdownList", true),
+                    ExpectedChild::new("DropdownGroup", false),
+                ],
+                source_files: vec![],
+            }],
+            vec![FileChanges {
+                file: PathBuf::from("packages/react-core/src/deprecated/components/Dropdown/Dropdown.d.ts"),
+                status: FileStatus::Deleted,
+                renamed_from: None,
+                breaking_api_changes: vec![
+                    ApiChange {
+                        symbol: "DropdownToggle".to_string(),
+                        kind: ApiChangeKind::Constant,
+                        change: ApiChangeType::Removed,
+                        before: None,
+                        after: None,
+                        description: "removed".to_string(),
+                        migration_target: None,
+                        removal_disposition: None,
+                        renders_element: None,
+                    },
+                    ApiChange {
+                        symbol: "KebabToggle".to_string(),
+                        kind: ApiChangeKind::Constant,
+                        change: ApiChangeType::Removed,
+                        before: None,
+                        after: None,
+                        description: "removed".to_string(),
+                        migration_target: None,
+                        removal_disposition: None,
+                        renders_element: None,
+                    },
+                ],
+                breaking_behavioral_changes: vec![],
+                container_changes: vec![],
+            }],
+        );
+
+        let new_surface = ApiSurface::default();
+        let new_hierarchies = HashMap::new();
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        let deprecated_deltas: Vec<&HierarchyDelta> = report
+            .hierarchy_deltas
+            .iter()
+            .filter(|d| d.source_package.is_some())
+            .collect();
+
+        assert_eq!(
+            deprecated_deltas.len(),
+            1,
+            "Should create one deprecated→main delta"
+        );
+
+        let delta = deprecated_deltas[0];
+        assert_eq!(delta.component, "Dropdown");
+        assert!(delta
+            .source_package
+            .as_ref()
+            .unwrap()
+            .contains("deprecated"));
+
+        // Should have expected_children from the main module
+        let child_names: Vec<&str> = delta
+            .added_children
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(child_names.contains(&"DropdownList"));
+        assert!(child_names.contains(&"DropdownGroup"));
+
+        // Should have migration_target
+        assert!(delta.migration_target.is_some());
+
+        // Should have removed symbols with no replacement
+        assert!(delta
+            .removed_children
+            .contains(&"DropdownToggle".to_string()));
+        assert!(delta.removed_children.contains(&"KebabToggle".to_string()));
+    }
+
+    #[test]
+    fn no_deprecated_delta_without_migration_target() {
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "ApplicationLauncher".to_string(),
+                definition_name: "ApplicationLauncherProps".to_string(),
+                status: ComponentStatus::Removed,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![],
+                source_files: vec![],
+            }],
+            vec![],
+        );
+
+        let new_surface = ApiSurface::default();
+        let new_hierarchies = HashMap::new();
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        let deprecated_deltas: Vec<&HierarchyDelta> = report
+            .hierarchy_deltas
+            .iter()
+            .filter(|d| d.source_package.is_some())
+            .collect();
+
+        assert_eq!(
+            deprecated_deltas.len(),
+            0,
+            "No deprecated delta without migration_target"
+        );
+    }
+
+    #[test]
+    fn deprecated_delta_has_migrated_members_from_props() {
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "Dropdown".to_string(),
+                definition_name: "DropdownProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: Some(MigrationTarget {
+                    removed_symbol: "Dropdown".to_string(),
+                    removed_qualified_name:
+                        "packages/react-core/src/deprecated/components/Dropdown/Dropdown.DropdownProps"
+                            .to_string(),
+                    removed_package: Some("@patternfly/react-core".to_string()),
+                    replacement_symbol: "Dropdown".to_string(),
+                    replacement_qualified_name:
+                        "packages/react-core/src/components/Dropdown/Dropdown.DropdownProps".to_string(),
+                    replacement_package: Some("@patternfly/react-core".to_string()),
+                    matching_members: vec![
+                        MemberMapping { old_name: "className".to_string(), new_name: "className".to_string() },
+                        MemberMapping { old_name: "isOpen".to_string(), new_name: "isOpen".to_string() },
+                    ],
+                    removed_only_members: vec!["dropdownItems".to_string()],
+                    overlap_ratio: 0.5,
+                }),
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![ExpectedChild::new("DropdownList", true)],
+                source_files: vec![],
+            }],
+            vec![],
+        );
+
+        let new_surface = ApiSurface::default();
+        let new_hierarchies = HashMap::new();
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        let deprecated_deltas: Vec<&HierarchyDelta> = report
+            .hierarchy_deltas
+            .iter()
+            .filter(|d| d.source_package.is_some())
+            .collect();
+
+        assert_eq!(deprecated_deltas.len(), 1);
+        let delta = &deprecated_deltas[0];
+
+        assert_eq!(
+            delta.migrated_members.len(),
+            2,
+            "Should have 2 migrated members"
+        );
+        assert!(
+            delta
+                .migrated_members
+                .iter()
+                .any(|m| m.member_name == "className" && m.target_child == "Dropdown"),
+            "className should map to Dropdown"
         );
     }
 }

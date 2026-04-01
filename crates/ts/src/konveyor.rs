@@ -49,6 +49,11 @@ fn detect_collapsible_constant_groups<'a>(
             if change.symbol.contains('.') {
                 continue;
             }
+            // Skip symbols with migration_target — they get per-component rules
+            // with specific migration guidance.
+            if change.migration_target.is_some() {
+                continue;
+            }
             // Compute the strategy for this change so we can group by it
             let strategy = match api_change_to_strategy(
                 change,
@@ -75,6 +80,27 @@ fn detect_collapsible_constant_groups<'a>(
     // Only keep groups that exceed the threshold
     groups.retain(|_, changes| changes.len() >= CONSTANT_COLLAPSE_THRESHOLD);
     groups
+}
+
+/// Derive the import path from a package name and qualified name.
+///
+/// For symbols in a deprecated or next subpath, the import path includes
+/// the subpath suffix. For example:
+/// - package `@patternfly/react-core`, qualified_name containing `/deprecated/`
+///   → `@patternfly/react-core/deprecated`
+/// - package `@patternfly/react-core`, qualified_name containing `/next/`
+///   → `@patternfly/react-core/next`
+/// - package `@patternfly/react-core`, no special segment
+///   → `@patternfly/react-core`
+fn derive_import_path(package: Option<&str>, qualified_name: &str) -> String {
+    let base = package.unwrap_or("unknown");
+    if qualified_name.contains("/deprecated/") {
+        format!("{}/deprecated", base)
+    } else if qualified_name.contains("/next/") {
+        format!("{}/next", base)
+    } else {
+        base.to_string()
+    }
 }
 
 fn build_migration_message_legacy(
@@ -368,6 +394,33 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
             "MIGRATION: Replace <{}> with props on <{}>.\n\n",
             component_name, replacement
         ));
+
+        // Import guidance when the replacement is in a different package or
+        // subpath. The package field may be the same for deprecated→main
+        // moves (both are @patternfly/react-core), so we also check the
+        // qualified_name for /deprecated/ or /next/ segments to derive
+        // the correct import subpath.
+        {
+            let old_import = derive_import_path(
+                target.removed_package.as_deref(),
+                &target.removed_qualified_name,
+            );
+            let new_import = derive_import_path(
+                target.replacement_package.as_deref(),
+                &target.replacement_qualified_name,
+            );
+
+            if old_import != new_import {
+                msg.push_str(&format!(
+                    "Import change:\n\
+                     \x20 Replace: import {{ {} }} from '{}';\n\
+                     \x20 With:    import {{ {} }} from '{}';\n\n\
+                     NOTE: The new <{}> may have a significantly different API.\n\
+                     Review the property mapping below and update your usage accordingly.\n\n",
+                    component_name, old_import, replacement, new_import, replacement
+                ));
+            }
+        }
 
         if !target.matching_members.is_empty() {
             msg.push_str("Property mapping:\n");
@@ -1022,6 +1075,40 @@ pub fn generate_rules(
         }
     }
 
+    // Pre-populate covered_components from hierarchy deltas so that
+    // individual per-file rules for symbols covered by hierarchy or
+    // deprecated migration rules are suppressed. The hierarchy rule
+    // loop runs later but the coverage information is needed here.
+    for delta in &report.hierarchy_deltas {
+        covered_components.insert(delta.component.clone());
+        covered_components.insert(format!("{}Props", delta.component));
+
+        // For deprecated deltas, cover ALL deprecated family symbols
+        if delta.source_package.is_some() {
+            for child_name in &delta.removed_children {
+                covered_components.insert(child_name.clone());
+                covered_components.insert(format!("{}Props", child_name));
+            }
+            for child in &delta.added_children {
+                covered_components.insert(child.name.clone());
+                covered_components.insert(format!("{}Props", child.name));
+            }
+            // Also scan file changes for any other symbols from this deprecated directory
+            let deprecated_dir = format!("/deprecated/components/{}/", delta.component);
+            for fc in &report.changes {
+                let file_str = fc.file.to_string_lossy();
+                if !file_str.contains(&deprecated_dir) {
+                    continue;
+                }
+                for api in &fc.breaking_api_changes {
+                    if !api.symbol.contains('.') {
+                        covered_components.insert(api.symbol.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // API changes (per-file)
     for file_changes in &report.changes {
         // resolve_npm_package already appends /deprecated or /next when the
@@ -1072,6 +1159,18 @@ pub fn generate_rules(
                 if api_change.change == ApiChangeType::Removed {
                     continue;
                 }
+            }
+
+            // Suppress "moved to deprecated" rules. These point consumers
+            // toward the deprecated import path instead of the replacement.
+            // The hierarchy rule (or deprecated migration rule) already
+            // provides the correct guidance.
+            if api_change.change == ApiChangeType::Renamed
+                && api_change
+                    .description
+                    .contains("moved to deprecated exports")
+            {
+                continue;
             }
 
             let new_rules = api_change_to_rules(
@@ -1153,6 +1252,19 @@ pub fn generate_rules(
             // Skip entries consolidated into parent-level children→prop rules
             if consolidated_composition_keys.contains(&dedup_key) {
                 continue;
+            }
+
+            // Skip composition changes for components already covered by
+            // hierarchy rules. The hierarchy rule has richer context.
+            if covered_components.contains(component) {
+                continue;
+            }
+            // Also check if the component's old/new parent is covered
+            if let Some(ref old_p) = comp_change.old_container {
+                let bare = old_p.split(" (").next().unwrap_or(old_p).trim();
+                if covered_components.contains(bare) {
+                    continue;
+                }
             }
 
             // Skip hallucinated template variables
@@ -2590,6 +2702,26 @@ pub fn generate_rules(
             .find(|pkg| pkg.type_summaries.iter().any(|c| c.name == *component))
             .map(|pkg| pkg.name.clone());
 
+        // Add import guidance for new child components. Consumers need to
+        // know which imports to add for the new children.
+        if let Some(expected_children) = all_expected {
+            let new_child_names: Vec<&str> = expected_children
+                .iter()
+                .filter(|c| c.mechanism != "prop") // Only direct JSX children need imports
+                .map(|c| c.name.as_str())
+                .collect();
+
+            if !new_child_names.is_empty() {
+                if let Some(ref pkg) = from_pkg {
+                    msg.push_str(&format!(
+                        "\nAdd to your imports:\n  import {{ {} }} from '{}';\n",
+                        new_child_names.join(", "),
+                        pkg,
+                    ));
+                }
+            }
+        }
+
         // Track components covered by hierarchy rules for prop/behavioral dedup
         covered_components.insert(component.clone());
         if let Some(cs) = comp_summary {
@@ -2600,68 +2732,303 @@ pub fn generate_rules(
             }
         }
 
-        // Build a targeted `when` clause. If we know which props were
-        // removed/migrated, trigger only on files that actually use one of
-        // those props on this component (JSX_PROP). Otherwise fall back to
-        // matching any JSX usage of the component (JSX_COMPONENT).
-        let mut trigger_props: BTreeSet<String> = BTreeSet::new();
-        for rp in &removed_props {
-            trigger_props.insert(rp.name.clone());
-        }
-        for mp in &delta.migrated_members {
-            trigger_props.insert(mp.member_name.clone());
-        }
+        // Build the `when` clause and rule metadata.
+        //
+        // For deprecated→main deltas (source_package is set):
+        //   Trigger on IMPORT of any symbol from the deprecated family.
+        //   The pattern matches all symbols (component + removed symbols).
+        //
+        // For main→main deltas (source_package is None):
+        //   Trigger on JSX_PROP (specific removed/migrated props) or
+        //   JSX_COMPONENT (fallback) from the main package.
+        if let Some(ref deprecated_pkg) = delta.source_package {
+            // ── Deprecated→main migration rule ──
 
-        let (location, pattern, component_filter) = if !trigger_props.is_empty() {
-            let prop_pattern = format!(
+            // Collect all symbols from the deprecated family for the pattern
+            let mut deprecated_symbols: BTreeSet<String> = BTreeSet::new();
+            deprecated_symbols.insert(component.clone());
+            for child_name in &delta.removed_children {
+                deprecated_symbols.insert(child_name.clone());
+            }
+            // Also add any component names from migrated_members targets
+            for mm in &delta.migrated_members {
+                deprecated_symbols.insert(mm.target_child.clone());
+            }
+            // Search the file changes for all symbols from this deprecated directory
+            let deprecated_dir = format!("/deprecated/components/{}/", component);
+            for fc in &report.changes {
+                let file_str = fc.file.to_string_lossy();
+                if !file_str.contains(&deprecated_dir) {
+                    continue;
+                }
+                for api in &fc.breaking_api_changes {
+                    if !api.symbol.contains('.') && !api.symbol.ends_with("Props") {
+                        deprecated_symbols.insert(api.symbol.clone());
+                    }
+                }
+            }
+
+            let symbol_pattern = format!(
                 "^({})$",
-                trigger_props
+                deprecated_symbols
                     .iter()
-                    .map(|p| regex_escape(p))
+                    .map(|s| regex_escape(s))
                     .collect::<Vec<_>>()
                     .join("|"),
             );
-            (
-                "JSX_PROP".to_string(),
-                prop_pattern,
-                Some(format!("^{}$", regex_escape(component))),
-            )
-        } else {
-            (
-                "JSX_COMPONENT".to_string(),
-                format!("^{}$", regex_escape(component)),
-                None,
-            )
-        };
 
-        rules.push(KonveyorRule {
-            rule_id,
-            labels: vec![
-                "source=semver-analyzer".to_string(),
-                "change-type=hierarchy-composition".to_string(),
-                "has-codemod=false".to_string(),
-            ],
-            effort: 5,
-            category: "mandatory".to_string(),
-            description: format!(
-                "<{}> composition structure changed — use child components",
-                component,
-            ),
-            message: msg,
-            links: Vec::new(),
-            when: KonveyorCondition::FrontendReferenced {
-                referenced: FrontendReferencedFields {
-                    pattern,
-                    location,
-                    component: component_filter,
-                    parent: None,
-                    value: None,
-                    from: from_pkg,
-                    parent_from: None,
+            // Add all deprecated family symbols to covered_components
+            for sym in &deprecated_symbols {
+                covered_components.insert(sym.clone());
+                covered_components.insert(format!("{}Props", sym));
+            }
+
+            // Determine the replacement package
+            let replacement_pkg = delta
+                .migration_target
+                .as_ref()
+                .and_then(|mt| mt.replacement_package.as_ref())
+                .cloned()
+                .or_else(|| from_pkg.clone());
+
+            // Build a self-contained deprecated migration message.
+            // This does NOT reuse the standard hierarchy `msg` because
+            // the deprecated migration has different semantics — the
+            // migrated_members represent "props that carry over" not
+            // "removed props moved to children."
+            let replacement_str = replacement_pkg
+                .as_deref()
+                .unwrap_or("@patternfly/react-core");
+
+            let mut deprecated_msg = format!(
+                "MIGRATION: The legacy <{}> from {} has been removed.\n\
+                 Replace with the new <{}> from {}.\n\n",
+                component, deprecated_pkg, component, replacement_str,
+            );
+
+            // Import change guidance — list all new components needed
+            let mut import_names: BTreeSet<String> = BTreeSet::new();
+            import_names.insert(component.clone());
+            // Recursively collect all component names from the composition tree
+            {
+                let mut queue: Vec<String> = delta
+                    .added_children
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let mut visited: HashSet<String> = HashSet::new();
+                while let Some(name) = queue.pop() {
+                    if !visited.insert(name.clone()) {
+                        continue;
+                    }
+                    import_names.insert(name.clone());
+                    // Look up this child's expected_children
+                    for pkg in &report.packages {
+                        for comp_s in &pkg.type_summaries {
+                            if comp_s.name == name {
+                                for ec in &comp_s.expected_children {
+                                    queue.push(ec.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            deprecated_msg.push_str(&format!(
+                "Import change:\n\
+                 \x20 Replace: import {{ ... }} from '{}';\n\
+                 \x20 With:    import {{ {} }} from '{}';\n\n",
+                deprecated_pkg,
+                import_names.iter().cloned().collect::<Vec<_>>().join(", "),
+                replacement_str,
+            ));
+
+            // Property mapping from migration_target
+            if let Some(ref mt) = delta.migration_target {
+                if !mt.matching_members.is_empty() {
+                    deprecated_msg.push_str(&format!(
+                        "Props that carry over to the new <{}>:\n",
+                        component
+                    ));
+                    for m in &mt.matching_members {
+                        if m.old_name == m.new_name {
+                            deprecated_msg.push_str(&format!("  - {} (same name)\n", m.old_name));
+                        } else {
+                            deprecated_msg.push_str(&format!(
+                                "  - {} → {} (renamed)\n",
+                                m.old_name, m.new_name
+                            ));
+                        }
+                    }
+                    deprecated_msg.push('\n');
+                }
+                if !mt.removed_only_members.is_empty() {
+                    deprecated_msg.push_str(&format!(
+                        "Removed props (no equivalent in new API): {}\n\n",
+                        mt.removed_only_members.join(", "),
+                    ));
+                }
+            }
+
+            // New composition structure with recursive nesting
+            deprecated_msg.push_str("The new API uses a composition-based structure:\n\n");
+
+            // Build recursive example
+            fn build_nested_example(
+                msg: &mut String,
+                component_name: &str,
+                report: &AnalysisReport<TypeScript>,
+                indent: usize,
+                visited: &mut HashSet<String>,
+            ) {
+                let prefix = " ".repeat(indent);
+                if !visited.insert(component_name.to_string()) {
+                    msg.push_str(&format!("{}<{} />\n", prefix, component_name));
+                    return;
+                }
+
+                // Look up expected_children for this component
+                let children: Vec<ExpectedChild> = report
+                    .packages
+                    .iter()
+                    .flat_map(|pkg| &pkg.type_summaries)
+                    .find(|c| c.name == component_name)
+                    .map(|c| c.expected_children.clone())
+                    .unwrap_or_default();
+
+                if children.is_empty() {
+                    msg.push_str(&format!(
+                        "{}<{}>...</{}>\n",
+                        prefix, component_name, component_name
+                    ));
+                } else {
+                    msg.push_str(&format!("{}<{}>\n", prefix, component_name));
+                    for child in &children {
+                        if child.mechanism == "prop" {
+                            msg.push_str(&format!(
+                                "{}  {{/* {} passed via prop */}}\n",
+                                prefix, child.name
+                            ));
+                        } else {
+                            build_nested_example(msg, &child.name, report, indent + 2, visited);
+                        }
+                    }
+                    msg.push_str(&format!("{}</{}>\n", prefix, component_name));
+                }
+            }
+
+            {
+                let mut visited = HashSet::new();
+                build_nested_example(&mut deprecated_msg, component, report, 2, &mut visited);
+            }
+
+            // List truly removed symbols (no equivalent in new API)
+            if !delta.removed_children.is_empty() {
+                deprecated_msg.push_str("\nComponents with no direct replacement:\n");
+                for child_name in &delta.removed_children {
+                    deprecated_msg.push_str(&format!("  - {} (removed)\n", child_name));
+                }
+            }
+
+            deprecated_msg.push('\n');
+            deprecated_msg.push_str(&format!(
+                "NOTE: The new <{}> has a significantly different API.\n\
+                 The old and new components are not drop-in replacements.\n\
+                 Review all prop usage and update your JSX structure accordingly.\n",
+                component
+            ));
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=deprecated-migration".to_string(),
+                    "has-codemod=false".to_string(),
+                ],
+                effort: 7,
+                category: "mandatory".to_string(),
+                description: format!(
+                    "Legacy <{}> removed from deprecated — migrate to new API",
+                    component,
+                ),
+                message: deprecated_msg,
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: symbol_pattern,
+                        location: "IMPORT".to_string(),
+                        component: None,
+                        parent: None,
+                        value: None,
+                        from: Some(deprecated_pkg.clone()),
+                        parent_from: None,
+                    },
                 },
-            },
-            fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
-        });
+                fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+            });
+        } else {
+            // ── Main→main hierarchy rule (existing behavior) ──
+
+            let mut trigger_props: BTreeSet<String> = BTreeSet::new();
+            for rp in &removed_props {
+                trigger_props.insert(rp.name.clone());
+            }
+            for mp in &delta.migrated_members {
+                trigger_props.insert(mp.member_name.clone());
+            }
+
+            let (location, pattern, component_filter) = if !trigger_props.is_empty() {
+                let prop_pattern = format!(
+                    "^({})$",
+                    trigger_props
+                        .iter()
+                        .map(|p| regex_escape(p))
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                );
+                (
+                    "JSX_PROP".to_string(),
+                    prop_pattern,
+                    Some(format!("^{}$", regex_escape(component))),
+                )
+            } else {
+                (
+                    "JSX_COMPONENT".to_string(),
+                    format!("^{}$", regex_escape(component)),
+                    None,
+                )
+            };
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=hierarchy-composition".to_string(),
+                    "has-codemod=false".to_string(),
+                ],
+                effort: 5,
+                category: "mandatory".to_string(),
+                description: format!(
+                    "<{}> composition structure changed — use child components",
+                    component,
+                ),
+                message: msg,
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern,
+                        location,
+                        component: component_filter,
+                        parent: None,
+                        value: None,
+                        from: from_pkg,
+                        parent_from: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+            });
+        }
     }
 
     // ── Post-generation: deduplicate behavioral rules ──
@@ -9088,6 +9455,8 @@ mod tests {
             added_children: vec![ExpectedChild::new("DropdownList", true)],
             removed_children: vec!["DropdownItem".to_string()],
             migrated_members: vec![],
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_rules(
@@ -9195,6 +9564,8 @@ mod tests {
                     target_member_name: None,
                 },
             ],
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_rules(
@@ -9346,6 +9717,8 @@ mod tests {
             added_children: vec![ExpectedChild::new("ModalHeader", false)],
             removed_children: vec![],
             migrated_members: vec![],
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_conformance_rules(&report);
@@ -9591,6 +9964,8 @@ mod tests {
             ],
             removed_children: vec![],
             migrated_members: vec![], // No props migrated to children
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_rules(
@@ -9685,6 +10060,8 @@ mod tests {
                 target_child: "ModalHeader".to_string(),
                 target_member_name: None,
             }],
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_rules(
@@ -9782,6 +10159,8 @@ mod tests {
             added_children: vec![ExpectedChild::new("ModalBody", true)],
             removed_children: vec![],
             migrated_members: vec![],
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_rules(
@@ -9861,6 +10240,8 @@ mod tests {
             added_children: vec![ExpectedChild::new("FormGroup", false)],
             removed_children: vec![],
             migrated_members: vec![],
+            source_package: None,
+            migration_target: None,
         }];
 
         let rules = generate_rules(

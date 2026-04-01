@@ -592,6 +592,72 @@ pub fn suppress_redundant_prop_value_rules(rules: Vec<KonveyorRule>) -> Vec<Konv
     rules
 }
 
+/// Merge rules that have identical detection conditions into a single rule.
+///
+/// Multiple rules can target the same `(component, prop, from, location)` tuple
+/// when different change types (type-changed, removed, value-removed, etc.)
+/// produce separate rules for the same detection pattern. Since the provider
+/// evaluates each rule independently, duplicates cause the same file+line to
+/// be reported multiple times.
+///
+/// This function merges such duplicates by keeping the first rule's condition
+/// and combining the messages and labels from all duplicates.
+pub fn merge_duplicate_conditions(rules: Vec<KonveyorRule>) -> Vec<KonveyorRule> {
+    // Build a key from the serialized `when` clause. Rules with identical
+    // conditions will produce identical keys. Use a HashMap for grouping
+    // and a Vec to preserve insertion order.
+    let mut group_index: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<Vec<KonveyorRule>> = Vec::new();
+    for rule in rules {
+        let key = serde_json::to_string(&rule.when).unwrap_or_default();
+        if let Some(&idx) = group_index.get(&key) {
+            groups[idx].push(rule);
+        } else {
+            let idx = groups.len();
+            group_index.insert(key, idx);
+            groups.push(vec![rule]);
+        }
+    }
+
+    let mut merged = Vec::new();
+    let mut total_merged = 0usize;
+    for group in groups {
+        if group.len() == 1 {
+            merged.push(group.into_iter().next().unwrap());
+            continue;
+        }
+
+        total_merged += group.len() - 1;
+
+        // Take the first rule as the base, merge labels from all duplicates.
+        let mut iter = group.into_iter();
+        let mut base = iter.next().unwrap();
+
+        // Collect labels from all duplicate rules (deduplicated, sorted)
+        let mut all_labels: BTreeSet<String> = BTreeSet::new();
+        for l in &base.labels {
+            all_labels.insert(l.clone());
+        }
+        for dup in iter {
+            for l in &dup.labels {
+                all_labels.insert(l.clone());
+            }
+        }
+        base.labels = all_labels.into_iter().collect();
+
+        merged.push(base);
+    }
+
+    if total_merged > 0 {
+        tracing::debug!(
+            count = total_merged,
+            "Merged rules with duplicate detection conditions"
+        );
+    }
+
+    merged
+}
+
 /// Consolidate rules by grouping related rules into single combined rules.
 pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMap<String, String>) {
     let mut groups: BTreeMap<String, Vec<KonveyorRule>> = BTreeMap::new();
@@ -672,7 +738,8 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
         | "component-removal"
         | "dependency-update"
         | "composition"
-        | "hierarchy-composition" => {
+        | "hierarchy-composition"
+        | "deprecated-migration" => {
             return rule.rule_id.clone();
         }
         _ => {}
@@ -727,9 +794,9 @@ pub fn resolve_npm_package(file_path: &str, cache: &HashMap<String, String>) -> 
     let has_next = parts.contains(&"next");
 
     if has_deprecated {
-        Some(format!("^{}/deprecated$", regex_escape(base_name)))
+        Some(format!("{}/deprecated", base_name))
     } else if has_next {
-        Some(format!("^{}/next$", regex_escape(base_name)))
+        Some(format!("{}/next", base_name))
     } else {
         Some(base_name.clone())
     }
@@ -2107,5 +2174,118 @@ mod tests {
             !is_additive_change(&change),
             "Renamed should never be additive"
         );
+    }
+
+    // ── merge_duplicate_conditions tests ─────────────────────────────
+
+    #[test]
+    fn test_merge_duplicate_conditions_no_dupes() {
+        let rules = vec![
+            KonveyorRule {
+                rule_id: "rule-1".into(),
+                labels: vec!["change-type=removed".into()],
+                effort: 1,
+                category: "mandatory".into(),
+                description: "Prop removed".into(),
+                message: "variant removed from Button".into(),
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^variant$".into(),
+                        location: "JSX_PROP".into(),
+                        component: Some("^Button$".into()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".into()),
+                        parent_from: None,
+                    },
+                },
+                fix_strategy: None,
+            },
+            KonveyorRule {
+                rule_id: "rule-2".into(),
+                labels: vec!["change-type=removed".into()],
+                effort: 1,
+                category: "mandatory".into(),
+                description: "Prop removed".into(),
+                message: "variant removed from Banner".into(),
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^variant$".into(),
+                        location: "JSX_PROP".into(),
+                        component: Some("^Banner$".into()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".into()),
+                        parent_from: None,
+                    },
+                },
+                fix_strategy: None,
+            },
+        ];
+        let result = merge_duplicate_conditions(rules);
+        assert_eq!(result.len(), 2, "Different conditions should not merge");
+    }
+
+    #[test]
+    fn test_merge_duplicate_conditions_with_dupes() {
+        let rules = vec![
+            KonveyorRule {
+                rule_id: "rule-dts".into(),
+                labels: vec!["change-type=removed".into()],
+                effort: 1,
+                category: "mandatory".into(),
+                description: "From .d.ts".into(),
+                message: "variant removed (d.ts)".into(),
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^variant$".into(),
+                        location: "JSX_PROP".into(),
+                        component: Some("^Button$".into()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".into()),
+                        parent_from: None,
+                    },
+                },
+                fix_strategy: None,
+            },
+            KonveyorRule {
+                rule_id: "rule-tsx".into(),
+                labels: vec!["change-type=type-changed".into()],
+                effort: 1,
+                category: "mandatory".into(),
+                description: "From .tsx".into(),
+                message: "variant type changed (tsx)".into(),
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^variant$".into(),
+                        location: "JSX_PROP".into(),
+                        component: Some("^Button$".into()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".into()),
+                        parent_from: None,
+                    },
+                },
+                fix_strategy: None,
+            },
+        ];
+        let result = merge_duplicate_conditions(rules);
+        assert_eq!(
+            result.len(),
+            1,
+            "Identical conditions should merge into one rule"
+        );
+        // Labels from both should be present
+        assert!(result[0]
+            .labels
+            .contains(&"change-type=removed".to_string()));
+        assert!(result[0]
+            .labels
+            .contains(&"change-type=type-changed".to_string()));
     }
 }
