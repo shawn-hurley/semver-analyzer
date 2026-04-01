@@ -281,11 +281,11 @@ pub fn diff_surfaces_with_semantics(
 
     let renames = detect_renames(&remaining_removed, &remaining_added);
 
-    let renamed_old: HashSet<&str> = renames
+    let mut renamed_old: HashSet<&str> = renames
         .iter()
         .map(|r| r.old.qualified_name.as_str())
         .collect();
-    let renamed_new: HashSet<&str> = renames
+    let mut renamed_new: HashSet<&str> = renames
         .iter()
         .map(|r| r.new.qualified_name.as_str())
         .collect();
@@ -406,6 +406,59 @@ pub fn diff_surfaces_with_semantics(
             impact: None,
             migration_target: None,
         });
+    }
+
+    // ── Phase 2b: Token rename detection ────────────────────────────
+    // Constants/variables (like design tokens) can't be matched by type
+    // fingerprinting because they all share the same shape. Instead, split
+    // names on `_`, lowercase, and match by segment set overlap (Jaccard).
+    {
+        let token_remaining_removed: Vec<&Symbol> = removed
+            .iter()
+            .filter(|s| {
+                !relocated_old.contains(s.qualified_name.as_str())
+                    && !renamed_old.contains(s.qualified_name.as_str())
+            })
+            .copied()
+            .collect();
+        let token_remaining_added: Vec<&Symbol> = added
+            .iter()
+            .filter(|s| {
+                !relocated_new.contains(s.qualified_name.as_str())
+                    && !renamed_new.contains(s.qualified_name.as_str())
+            })
+            .copied()
+            .collect();
+
+        let token_renames =
+            rename::detect_token_renames(&token_remaining_removed, &token_remaining_added);
+
+        for rm in &token_renames {
+            renamed_old.insert(rm.old.qualified_name.as_str());
+            renamed_new.insert(rm.new.qualified_name.as_str());
+
+            changes.push(StructuralChange {
+                symbol: rm.old.name.clone(),
+                qualified_name: rm.old.qualified_name.clone(),
+                kind: rm.old.kind,
+                package: rm.old.package.clone(),
+                change_type: StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { kind: rm.old.kind },
+                    to: ChangeSubject::Symbol { kind: rm.new.kind },
+                },
+                before: Some(rm.old.name.clone()),
+                after: Some(rm.new.name.clone()),
+                description: format!(
+                    "Exported {} `{}` was renamed to `{}`",
+                    kind_label(rm.old.kind),
+                    rm.old.name,
+                    rm.new.name
+                ),
+                is_breaking: true,
+                impact: None,
+                migration_target: None,
+            });
+        }
     }
 
     // ── Phase 3: Unmatched symbols ───────────────────────────────────
