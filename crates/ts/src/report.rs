@@ -21,6 +21,7 @@ use semver_analyzer_core::{
 };
 
 use crate::TypeScript;
+use semver_analyzer_konveyor_core::parse_union_string_values;
 
 // ─── Public entry point ──────────────────────────────────────────────────
 
@@ -192,6 +193,106 @@ fn build_report_inner(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ── Value rename detection for ReplacedByMember props ──────
+    //
+    // When a prop like `spaceItems` is removed and replaced by `gap`, the
+    // old prop's union values (spaceItemsMd, spaceItemsNone) need to be
+    // mapped to the new prop's values (gapMd, gapNone). We do this by
+    // suffix matching: strip the old prop name prefix, match to a new
+    // value with the same suffix. Emit Renamed changes so the fix engine
+    // can replace both the prop name and values.
+    {
+        let mut value_renames: Vec<(PathBuf, ApiChange)> = Vec::new();
+
+        for (file, changes) in file_api_map.iter() {
+            for change in changes {
+                if change.change != ApiChangeType::Removed {
+                    continue;
+                }
+                let new_member = match &change.removal_disposition {
+                    Some(RemovalDisposition::ReplacedByMember { new_member }) => new_member,
+                    _ => continue,
+                };
+
+                let old_prop = change
+                    .symbol
+                    .rsplit_once('.')
+                    .map(|(_, p)| p)
+                    .unwrap_or(&change.symbol);
+
+                // Extract old values from the removed prop's before type
+                let old_values = change
+                    .before
+                    .as_deref()
+                    .map(parse_union_string_values)
+                    .unwrap_or_default();
+                if old_values.is_empty() {
+                    continue;
+                }
+
+                // Find the replacement member's change to get new values
+                let parent = change.symbol.rsplit_once('.').map(|(p, _)| p);
+                let replacement_sym = parent
+                    .map(|p| format!("{}.{}", p, new_member))
+                    .unwrap_or_else(|| new_member.clone());
+                let new_values: BTreeSet<String> = changes
+                    .iter()
+                    .find(|c| c.symbol == replacement_sym)
+                    .and_then(|c| c.after.as_deref())
+                    .map(parse_union_string_values)
+                    .unwrap_or_default();
+
+                if new_values.is_empty() {
+                    continue;
+                }
+
+                // Match old values to new by suffix
+                let old_lower = old_prop.to_lowercase();
+                for old_val in &old_values {
+                    let val_lower = old_val.to_lowercase();
+                    if let Some(suffix) = val_lower.strip_prefix(&old_lower) {
+                        // Find a new value with the same suffix
+                        let new_lower = new_member.to_lowercase();
+                        let candidate = format!("{}{}", new_lower, suffix);
+                        if let Some(new_val) =
+                            new_values.iter().find(|v| v.to_lowercase() == candidate)
+                        {
+                            if old_val != new_val {
+                                value_renames.push((
+                                    file.clone(),
+                                    ApiChange {
+                                        symbol: format!("{} (value)", old_val),
+                                        kind: ApiChangeKind::Property,
+                                        change: ApiChangeType::Renamed,
+                                        before: Some(old_val.clone()),
+                                        after: Some(new_val.clone()),
+                                        description: format!(
+                                            "Prop value '{}' renamed to '{}' (prop '{}' → '{}')",
+                                            old_val, new_val, old_prop, new_member
+                                        ),
+                                        migration_target: None,
+                                        removal_disposition: None,
+                                        renders_element: None,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !value_renames.is_empty() {
+            tracing::info!(
+                count = value_renames.len(),
+                "Detected prop value renames from ReplacedByMember dispositions"
+            );
+            for (file, change) in value_renames {
+                file_api_map.entry(file).or_default().push(change);
             }
         }
     }
