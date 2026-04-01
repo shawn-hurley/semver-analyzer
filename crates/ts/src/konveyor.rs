@@ -3939,6 +3939,52 @@ fn api_change_to_rules(
 
     let mut message = build_api_message(change, &file_path);
 
+    // Enrich removed props with replacement info from removal_disposition.
+    // This tells the LLM what to rename the prop to AND what the new type is.
+    if change.change == ApiChangeType::Removed {
+        if let Some(ref disp) = change.removal_disposition {
+            match disp {
+                RemovalDisposition::ReplacedByMember { new_member } => {
+                    // Look up the new member's type from the same file's changes
+                    let new_type = file_changes
+                        .breaking_api_changes
+                        .iter()
+                        .find(|a| {
+                            let leaf = a.symbol.split('.').last().unwrap_or("");
+                            leaf == new_member.as_str()
+                                && matches!(
+                                    a.change,
+                                    ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
+                                )
+                        })
+                        .and_then(|a| a.after.as_ref());
+
+                    message.push_str(&format!("\n\nReplacement: use '{}' instead.", new_member));
+                    if let Some(new_type_str) = new_type {
+                        message.push_str(&format!("\nNew type: {}", new_type_str));
+                    }
+                }
+                RemovalDisposition::MadeAutomatic => {
+                    message.push_str("\n\nThis prop is now automatic — remove it.");
+                }
+                RemovalDisposition::TrulyRemoved => {
+                    message.push_str("\n\nThis prop has been removed with no replacement.");
+                }
+                RemovalDisposition::MovedToRelatedType {
+                    target_type,
+                    mechanism,
+                    ..
+                } => {
+                    message.push_str(&format!(
+                        "\n\nThis prop moved to <{}>. Pass it as a {} on <{}>.",
+                        target_type, mechanism, target_type
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Enrich with behavioral context from the same file for this component.
     // This gives the LLM information about DOM/CSS/rendering changes alongside
     // the API removal/rename information.
