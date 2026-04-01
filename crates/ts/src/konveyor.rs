@@ -103,6 +103,36 @@ fn derive_import_path(package: Option<&str>, qualified_name: &str) -> String {
     }
 }
 
+/// Extract unique union string literal values from a type annotation string.
+///
+/// Given a type like `property: gap: { default?: 'gapLg' | 'gapMd' | 'gapNone'; ... }`,
+/// returns the deduplicated sorted list `["gapLg", "gapMd", "gapNone"]`.
+///
+/// Filters out breakpoint keys like `default`, `sm`, `md`, `lg`, `xl`, `2xl`
+/// that appear as object property names rather than union values.
+fn extract_union_values(type_str: &str) -> Vec<String> {
+    static BREAKPOINT_KEYS: &[&str] = &["default", "sm", "md", "lg", "xl", "2xl"];
+    let mut values: BTreeSet<String> = BTreeSet::new();
+    for part in type_str.split('\'') {
+        // Split by single quotes: even indices are outside quotes, odd are inside
+        // We only want the values inside quotes
+        let trimmed = part.trim();
+        if !trimmed.is_empty()
+            && !trimmed.contains(':')
+            && !trimmed.contains('{')
+            && !trimmed.contains('}')
+            && !trimmed.contains('|')
+            && !trimmed.contains('?')
+            && !trimmed.contains(';')
+            && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !BREAKPOINT_KEYS.contains(&trimmed)
+        {
+            values.insert(trimmed.to_string());
+        }
+    }
+    values.into_iter().collect()
+}
+
 fn build_migration_message_legacy(
     component_name: &str,
     interface_name: &str,
@@ -1082,6 +1112,21 @@ pub fn generate_rules(
     for delta in &report.hierarchy_deltas {
         covered_components.insert(delta.component.clone());
         covered_components.insert(format!("{}Props", delta.component));
+
+        // Mark the parent's removed props as covered — the hierarchy rule
+        // handles them (e.g., "spacer → use 'gap' instead"), so individual
+        // prop-removal rules are redundant.
+        if let Some(comp) = report
+            .packages
+            .iter()
+            .flat_map(|pkg| &pkg.type_summaries)
+            .find(|c| c.name == delta.component)
+        {
+            for rp in &comp.removed_members {
+                covered_props.insert((comp.name.clone(), rp.name.clone()));
+                covered_props.insert((comp.definition_name.clone(), rp.name.clone()));
+            }
+        }
 
         // For deprecated deltas, cover ALL deprecated family symbols
         if delta.source_package.is_some() {
@@ -2632,11 +2677,41 @@ pub fn generate_rules(
             .collect();
 
         if !uncovered_removed.is_empty() {
+            // Build a lookup of new prop accepted values from the component's
+            // API changes. When a removed prop is replaced (e.g., spacer → gap),
+            // we include the new prop's accepted values so the LLM can map
+            // old values to new ones.
+            let new_prop_values: HashMap<String, Vec<String>> = {
+                let mut m: HashMap<String, Vec<String>> = HashMap::new();
+                for fc in &report.changes {
+                    for api in &fc.breaking_api_changes {
+                        if let Some(ref after) = api.after {
+                            // Check if this change is for the current component
+                            if api.symbol.starts_with(&format!("{}.", component)) {
+                                let prop_name = api.symbol.splitn(2, '.').nth(1).unwrap_or("");
+                                let values = extract_union_values(after);
+                                if !values.is_empty() {
+                                    m.insert(prop_name.to_string(), values);
+                                }
+                            }
+                        }
+                    }
+                }
+                m
+            };
+
             msg.push_str("Other removed props:\n");
             for rp in &uncovered_removed {
                 let disposition_hint = match &rp.removal_disposition {
                     Some(RemovalDisposition::ReplacedByMember { new_member }) => {
-                        format!(" → use '{}' instead", new_member)
+                        let mut hint = format!(" → use '{}' instead", new_member);
+                        if let Some(values) = new_prop_values.get(new_member.as_str()) {
+                            hint.push_str(&format!(
+                                "\n      Accepted values: {}",
+                                values.join(", ")
+                            ));
+                        }
+                        hint
                     }
                     Some(RemovalDisposition::MadeAutomatic) => " (now automatic)".to_string(),
                     Some(RemovalDisposition::TrulyRemoved) => {
