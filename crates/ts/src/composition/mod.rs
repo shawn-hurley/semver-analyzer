@@ -9,10 +9,10 @@
 //! The resulting tree describes the expected JSX composition structure
 //! for consumers of the component family.
 
-use crate::source_profile::bem::{classify_bem_relationship, BemRelationship};
 use crate::sd_types::{
     ChildRelationship, ComponentSourceProfile, CompositionEdge, CompositionTree,
 };
+use crate::source_profile::bem::{classify_bem_relationship, BemRelationship};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 

@@ -9,13 +9,17 @@ use std::path::PathBuf;
 
 /// Language-agnostic public API surface extracted from source code at a git ref.
 /// Used by TD (Top-Down) pipeline.
+///
+/// The type parameter `M` carries language-specific metadata on each symbol.
+/// Languages that don't need per-symbol metadata use the default `M = ()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ApiSurface {
+#[serde(bound(serialize = "M: Serialize", deserialize = "M: Deserialize<'de>"))]
+pub struct ApiSurface<M: Default + Clone = ()> {
     /// All exported symbols in the API surface.
-    pub symbols: Vec<Symbol>,
+    pub symbols: Vec<Symbol<M>>,
 }
 
-impl ApiSurface {
+impl<M: Default + Clone> ApiSurface<M> {
     /// Returns true if the surface has no symbols.
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
@@ -28,8 +32,15 @@ impl ApiSurface {
 }
 
 /// A single exported symbol in the API surface.
+///
+/// The type parameter `M` carries language-specific metadata. The diff engine
+/// is generic over `M` and never inspects it — only the language implementation
+/// populates and consumes this data.
+///
+/// Languages that don't need per-symbol metadata use the default `M = ()`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Symbol {
+#[serde(bound(serialize = "M: Serialize", deserialize = "M: Deserialize<'de>"))]
+pub struct Symbol<M: Default + Clone = ()> {
     /// Simple name (e.g., "createUser").
     pub name: String,
 
@@ -47,27 +58,15 @@ pub struct Symbol {
 
     /// Distribution/dependency identity for this symbol's package.
     ///
-    /// This is the name that appears in dependency manifests:
-    /// - TypeScript: npm package name (e.g., `"@patternfly/react-charts"`)
-    /// - Go: module path from go.mod (e.g., `"github.com/org/repo"`)
-    /// - Python: PyPI package name (e.g., `"requests"`)
-    ///
-    /// See also [`import_path`](Self::import_path) for the consumer-facing
-    /// import specifier, which may include subpath information.
+    /// This is the name that appears in dependency manifests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
 
     /// Consumer-facing import specifier through which this symbol is accessible.
     ///
     /// Distinct from [`package`](Self::package), which identifies the
-    /// distribution/dependency unit (what appears in dependency manifests).
-    /// `import_path` is what consumers write in their source code import
-    /// statements.
-    ///
-    /// Examples:
-    /// - TypeScript: `"@patternfly/react-charts/victory"` (subpath export)
-    /// - Go: `"github.com/org/repo/pkg/auth"` (package import path)
-    /// - Python: `"requests.auth"` (module import path)
+    /// distribution/dependency unit. `import_path` is what consumers write
+    /// in their source code import statements.
     ///
     /// When `None`, the import path is assumed to be the same as `package`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,27 +79,17 @@ pub struct Symbol {
     pub signature: Option<Signature>,
 
     // -- Class hierarchy --
-    /// Parent class (`extends` clause). e.g., "BaseValidator" for
-    /// `class EmailValidator extends BaseValidator`.
+    /// Parent class (`extends` clause).
     pub extends: Option<String>,
 
-    /// Implemented interfaces. e.g., `["Serializable", "Comparable"]`.
+    /// Implemented interfaces.
     pub implements: Vec<String>,
 
     /// Whether this symbol is abstract (class or method).
     pub is_abstract: bool,
 
     // -- Type dependencies --
-    /// Types referenced in this symbol's signature (parameter types,
-    /// return types, generic constraints, property types). Used for
-    /// transitive impact analysis: if a referenced type changes,
-    /// this symbol is potentially affected.
-    ///
-    /// Example: `fn createUser(opts: UserOptions): Promise<User>`
-    ///   -> type_dependencies: `["UserOptions", "User"]`
-    ///
-    /// Includes compile-time-only dependencies that affect the API surface
-    /// but may not exist at runtime.
+    /// Types referenced in this symbol's signature.
     pub type_dependencies: Vec<String>,
 
     // -- Member modifiers (for class/interface members) --
@@ -116,27 +105,55 @@ pub struct Symbol {
     // -- Members (for classes, interfaces, enums) --
     /// Child members (methods, properties, enum variants).
     /// Only populated for Class, Interface, and Enum kinds.
-    pub members: Vec<Symbol>,
+    pub members: Vec<Symbol<M>>,
 
-    // -- JSX render tree (for React components) --
-    /// Components from the same package that this component renders internally
-    /// in its JSX return tree. Determined by parsing the `.tsx` source file.
+    // -- Language-specific metadata --
+    /// Language-specific data associated with this symbol.
     ///
-    /// Used for hierarchy inference: components in the same family that do NOT
-    /// appear in this list are likely consumer-provided children.
+    /// Populated during extraction by the language implementation.
+    /// The diff engine never reads this field — it's carried through
+    /// for language-specific analysis (hierarchy inference, SD pipeline, etc.).
     ///
-    /// Only populated for Function/Variable/Constant symbols that represent
-    /// React components with JSX render functions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rendered_components: Vec<String>,
-
-    /// CSS class tokens used by this component (e.g., `["inputGroup", "inputGroupItem"]`).
-    /// Extracted from `styles.xxx` references in component source files.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub css: Vec<String>,
+    /// For TypeScript: `TsSymbolData { rendered_components, css }`.
+    /// For languages without per-symbol metadata: `()`.
+    #[serde(default)]
+    pub language_data: M,
 }
 
 impl Symbol {
+    /// Convert a `Symbol<()>` to a `Symbol<M>` with default language metadata.
+    ///
+    /// Used by language extractors that build `Symbol<()>` during parsing
+    /// and then upgrade to their language-specific metadata type.
+    pub fn with_metadata<M: Default + Clone>(self) -> Symbol<M> {
+        Symbol {
+            name: self.name,
+            qualified_name: self.qualified_name,
+            kind: self.kind,
+            visibility: self.visibility,
+            file: self.file,
+            package: self.package,
+            import_path: self.import_path,
+            line: self.line,
+            signature: self.signature,
+            extends: self.extends,
+            implements: self.implements,
+            is_abstract: self.is_abstract,
+            type_dependencies: self.type_dependencies,
+            is_readonly: self.is_readonly,
+            is_static: self.is_static,
+            accessor_kind: self.accessor_kind,
+            members: self
+                .members
+                .into_iter()
+                .map(|m| m.with_metadata())
+                .collect(),
+            language_data: M::default(),
+        }
+    }
+}
+
+impl<M: Default + Clone> Symbol<M> {
     /// Create a new Symbol with required fields, defaulting optional fields.
     pub fn new(
         name: impl Into<String>,
@@ -164,8 +181,7 @@ impl Symbol {
             is_static: false,
             accessor_kind: None,
             members: Vec::new(),
-            rendered_components: Vec::new(),
-            css: Vec::new(),
+            language_data: M::default(),
         }
     }
 }

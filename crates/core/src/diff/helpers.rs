@@ -13,13 +13,13 @@ use std::fmt::Write;
 /// - Multiple `export *` in the same file share the same qualified_name
 /// - The individual symbols they re-export are tracked via their source files
 /// - Star re-export changes are noise in the output (v2 harness excludes them)
-pub(super) fn is_star_reexport(sym: &Symbol) -> bool {
+pub(super) fn is_star_reexport<M: Default + Clone>(sym: &Symbol<M>) -> bool {
     sym.name == "*"
 }
 
 /// Create a StructuralChange from common fields.
-pub(super) fn change(
-    sym: &Symbol,
+pub(super) fn change<M: Default + Clone>(
+    sym: &Symbol<M>,
     change_type: StructuralChangeType,
     before: Option<String>,
     after: Option<String>,
@@ -63,7 +63,7 @@ pub(super) fn kind_label(kind: SymbolKind) -> &'static str {
 }
 
 /// Brief summary of a symbol for before/after display.
-pub(super) fn symbol_summary(sym: &Symbol) -> String {
+pub(super) fn symbol_summary<M: Default + Clone>(sym: &Symbol<M>) -> String {
     let mut s = format!("{}: {}", kind_label(sym.kind), sym.name);
     if let Some(sig) = &sym.signature {
         if let Some(ret) = &sig.return_type {

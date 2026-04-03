@@ -21,11 +21,11 @@ use super::rename::detect_renames;
 /// individual comparison functions for each aspect. Note the mutual
 /// recursion with `diff_members` (which calls back into `diff_symbol`
 /// for matched member pairs).
-pub(super) fn diff_symbol(
-    old: &Symbol,
-    new: &Symbol,
+pub(super) fn diff_symbol<M: Default + Clone, S: LanguageSemantics<M>>(
+    old: &Symbol<M>,
+    new: &Symbol<M>,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     diff_visibility(old, new, changes, semantics);
     diff_modifiers(old, new, changes);
@@ -36,11 +36,11 @@ pub(super) fn diff_symbol(
 
 // ─── Visibility diff ─────────────────────────────────────────────────────
 
-fn diff_visibility(
-    old: &Symbol,
-    new: &Symbol,
+fn diff_visibility<M: Default + Clone, S: LanguageSemantics<M>>(
+    old: &Symbol<M>,
+    new: &Symbol<M>,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     if old.visibility == new.visibility {
         return;
@@ -78,7 +78,11 @@ fn diff_visibility(
 
 // ─── Modifier diff ───────────────────────────────────────────────────────
 
-fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange>) {
+fn diff_modifiers<M: Default + Clone>(
+    old: &Symbol<M>,
+    new: &Symbol<M>,
+    changes: &mut Vec<StructuralChange>,
+) {
     // readonly
     if !old.is_readonly && new.is_readonly {
         changes.push(change(
@@ -168,7 +172,11 @@ fn diff_modifiers(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
 
 // ─── Class hierarchy diff ────────────────────────────────────────────────
 
-fn diff_hierarchy(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange>) {
+fn diff_hierarchy<M: Default + Clone>(
+    old: &Symbol<M>,
+    new: &Symbol<M>,
+    changes: &mut Vec<StructuralChange>,
+) {
     // extends (base class)
     if old.extends != new.extends {
         changes.push(change(
@@ -221,11 +229,11 @@ fn diff_hierarchy(old: &Symbol, new: &Symbol, changes: &mut Vec<StructuralChange
 
 // ─── Signature diff ──────────────────────────────────────────────────────
 
-fn diff_signatures(
-    old: &Symbol,
-    new: &Symbol,
+fn diff_signatures<M: Default + Clone, S: LanguageSemantics<M>>(
+    old: &Symbol<M>,
+    new: &Symbol<M>,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     match (&old.signature, &new.signature) {
         (Some(old_sig), Some(new_sig)) => {
@@ -256,12 +264,12 @@ fn diff_signatures(
 
 // ─── Parameter diff ──────────────────────────────────────────────────────
 
-fn diff_parameters(
-    sym: &Symbol,
+fn diff_parameters<M: Default + Clone, S: LanguageSemantics<M>>(
+    sym: &Symbol<M>,
     old_sig: &Signature,
     new_sig: &Signature,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     let old_params = &old_sig.parameters;
     let new_params = &new_sig.parameters;
@@ -440,12 +448,12 @@ fn diff_parameters(
 
 // ─── Return type diff ────────────────────────────────────────────────────
 
-fn diff_return_type(
-    sym: &Symbol,
+fn diff_return_type<M: Default + Clone, S: LanguageSemantics<M>>(
+    sym: &Symbol<M>,
     old_sig: &Signature,
     new_sig: &Signature,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     if old_sig.return_type == new_sig.return_type {
         return;
@@ -498,8 +506,8 @@ fn diff_return_type(
 
 // ─── Type parameter diff ─────────────────────────────────────────────────
 
-fn diff_type_parameters(
-    sym: &Symbol,
+fn diff_type_parameters<M: Default + Clone>(
+    sym: &Symbol<M>,
     old_sig: &Signature,
     new_sig: &Signature,
     changes: &mut Vec<StructuralChange>,
@@ -629,28 +637,28 @@ fn diff_type_parameters(
 /// This function is mutually recursive with `diff_symbol` — matched members
 /// are compared by calling `diff_symbol` again. This is why both functions
 /// live in the same module visibility scope.
-pub(super) fn diff_members(
-    old: &Symbol,
-    new: &Symbol,
+pub(super) fn diff_members<M: Default + Clone, S: LanguageSemantics<M>>(
+    old: &Symbol<M>,
+    new: &Symbol<M>,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     if old.members.is_empty() && new.members.is_empty() {
         return;
     }
 
-    let old_map: HashMap<&str, &Symbol> =
+    let old_map: HashMap<&str, &Symbol<M>> =
         old.members.iter().map(|m| (m.name.as_str(), m)).collect();
-    let new_map: HashMap<&str, &Symbol> =
+    let new_map: HashMap<&str, &Symbol<M>> =
         new.members.iter().map(|m| (m.name.as_str(), m)).collect();
 
     // Collect removed and added members
-    let removed: Vec<&Symbol> = old
+    let removed: Vec<&Symbol<M>> = old
         .members
         .iter()
         .filter(|m| !new_map.contains_key(m.name.as_str()))
         .collect();
-    let added: Vec<&Symbol> = new
+    let added: Vec<&Symbol<M>> = new
         .members
         .iter()
         .filter(|m| !old_map.contains_key(m.name.as_str()))
@@ -801,13 +809,13 @@ pub(super) fn diff_members(
 ///   - `UnionMemberAdded` for `'d'`
 ///
 /// The parent symbol provides context (e.g., `Button.variant`).
-fn diff_union_literals(
-    sym: &Symbol,
+fn diff_union_literals<M: Default + Clone, S: LanguageSemantics<M>>(
+    sym: &Symbol<M>,
     prop_name: &str,
     old_type: &str,
     new_type: &str,
     changes: &mut Vec<StructuralChange>,
-    semantics: &dyn LanguageSemantics,
+    semantics: &S,
 ) {
     let old_literals = match semantics.parse_union_values(old_type) {
         Some(l) => l,
@@ -868,10 +876,10 @@ fn diff_union_literals(
     }
 }
 
-fn diff_enum_member_value(
-    parent: &Symbol,
-    old_member: &Symbol,
-    new_member: &Symbol,
+fn diff_enum_member_value<M: Default + Clone>(
+    parent: &Symbol<M>,
+    old_member: &Symbol<M>,
+    new_member: &Symbol<M>,
     changes: &mut Vec<StructuralChange>,
 ) {
     let old_val = old_member

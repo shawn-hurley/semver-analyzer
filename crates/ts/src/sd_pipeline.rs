@@ -890,18 +890,16 @@ fn enrich_trees_with_css(
                         .iter()
                         .any(|e| e.parent == container && e.child == member)
                     {
-                        tree.edges
-                            .push(crate::sd_types::CompositionEdge {
-                                parent: container.to_string(),
-                                child: member.to_string(),
-                                relationship:
-                                    crate::sd_types::ChildRelationship::DirectChild,
-                                required: false,
-                                bem_evidence: Some(format!(
+                        tree.edges.push(crate::sd_types::CompositionEdge {
+                            parent: container.to_string(),
+                            child: member.to_string(),
+                            relationship: crate::sd_types::ChildRelationship::DirectChild,
+                            required: false,
+                            bem_evidence: Some(format!(
                                 "CSS grid nesting: {} (no grid-column) inside {} (flex container)",
                                 member, container
                             )),
-                            });
+                        });
                     }
                 }
             }
@@ -1090,9 +1088,7 @@ fn project_delegate_trees(
         let non_internal_edges = tree
             .edges
             .iter()
-            .filter(|e| {
-                e.relationship != crate::sd_types::ChildRelationship::Internal
-            })
+            .filter(|e| e.relationship != crate::sd_types::ChildRelationship::Internal)
             .count();
         if non_internal_edges > 0 {
             continue;
@@ -1167,17 +1163,16 @@ fn project_delegate_trees(
                 continue;
             }
 
-            tree.edges
-                .push(crate::sd_types::CompositionEdge {
-                    parent: wrapper_parent.to_string(),
-                    child: wrapper_child.to_string(),
-                    relationship: edge.relationship.clone(),
-                    required: edge.required,
-                    bem_evidence: Some(format!(
-                        "Projected from {} tree: {} extends {}, {} extends {}",
-                        delegate_tree.root, wrapper_parent, edge.parent, wrapper_child, edge.child,
-                    )),
-                });
+            tree.edges.push(crate::sd_types::CompositionEdge {
+                parent: wrapper_parent.to_string(),
+                child: wrapper_child.to_string(),
+                relationship: edge.relationship.clone(),
+                required: edge.required,
+                bem_evidence: Some(format!(
+                    "Projected from {} tree: {} extends {}, {} extends {}",
+                    delegate_tree.root, wrapper_parent, edge.parent, wrapper_child, edge.child,
+                )),
+            });
         }
     }
 }

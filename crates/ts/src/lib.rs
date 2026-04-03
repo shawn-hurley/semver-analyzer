@@ -31,6 +31,7 @@ pub mod source_profile;
 pub mod extensions;
 pub mod hierarchy_types;
 pub mod sd_types;
+pub mod symbol_data;
 
 // Re-export key types for convenience
 pub use extensions::TsAnalysisExtensions;

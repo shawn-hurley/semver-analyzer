@@ -47,7 +47,10 @@ impl OxcExtractor {
     ///
     /// **Phase 2**: Extract symbols from each file using the merged global import
     /// map as a fallback. Per-file imports take priority over the global map.
-    pub fn extract_from_dir(&self, dir: &Path) -> Result<ApiSurface> {
+    pub fn extract_from_dir(
+        &self,
+        dir: &Path,
+    ) -> Result<ApiSurface<crate::symbol_data::TsSymbolData>> {
         let all_files = find_dts_files(dir)?;
 
         // Phase -1: Filter to only files reachable from package entry points (index.d.ts).
@@ -131,7 +134,11 @@ impl OxcExtractor {
             set_import_paths(&mut symbols, &file_sources, &reachability.provenance, dir);
         }
 
-        // Phase 5: Populate rendered_components from .tsx source files.
+        // Phase 4.5: Convert Symbol<()> to Symbol<TsSymbolData> before TS-specific enrichment.
+        let mut symbols: Vec<semver_analyzer_core::Symbol<crate::symbol_data::TsSymbolData>> =
+            symbols.into_iter().map(|s| s.with_metadata()).collect();
+
+        // Phase 5: Populate language_data.rendered_components from .tsx source files.
         // For each symbol that could be a React component, find the corresponding
         // .tsx file in the worktree and extract its JSX render tree.
         populate_rendered_components(&mut symbols, dir);
@@ -205,7 +212,7 @@ impl OxcExtractor {
         repo: &Path,
         git_ref: &str,
         build_command: Option<&str>,
-    ) -> Result<ApiSurface> {
+    ) -> Result<ApiSurface<crate::symbol_data::TsSymbolData>> {
         use crate::worktree::WorktreeGuard;
 
         // Create worktree, install deps, run tsc --declaration (with fallback)
@@ -266,7 +273,7 @@ fn remap_dist_to_src(path: &Path) -> PathBuf {
 
 // ─── Rendered-component enrichment ───────────────────────────────────────
 
-/// Populate `rendered_components` on symbols that represent React components.
+/// Populate `language_data.rendered_components` on symbols that represent React components.
 ///
 /// For each symbol whose `.d.ts` declaration suggests it could be a React
 /// component (PascalCase name, Variable/Function/Constant kind), we look for
@@ -297,7 +304,10 @@ fn extract_css_style_tokens(source: &str) -> Vec<String> {
     tokens
 }
 
-fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
+fn populate_rendered_components(
+    symbols: &mut [Symbol<crate::symbol_data::TsSymbolData>],
+    worktree_dir: &Path,
+) {
     use std::collections::HashMap;
 
     // Build a cache: source-relative .tsx path -> (rendered components, css tokens).
@@ -330,11 +340,11 @@ fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
 
         if let Some((rendered, css_tokens)) = cache.get(&tsx_relative) {
             if !rendered.is_empty() {
-                sym.rendered_components = rendered.clone();
+                sym.language_data.rendered_components = rendered.clone();
                 enriched += 1;
             }
             if !css_tokens.is_empty() {
-                sym.css = css_tokens.clone();
+                sym.language_data.css = css_tokens.clone();
             }
             continue;
         }
@@ -350,11 +360,11 @@ fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
         };
 
         if !rendered.is_empty() {
-            sym.rendered_components = rendered.clone();
+            sym.language_data.rendered_components = rendered.clone();
             enriched += 1;
         }
         if !css_tokens.is_empty() {
-            sym.css = css_tokens.clone();
+            sym.language_data.css = css_tokens.clone();
         }
         cache.insert(tsx_relative, (rendered, css_tokens));
     }
@@ -363,7 +373,7 @@ fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
         tracing::info!(
             enriched_symbols = enriched,
             tsx_files_parsed = cache.values().filter(|(v, _)| !v.is_empty()).count(),
-            "Populated rendered_components from .tsx source files"
+            "Populated language_data.rendered_components from .tsx source files"
         );
     }
 }
@@ -3989,27 +3999,27 @@ export const Dropdown: React.FC = ({ children }) => {
         let mut symbols = vec![sym.clone(), type_sym, const_sym];
         populate_rendered_components(&mut symbols, base);
 
-        // The Dropdown symbol should have rendered_components populated
+        // The Dropdown symbol should have language_data.rendered_components populated
         assert!(
-            !symbols[0].rendered_components.is_empty(),
-            "Dropdown should have rendered_components"
+            !symbols[0].language_data.rendered_components.is_empty(),
+            "Dropdown should have language_data.rendered_components"
         );
         assert!(
             symbols[0]
-                .rendered_components
+                .language_data.rendered_components
                 .contains(&"DropdownToggle".to_string()),
             "should contain DropdownToggle"
         );
         assert!(
             symbols[0]
-                .rendered_components
+                .language_data.rendered_components
                 .contains(&"DropdownMenu".to_string()),
             "should contain DropdownMenu"
         );
 
-        // Interface and lowercase symbols should NOT have rendered_components
-        assert!(symbols[1].rendered_components.is_empty());
-        assert!(symbols[2].rendered_components.is_empty());
+        // Interface and lowercase symbols should NOT have language_data.rendered_components
+        assert!(symbols[1].language_data.rendered_components.is_empty());
+        assert!(symbols[2].language_data.rendered_components.is_empty());
     }
 
     #[test]
@@ -4032,7 +4042,7 @@ export const Dropdown: React.FC = ({ children }) => {
         populate_rendered_components(&mut symbols, tmp.path());
 
         // Should gracefully handle missing file
-        assert!(symbols[0].rendered_components.is_empty());
+        assert!(symbols[0].language_data.rendered_components.is_empty());
     }
 
     #[test]
@@ -4076,13 +4086,13 @@ export const Modal = () => {
         let mut symbols = vec![sym1, sym2];
         populate_rendered_components(&mut symbols, tmp.path());
 
-        // Both should get the same rendered_components (from cache)
+        // Both should get the same language_data.rendered_components (from cache)
         assert_eq!(
-            symbols[0].rendered_components,
-            symbols[1].rendered_components
+            symbols[0].language_data.rendered_components,
+            symbols[1].language_data.rendered_components
         );
         assert!(symbols[0]
-            .rendered_components
+            .language_data.rendered_components
             .contains(&"ModalBody".to_string()));
     }
 }

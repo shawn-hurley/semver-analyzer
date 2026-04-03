@@ -974,8 +974,8 @@ impl<L: Language> Analyzer<L> {
     fn infer_rename_patterns(
         lang: &L,
         structural_changes: &[StructuralChange],
-        old_surface: &ApiSurface,
-        new_surface: &ApiSurface,
+        old_surface: &ApiSurface<L::SymbolData>,
+        new_surface: &ApiSurface<L::SymbolData>,
         llm_command: &str,
         from_ref: &str,
         to_ref: &str,
@@ -1119,12 +1119,12 @@ impl<L: Language> Analyzer<L> {
 
         // Build O(1) lookup indexes by qualified_name — avoids O(n) linear
         // scans per structural change when the symbol lists are large.
-        let old_by_qname: HashMap<&str, &Symbol> = old_surface
+        let old_by_qname: HashMap<&str, &Symbol<L::SymbolData>> = old_surface
             .symbols
             .iter()
             .map(|s| (s.qualified_name.as_str(), s))
             .collect();
-        let new_by_qname: HashMap<&str, &Symbol> = new_surface
+        let new_by_qname: HashMap<&str, &Symbol<L::SymbolData>> = new_surface
             .symbols
             .iter()
             .map(|s| (s.qualified_name.as_str(), s))

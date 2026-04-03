@@ -7075,8 +7075,8 @@ mod tests {
                         ],
                         removed_only_members: vec!["className".to_string(), "children".to_string()],
                         overlap_ratio: 0.6,
-                    old_extends: None,
-                    new_extends: None,
+                        old_extends: None,
+                        new_extends: None,
                     });
                     change
                 },
@@ -8748,8 +8748,8 @@ mod tests {
                 ],
                 removed_only_members: vec!["className".to_string()],
                 overlap_ratio: 0.67,
-                    old_extends: None,
-                    new_extends: None,
+                old_extends: None,
+                new_extends: None,
             }),
             behavioral_changes: vec![make_behavioral(
                 "EmptyStateHeader",

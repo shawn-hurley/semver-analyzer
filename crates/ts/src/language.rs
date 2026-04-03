@@ -9,6 +9,7 @@
 //! can call through the `LanguageSemantics` and `MessageFormatter` traits.
 
 use crate::extensions::TsAnalysisExtensions;
+use crate::symbol_data::TsSymbolData;
 use anyhow::Result;
 use semver_analyzer_core::{
     AnalysisReport, AnalysisResult, ApiSurface, BehavioralChangeKind, BodyAnalysisResult,
@@ -121,8 +122,12 @@ pub struct TsReportData {
 
 // ── LanguageSemantics ───────────────────────────────────────────────────
 
-impl LanguageSemantics for TypeScript {
-    fn is_member_addition_breaking(&self, container: &Symbol, member: &Symbol) -> bool {
+impl LanguageSemantics<TsSymbolData> for TypeScript {
+    fn is_member_addition_breaking(
+        &self,
+        container: &Symbol<TsSymbolData>,
+        member: &Symbol<TsSymbolData>,
+    ) -> bool {
         // TypeScript uses structural typing. Adding a required member to an
         // interface or type alias breaks consumers because they must now
         // provide it. Adding an optional member is non-breaking.
@@ -142,7 +147,7 @@ impl LanguageSemantics for TypeScript {
         }
     }
 
-    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool {
+    fn same_family(&self, a: &Symbol<TsSymbolData>, b: &Symbol<TsSymbolData>) -> bool {
         // React convention: components in the same directory are a family.
         // E.g., components/Modal/Modal.tsx and components/Modal/ModalHeader.tsx
         //
@@ -153,7 +158,7 @@ impl LanguageSemantics for TypeScript {
             == canonical_component_dir(&b.file.to_string_lossy())
     }
 
-    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool {
+    fn same_identity(&self, a: &Symbol<TsSymbolData>, b: &Symbol<TsSymbolData>) -> bool {
         // React convention: ButtonProps and Button are the same concept.
         // Strip the "Props" suffix before comparing.
         strip_props_suffix(&a.name) == strip_props_suffix(&b.name)
@@ -228,6 +233,7 @@ impl MessageFormatter for TypeScript {
 // ── Language ────────────────────────────────────────────────────────────
 
 impl Language for TypeScript {
+    type SymbolData = TsSymbolData;
     type Category = TsCategory;
     type ManifestChangeType = TsManifestChangeType;
     type Evidence = TsEvidence;
@@ -240,7 +246,7 @@ impl Language for TypeScript {
     const MANIFEST_FILES: &'static [&'static str] = &["package.json"];
     const SOURCE_FILE_PATTERNS: &'static [&'static str] = &["*.ts", "*.tsx"];
 
-    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface> {
+    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface<TsSymbolData>> {
         let extractor = crate::extract::OxcExtractor::new();
         extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref())
     }
@@ -389,8 +395,8 @@ impl Language for TypeScript {
         from_ref: &str,
         to_ref: &str,
         _structural_changes: &[StructuralChange],
-        _old_surface: &ApiSurface,
-        _new_surface: &ApiSurface,
+        _old_surface: &ApiSurface<TsSymbolData>,
+        _new_surface: &ApiSurface<TsSymbolData>,
         _llm_command: Option<&str>,
         dep_css_dir: Option<&Path>,
         _no_llm: bool,
@@ -881,11 +887,11 @@ mod tests {
     use super::*;
     use semver_analyzer_core::{Parameter, Signature};
 
-    fn sym(name: &str, kind: SymbolKind) -> Symbol {
+    fn sym(name: &str, kind: SymbolKind) -> Symbol<TsSymbolData> {
         Symbol::new(name, name, kind, Visibility::Exported, "test.d.ts", 1)
     }
 
-    fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
+    fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol<TsSymbolData> {
         let mut s = Symbol::new(
             name,
             &format!("{}.{}", file, name),

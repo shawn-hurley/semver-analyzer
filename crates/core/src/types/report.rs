@@ -892,8 +892,8 @@ pub struct AnalysisResult<L: Language> {
     pub behavioral_changes: Vec<BehavioralChange<L>>,
     pub manifest_changes: Vec<ManifestChange<L>>,
     pub llm_api_changes: Vec<LlmApiChange>,
-    pub old_surface: Arc<ApiSurface>,
-    pub new_surface: Arc<ApiSurface>,
+    pub old_surface: Arc<ApiSurface<L::SymbolData>>,
+    pub new_surface: Arc<ApiSurface<L::SymbolData>>,
     pub inferred_rename_patterns: Option<InferredRenamePatterns>,
     pub container_changes: Vec<(String, Vec<ContainerChange>)>,
 

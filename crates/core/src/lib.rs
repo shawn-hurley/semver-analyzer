@@ -58,6 +58,7 @@ pub(crate) mod test_support {
     }
 
     impl Language for TestLang {
+        type SymbolData = ();
         type Category = String;
         type ManifestChangeType = String;
         type Evidence = String;

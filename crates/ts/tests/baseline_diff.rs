@@ -15,7 +15,7 @@ use semver_analyzer_core::diff::diff_surfaces_with_semantics;
 use semver_analyzer_core::*;
 use semver_analyzer_ts::TypeScript;
 
-fn diff(old: &ApiSurface, new: &ApiSurface) -> Vec<NormalizedChange> {
+fn diff(old: &ApiSurface<semver_analyzer_ts::symbol_data::TsSymbolData>, new: &ApiSurface<semver_analyzer_ts::symbol_data::TsSymbolData>) -> Vec<NormalizedChange> {
     normalize(&diff_surfaces_with_semantics(
         old,
         new,

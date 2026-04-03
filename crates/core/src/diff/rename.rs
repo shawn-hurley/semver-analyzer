@@ -20,7 +20,7 @@ struct MemberFingerprint {
 }
 
 impl MemberFingerprint {
-    fn from_symbol(sym: &Symbol) -> Self {
+    fn from_symbol<M: Default + Clone>(sym: &Symbol<M>) -> Self {
         let (return_type, is_optional, param_count) = match &sym.signature {
             Some(sig) => (
                 sig.return_type.clone(),
@@ -39,9 +39,9 @@ impl MemberFingerprint {
 }
 
 /// A detected rename: old name → new name, with the matched symbols.
-pub(super) struct RenameMatch<'a> {
-    pub old: &'a Symbol,
-    pub new: &'a Symbol,
+pub(super) struct RenameMatch<'a, M: Default + Clone = ()> {
+    pub old: &'a Symbol<M>,
+    pub new: &'a Symbol<M>,
 }
 
 /// Detect renames among removed and added symbol lists.
@@ -52,16 +52,16 @@ pub(super) struct RenameMatch<'a> {
 /// 3. When exactly one removed matches one added → automatic rename.
 /// 4. When multiple match, score by name similarity and greedily assign.
 /// 5. Require a minimum similarity threshold to avoid false matches.
-pub(super) fn detect_renames<'a>(
-    removed: &[&'a Symbol],
-    added: &[&'a Symbol],
-) -> Vec<RenameMatch<'a>> {
+pub(super) fn detect_renames<'a, M: Default + Clone>(
+    removed: &[&'a Symbol<M>],
+    added: &[&'a Symbol<M>],
+) -> Vec<RenameMatch<'a, M>> {
     if removed.is_empty() || added.is_empty() {
         return Vec::new();
     }
 
     // Group added symbols by fingerprint
-    let mut added_by_fp: HashMap<MemberFingerprint, Vec<(usize, &'a Symbol)>> = HashMap::new();
+    let mut added_by_fp: HashMap<MemberFingerprint, Vec<(usize, &'a Symbol<M>)>> = HashMap::new();
     for (ai, sym) in added.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol(sym);
         added_by_fp.entry(fp).or_default().push((ai, sym));
@@ -138,14 +138,14 @@ pub(super) fn detect_renames<'a>(
 ///
 /// Uses an inverted index for efficiency: each segment maps to the added tokens
 /// that contain it, so we only compute Jaccard for candidates sharing segments.
-pub(super) fn detect_token_renames<'a>(
-    removed: &[&'a Symbol],
-    added: &[&'a Symbol],
-) -> Vec<RenameMatch<'a>> {
+pub(super) fn detect_token_renames<'a, M: Default + Clone>(
+    removed: &[&'a Symbol<M>],
+    added: &[&'a Symbol<M>],
+) -> Vec<RenameMatch<'a, M>> {
     use std::collections::{BTreeSet, HashSet};
 
     // Filter to constant/variable symbols only
-    let removed_tokens: Vec<(usize, &Symbol, BTreeSet<String>)> = removed
+    let removed_tokens: Vec<(usize, &Symbol<M>, BTreeSet<String>)> = removed
         .iter()
         .enumerate()
         .filter(|(_, s)| matches!(s.kind, SymbolKind::Constant | SymbolKind::Variable))
@@ -155,7 +155,7 @@ pub(super) fn detect_token_renames<'a>(
         })
         .collect();
 
-    let added_tokens: Vec<(usize, &Symbol, BTreeSet<String>)> = added
+    let added_tokens: Vec<(usize, &Symbol<M>, BTreeSet<String>)> = added
         .iter()
         .enumerate()
         .filter(|(_, s)| matches!(s.kind, SymbolKind::Constant | SymbolKind::Variable))
@@ -376,7 +376,7 @@ fn tokenize_name(name: &str) -> BTreeSet<String> {
 /// This function extracts the `"value"` field (e.g., `"#151515"`) from the
 /// `signature.return_type` string. Returns `None` if the signature is missing
 /// or doesn't contain a parseable value.
-fn extract_token_value(symbol: &Symbol) -> Option<String> {
+fn extract_token_value<M: Default + Clone>(symbol: &Symbol<M>) -> Option<String> {
     let return_type = symbol.signature.as_ref()?.return_type.as_deref()?;
 
     // Match ["value"]: "..." or "value": "..."
@@ -426,8 +426,7 @@ mod token_tests {
             is_static: false,
             accessor_kind: None,
             members: vec![],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         }
     }
 
@@ -857,8 +856,7 @@ mod token_tests {
             is_static: false,
             accessor_kind: None,
             members: vec![],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         }
     }
 

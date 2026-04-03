@@ -16,11 +16,11 @@ pub mod diff;
 pub mod prop_defaults;
 pub mod react_api;
 
+use crate::sd_types::ComponentSourceProfile;
 use bem::{extract_style_tokens, parse_bem_structure, StyleToken};
 use children_slot::{has_children_prop, trace_children_slot};
 use prop_defaults::extract_prop_defaults;
 use react_api::detect_react_api_usage;
-use crate::sd_types::ComponentSourceProfile;
 use std::collections::{BTreeMap, BTreeSet};
 
 use oxc_allocator::Allocator;

@@ -62,10 +62,10 @@ pub struct SharedFindings<L: Language> {
     /// API surface from the OLD ref (set by TD after extraction).
     /// Stored as `Arc` so consumers can cheaply share the surface
     /// across concurrent tasks without deep-cloning.
-    old_surface: tokio::sync::OnceCell<Arc<ApiSurface>>,
+    old_surface: tokio::sync::OnceCell<Arc<ApiSurface<L::SymbolData>>>,
 
     /// API surface from the NEW ref (set by TD after extraction).
-    new_surface: tokio::sync::OnceCell<Arc<ApiSurface>>,
+    new_surface: tokio::sync::OnceCell<Arc<ApiSurface<L::SymbolData>>>,
 }
 
 impl<L: Language> SharedFindings<L> {
@@ -104,12 +104,12 @@ impl<L: Language> SharedFindings<L> {
 
     /// Set the old API surface (called by TD after extraction).
     /// Accepts an `Arc` so the caller can retain a cheap handle.
-    pub fn set_old_surface(&self, surface: Arc<ApiSurface>) {
+    pub fn set_old_surface(&self, surface: Arc<ApiSurface<L::SymbolData>>) {
         let _ = self.old_surface.set(surface);
     }
 
     /// Set the new API surface (called by TD after extraction).
-    pub fn set_new_surface(&self, surface: Arc<ApiSurface>) {
+    pub fn set_new_surface(&self, surface: Arc<ApiSurface<L::SymbolData>>) {
         let _ = self.new_surface.set(surface);
     }
 
@@ -153,14 +153,14 @@ impl<L: Language> SharedFindings<L> {
     }
 
     /// Get the old API surface (blocks if TD hasn't set it yet).
-    pub async fn get_old_surface(&self) -> &Arc<ApiSurface> {
+    pub async fn get_old_surface(&self) -> &Arc<ApiSurface<L::SymbolData>> {
         self.old_surface
             .get_or_init(|| async { panic!("TD must set old_surface before BU reads it") })
             .await
     }
 
     /// Get the new API surface (blocks if TD hasn't set it yet).
-    pub async fn get_new_surface(&self) -> &Arc<ApiSurface> {
+    pub async fn get_new_surface(&self) -> &Arc<ApiSurface<L::SymbolData>> {
         self.new_surface
             .get_or_init(|| async { panic!("TD must set new_surface before BU reads it") })
             .await
@@ -169,12 +169,12 @@ impl<L: Language> SharedFindings<L> {
     /// Try to get the old surface without blocking (returns None if not set yet).
     /// Returns a reference to the `Arc` — clone the Arc (cheap) if you need
     /// ownership, or borrow through it with `&**arc`.
-    pub fn try_get_old_surface(&self) -> Option<&Arc<ApiSurface>> {
+    pub fn try_get_old_surface(&self) -> Option<&Arc<ApiSurface<L::SymbolData>>> {
         self.old_surface.get()
     }
 
     /// Try to get the new surface without blocking (returns None if not set yet).
-    pub fn try_get_new_surface(&self) -> Option<&Arc<ApiSurface>> {
+    pub fn try_get_new_surface(&self) -> Option<&Arc<ApiSurface<L::SymbolData>>> {
         self.new_surface.get()
     }
 

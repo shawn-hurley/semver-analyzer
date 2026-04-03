@@ -13,7 +13,11 @@
 use semver_analyzer_core::*;
 use semver_analyzer_ts::jsx_diff::JsxChange;
 use semver_analyzer_ts::language::TypeScript;
+use semver_analyzer_ts::symbol_data::TsSymbolData;
 use serde::Serialize;
+
+/// Type alias for Symbol with TypeScript metadata.
+type TsSym = Symbol<TsSymbolData>;
 
 /// Semantic representation of a structural change, independent of
 /// internal enum types. Used for snapshot comparison across the
@@ -56,11 +60,11 @@ pub fn normalize(changes: &[StructuralChange]) -> Vec<NormalizedChange> {
 // Mirrors the helpers in core/diff/tests.rs but accessible from
 // integration tests.
 
-pub fn sym(name: &str, kind: SymbolKind) -> Symbol {
+pub fn sym(name: &str, kind: SymbolKind) -> TsSym {
     Symbol::new(name, name, kind, Visibility::Exported, "test.d.ts", 1)
 }
 
-pub fn func(name: &str, params: Vec<Parameter>, ret: &str) -> Symbol {
+pub fn func(name: &str, params: Vec<Parameter>, ret: &str) -> TsSym {
     let mut s = sym(name, SymbolKind::Function);
     s.signature = Some(Signature {
         parameters: params,
@@ -104,12 +108,12 @@ pub fn rest_param(name: &str, ty: &str) -> Parameter {
     }
 }
 
-pub fn surface(symbols: Vec<Symbol>) -> ApiSurface {
+pub fn surface(symbols: Vec<TsSym>) -> ApiSurface<TsSymbolData> {
     ApiSurface { symbols }
 }
 
 /// Convenience: create a property symbol with a type annotation (stored in signature.return_type).
-pub fn mk_prop(name: &str, ty: &str) -> Symbol {
+pub fn mk_prop(name: &str, ty: &str) -> TsSym {
     let mut p = sym(name, SymbolKind::Property);
     p.signature = Some(Signature {
         parameters: vec![],
@@ -121,7 +125,7 @@ pub fn mk_prop(name: &str, ty: &str) -> Symbol {
 }
 
 /// Create an enum member with a value.
-pub fn enum_member(name: &str, value: &str) -> Symbol {
+pub fn enum_member(name: &str, value: &str) -> TsSym {
     let mut m = sym(name, SymbolKind::EnumMember);
     m.signature = Some(Signature {
         parameters: vec![],
@@ -133,7 +137,7 @@ pub fn enum_member(name: &str, value: &str) -> Symbol {
 }
 
 /// Create an interface with named property members.
-pub fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
+pub fn make_interface(name: &str, file: &str, members: &[&str]) -> TsSym {
     let mut s = Symbol::new(
         name,
         &format!("{}.{}", file, name),

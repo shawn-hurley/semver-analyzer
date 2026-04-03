@@ -14,9 +14,9 @@ use crate::types::{Symbol, SymbolKind};
 use std::collections::HashMap;
 
 /// A detected symbol relocation: same name+kind but different file path.
-pub(super) struct RelocationMatch<'a> {
-    pub old: &'a Symbol,
-    pub new: &'a Symbol,
+pub(super) struct RelocationMatch<'a, M: Default + Clone = ()> {
+    pub old: &'a Symbol<M>,
+    pub new: &'a Symbol<M>,
     pub relocation_type: RelocationType,
 }
 
@@ -42,10 +42,10 @@ pub(super) enum RelocationType {
 /// paths match, the symbol moved rather than being removed+added.
 ///
 /// Returns: (matched relocations, indices of removed to skip, indices of added to skip)
-pub(super) fn detect_relocations<'a>(
-    removed: &[&'a Symbol],
-    added: &[&'a Symbol],
-) -> (Vec<RelocationMatch<'a>>, Vec<usize>, Vec<usize>) {
+pub(super) fn detect_relocations<'a, M: Default + Clone>(
+    removed: &[&'a Symbol<M>],
+    added: &[&'a Symbol<M>],
+) -> (Vec<RelocationMatch<'a, M>>, Vec<usize>, Vec<usize>) {
     if removed.is_empty() || added.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new());
     }
@@ -53,7 +53,7 @@ pub(super) fn detect_relocations<'a>(
     // Build a map of added symbols by (canonical_path, kind)
     // Multiple added symbols might share the same canonical path (rare but possible).
     // We use Vec to handle that, and match greedily.
-    let mut added_by_canonical: HashMap<(String, SymbolKind), Vec<(usize, &'a Symbol)>> =
+    let mut added_by_canonical: HashMap<(String, SymbolKind), Vec<(usize, &'a Symbol<M>)>> =
         HashMap::new();
     for (ai, sym) in added.iter().enumerate() {
         let canonical = canonical_path(&sym.qualified_name);

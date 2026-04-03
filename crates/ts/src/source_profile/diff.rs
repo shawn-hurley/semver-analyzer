@@ -3,9 +3,7 @@
 //! Each change is deterministic — a fact derived from comparing two AST-extracted
 //! profiles. No confidence scores, no LLM involvement.
 
-use crate::sd_types::{
-    ComponentSourceProfile, SourceLevelCategory, SourceLevelChange,
-};
+use crate::sd_types::{ComponentSourceProfile, SourceLevelCategory, SourceLevelChange};
 
 /// Diff two component profiles and produce a list of source-level changes.
 ///

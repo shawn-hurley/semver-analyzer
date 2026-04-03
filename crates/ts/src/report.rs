@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::hierarchy_types::{HierarchyDelta, MigratedMember};
+use crate::symbol_data::TsSymbolData;
 use semver_analyzer_core::{
     AddedExport, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
     ApiChangeType, ApiSurface, BehavioralChange, ChangeSubject, ChildComponent,
@@ -98,8 +99,8 @@ fn build_report_inner(
     behavioral_changes: &[BehavioralChange<TypeScript>],
     manifest_changes: &[ManifestChange<TypeScript>],
     llm_api_changes: &[LlmApiChange],
-    old_surface: &ApiSurface,
-    new_surface: &ApiSurface,
+    old_surface: &ApiSurface<TsSymbolData>,
+    new_surface: &ApiSurface<TsSymbolData>,
     inferred_rename_patterns: Option<InferredRenamePatterns>,
 ) -> AnalysisReport<TypeScript> {
     // Group breaking structural changes by file, converting to v2 ApiChange format.
@@ -509,8 +510,8 @@ fn build_report_inner(
 fn build_package_summaries(
     structural_changes: &[StructuralChange],
     behavioral_changes: &[BehavioralChange<TypeScript>],
-    old_surface: &ApiSurface,
-    new_surface: &ApiSurface,
+    old_surface: &ApiSurface<TsSymbolData>,
+    new_surface: &ApiSurface<TsSymbolData>,
     llm_api_changes: &[LlmApiChange],
 ) -> Vec<PackageChanges<TypeScript>> {
     if old_surface.symbols.is_empty() && new_surface.symbols.is_empty() {
@@ -576,13 +577,13 @@ fn build_package_summaries(
     }
 
     // ── Step 3: Index old/new surface symbols by qualified_name ──────
-    let _old_by_qn: HashMap<&str, &Symbol> = old_surface
+    let _old_by_qn: HashMap<&str, &Symbol<TsSymbolData>> = old_surface
         .symbols
         .iter()
         .map(|s| (s.qualified_name.as_str(), s))
         .collect();
 
-    let _new_by_qn: HashMap<&str, &Symbol> = new_surface
+    let _new_by_qn: HashMap<&str, &Symbol<TsSymbolData>> = new_surface
         .symbols
         .iter()
         .map(|s| (s.qualified_name.as_str(), s))
@@ -1003,8 +1004,8 @@ fn build_package_summaries(
 fn discover_child_components(
     component_name: &str,
     parent_qn: &str,
-    old_surface: &ApiSurface,
-    new_surface: &ApiSurface,
+    old_surface: &ApiSurface<TsSymbolData>,
+    new_surface: &ApiSurface<TsSymbolData>,
     structural_changes: &[StructuralChange],
     _behavioral_changes: &[BehavioralChange<TypeScript>],
     removed_member_names: &[&str],
@@ -1212,7 +1213,7 @@ fn infer_prop_name_for_child(
 fn enrich_hierarchy_deltas(
     report: &mut AnalysisReport<TypeScript>,
     mut deltas: Vec<HierarchyDelta>,
-    new_surface: &ApiSurface,
+    new_surface: &ApiSurface<TsSymbolData>,
     new_hierarchies: &HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 ) {
     // Build a lookup of component name → props from the new surface.
@@ -1790,11 +1791,11 @@ fn enrich_hierarchy_deltas(
         // Build a map of css token → component name from all symbols
         let mut token_to_component: HashMap<String, String> = HashMap::new();
         for sym in &new_surface.symbols {
-            if sym.css.is_empty() {
+            if sym.language_data.css.is_empty() {
                 continue;
             }
             // Use the first non-modifier token as the component's primary CSS token
-            for token in &sym.css {
+            for token in &sym.language_data.css {
                 token_to_component
                     .entry(token.clone())
                     .or_insert_with(|| sym.name.clone());
@@ -1815,12 +1816,12 @@ fn enrich_hierarchy_deltas(
                 let comp_sym = new_surface
                     .symbols
                     .iter()
-                    .find(|s| s.name == comp.name && !s.css.is_empty());
+                    .find(|s| s.name == comp.name && !s.language_data.css.is_empty());
                 let block_token = match comp_sym {
                     Some(sym) => {
                         // The block token is the one that matches just the block
                         // (no BEM element suffix). For InputGroup, that's "inputGroup".
-                        sym.css.first().cloned()
+                        sym.language_data.css.first().cloned()
                     }
                     None => continue,
                 };
@@ -2165,7 +2166,7 @@ fn count_commits(repo: &Path, from_ref: &str, to_ref: &str) -> Option<usize> {
 }
 
 /// Count unique files in an API surface.
-pub fn count_unique_files(surface: &ApiSurface) -> usize {
+pub fn count_unique_files(surface: &ApiSurface<TsSymbolData>) -> usize {
     let files: HashSet<&Path> = surface.symbols.iter().map(|s| s.file.as_path()).collect();
     files.len()
 }
@@ -2199,8 +2200,8 @@ mod tests {
             behavioral_changes: vec![],
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface: Arc::new(ApiSurface::default()),
-            new_surface: Arc::new(ApiSurface::default()),
+            old_surface: Arc::new(ApiSurface::<TsSymbolData>::default()),
+            new_surface: Arc::new(ApiSurface::<TsSymbolData>::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
             extensions: crate::TsAnalysisExtensions::default(),
@@ -2259,8 +2260,8 @@ mod tests {
             behavioral_changes: vec![],
             manifest_changes: manifest,
             llm_api_changes: vec![],
-            old_surface: Arc::new(ApiSurface::default()),
-            new_surface: Arc::new(ApiSurface::default()),
+            old_surface: Arc::new(ApiSurface::<TsSymbolData>::default()),
+            new_surface: Arc::new(ApiSurface::<TsSymbolData>::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
             extensions: crate::TsAnalysisExtensions::default(),
@@ -2293,8 +2294,8 @@ mod tests {
             behavioral_changes: behavioral,
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface: Arc::new(ApiSurface::default()),
-            new_surface: Arc::new(ApiSurface::default()),
+            old_surface: Arc::new(ApiSurface::<TsSymbolData>::default()),
+            new_surface: Arc::new(ApiSurface::<TsSymbolData>::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
             extensions: crate::TsAnalysisExtensions::default(),
@@ -2308,7 +2309,7 @@ mod tests {
 
     #[test]
     fn truly_removed_component_still_marked_removed() {
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![Symbol {
                 name: "FooProps".to_string(),
                 qualified_name: "src/components/Foo/Foo.FooProps".to_string(),
@@ -2344,11 +2345,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 }],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
         };
 
@@ -2399,7 +2398,7 @@ mod tests {
 
     #[test]
     fn helper_interface_removal_does_not_mark_component_removed() {
-        fn make_sym(name: &str, kind: SymbolKind, qn: &str) -> Symbol {
+        fn make_sym(name: &str, kind: SymbolKind, qn: &str) -> Symbol<TsSymbolData> {
             Symbol {
                 name: name.to_string(),
                 qualified_name: qn.to_string(),
@@ -2435,15 +2434,13 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 }],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }
         }
 
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![
                 make_sym(
                     "IconProps",
@@ -2458,7 +2455,7 @@ mod tests {
             ],
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![make_sym(
                 "Icon",
                 SymbolKind::Variable,
@@ -2514,7 +2511,7 @@ mod tests {
 
     #[test]
     fn discover_child_detects_same_dir_pascal_case() {
-        fn make_symbol(name: &str, kind: SymbolKind, dir: &str) -> Symbol {
+        fn make_symbol(name: &str, kind: SymbolKind, dir: &str) -> Symbol<TsSymbolData> {
             Symbol {
                 name: name.to_string(),
                 qualified_name: format!("{}/{}", dir, name),
@@ -2533,16 +2530,15 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }
         }
 
         let dir = "packages/react-core/src/components/Modal";
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![make_symbol("Modal", SymbolKind::Variable, dir)],
         };
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![
                 make_symbol("Modal", SymbolKind::Variable, dir),
                 make_symbol("ModalHeader", SymbolKind::Variable, dir),
@@ -2576,7 +2572,7 @@ mod tests {
 
     #[test]
     fn discover_child_excludes_different_dir() {
-        fn make_symbol(name: &str, kind: SymbolKind, dir: &str) -> Symbol {
+        fn make_symbol(name: &str, kind: SymbolKind, dir: &str) -> Symbol<TsSymbolData> {
             Symbol {
                 name: name.to_string(),
                 qualified_name: format!("{}/{}", dir, name),
@@ -2595,17 +2591,16 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }
         }
 
         let modal_dir = "packages/react-core/src/components/Modal";
         let button_dir = "packages/react-core/src/components/Button";
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![make_symbol("Modal", SymbolKind::Variable, modal_dir)],
         };
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![
                 make_symbol("Modal", SymbolKind::Variable, modal_dir),
                 // This has the right prefix but wrong directory
@@ -2634,7 +2629,7 @@ mod tests {
 
     #[test]
     fn discover_child_components_filters_enums_and_types() {
-        fn make_symbol(name: &str, kind: SymbolKind, dir: &str) -> Symbol {
+        fn make_symbol(name: &str, kind: SymbolKind, dir: &str) -> Symbol<TsSymbolData> {
             Symbol {
                 name: name.to_string(),
                 qualified_name: format!("{}/{}", dir, name),
@@ -2653,18 +2648,17 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }
         }
 
         let dir = "packages/react-core/src/components/Button";
 
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![make_symbol("Button", SymbolKind::Variable, dir)],
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![
                 make_symbol("Button", SymbolKind::Variable, dir),
                 make_symbol("ButtonState", SymbolKind::Enum, dir),
@@ -2724,7 +2718,7 @@ mod tests {
 
     #[test]
     fn discover_child_components_skips_deprecated_path() {
-        fn make_symbol(name: &str, kind: SymbolKind, qn: &str) -> Symbol {
+        fn make_symbol(name: &str, kind: SymbolKind, qn: &str) -> Symbol<TsSymbolData> {
             Symbol {
                 name: name.to_string(),
                 qualified_name: qn.to_string(),
@@ -2743,15 +2737,14 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }
         }
 
         let main_dir = "packages/react-core/src/components/Modal";
         let depr_dir = "packages/react-core/src/deprecated/components/Modal";
 
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![make_symbol(
                 "Modal",
                 SymbolKind::Variable,
@@ -2759,7 +2752,7 @@ mod tests {
             )],
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![
                 make_symbol(
                     "Modal",
@@ -2906,7 +2899,7 @@ mod tests {
         // the PackageChanges.name should use that instead of the bare directory name.
         use semver_analyzer_core::StructuralChangeType;
 
-        let old_surface = ApiSurface {
+        let old_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![Symbol {
                 name: "ButtonProps".into(),
                 qualified_name: "packages/react-core/src/components/Button/Button.ButtonProps"
@@ -2945,15 +2938,13 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 }],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![Symbol {
                 name: "ButtonProps".into(),
                 qualified_name: "packages/react-core/src/components/Button/Button.ButtonProps"
@@ -2973,8 +2964,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
         };
 
@@ -3419,8 +3409,7 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 },
                 Symbol {
                     name: "children".to_string(),
@@ -3445,15 +3434,13 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 },
             ],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![form_group_props],
         };
         let new_hierarchies = HashMap::new();
@@ -3559,14 +3546,12 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![form_group_props],
         };
         let new_hierarchies = HashMap::new();
@@ -3649,14 +3634,12 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![form_group_props],
         };
         let new_hierarchies = HashMap::new();
@@ -3744,14 +3727,12 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         };
 
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![modal_props],
         };
         let new_hierarchies = HashMap::new();
@@ -3854,11 +3835,9 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: Default::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         };
 
         // Deprecated ModalProps (old API re-exported in v6) — HAS header/footer
@@ -3903,8 +3882,7 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 },
                 Symbol {
                     name: "footer".to_string(),
@@ -3929,16 +3907,14 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: Default::default(),
                 },
             ],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         };
 
         // new_surface contains BOTH — simulating what the real extraction produces
-        let new_surface = ApiSurface {
+        let new_surface = ApiSurface::<TsSymbolData> {
             symbols: vec![main_modal_props, deprecated_modal_props],
         };
         let new_hierarchies = HashMap::new();

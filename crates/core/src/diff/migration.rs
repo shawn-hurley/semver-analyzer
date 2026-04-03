@@ -44,9 +44,9 @@ fn min_overlap_count(member_count: usize) -> usize {
 
 /// A detected migration relationship between a removed symbol and a candidate
 /// replacement in the same component directory.
-pub(super) struct MigrationMatch<'a> {
+pub(super) struct MigrationMatch<'a, M: Default + Clone = ()> {
     /// The removed symbol (interface/class).
-    pub removed: &'a Symbol,
+    pub removed: &'a Symbol<M>,
     /// The migration target metadata.
     pub target: MigrationTarget,
 }
@@ -66,16 +66,16 @@ pub(super) struct MigrationMatch<'a> {
 /// `old_symbols` — all symbols from the old surface.
 /// `new_symbols` — all symbols from the new surface.
 /// `dir_renames` — directory mappings from Phase 2 rename detection (old_dir → [new_dirs]).
-pub(super) fn detect_migrations<'a>(
-    removed: &[&'a Symbol],
-    old_symbols: &[&'a Symbol],
-    new_symbols: &[&'a Symbol],
-    semantics: &dyn crate::traits::LanguageSemantics,
+pub(super) fn detect_migrations<'a, M: Default + Clone, S: crate::traits::LanguageSemantics<M>>(
+    removed: &[&'a Symbol<M>],
+    old_symbols: &[&'a Symbol<M>],
+    new_symbols: &[&'a Symbol<M>],
+    semantics: &S,
     dir_renames: &HashMap<String, Vec<String>>,
-) -> Vec<MigrationMatch<'a>> {
+) -> Vec<MigrationMatch<'a, M>> {
     // Only consider removed interfaces and classes — these are the container
     // types whose members might have moved.
-    let removed_interfaces: Vec<&&Symbol> = removed
+    let removed_interfaces: Vec<&&Symbol<M>> = removed
         .iter()
         .filter(|s| is_container_kind(s.kind))
         .collect();
@@ -85,7 +85,7 @@ pub(super) fn detect_migrations<'a>(
     }
 
     // Collect new container symbols for candidate matching.
-    let new_containers: Vec<&Symbol> = new_symbols
+    let new_containers: Vec<&Symbol<M>> = new_symbols
         .iter()
         .filter(|s| is_container_kind(s.kind))
         .copied()
@@ -94,7 +94,7 @@ pub(super) fn detect_migrations<'a>(
     // Also index old surviving symbols (interfaces that exist in both versions
     // but gained new members). We detect "added members" by checking which
     // members exist in the new version but not the old.
-    let old_by_qname: HashMap<&str, &Symbol> = old_symbols
+    let old_by_qname: HashMap<&str, &Symbol<M>> = old_symbols
         .iter()
         .filter(|s| is_container_kind(s.kind))
         .map(|s| (s.qualified_name.as_str(), *s))
@@ -115,7 +115,7 @@ pub(super) fn detect_migrations<'a>(
         }
 
         // Find candidate replacements in the same family (same_family check).
-        let mut candidates: Vec<&&Symbol> = new_containers
+        let mut candidates: Vec<&&Symbol<M>> = new_containers
             .iter()
             .filter(|c| semantics.same_family(removed_sym, c))
             .collect();
@@ -153,7 +153,7 @@ pub(super) fn detect_migrations<'a>(
             }
         }
 
-        let mut best_match: Option<(&Symbol, f64, Vec<MemberMapping>, Vec<String>)> = None;
+        let mut best_match: Option<(&Symbol<M>, f64, Vec<MemberMapping>, Vec<String>)> = None;
 
         for candidate in candidates {
             // Skip if it's the exact same symbol instance (same qualified_name).

@@ -182,6 +182,7 @@ mod tests {
     }
 
     impl Language for TestLang {
+        type SymbolData = ();
         type Category = TestCategory;
         type ManifestChangeType = TestManifest;
         type Evidence = TestEvidence;
