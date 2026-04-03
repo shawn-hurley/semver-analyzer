@@ -167,6 +167,41 @@ pub trait LanguageSemantics<M: Default + Clone = ()> {
     /// Most languages: no-op.
     fn post_process(&self, _changes: &mut Vec<StructuralChange>) {}
 
+    /// Whether a symbol should be skipped during diffing.
+    ///
+    /// Called by the diff engine before comparing symbols. Symbols that
+    /// return `true` are filtered out of both the old and new surfaces.
+    ///
+    /// TypeScript: filters `name == "*"` (star re-export directives in barrel files).
+    /// Default: no symbols are skipped.
+    fn should_skip_symbol(&self, _sym: &Symbol<M>) -> bool {
+        false
+    }
+
+    /// Human-readable label for container members in diff descriptions.
+    ///
+    /// Used in migration descriptions: "Matching {label}" and "Removed {label}".
+    ///
+    /// TypeScript: `"props"` (React component props).
+    /// Go: `"fields"`.
+    /// Default: `"members"`.
+    fn member_label(&self) -> &str {
+        "members"
+    }
+
+    /// Extract a fallback matching key from a symbol for rename detection.
+    ///
+    /// When the rename engine can't find a match by type fingerprint or
+    /// name similarity, it calls this to extract a language-specific
+    /// fallback key (e.g., a CSS custom property value from a `.d.ts`
+    /// type annotation).
+    ///
+    /// TypeScript: parses `{ ["value"]: "..."; }` from token `.d.ts` type
+    /// annotations. Default: `None` (no fallback key).
+    fn extract_rename_fallback_key(&self, _symbol: &Symbol<M>) -> Option<String> {
+        None
+    }
+
     /// If this language supports component hierarchy inference (e.g., React,
     /// Vue, Django templates), return the hierarchy semantics implementation.
     ///

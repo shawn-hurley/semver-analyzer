@@ -209,6 +209,43 @@ impl LanguageSemantics<TsSymbolData> for TypeScript {
             symbol, old_path, symbol, new_path,
         )
     }
+
+    fn should_skip_symbol(&self, sym: &Symbol<TsSymbolData>) -> bool {
+        // Star re-export symbols (`export * from './module'`) are barrel-file
+        // directives, not actual API symbols. They share qualified_names and
+        // produce noise in the diff output.
+        sym.name == "*"
+    }
+
+    fn member_label(&self) -> &str {
+        "props"
+    }
+
+    fn extract_rename_fallback_key(&self, symbol: &Symbol<TsSymbolData>) -> Option<String> {
+        // Extract the CSS value from a token symbol's `.d.ts` type annotation.
+        // Token files have type annotations like:
+        //   { ["name"]: "--pf-v5-global--Color--dark-100"; ["value"]: "#151515"; ["var"]: "var(...)" }
+        // This extracts the `"value"` field (e.g., `"#151515"`).
+        let return_type = symbol.signature.as_ref()?.return_type.as_deref()?;
+
+        let value_start = return_type
+            .find("[\"value\"]")
+            .or_else(|| return_type.find("\"value\""))?;
+        let after_key = &return_type[value_start..];
+
+        let colon_pos = after_key.find(':')?;
+        let after_colon = &after_key[colon_pos + 1..];
+        let open_quote = after_colon.find('"')?;
+        let after_open = &after_colon[open_quote + 1..];
+        let close_quote = after_open.find('"')?;
+
+        let value = after_open[..close_quote].to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
 }
 
 // ── MessageFormatter ────────────────────────────────────────────────────

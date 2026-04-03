@@ -30,7 +30,7 @@ use crate::types::{ApiSurface, ChangeSubject, StructuralChange, StructuralChange
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
-use helpers::{is_star_reexport, kind_label, symbol_summary};
+use helpers::{kind_label, symbol_summary};
 use migration::detect_migrations;
 use relocate::{detect_relocations, RelocationType};
 use rename::detect_renames;
@@ -64,17 +64,17 @@ pub fn diff_surfaces_with_semantics<M: Default + Clone, S: LanguageSemantics<M>>
 ) -> Vec<StructuralChange> {
     let mut changes = Vec::new();
 
-    // Filter out star re-export symbols — they represent `export * from '...'`
-    // directives in barrel files.
+    // Filter out symbols that the language says should be skipped.
+    // TypeScript: filters `export * from '...'` (star re-export directives).
     let old_symbols: Vec<&Symbol<M>> = old
         .symbols
         .iter()
-        .filter(|s| !is_star_reexport(s))
+        .filter(|s| !semantics.should_skip_symbol(s))
         .collect();
     let new_symbols: Vec<&Symbol<M>> = new
         .symbols
         .iter()
-        .filter(|s| !is_star_reexport(s))
+        .filter(|s| !semantics.should_skip_symbol(s))
         .collect();
 
     // Build lookup maps by qualified_name
@@ -430,8 +430,11 @@ pub fn diff_surfaces_with_semantics<M: Default + Clone, S: LanguageSemantics<M>>
             .copied()
             .collect();
 
-        let token_renames =
-            rename::detect_token_renames(&token_remaining_removed, &token_remaining_added);
+        let token_renames = rename::detect_token_renames(
+            &token_remaining_removed,
+            &token_remaining_added,
+            semantics,
+        );
 
         for rm in &token_renames {
             renamed_old.insert(rm.old.qualified_name.as_str());
@@ -612,17 +615,20 @@ pub fn diff_surfaces_with_semantics<M: Default + Clone, S: LanguageSemantics<M>>
                         String::new()
                     };
 
+                    let mlabel = semantics.member_label();
                     let mut desc = format!(
-                        "{} was removed — migrate to `{}`.{}\n  Matching props (use on `{}` instead): {}",
+                        "{} was removed — migrate to `{}`.{}\n  Matching {} (use on `{}` instead): {}",
                         base,
                         mig.target.replacement_symbol,
                         import_hint,
+                        mlabel,
                         mig.target.replacement_symbol,
                         matching_names.join(", "),
                     );
                     if !removed_names.is_empty() {
                         desc.push_str(&format!(
-                            "\n  Removed props with no direct equivalent: {}",
+                            "\n  Removed {} with no direct equivalent: {}",
+                            mlabel,
                             removed_names.join(", "),
                         ));
                     }

@@ -1137,11 +1137,33 @@ fn lcs_basic() {
     );
 }
 
-// ── Star re-export filtering ─────────────────────────────────────
+// ── should_skip_symbol filtering ─────────────────────────────────
+//
+// These tests verify the LanguageSemantics::should_skip_symbol() contract.
+// They use a custom semantics that skips "*" symbols (matching TypeScript behavior).
+
+/// Semantics that skips star-reexport symbols (for testing should_skip_symbol).
+struct StarSkipSemantics;
+impl crate::traits::LanguageSemantics for StarSkipSemantics {
+    fn is_member_addition_breaking(&self, _c: &Symbol, _m: &Symbol) -> bool {
+        false
+    }
+    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool {
+        a.file.parent() == b.file.parent()
+    }
+    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool {
+        a.name == b.name
+    }
+    fn visibility_rank(&self, _v: Visibility) -> u8 {
+        0
+    }
+    fn should_skip_symbol(&self, sym: &Symbol) -> bool {
+        sym.name == "*"
+    }
+}
 
 #[test]
 fn star_reexport_removed_is_filtered() {
-    // `export * from './utils'` removed — should NOT appear as SymbolRemoved
     let mut star = sym("*", SymbolKind::Namespace);
     star.qualified_name = "index.*".into();
 
@@ -1150,7 +1172,7 @@ fn star_reexport_removed_is_filtered() {
         func("greet", vec![param("name", "string")], "void"),
     ]);
     let new = surface(vec![func("greet", vec![param("name", "string")], "void")]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_with_semantics(&old, &new, &StarSkipSemantics);
 
     assert!(
         !changes.iter().any(|c| c.symbol == "*"),
@@ -1170,7 +1192,7 @@ fn star_reexport_added_is_filtered() {
         star,
         func("greet", vec![param("name", "string")], "void"),
     ]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_with_semantics(&old, &new, &StarSkipSemantics);
 
     assert!(
         !changes.iter().any(|c| c.symbol == "*"),
@@ -1190,7 +1212,7 @@ fn multiple_star_reexports_same_file_filtered() {
 
     let old = surface(vec![mk_star(), mk_star(), mk_star()]);
     let new = surface(vec![mk_star()]); // Two removed, one kept
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_with_semantics(&old, &new, &StarSkipSemantics);
 
     assert!(
         !changes.iter().any(|c| c.symbol == "*"),
@@ -1206,7 +1228,7 @@ fn star_reexport_filtered_but_real_symbols_still_diff() {
 
     let old = surface(vec![star.clone(), func("oldFunc", vec![], "void")]);
     let new = surface(vec![func("newFunc", vec![], "void")]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_with_semantics(&old, &new, &StarSkipSemantics);
 
     // Star should NOT appear
     assert!(!changes.iter().any(|c| c.symbol == "*"));

@@ -6,16 +6,8 @@ use crate::types::{
 };
 use std::fmt::Write;
 
-/// Check if a symbol represents a star re-export (`export * from './module'`).
-///
-/// These symbols have name `"*"` and represent barrel-file re-export directives
-/// rather than actual API symbols. They are filtered from diffing because:
-/// - Multiple `export *` in the same file share the same qualified_name
-/// - The individual symbols they re-export are tracked via their source files
-/// - Star re-export changes are noise in the output (v2 harness excludes them)
-pub(super) fn is_star_reexport<M: Default + Clone>(sym: &Symbol<M>) -> bool {
-    sym.name == "*"
-}
+// is_star_reexport was moved to LanguageSemantics::should_skip_symbol().
+// TypeScript returns true for sym.name == "*".
 
 /// Create a StructuralChange from common fields.
 pub(super) fn change<M: Default + Clone>(
