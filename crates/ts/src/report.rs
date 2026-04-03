@@ -10,14 +10,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::hierarchy_types::{HierarchyDelta, MigratedMember};
 use semver_analyzer_core::{
     AddedExport, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
     ApiChangeType, ApiSurface, BehavioralChange, ChangeSubject, ChildComponent,
     ChildComponentStatus, Comparison, ComponentStatus, ComponentSummary, ConstantGroup,
-    ExpectedChild, FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange,
-    ManifestChange, MemberSummary, MigratedMember, MigrationTarget, PackageChanges,
-    RemovalDisposition, RemovedMember, StructuralChange, StructuralChangeType, SuffixRename,
-    Summary, Symbol, SymbolKind, TypeChange,
+    ExpectedChild, FileChanges, FileStatus, InferredRenamePatterns, LlmApiChange, ManifestChange,
+    MemberSummary, MigrationTarget, PackageChanges, RemovalDisposition, RemovedMember,
+    StructuralChange, StructuralChangeType, SuffixRename, Summary, Symbol, SymbolKind, TypeChange,
 };
 
 use crate::TypeScript;
@@ -70,14 +70,19 @@ pub(crate) fn build_report(
     }
 
     // Enrich hierarchy deltas and populate expected_children.
-    if !results.hierarchy_deltas.is_empty() || !results.new_hierarchies.is_empty() {
+    if !results.extensions.hierarchy_deltas.is_empty()
+        || !results.extensions.new_hierarchies.is_empty()
+    {
         enrich_hierarchy_deltas(
             &mut report,
-            results.hierarchy_deltas.clone(),
+            results.extensions.hierarchy_deltas.clone(),
             &results.new_surface,
-            &results.new_hierarchies,
+            &results.extensions.new_hierarchies,
         );
     }
+
+    // Pass through SD pipeline results when present (v2 pipeline).
+    report.extensions.sd_result = results.extensions.sd_result.clone();
 
     report
 }
@@ -489,7 +494,7 @@ fn build_report_inner(
         packages,
         member_renames: HashMap::new(),
         inferred_rename_patterns,
-        hierarchy_deltas: Vec::new(),
+        extensions: crate::TsAnalysisExtensions::default(),
         metadata: AnalysisMetadata {
             call_graph_analysis: call_graph_info.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -762,6 +767,8 @@ fn build_package_summaries(
                             matching_members: props_target.matching_members.clone(),
                             removed_only_members: props_target.removed_only_members.clone(),
                             overlap_ratio: props_target.overlap_ratio,
+                            old_extends: props_target.old_extends.clone(),
+                            new_extends: props_target.new_extends.clone(),
                         })
                     } else {
                         None
@@ -1766,7 +1773,7 @@ fn enrich_hierarchy_deltas(
     }
 
     // Store deltas on the report
-    report.hierarchy_deltas = deltas;
+    report.extensions.hierarchy_deltas = deltas;
 
     // ── BEM CSS fallback for expected_children ─────────────────────
     //
@@ -1865,12 +1872,13 @@ fn enrich_hierarchy_deltas(
     }
 
     let total_migrated: usize = report
+        .extensions
         .hierarchy_deltas
         .iter()
         .map(|d| d.migrated_members.len())
         .sum();
     tracing::debug!(
-        deltas = report.hierarchy_deltas.len(),
+        deltas = report.extensions.hierarchy_deltas.len(),
         migrated_members = total_migrated,
         "Enriched hierarchy deltas and populated expected_children"
     );
@@ -2195,8 +2203,7 @@ mod tests {
             new_surface: Arc::new(ApiSurface::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
-            hierarchy_deltas: vec![],
-            new_hierarchies: HashMap::new(),
+            extensions: crate::TsAnalysisExtensions::default(),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1.0.0", "v2.0.0");
         assert_eq!(report.summary.total_breaking_changes, 0);
@@ -2256,8 +2263,7 @@ mod tests {
             new_surface: Arc::new(ApiSurface::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
-            hierarchy_deltas: vec![],
-            new_hierarchies: HashMap::new(),
+            extensions: crate::TsAnalysisExtensions::default(),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1", "v2");
         assert_eq!(report.summary.breaking_api_changes, 1);
@@ -2291,8 +2297,7 @@ mod tests {
             new_surface: Arc::new(ApiSurface::default()),
             inferred_rename_patterns: None,
             container_changes: vec![],
-            hierarchy_deltas: vec![],
-            new_hierarchies: HashMap::new(),
+            extensions: crate::TsAnalysisExtensions::default(),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1", "v2");
         assert_eq!(report.summary.breaking_api_changes, 0);
@@ -2374,8 +2379,7 @@ mod tests {
             new_surface: Arc::new(new_surface),
             inferred_rename_patterns: None,
             container_changes: vec![],
-            hierarchy_deltas: vec![],
-            new_hierarchies: HashMap::new(),
+            extensions: crate::TsAnalysisExtensions::default(),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v5", "v6");
 
@@ -2488,8 +2492,7 @@ mod tests {
             new_surface: Arc::new(new_surface),
             inferred_rename_patterns: None,
             container_changes: vec![],
-            hierarchy_deltas: vec![],
-            new_hierarchies: HashMap::new(),
+            extensions: crate::TsAnalysisExtensions::default(),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v5", "v6");
 
@@ -3040,7 +3043,7 @@ mod tests {
             added_files: vec![],
             member_renames: HashMap::new(),
             inferred_rename_patterns: None,
-            hierarchy_deltas: vec![],
+            extensions: crate::TsAnalysisExtensions::default(),
             metadata: semver_analyzer_core::AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "test".to_string(),
@@ -3089,6 +3092,8 @@ mod tests {
                     ],
                     removed_only_members: vec!["dropdownItems".to_string()],
                     overlap_ratio: 0.43,
+                    old_extends: None,
+                    new_extends: None,
                 }),
                 behavioral_changes: vec![],
                 child_components: vec![],
@@ -3136,6 +3141,7 @@ mod tests {
         enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
 
         let deprecated_deltas: Vec<&HierarchyDelta> = report
+            .extensions
             .hierarchy_deltas
             .iter()
             .filter(|d| d.source_package.is_some())
@@ -3198,6 +3204,7 @@ mod tests {
         enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
 
         let deprecated_deltas: Vec<&HierarchyDelta> = report
+            .extensions
             .hierarchy_deltas
             .iter()
             .filter(|d| d.source_package.is_some())
@@ -3236,6 +3243,8 @@ mod tests {
                     ],
                     removed_only_members: vec!["dropdownItems".to_string()],
                     overlap_ratio: 0.5,
+                    old_extends: None,
+                    new_extends: None,
                 }),
                 behavioral_changes: vec![],
                 child_components: vec![],
@@ -3250,6 +3259,7 @@ mod tests {
         enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
 
         let deprecated_deltas: Vec<&HierarchyDelta> = report
+            .extensions
             .hierarchy_deltas
             .iter()
             .filter(|d| d.source_package.is_some())
@@ -3653,6 +3663,7 @@ mod tests {
         enrich_hierarchy_deltas(&mut report, deltas, &new_surface, &new_hierarchies);
 
         let delta = report
+            .extensions
             .hierarchy_deltas
             .iter()
             .find(|d| d.component == "FormGroup")

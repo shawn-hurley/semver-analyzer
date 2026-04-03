@@ -69,6 +69,38 @@ pub struct CommonAnalyzeArgs {
     /// not just files that have associated test changes.
     #[arg(long)]
     pub llm_all_files: bool,
+
+    /// Use the v2 Source-Level Diff (SD) pipeline instead of the
+    /// Bottom-Up (BU) behavioral analysis pipeline.
+    ///
+    /// SD produces deterministic, AST-based source-level change facts
+    /// (portal usage, BEM tokens, prop defaults, DOM structure, etc.)
+    /// instead of relying on test-delta heuristics and LLM inference.
+    #[arg(long)]
+    pub pipeline_v2: bool,
+
+    /// Path to a dependency git repository (e.g., @patternfly/patternfly CSS repo).
+    ///
+    /// When provided, the SD pipeline extracts CSS profiles from this repo
+    /// and uses them to enrich composition trees (grid nesting, :has() selectors)
+    /// and generate CSS-level migration rules.
+    #[arg(long)]
+    pub dep_repo: Option<PathBuf>,
+
+    /// Git ref for the "old" version of the dependency repo.
+    /// Required when --dep-repo is set.
+    #[arg(long)]
+    pub dep_from: Option<String>,
+
+    /// Git ref for the "new" version of the dependency repo.
+    /// Required when --dep-repo is set.
+    #[arg(long)]
+    pub dep_to: Option<String>,
+
+    /// Build command for the dependency repo (e.g., "npm install && npx gulp compileSASS").
+    /// Runs in the worktree before CSS extraction.
+    #[arg(long)]
+    pub dep_build_command: Option<String>,
 }
 
 /// Common arguments for the `extract` command.
@@ -152,6 +184,23 @@ pub struct CommonKonveyorArgs {
     /// Send ALL files with changed exported functions to the LLM.
     #[arg(long)]
     pub llm_all_files: bool,
+
+    /// Use the v2 Source-Level Diff (SD) pipeline instead of the
+    /// Bottom-Up (BU) behavioral analysis pipeline.
+    #[arg(long)]
+    pub pipeline_v2: bool,
+
+    /// Path to a dependency git repository (e.g., @patternfly/patternfly CSS repo).
+    #[arg(long)]
+    pub dep_repo: Option<PathBuf>,
+
+    /// Git ref for the "old" version of the dependency repo.
+    #[arg(long)]
+    pub dep_from: Option<String>,
+
+    /// Git ref for the "new" version of the dependency repo.
+    #[arg(long)]
+    pub dep_to: Option<String>,
 
     /// Disable rule consolidation (keep one rule per declaration change).
     #[arg(long)]

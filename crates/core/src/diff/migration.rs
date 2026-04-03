@@ -245,6 +245,18 @@ pub(super) fn detect_migrations<'a>(
         if let Some((replacement, ratio, matching_members, removed_only_members)) = best_match {
             if !matched_removed.contains(removed_sym.qualified_name.as_str()) {
                 matched_removed.insert(&removed_sym.qualified_name);
+                // Capture base type changes (extends clause) when they differ.
+                // This tells the LLM that inherited members may have changed —
+                // e.g., extending React.HTMLProps → MenuItemProps means HTML
+                // attributes like `label`, `title`, etc. are no longer inherited.
+                let old_extends = removed_sym.extends.clone();
+                let new_extends = replacement.extends.clone();
+                let (old_ext, new_ext) = if old_extends != new_extends {
+                    (old_extends, new_extends)
+                } else {
+                    (None, None)
+                };
+
                 results.push(MigrationMatch {
                     removed: removed_sym,
                     target: MigrationTarget {
@@ -257,6 +269,8 @@ pub(super) fn detect_migrations<'a>(
                         matching_members,
                         removed_only_members,
                         overlap_ratio: ratio,
+                        old_extends: old_ext,
+                        new_extends: new_ext,
                     },
                 });
             }

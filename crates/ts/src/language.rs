@@ -8,6 +8,7 @@
 //! and `core/diff/mod.rs` into a trait implementation that the diff engine
 //! can call through the `LanguageSemantics` and `MessageFormatter` traits.
 
+use crate::extensions::TsAnalysisExtensions;
 use anyhow::Result;
 use semver_analyzer_core::{
     AnalysisReport, AnalysisResult, ApiSurface, BehavioralChangeKind, BodyAnalysisResult,
@@ -231,6 +232,7 @@ impl Language for TypeScript {
     type ManifestChangeType = TsManifestChangeType;
     type Evidence = TsEvidence;
     type ReportData = TsReportData;
+    type AnalysisExtensions = TsAnalysisExtensions;
 
     const RENAMEABLE_SYMBOL_KINDS: &'static [SymbolKind] =
         &[SymbolKind::Interface, SymbolKind::Class];
@@ -379,6 +381,36 @@ impl Language for TypeScript {
         || path_str.contains("__tests__")
         || path_str.contains("/dist/")
         || path_str.starts_with("dist/")
+    }
+
+    fn run_extended_analysis(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        _structural_changes: &[StructuralChange],
+        _old_surface: &ApiSurface,
+        _new_surface: &ApiSurface,
+        _llm_command: Option<&str>,
+        dep_css_dir: Option<&Path>,
+        _no_llm: bool,
+    ) -> Result<TsAnalysisExtensions> {
+        let css_profiles = dep_css_dir.and_then(|dir| {
+            crate::css_profile::extract_css_profiles_from_dir(dir)
+                .map_err(|e| {
+                    tracing::warn!(%e, "failed to extract CSS profiles from dependency");
+                    e
+                })
+                .ok()
+        });
+
+        let sd_result = crate::sd_pipeline::run_sd(repo, from_ref, to_ref, css_profiles.as_ref())?;
+
+        Ok(TsAnalysisExtensions {
+            sd_result: Some(sd_result),
+            hierarchy_deltas: Vec::new(),
+            new_hierarchies: std::collections::HashMap::new(),
+        })
     }
 }
 

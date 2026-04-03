@@ -21,10 +21,10 @@
 use anyhow::{Context, Result};
 use semver_analyzer_core::{
     diff_surfaces_with_semantics, should_skip_for_bu, ApiSurface, BehavioralBreak,
-    BehavioralChange, ChangeSubject, ChangedFunction, ContainerChange, EvidenceType, ExpectedChild,
-    HierarchyDelta, InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
-    InferredRenamePatterns, Language, LlmApiChange, ManifestChange, SharedFindings,
-    StructuralChange, StructuralChangeType, Symbol, Visibility,
+    BehavioralChange, ChangeSubject, ChangedFunction, ContainerChange, EvidenceType,
+    InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping, InferredRenamePatterns,
+    Language, LlmApiChange, ManifestChange, SharedFindings, StructuralChange,
+    StructuralChangeType, Symbol, Visibility,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
 
@@ -101,16 +101,12 @@ impl<L: Language> Analyzer<L> {
         let progress_bu_phase2 = progress.clone();
         let llm_api_entries_bu = llm_api_entries.clone();
 
-        // Additional clones for rename/hierarchy inference (run inside TD branch)
+        // Additional clones for rename inference (run inside TD branch)
         let lang_rename = self.lang.clone();
-        let lang_hierarchy = self.lang.clone();
-        let repo_hierarchy = repo.to_path_buf();
         let from_hierarchy = from_ref.to_string();
         let to_hierarchy = to_ref.to_string();
         let llm_cmd_rename = llm_cmd_default.to_string();
-        let llm_cmd_hierarchy = llm_cmd_default.to_string();
         let progress_rename = progress.clone();
-        let progress_hierarchy = progress.clone();
         let shared_inference = shared.clone();
 
         let (td_inference_result, bu_result) = tokio::join!(
@@ -145,52 +141,38 @@ impl<L: Language> Analyzer<L> {
                     .cloned()
                     .unwrap_or_else(|| default_surface.clone());
 
-                // Run rename + hierarchy concurrently (overlaps with BU Phase 2)
-                let (inferred_rename_patterns, (hierarchy_deltas, new_hierarchies)) = if !no_llm {
-                    // Arc clones for rename inference's spawn_blocking
+                // Run rename inference (overlaps with BU Phase 2)
+                // NOTE: Hierarchy inference has been moved to
+                // Language::run_extended_analysis() as part of the
+                // genericization effort. It will be re-added when the
+                // v1 pipeline calls run_extended_analysis after TD+BU.
+                let inferred_rename_patterns = if !no_llm {
                     let changes_rename = td.structural_changes.clone();
                     let old_surf_rename = old_surface.clone();
                     let new_surf_rename = new_surface.clone();
                     let from_rename = from_hierarchy.clone();
                     let to_rename = to_hierarchy.clone();
 
-                    tokio::join!(
-                        // Rename inference: sync (1-2 LLM calls)
-                        async {
-                            tokio::task::spawn_blocking(move || {
-                                let _span = info_span!("rename_inference").entered();
-                                let rename_phase =
-                                    progress_rename.start_phase("Inferring rename patterns");
-                                let result = Self::infer_rename_patterns(
-                                    lang_rename.as_ref(),
-                                    &changes_rename,
-                                    &old_surf_rename,
-                                    &new_surf_rename,
-                                    &llm_cmd_rename,
-                                    &from_rename,
-                                    &to_rename,
-                                );
-                                rename_phase.finish("Rename inference complete");
-                                result
-                            })
-                            .await
-                            .unwrap_or(None)
-                        },
-                        // Hierarchy inference: async (N concurrent LLM calls)
-                        Self::infer_and_diff_hierarchies(
-                            lang_hierarchy.as_ref(),
-                            &repo_hierarchy,
-                            &from_hierarchy,
-                            &to_hierarchy,
-                            &llm_cmd_hierarchy,
-                            &td.structural_changes,
-                            &old_surface,
-                            &new_surface,
-                            &progress_hierarchy,
-                        ),
-                    )
+                    tokio::task::spawn_blocking(move || {
+                        let _span = info_span!("rename_inference").entered();
+                        let rename_phase =
+                            progress_rename.start_phase("Inferring rename patterns");
+                        let result = Self::infer_rename_patterns(
+                            lang_rename.as_ref(),
+                            &changes_rename,
+                            &old_surf_rename,
+                            &new_surf_rename,
+                            &llm_cmd_rename,
+                            &from_rename,
+                            &to_rename,
+                        );
+                        rename_phase.finish("Rename inference complete");
+                        result
+                    })
+                    .await
+                    .unwrap_or(None)
                 } else {
-                    (None, (Vec::new(), HashMap::new()))
+                    None
                 };
 
                 Ok::<_, anyhow::Error>((
@@ -198,8 +180,6 @@ impl<L: Language> Analyzer<L> {
                     old_surface,
                     new_surface,
                     inferred_rename_patterns,
-                    hierarchy_deltas,
-                    new_hierarchies,
                 ))
             },
             // BU: Phase 1 → Phase 2 chained (independent of TD/inference)
@@ -248,8 +228,6 @@ impl<L: Language> Analyzer<L> {
             old_surface,
             new_surface,
             inferred_rename_patterns,
-            hierarchy_deltas,
-            new_hierarchies,
         ) = td_inference_result?;
 
         let (phase1_stats, llm_stats, container_changes) = bu_result?;
@@ -289,6 +267,11 @@ impl<L: Language> Analyzer<L> {
         bu_stats.call_graph_propagated,
     ));
 
+        // TODO: hierarchy inference currently disabled in v1 pipeline.
+        // It will be re-implemented inside Language::run_extended_analysis()
+        // so the language owns the entire hierarchy lifecycle.
+        let extensions = L::AnalysisExtensions::default();
+
         Ok(AnalysisResult {
             structural_changes: td.structural_changes,
             behavioral_changes,
@@ -298,8 +281,195 @@ impl<L: Language> Analyzer<L> {
             new_surface,
             inferred_rename_patterns,
             container_changes,
-            hierarchy_deltas,
-            new_hierarchies,
+            extensions,
+        })
+    }
+    /// Run the v2 concurrent TD+SD analysis pipeline.
+    ///
+    /// Replaces the BU pipeline with the deterministic SD (Source-Level Diff)
+    /// pipeline. TD runs for structural changes; SD runs for source-level
+    /// change facts. Both run concurrently via `tokio::join!`.
+    ///
+    /// Optionally runs rename inference (LLM) after TD completes, but skips
+    /// BU entirely — no test-delta analysis, no LLM file analysis.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_v2(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        no_llm: bool,
+        llm_command: Option<&str>,
+        build_command: Option<&str>,
+        dep_css_dir: Option<&Path>,
+        progress: &ProgressReporter,
+    ) -> Result<AnalysisResult<L>> {
+        let _span = info_span!("analyze_pipeline_v2", %from_ref, %to_ref).entered();
+        let shared = Arc::new(SharedFindings::<L>::new());
+
+        // ── Owned clones for TD's spawn_blocking ────────────────────
+        let lang_td = self.lang.clone();
+        let repo_td = repo.to_path_buf();
+        let from_td = from_ref.to_string();
+        let to_td = to_ref.to_string();
+        let build_cmd = build_command.map(|s| s.to_string());
+        let shared_td = shared.clone();
+        let progress_td = progress.clone();
+
+        // ── Owned clones for SD's spawn_blocking ────────────────────
+        let lang_sd = self.lang.clone();
+        let repo_sd = repo.to_path_buf();
+        let from_sd = from_ref.to_string();
+        let to_sd = to_ref.to_string();
+        let dep_css_dir_sd = dep_css_dir.map(|p| p.to_path_buf());
+        let progress_sd = progress.clone();
+
+        // ── Owned clones for rename inference ────────────────────────
+        // Note: hierarchy inference is skipped in v2 — the SD pipeline
+        // derives composition trees deterministically from BEM, DOM
+        // nesting, context, and name-prefix signals.
+        let lang_rename = self.lang.clone();
+        let from_rename_ref = from_ref.to_string();
+        let to_rename_ref = to_ref.to_string();
+        let llm_cmd_default = llm_command.unwrap_or("goose run --no-session -q -t");
+        let llm_cmd_rename = llm_cmd_default.to_string();
+        let progress_rename = progress.clone();
+        let shared_inference = shared.clone();
+
+        // ── Run TD + extended analysis concurrently ────────────────
+        let no_llm_val = no_llm;
+        let llm_cmd_sd = llm_command.map(|s| s.to_string());
+        let (td_inference_result, ext_result) = tokio::join!(
+            // TD branch: structural diff → rename inference → hierarchy inference
+            async move {
+                // TD: blocking (extract surfaces, structural diff)
+                let td = tokio::task::spawn_blocking(move || {
+                    Self::run_td(
+                        lang_td.as_ref(),
+                        &repo_td,
+                        &from_td,
+                        &to_td,
+                        build_cmd.as_deref(),
+                        &shared_td,
+                        &progress_td,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("TD task panicked: {}", e))?
+                .context("TD pipeline failed")?;
+
+                // TD done — extract surfaces for inference phases
+                let default_surface = Arc::new(ApiSurface::default());
+                let old_surface = shared_inference
+                    .try_get_old_surface()
+                    .cloned()
+                    .unwrap_or_else(|| default_surface.clone());
+                let new_surface = shared_inference
+                    .try_get_new_surface()
+                    .cloned()
+                    .unwrap_or_else(|| default_surface.clone());
+
+                // Run rename inference (if LLM enabled).
+                // Hierarchy inference is skipped in v2 — the SD pipeline
+                // derives composition trees deterministically.
+                let inferred_rename_patterns = if !no_llm {
+                    let changes_rename = td.structural_changes.clone();
+                    let old_surf_rename = old_surface.clone();
+                    let new_surf_rename = new_surface.clone();
+                    let from_rename = from_rename_ref.clone();
+                    let to_rename = to_rename_ref.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let _span = info_span!("rename_inference").entered();
+                        let rename_phase =
+                            progress_rename.start_phase("Inferring rename patterns");
+                        let result = Self::infer_rename_patterns(
+                            lang_rename.as_ref(),
+                            &changes_rename,
+                            &old_surf_rename,
+                            &new_surf_rename,
+                            &llm_cmd_rename,
+                            &from_rename,
+                            &to_rename,
+                        );
+                        rename_phase.finish("Rename inference complete");
+                        result
+                    })
+                    .await
+                    .unwrap_or(None)
+                } else {
+                    None
+                };
+                Ok::<_, anyhow::Error>((
+                    td,
+                    old_surface,
+                    new_surface,
+                    inferred_rename_patterns,
+                ))
+            },
+            // Extended analysis branch: language-specific pipelines (independent of TD)
+            async move {
+                let ext_phase = progress_sd.start_phase("[EXT] Language-specific analysis ...");
+                let no_llm_sd = no_llm_val;
+                let result = tokio::task::spawn_blocking(move || {
+                    lang_sd.run_extended_analysis(
+                        &repo_sd,
+                        &from_sd,
+                        &to_sd,
+                        &[], // structural_changes not yet available
+                        &semver_analyzer_core::ApiSurface::default(),
+                        &semver_analyzer_core::ApiSurface::default(),
+                        llm_cmd_sd.as_deref(),
+                        dep_css_dir_sd.as_deref(),
+                        no_llm_sd,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Extended analysis task panicked: {}", e))?;
+
+                match &result {
+                    Ok(_) => {
+                        ext_phase.finish("[EXT] Language-specific analysis complete");
+                    }
+                    Err(e) => {
+                        warn!(%e, "Extended analysis failed");
+                        ext_phase.finish("[EXT] Language-specific analysis failed");
+                    }
+                }
+
+                result
+            },
+        );
+
+        // ── Unwrap results ──────────────────────────────────────────
+        let (
+            td,
+            old_surface,
+            new_surface,
+            inferred_rename_patterns,
+        ) = td_inference_result?;
+
+        let extensions = match ext_result {
+            Ok(ext) => ext,
+            Err(e) => {
+                warn!(%e, "Extended analysis failed, continuing with empty results");
+                L::AnalysisExtensions::default()
+            }
+        };
+
+        // ── Summary logging ─────────────────────────────────────────
+        progress.println(&format!("  [EXT] {:?}", extensions));
+
+        Ok(AnalysisResult {
+            structural_changes: td.structural_changes,
+            behavioral_changes: vec![], // No BU in v2
+            manifest_changes: td.manifest_changes,
+            llm_api_changes: vec![], // No LLM file analysis in v2
+            old_surface,
+            new_surface,
+            inferred_rename_patterns,
+            container_changes: vec![], // No BU container changes in v2
+            extensions,
         })
     }
 } // end impl Analyzer<L> (public API)
@@ -1474,423 +1644,29 @@ fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> 
 
 // ── Component Hierarchy Inference ────────────────────────────────────────
 //
-// Infers the component parent-child hierarchy for both versions by giving
-// the LLM each component family's source code, then diffs the hierarchies
-// to produce HierarchyDelta entries.
+// NOTE: Hierarchy inference has been moved to the Language implementation
+// (e.g., TypeScript::run_extended_analysis). The language provides prompts
+// and processes results; the orchestrator handles LLM invocation.
+//
+// The ~420 lines of hierarchy inference code that were here have been
+// removed as part of the genericization effort. The hierarchy concept
+// is framework-specific (React, Vue, etc.) and does not belong in the
+// generic orchestrator.
+//
+// To re-enable hierarchy inference:
+// 1. Language::run_extended_analysis() returns hierarchy data in AnalysisExtensions
+// 2. The orchestrator calls run_extended_analysis() after TD completes
+// 3. For LLM-based inference, the Language provides prompts via a trait method
+//    and the orchestrator handles invocation/concurrency
+
+// The hierarchy inference code has been removed. See git history for
+// the original `infer_and_diff_hierarchies` implementation.
 
 impl<L: Language> Analyzer<L> {
-    /// Infer hierarchies for both versions and compute deltas.
-    #[allow(clippy::too_many_arguments)]
-    async fn infer_and_diff_hierarchies(
-        lang: &L,
-        repo: &Path,
-        from_ref: &str,
-        to_ref: &str,
-        llm_command: &str,
-        structural_changes: &[StructuralChange],
-        old_surface: &ApiSurface,
-        new_surface: &ApiSurface,
-        progress: &ProgressReporter,
-    ) -> (
-        Vec<HierarchyDelta>,
-        HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
-    ) {
-        let _span = info_span!("hierarchy_inference").entered();
+    // Placeholder — hierarchy methods removed during genericization.
+}
 
-        let hierarchy = match lang.hierarchy() {
-            Some(h) => h,
-            None => return (Vec::new(), HashMap::new()),
-        };
-
-        // Find families to analyze: group symbols by family, filter to those with
-        // breaking changes and enough components.
-        let families = {
-            // O(1) lookup indexes to avoid linear scans per structural change
-            let new_by_qname: HashMap<&str, &Symbol> = new_surface
-                .symbols
-                .iter()
-                .map(|s| (s.qualified_name.as_str(), s))
-                .collect();
-            let old_by_qname: HashMap<&str, &Symbol> = old_surface
-                .symbols
-                .iter()
-                .map(|s| (s.qualified_name.as_str(), s))
-                .collect();
-
-            let changed_dirs: HashSet<String> = structural_changes
-                .iter()
-                .filter(|c| c.is_breaking)
-                .filter_map(|c| {
-                    let sym = new_by_qname
-                        .get(c.qualified_name.as_str())
-                        .or_else(|| old_by_qname.get(c.qualified_name.as_str()));
-                    sym.and_then(|s| hierarchy.family_name_from_symbols(&[s]))
-                })
-                .collect();
-
-            // Group new surface symbols by family
-            let mut family_components: HashMap<String, HashSet<String>> = HashMap::new();
-            for sym in &new_surface.symbols {
-                if !hierarchy.is_hierarchy_candidate(sym) {
-                    continue;
-                }
-                if let Some(family_name) = hierarchy.family_name_from_symbols(&[sym]) {
-                    family_components
-                        .entry(family_name)
-                        .or_default()
-                        .insert(sym.name.clone());
-                }
-            }
-
-            let min_components = hierarchy.min_components_for_hierarchy();
-            let result: Vec<String> = family_components
-                .into_iter()
-                .filter(|(dir, components)| {
-                    components.len() >= min_components && changed_dirs.contains(dir)
-                })
-                .map(|(dir, _)| dir)
-                .collect();
-
-            info!(count = result.len(), "qualifying hierarchy families");
-            result
-        };
-
-        if families.is_empty() {
-            return (Vec::new(), HashMap::new());
-        }
-
-        // ── Phase 0: Deterministic hierarchy ─────────────────────────
-        //
-        // Compute hierarchy without LLM using three signals:
-        // 1. Prop absorption: removed props that moved to new child components
-        // 2. Cross-family extends: components whose props extend another family
-        // 3. Internal rendering: what JSX components are rendered internally
-        //
-        // The old surface uses rendered_components only (no structural changes).
-        // The new surface uses all three signals.
-        let deterministic_old =
-            hierarchy.compute_deterministic_hierarchy(old_surface, &[]);
-        let deterministic_new =
-            hierarchy.compute_deterministic_hierarchy(new_surface, structural_changes);
-
-        let det_old_count = deterministic_old.len();
-        let det_new_count = deterministic_new.len();
-        if det_old_count > 0 || det_new_count > 0 {
-            info!(
-                old_families = det_old_count,
-                new_families = det_new_count,
-                "deterministic hierarchy computed from rendered_components"
-            );
-            for (family, components) in &deterministic_new {
-                let children_count: usize = components.values().map(|v| v.len()).sum();
-                debug!(
-                    family = %family,
-                    components = components.len(),
-                    children = children_count,
-                    "deterministic hierarchy"
-                );
-            }
-        }
-
-        // Families that have deterministic hierarchy data for the new version
-        // can skip LLM inference entirely.
-        let families_needing_llm: Vec<String> = families
-            .iter()
-            .filter(|f| !deterministic_new.contains_key(*f))
-            .cloned()
-            .collect();
-
-        let families_with_det: usize = families.len() - families_needing_llm.len();
-        if families_with_det > 0 {
-            info!(
-                deterministic = families_with_det,
-                llm = families_needing_llm.len(),
-                "hierarchy inference split"
-            );
-        }
-
-        // Detect cross-family relationships and prepare related signatures
-        let context_rels = hierarchy.cross_family_relationships(repo, to_ref);
-
-        // Build lookup: consumer_family → [(provider_family, [relationship_names])]
-        let mut context_providers: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
-        for (consumer, provider, rel_name) in &context_rels {
-            context_providers
-                .entry(consumer.clone())
-                .or_default()
-                .entry(provider.clone())
-                .or_default()
-                .push(rel_name.clone());
-        }
-
-        // Pre-read related component signatures for each consumer family
-        let mut related_signatures: HashMap<String, String> = HashMap::new();
-        for (consumer, providers) in &context_providers {
-            let mut combined = String::new();
-            for (provider, rel_names) in providers {
-                if let Some(sigs) =
-                    hierarchy.related_family_content(repo, to_ref, provider, rel_names)
-                {
-                    combined.push_str(&sigs);
-                }
-            }
-            if !combined.is_empty() {
-                related_signatures.insert(consumer.clone(), combined);
-            }
-        }
-
-        info!(
-            families = families.len(),
-            llm_families = families_needing_llm.len(),
-            cross_family = related_signatures.len(),
-            "analyzing component hierarchy for both versions"
-        );
-
-        let bar = progress.start_counted(
-            "[Hierarchy] Inference",
-            families_needing_llm.len() as u64,
-        );
-
-        // Run LLM calls concurrently — only for families without deterministic data
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(LLM_CONCURRENCY));
-
-        // For each family needing LLM, infer hierarchy for BOTH old and new refs
-        let mut handles = Vec::new();
-
-        for family in &families_needing_llm {
-            // Pre-compute file paths before spawning — hierarchy is a reference
-            // that can't cross the 'static boundary of tokio::spawn.
-            let old_paths = hierarchy.family_source_paths(repo, from_ref, family);
-            let new_paths = hierarchy.family_source_paths(repo, to_ref, family);
-
-            let sem = semaphore.clone();
-            let repo = repo.to_path_buf();
-            let from_ref = from_ref.to_string();
-            let to_ref = to_ref.to_string();
-            let llm_cmd = llm_command.to_string();
-            let family = family.clone();
-            let related = related_signatures.get(&family).cloned();
-            let has_context = related.is_some();
-
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.expect("semaphore closed");
-
-                debug!(
-                    family = %family,
-                    cross_family = has_context,
-                    "inferring hierarchy"
-                );
-
-                let old_content = {
-                    if old_paths.is_empty() {
-                        None
-                    } else {
-                        let mut content = String::new();
-                        for file_path in &old_paths {
-                            if let Some(file_content) = read_git_file(&repo, &from_ref, file_path) {
-                                content.push_str(&format!("\n--- File: {} ---\n", file_path));
-                                content.push_str(&file_content);
-                                content.push('\n');
-                            }
-                        }
-                        if content.is_empty() {
-                            None
-                        } else {
-                            Some(content)
-                        }
-                    }
-                };
-
-                let new_content = {
-                    if new_paths.is_empty() {
-                        None
-                    } else {
-                        let mut content = String::new();
-                        for file_path in &new_paths {
-                            if let Some(file_content) = read_git_file(&repo, &to_ref, file_path) {
-                                content.push_str(&format!("\n--- File: {} ---\n", file_path));
-                                content.push_str(&file_content);
-                                content.push('\n');
-                            }
-                        }
-                        if content.is_empty() {
-                            None
-                        } else {
-                            Some(content)
-                        }
-                    }
-                };
-
-                // Infer old hierarchy (if family existed in old version)
-                // Old version doesn't get related signatures — conformance is
-                // about the new version's expected structure.
-                let old_hierarchy = if let Some(content) = old_content {
-                    tokio::task::spawn_blocking({
-                        let analyzer_cmd = llm_cmd.clone();
-                        let family_name = family.clone();
-                        move || {
-                            let _span = info_span!("llm_hierarchy", %family_name, version = "old")
-                                .entered();
-                            let a = LlmBehaviorAnalyzer::new(&analyzer_cmd);
-                            match a.infer_component_hierarchy(&family_name, &content, None) {
-                                Ok(h) => Some(h),
-                                Err(e) => {
-                                    warn!(
-                                        family = %family_name,
-                                        %e,
-                                        "old hierarchy inference failed"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-                } else {
-                    HashMap::new()
-                };
-
-                // Infer new hierarchy — include related signatures if available.
-                // Retry once on failure since the LLM sometimes returns prose
-                // instead of the expected JSON block.
-                let new_hierarchy = if let Some(content) = new_content {
-                    tokio::task::spawn_blocking({
-                        let family_name = family.clone();
-                        let related_sigs = related;
-                        move || {
-                            let _span = info_span!("llm_hierarchy", %family_name, version = "new")
-                                .entered();
-                            let analyzer = LlmBehaviorAnalyzer::new(&llm_cmd);
-                            match analyzer.infer_component_hierarchy(
-                                &family_name,
-                                &content,
-                                related_sigs.as_deref(),
-                            ) {
-                                Ok(h) => Some(h),
-                                Err(e) => {
-                                    warn!(
-                                        family = %family_name,
-                                        %e,
-                                        "new hierarchy failed, retrying"
-                                    );
-                                    // Retry once
-                                    match analyzer.infer_component_hierarchy(
-                                        &family_name,
-                                        &content,
-                                        related_sigs.as_deref(),
-                                    ) {
-                                        Ok(h) => Some(h),
-                                        Err(e2) => {
-                                            error!(
-                                                family = %family_name,
-                                                %e2,
-                                                "new hierarchy retry also failed"
-                                            );
-                                            None
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-                } else {
-                    HashMap::new()
-                };
-
-                (family, old_hierarchy, new_hierarchy)
-            });
-
-            handles.push(handle);
-        }
-
-        // Collect LLM results
-        let mut all_old: HashMap<String, HashMap<String, Vec<ExpectedChild>>> = HashMap::new();
-        let mut all_new: HashMap<String, HashMap<String, Vec<ExpectedChild>>> = HashMap::new();
-
-        for handle in handles {
-            if let Ok((family, old_h, new_h)) = handle.await {
-                let old_count: usize = old_h.values().map(|v| v.len()).sum();
-                let new_count: usize = new_h.values().map(|v| v.len()).sum();
-                debug!(
-                    family = %family,
-                    old_children = old_count,
-                    new_children = new_count,
-                    source = "llm",
-                    "hierarchy inferred"
-                );
-                all_old.insert(family.clone(), old_h);
-                all_new.insert(family, new_h);
-            }
-            bar.inc();
-        }
-        bar.finish();
-
-        // Merge deterministic hierarchy results (from rendered_components).
-        // These cover families that were skipped for LLM inference.
-        for (family, components) in deterministic_old {
-            all_old.entry(family).or_insert(components);
-        }
-        for (family, components) in deterministic_new {
-            all_new.entry(family).or_insert(components);
-        }
-
-        // Compute deltas
-        let mut deltas = Vec::new();
-
-        for (family, new_hierarchy) in &all_new {
-            let old_hierarchy = all_old.get(family).cloned().unwrap_or_default();
-
-            for (component, new_children) in new_hierarchy {
-                let old_children = old_hierarchy.get(component).cloned().unwrap_or_default();
-
-                let old_child_names: HashSet<String> =
-                    old_children.iter().map(|c| c.name.clone()).collect();
-                let new_child_names: HashSet<String> =
-                    new_children.iter().map(|c| c.name.clone()).collect();
-
-                let added: Vec<ExpectedChild> = new_children
-                    .iter()
-                    .filter(|c| !old_child_names.contains(&c.name))
-                    .map(|c| ExpectedChild {
-                        name: c.name.clone(),
-                        required: c.required,
-                        mechanism: c.mechanism.clone(),
-                        prop_name: c.prop_name.clone(),
-                    })
-                    .collect();
-
-                let removed: Vec<String> = old_children
-                    .iter()
-                    .filter(|c| !new_child_names.contains(&c.name))
-                    .map(|c| c.name.clone())
-                    .collect();
-
-                if !added.is_empty() || !removed.is_empty() {
-                    deltas.push(HierarchyDelta {
-                        component: component.clone(),
-                        added_children: added,
-                        removed_children: removed,
-                        migrated_members: Vec::new(), // Populated during report building
-                        source_package: None,
-                        migration_target: None,
-                    });
-                }
-            }
-        }
-
-        info!(
-            deltas = deltas.len(),
-            families = all_new.len(),
-            "hierarchy deltas detected"
-        );
-
-        (deltas, all_new)
-    }
-} // end impl Analyzer<L> (private methods, part 2)
+// NOTE: ~420 lines of hierarchy inference code (infer_and_diff_hierarchies)
+// were removed during genericization. See git history for the original
+// implementation. The hierarchy lifecycle is now owned by the Language
+// implementation via run_extended_analysis().

@@ -62,6 +62,7 @@ pub(crate) mod test_support {
         type ManifestChangeType = String;
         type Evidence = String;
         type ReportData = String;
+        type AnalysisExtensions = ();
         const RENAMEABLE_SYMBOL_KINDS: &'static [crate::types::SymbolKind] = &[];
         const NAME: &'static str = "test";
         const MANIFEST_FILES: &'static [&'static str] = &[];
@@ -141,7 +142,7 @@ pub(crate) mod test_support {
                 packages: vec![],
                 member_renames: HashMap::new(),
                 inferred_rename_patterns: None,
-                hierarchy_deltas: vec![],
+                extensions: (),
                 metadata: AnalysisMetadata {
                     call_graph_analysis: String::new(),
                     tool_version: String::new(),

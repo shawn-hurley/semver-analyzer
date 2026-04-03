@@ -21,7 +21,8 @@
 #   --skip-fix         Skip applying fixes
 #   --release          Build in release mode
 #   --work-dir DIR     Working directory (default: /tmp/semver-integration)
-#   --rename-patterns  Path to rename patterns YAML (default: patternfly-rename-patterns.yaml)
+#   --rename-patterns  Path to token mappings YAML (default: patternfly-token-mappings.yaml)
+#   --no-pipeline-v2   Use v1 (BU) pipeline instead of v2 (SD)
 #   --help             Show this help message
 #
 set -euo pipefail
@@ -32,6 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEMVER_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FAP_DIR="$(cd "$SEMVER_DIR/../frontend-analyzer-provider" && pwd)"
 PF_REPO="${SEMVER_DIR}/../testdata/patternfly-react"
+PF_CSS_REPO_URL="https://github.com/patternfly/patternfly.git"
 
 WORK_DIR="/tmp/semver-integration"
 SKIP_ANALYSIS=false
@@ -41,10 +43,11 @@ SKIP_FIX=false
 RELEASE=false
 
 PF_FROM="v5.4.0"
-PF_TO="v6.1.0"
+PF_TO="v6.4.1"
 QUIPUCORDS_REPO="git@github.com:jwmatthews/quipucords-ui.git"
 QUIPUCORDS_V5_COMMIT="3b3ce52"
-RENAME_PATTERNS="$SCRIPT_DIR/patternfly-rename-patterns.yaml"
+RENAME_PATTERNS="$SCRIPT_DIR/patternfly-token-mappings.yaml"
+PIPELINE_V2=true  # v2 is the default; use --no-pipeline-v2 to disable
 
 # ── Parse args ───────────────────────────────────────────────────────────
 
@@ -62,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --release)       RELEASE=true;       shift ;;
         --work-dir)      WORK_DIR="$2";      shift 2 ;;
         --rename-patterns) RENAME_PATTERNS="$2"; shift 2 ;;
+        --no-pipeline-v2) PIPELINE_V2=false; shift ;;
         --help|-h)       usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -69,6 +73,7 @@ done
 
 # ── Directories ──────────────────────────────────────────────────────────
 
+PF_CSS_REPO="$WORK_DIR/patternfly"
 REPORT="$WORK_DIR/patternfly-report.json"
 RULES_BUILTIN="$WORK_DIR/konveyor-rules-builtin"
 RULES_FRONTEND="$WORK_DIR/konveyor-rules-frontend"
@@ -133,12 +138,32 @@ if [[ "$SKIP_ANALYSIS" == false ]]; then
     echo "==> Step 1: Analyzing PatternFly $PF_FROM → $PF_TO..."
     echo "    Repo: $PF_REPO"
 
+    # Clone the CSS repo for CSS profile extraction + dep-update rule
+    if [[ ! -d "$PF_CSS_REPO/.git" ]]; then
+        echo "    Cloning PatternFly CSS from $PF_CSS_REPO_URL..."
+        git clone "$PF_CSS_REPO_URL" "$PF_CSS_REPO"
+    fi
+    (cd "$PF_CSS_REPO" && git checkout "$PF_TO" --force 2>/dev/null || true)
+
+    PIPELINE_FLAG=""
+    if [[ "$PIPELINE_V2" == true ]]; then
+        PIPELINE_FLAG="--pipeline-v2"
+    fi
+
+    DEP_REPO_FLAG=""
+    if [[ -d "$PF_CSS_REPO/.git" ]]; then
+        DEP_REPO_FLAG="--dep-repo $PF_CSS_REPO"
+        echo "    CSS dep repo: $PF_CSS_REPO"
+    fi
+
     "$SEMVER_BIN" analyze \
         --repo "$PF_REPO" \
         --from "$PF_FROM" \
         --to "$PF_TO" \
         --no-llm \
-        --build-command "yarn build" \
+        --build-command "yarn build:generate && yarn build:esm" \
+        $PIPELINE_FLAG \
+        $DEP_REPO_FLAG \
         -o "$REPORT"
 
     echo ""
@@ -149,6 +174,11 @@ if [[ "$SKIP_ANALYSIS" == false ]]; then
         echo "    Breaking changes: $(jq '.summary.total_breaking_changes' "$REPORT")"
         echo "    API changes: $(jq '.summary.breaking_api_changes' "$REPORT")"
         echo "    Behavioral: $(jq '.summary.breaking_behavioral_changes' "$REPORT")"
+        if [[ "$PIPELINE_V2" == true ]]; then
+            echo "    SD source-level: $(jq '.sd_result.source_level_changes | length' "$REPORT")"
+            echo "    SD composition trees: $(jq '.sd_result.composition_trees | length' "$REPORT")"
+            echo "    SD conformance checks: $(jq '.sd_result.conformance_checks | length' "$REPORT")"
+        fi
     fi
     echo ""
 else
@@ -160,11 +190,17 @@ fi
 
 echo "==> Step 2: Generating Konveyor rules..."
 
-# Build rename-patterns flag if file exists
+# Build flags
 RENAME_FLAG=""
 if [[ -f "$RENAME_PATTERNS" ]]; then
     RENAME_FLAG="--rename-patterns $RENAME_PATTERNS"
-    echo "    Using rename patterns: $RENAME_PATTERNS"
+    echo "    Using token mappings: $RENAME_PATTERNS"
+fi
+
+PIPELINE_FLAG=""
+if [[ "$PIPELINE_V2" == true ]]; then
+    PIPELINE_FLAG="--pipeline-v2"
+    echo "    Pipeline: v2 (TD+SD)"
 fi
 
 # Generate Konveyor rules
@@ -172,14 +208,16 @@ echo "    2a: generating rules..."
 "$SEMVER_BIN" konveyor \
     --from-report "$REPORT" \
     --output-dir "$RULES_BUILTIN" \
-    $RENAME_FLAG
+    $RENAME_FLAG \
+    $PIPELINE_FLAG
 
 # Also generate in the frontend rules directory (same output, for kantra)
 echo "    2b: copying to frontend rules dir..."
 "$SEMVER_BIN" konveyor \
     --from-report "$REPORT" \
     --output-dir "$RULES_FRONTEND" \
-    $RENAME_FLAG
+    $RENAME_FLAG \
+    $PIPELINE_FLAG
 
 echo ""
 if command -v yq >/dev/null 2>&1; then

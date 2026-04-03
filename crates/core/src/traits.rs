@@ -752,7 +752,7 @@ pub trait MessageFormatter {
 
 /// The core language abstraction.
 ///
-/// Composes `LanguageSemantics + MessageFormatter` and adds four associated
+/// Composes `LanguageSemantics + MessageFormatter` and adds five associated
 /// types representing language-specific data flowing through the pipeline.
 ///
 /// Code that only needs semantic rules can take `&dyn LanguageSemantics`
@@ -777,6 +777,16 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
 
     /// Language-specific report data.
     type ReportData: Debug + Clone + Serialize + DeserializeOwned + Send + Sync;
+
+    /// Language-specific analysis extensions.
+    ///
+    /// Opaque data produced during analysis that core passes through
+    /// without inspecting. The language implementation populates this
+    /// during `run_extended_analysis()` and consumes it in `build_report()`.
+    ///
+    /// For TypeScript: SD pipeline results + hierarchy inference results.
+    /// For languages without extended analysis: `()`.
+    type AnalysisExtensions: Debug + Clone + Default + Serialize + DeserializeOwned + Send + Sync;
 
     // ── Constants ────────────────────────────────────────────────────
 
@@ -905,6 +915,32 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
     /// Default: return the qualified name as-is
     fn display_name(&self, qualified_name: &str) -> String {
         qualified_name.to_string()
+    }
+
+    // ── Extended analysis (language-specific pipelines) ────────────
+
+    /// Run all language-specific analysis beyond TD/BU.
+    ///
+    /// This is the single entry point for language-specific pipeline
+    /// steps that core doesn't understand. The orchestrator calls this
+    /// after TD completes and passes the results through to `build_report()`.
+    ///
+    /// For TypeScript: runs the SD pipeline + hierarchy inference.
+    /// Default: returns empty extensions (no language-specific analysis).
+    #[allow(unused_variables)]
+    fn run_extended_analysis(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        structural_changes: &[crate::types::StructuralChange],
+        old_surface: &ApiSurface,
+        new_surface: &ApiSurface,
+        llm_command: Option<&str>,
+        dep_css_dir: Option<&Path>,
+        no_llm: bool,
+    ) -> Result<Self::AnalysisExtensions> {
+        Ok(Self::AnalysisExtensions::default())
     }
 }
 

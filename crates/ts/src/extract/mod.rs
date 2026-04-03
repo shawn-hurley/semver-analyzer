@@ -1693,11 +1693,13 @@ fn extract_interface(
     // extends (Vec, not Option)
     if !iface.extends.is_empty() {
         // Use first extends as `extends` field, rest go into implements
-        // (interfaces can extend multiple interfaces)
+        // (interfaces can extend multiple interfaces).
+        // Use the full span (expression + type arguments) to capture
+        // generic wrappers like `Omit<React.HTMLProps<HTMLElement>, 'ref'>`.
         let names: Vec<String> = iface
             .extends
             .iter()
-            .map(|ext| span_text(source, ext.expression.span()).to_string())
+            .map(|ext| span_text(source, ext.span).to_string())
             .collect();
         if let Some(first) = names.first() {
             sym.extends = Some(first.clone());

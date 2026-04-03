@@ -11,11 +11,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::hierarchy_types::MigratedMember;
 use crate::{TsCategory, TsManifestChangeType, TypeScript};
 use semver_analyzer_core::{
     AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange,
     ChildComponentStatus, ComponentStatus, ComponentSummary, ExpectedChild, FileChanges,
-    ManifestChange, MigratedMember, RemovalDisposition, RemovedMember,
+    ManifestChange, RemovalDisposition, RemovedMember,
 };
 
 // Re-export all types and functions from semver-analyzer-konveyor-core.
@@ -1214,7 +1215,7 @@ pub fn generate_rules(
     // individual per-file rules for symbols covered by hierarchy or
     // deprecated migration rules are suppressed. The hierarchy rule
     // loop runs later but the coverage information is needed here.
-    for delta in &report.hierarchy_deltas {
+    for delta in &report.extensions.hierarchy_deltas {
         covered_components.insert(delta.component.clone());
         covered_components.insert(format!("{}Props", delta.component));
 
@@ -1568,6 +1569,7 @@ pub fn generate_rules(
     // child" without guidance on what to do instead — P0-C is still
     // needed for prop migration instructions in those cases.
     let hierarchy_covered_components: HashSet<String> = report
+        .extensions
         .hierarchy_deltas
         .iter()
         .filter(|d| !d.added_children.is_empty())
@@ -2481,7 +2483,7 @@ pub fn generate_rules(
     // The rule message incorporates removed property data from the
     // ComponentSummary to produce rich per-prop migration instructions,
     // replacing the P0-C message format.
-    for delta in &report.hierarchy_deltas {
+    for delta in &report.extensions.hierarchy_deltas {
         if delta.added_children.is_empty() && delta.removed_children.is_empty() {
             continue;
         }
@@ -2732,7 +2734,7 @@ pub fn generate_rules(
             for child_name in &delta.removed_children {
                 // Check if the child moved under a new parent
                 let new_parent = delta.added_children.iter().find(|added| {
-                    report.hierarchy_deltas.iter().any(|d| {
+                    report.extensions.hierarchy_deltas.iter().any(|d| {
                         d.component == added.name
                             && d.added_children.iter().any(|c| c.name == *child_name)
                     })
@@ -3451,8 +3453,15 @@ pub fn generate_dependency_update_rules(
     let mut rules = Vec::new();
     let mut strategies = HashMap::new();
 
-    // Collect packages that have breaking changes
+    // Collect packages that need dependency-update rules.
+    //
+    // Two sources:
+    // 1. Packages with breaking API/behavioral changes in the report
+    // 2. ALL packages in the cache that had a major version bump (e.g., 5.x → 6.x)
+    //    even if they have no breaking changes in the report (e.g., react-styles)
     let mut packages_with_changes: HashMap<String, &PackageInfo> = HashMap::new();
+
+    // Source 1: packages with breaking changes
     for file_changes in &report.changes {
         let file_str = file_changes.file.to_string_lossy();
         let parts: Vec<&str> = file_str.split('/').collect();
@@ -3460,7 +3469,6 @@ pub fn generate_dependency_update_rules(
         if let Some(pkg_idx) = parts.iter().position(|&p| p == "packages") {
             if let Some(pkg_dir_name) = parts.get(pkg_idx + 1) {
                 if let Some(info) = pkg_info_cache.get(*pkg_dir_name) {
-                    // Only include if the package has a version and breaking changes
                     if info.version.is_some()
                         && (!file_changes.breaking_api_changes.is_empty()
                             || !file_changes.breaking_behavioral_changes.is_empty())
@@ -3470,6 +3478,36 @@ pub fn generate_dependency_update_rules(
                             .or_insert(info);
                     }
                 }
+            }
+        }
+    }
+
+    // Source 2: any package with a major version bump vs the from_ref.
+    // This catches packages like react-styles that ship a new major version
+    // alongside the rest of the monorepo but have no breaking API surface.
+    let from_major = report
+        .comparison
+        .from_ref
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    for (_dir_name, info) in pkg_info_cache {
+        if packages_with_changes.contains_key(&info.name) {
+            continue;
+        }
+        if let Some(ref ver) = info.version {
+            let new_major = ver
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if new_major > from_major {
+                packages_with_changes
+                    .entry(info.name.clone())
+                    .or_insert(info);
             }
         }
     }
@@ -3920,6 +3958,36 @@ pub fn build_package_info_cache(
                     version: npm_version,
                 };
                 cache.insert(pkg_dir_name.to_string(), info);
+            }
+        }
+    }
+
+    // Discover ALL workspace packages via `git ls-tree` so packages without
+    // breaking API changes (e.g., react-styles) still get dependency-update rules
+    // when they have a major version bump.
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["ls-tree", "--name-only", to_ref, "packages/"])
+        .current_dir(repo_path)
+        .output()
+    {
+        if output.status.success() {
+            let listing = String::from_utf8_lossy(&output.stdout);
+            for line in listing.lines() {
+                // line is e.g. "packages/react-styles"
+                let dir_name = line.trim_start_matches("packages/");
+                if dir_name.is_empty() || cache.contains_key(dir_name) {
+                    continue;
+                }
+                let pkg_json_git_path = format!("{}/package.json", line);
+                if let Some((npm_name, npm_version)) =
+                    read_package_json_at_ref(repo_path, to_ref, &pkg_json_git_path)
+                {
+                    let info = PackageInfo {
+                        name: npm_name.unwrap_or_else(|| dir_name.to_string()),
+                        version: npm_version,
+                    };
+                    cache.insert(dir_name.to_string(), info);
+                }
             }
         }
     }
@@ -5183,6 +5251,7 @@ fn manifest_change_type_label(change_type: &TsManifestChangeType) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hierarchy_types::HierarchyDelta;
     use semver_analyzer_core::*;
     use std::path::PathBuf;
 
@@ -5212,7 +5281,7 @@ mod tests {
             packages: vec![],
             member_renames: HashMap::new(),
             inferred_rename_patterns: None,
-            hierarchy_deltas: Vec::new(),
+            extensions: crate::TsAnalysisExtensions::default(),
             metadata: AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "0.1.0".to_string(),
@@ -7006,6 +7075,8 @@ mod tests {
                         ],
                         removed_only_members: vec!["className".to_string(), "children".to_string()],
                         overlap_ratio: 0.6,
+                    old_extends: None,
+                    new_extends: None,
                     });
                     change
                 },
@@ -8677,6 +8748,8 @@ mod tests {
                 ],
                 removed_only_members: vec!["className".to_string()],
                 overlap_ratio: 0.67,
+                    old_extends: None,
+                    new_extends: None,
             }),
             behavioral_changes: vec![make_behavioral(
                 "EmptyStateHeader",
@@ -10156,7 +10229,7 @@ mod tests {
 
         // Add a hierarchy delta: Dropdown gained DropdownList as required child,
         // and DropdownItem moved from Dropdown to DropdownList
-        report.hierarchy_deltas = vec![HierarchyDelta {
+        report.extensions.hierarchy_deltas = vec![HierarchyDelta {
             component: "Dropdown".to_string(),
             added_children: vec![ExpectedChild::new("DropdownList", true)],
             removed_children: vec!["DropdownItem".to_string()],
@@ -10250,7 +10323,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        report.hierarchy_deltas = vec![HierarchyDelta {
+        report.extensions.hierarchy_deltas = vec![HierarchyDelta {
             component: "Modal".to_string(),
             added_children: vec![
                 ExpectedChild::new("ModalHeader", false),
@@ -10377,7 +10450,7 @@ mod tests {
             constants: vec![],
             added_exports: vec![],
         }];
-        report.hierarchy_deltas = vec![];
+        report.extensions.hierarchy_deltas = vec![];
 
         let rules = generate_conformance_rules(&report);
 
@@ -10461,7 +10534,7 @@ mod tests {
             constants: vec![],
             added_exports: vec![],
         }];
-        report.hierarchy_deltas = vec![];
+        report.extensions.hierarchy_deltas = vec![];
 
         let rules = generate_conformance_rules(&report);
         assert_eq!(
@@ -10514,7 +10587,7 @@ mod tests {
             constants: vec![],
             added_exports: vec![],
         }];
-        report.hierarchy_deltas = vec![];
+        report.extensions.hierarchy_deltas = vec![];
 
         let rules = generate_conformance_rules(&report);
         assert_eq!(
@@ -10549,7 +10622,7 @@ mod tests {
             constants: vec![],
             added_exports: vec![],
         }];
-        report.hierarchy_deltas = vec![];
+        report.extensions.hierarchy_deltas = vec![];
 
         let rules = generate_conformance_rules(&report);
         assert_eq!(
@@ -10786,7 +10859,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        report.hierarchy_deltas = vec![HierarchyDelta {
+        report.extensions.hierarchy_deltas = vec![HierarchyDelta {
             component: "ToolbarGroup".to_string(),
             added_children: vec![
                 ExpectedChild::new("ToolbarItem", false),
@@ -10878,7 +10951,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        report.hierarchy_deltas = vec![HierarchyDelta {
+        report.extensions.hierarchy_deltas = vec![HierarchyDelta {
             component: "Modal".to_string(),
             added_children: vec![
                 ExpectedChild::new("ModalHeader", false),
@@ -10984,7 +11057,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        report.hierarchy_deltas = vec![HierarchyDelta {
+        report.extensions.hierarchy_deltas = vec![HierarchyDelta {
             component: "Modal".to_string(),
             added_children: vec![ExpectedChild::new("ModalBody", true)],
             removed_children: vec![],
@@ -11065,7 +11138,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        report.hierarchy_deltas = vec![HierarchyDelta {
+        report.extensions.hierarchy_deltas = vec![HierarchyDelta {
             component: "FormFieldGroup".to_string(),
             added_children: vec![ExpectedChild::new("FormGroup", false)],
             removed_children: vec![],

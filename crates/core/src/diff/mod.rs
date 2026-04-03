@@ -626,6 +626,18 @@ pub fn diff_surfaces_with_semantics(
                             removed_names.join(", "),
                         ));
                     }
+                    // When the base type (extends clause) changed, warn that
+                    // inherited members may no longer be available. The LLM
+                    // knows what members React.HTMLProps provides vs MenuItemProps.
+                    if mig.target.old_extends.is_some() || mig.target.new_extends.is_some() {
+                        let old_ext = mig.target.old_extends.as_deref().unwrap_or("(none)");
+                        let new_ext = mig.target.new_extends.as_deref().unwrap_or("(none)");
+                        desc.push_str(&format!(
+                            "\n  Base type changed: {} → {}. \
+                             Inherited members from the old base type are no longer available.",
+                            old_ext, new_ext,
+                        ));
+                    }
                     change.description = desc;
                     break;
                 }

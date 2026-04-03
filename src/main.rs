@@ -192,18 +192,34 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
     let analyzer = orchestrator::Analyzer {
         lang: Arc::new(TypeScript::new(args.build_command)),
     };
-    let result = analyzer
-        .run(
-            &common.repo,
-            &common.from,
-            &common.to,
-            common.no_llm,
-            common.llm_command.as_deref(),
-            None, // build_command already on TypeScript
-            common.llm_all_files,
-            reporter,
-        )
-        .await?;
+    let result = if common.pipeline_v2 {
+        reporter.println("Pipeline: v2 (TD+SD, no BU)");
+        analyzer
+            .run_v2(
+                &common.repo,
+                &common.from,
+                &common.to,
+                common.no_llm,
+                common.llm_command.as_deref(),
+                None,
+                common.dep_repo.as_deref(),
+                reporter,
+            )
+            .await?
+    } else {
+        analyzer
+            .run(
+                &common.repo,
+                &common.from,
+                &common.to,
+                common.no_llm,
+                common.llm_command.as_deref(),
+                None, // build_command already on TypeScript
+                common.llm_all_files,
+                reporter,
+            )
+            .await?
+    };
 
     // Print summary stats
     let manifest_breaking = result
@@ -379,24 +395,40 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         let analyzer = orchestrator::Analyzer {
             lang: Arc::new(TypeScript::new(args.build_command.clone())),
         };
-        let result = analyzer
-            .run(
-                repo,
-                from,
-                to,
-                common.no_llm,
-                common.llm_command.as_deref(),
-                None, // build_command already on TypeScript
-                common.llm_all_files,
-                reporter,
-            )
-            .await?;
+        let result = if common.pipeline_v2 {
+            reporter.println("Pipeline: v2 (TD+SD, no BU)");
+            analyzer
+                .run_v2(
+                    repo,
+                    from,
+                    to,
+                    common.no_llm,
+                    common.llm_command.as_deref(),
+                    None,
+                    common.dep_repo.as_deref(),
+                    reporter,
+                )
+                .await?
+        } else {
+            analyzer
+                .run(
+                    repo,
+                    from,
+                    to,
+                    common.no_llm,
+                    common.llm_command.as_deref(),
+                    None, // build_command already on TypeScript
+                    common.llm_all_files,
+                    reporter,
+                )
+                .await?
+        };
 
         <TypeScript as Language>::build_report(&result, repo, from, to)
     };
 
     // Build package info cache
-    let pkg_info_cache = konveyor::build_package_info_cache(&report);
+    let mut pkg_info_cache = konveyor::build_package_info_cache(&report);
     let pkg_cache: HashMap<String, String> = pkg_info_cache
         .iter()
         .map(|(k, v)| (k.clone(), v.name.clone()))
@@ -491,6 +523,21 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
 
     let mut strategies = konveyor::extract_fix_strategies(&rules);
 
+    // Add dep-repo packages (e.g., @patternfly/patternfly CSS package) to the
+    // cache so they get dependency-update rules even though they're from a
+    // separate repo.
+    if let Some(ref sd) = report.extensions.sd_result {
+        for (name, version) in &sd.dep_repo_packages {
+            let dir_name = name.rsplit('/').next().unwrap_or(name);
+            pkg_info_cache.entry(dir_name.to_string()).or_insert_with(|| {
+                semver_analyzer_konveyor_core::PackageInfo {
+                    name: name.clone(),
+                    version: Some(version.clone()),
+                }
+            });
+        }
+    }
+
     // Generate dependency update rules
     let (dep_update_rules, dep_update_strategies) =
         konveyor::generate_dependency_update_rules(&report, &pkg_info_cache);
@@ -498,6 +545,81 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
 
     let mut all_rules = rules;
     all_rules.extend(dep_update_rules);
+
+    // v2 SD rules — composition, conformance, context, prop↔child migration
+    if common.pipeline_v2 {
+        if let Some(ref sd) = report.extensions.sd_result {
+            let sd_rule_phase = reporter.start_phase("Generating v2 SD rules");
+            let sd_rules =
+                semver_analyzer_ts::konveyor_v2::generate_sd_rules(&report, sd, &pkg_cache);
+            let sd_count = sd_rules.len();
+
+            // Collect components covered by SD prop→child or deprecated-migration rules.
+            // Suppress v1 "component-removal" rules for these components since the
+            // SD rules provide more precise, actionable guidance.
+            let sd_covered: std::collections::HashSet<String> = sd_rules
+                .iter()
+                .filter(|r| {
+                    r.labels.iter().any(|l| {
+                        l == "change-type=prop-to-child"
+                            || l == "change-type=deprecated-migration"
+                    })
+                })
+                .filter_map(|r| {
+                    r.fix_strategy
+                        .as_ref()
+                        .and_then(|fs| fs.component.clone())
+                })
+                .collect();
+
+            if !sd_covered.is_empty() {
+                let before = all_rules.len();
+                all_rules.retain(|r| {
+                    let is_component_removal = r
+                        .labels
+                        .iter()
+                        .any(|l| l == "change-type=component-removal");
+                    if !is_component_removal {
+                        return true;
+                    }
+                    // Extract component name from fix_strategy or from the
+                    // condition pattern (strip ^...$ anchors)
+                    let component = r
+                        .fix_strategy
+                        .as_ref()
+                        .and_then(|fs| fs.component.clone())
+                        .or_else(|| {
+                            // Extract from condition pattern
+                            if let semver_analyzer_konveyor_core::KonveyorCondition::FrontendReferenced {
+                                ref referenced,
+                            } = r.when
+                            {
+                                let p = &referenced.pattern;
+                                Some(
+                                    p.trim_start_matches('^')
+                                        .trim_end_matches('$')
+                                        .to_string(),
+                                )
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    !sd_covered.contains(&component)
+                });
+                let suppressed = before - all_rules.len();
+                if suppressed > 0 {
+                    info!(
+                        suppressed,
+                        "suppressed v1 component-removal rules covered by v2 SD rules"
+                    );
+                }
+            }
+
+            all_rules.extend(sd_rules);
+            sd_rule_phase.finish_with_detail("SD rules generated", &format!("{} rules", sd_count));
+        }
+    }
 
     let fix_guidance = konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
     let rule_count = all_rules.len();
@@ -510,16 +632,17 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let fix_dir = konveyor::write_fix_guidance_dir(&common.output_dir, &fix_guidance)?;
     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
 
-    // Conformance rules — targeted nesting-violation rules that fire
-    // when a component is used as a direct child of a parent but should
-    // be wrapped in an intermediate component (e.g., DropdownItem must
-    // be inside DropdownList, not directly in Dropdown).
-    let conformance_rules = konveyor::generate_conformance_rules(&report);
-    if !conformance_rules.is_empty() {
-        let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
-        konveyor::write_conformance_rules(&common.output_dir, &conformance_rules)?;
-        strategies.extend(conformance_strategies);
-        konveyor::write_fix_strategies(&fix_dir, &strategies)?;
+    // Conformance rules — targeted nesting-violation rules.
+    // v2 pipeline generates these from SD composition trees (more accurate),
+    // v1 generates from LLM-inferred hierarchy deltas.
+    if !common.pipeline_v2 {
+        let conformance_rules = konveyor::generate_conformance_rules(&report);
+        if !conformance_rules.is_empty() {
+            let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
+            konveyor::write_conformance_rules(&common.output_dir, &conformance_rules)?;
+            strategies.extend(conformance_strategies);
+            konveyor::write_fix_strategies(&fix_dir, &strategies)?;
+        }
     }
     write_phase.finish("Output written");
 
