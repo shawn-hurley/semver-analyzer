@@ -5,6 +5,19 @@
 
 use std::path::Path;
 
+/// Extract the package manager name from the `packageManager` field in
+/// `package.json` (e.g., "yarn" from "yarn@4.5.0").
+///
+/// Returns `None` if the field is missing, unreadable, or malformed.
+fn package_manager_from_field(dir: &Path) -> Option<String> {
+    let pkg_path = dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let field = json.get("packageManager")?.as_str()?;
+    // Field format is "name@version", e.g., "yarn@4.5.0"
+    Some(field.split('@').next()?.to_string())
+}
+
 /// Supported package managers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
@@ -48,12 +61,31 @@ impl PackageManager {
     ///
     /// All commands use frozen lockfile mode to ensure reproducible installs.
     /// For Yarn Berry (v2+), uses `--immutable` instead of `--frozen-lockfile`.
-    pub fn install_command(&self) -> (&'static str, &'static [&'static str]) {
-        match self {
+    ///
+    /// When `package.json` declares a `packageManager` field that matches the
+    /// detected manager (e.g., `yarn@4.5.0` for a Yarn project), the command
+    /// is wrapped with `corepack` so that the declared version is used.
+    /// If the field names a different manager, corepack is not used.
+    pub fn install_command(&self, dir: &Path) -> (String, Vec<String>) {
+        let (base_cmd, args): (&str, &[&str]) = match self {
             Self::Npm => ("npm", &["ci"]),
             Self::Yarn => ("yarn", &["install", "--immutable"]),
             Self::YarnClassic => ("yarn", &["install", "--frozen-lockfile"]),
             Self::Pnpm => ("pnpm", &["install", "--frozen-lockfile"]),
+        };
+
+        let use_corepack = package_manager_from_field(dir)
+            .is_some_and(|pm_name| pm_name == base_cmd);
+
+        if use_corepack {
+            let mut full_args: Vec<String> = vec![base_cmd.to_string()];
+            full_args.extend(args.iter().map(|s| s.to_string()));
+            ("corepack".to_string(), full_args)
+        } else {
+            (
+                base_cmd.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            )
         }
     }
 
@@ -168,30 +200,73 @@ mod tests {
 
     #[test]
     fn install_command_npm() {
-        let (cmd, args) = PackageManager::Npm.install_command();
+        let dir = TempDir::new().unwrap();
+        let (cmd, args) = PackageManager::Npm.install_command(dir.path());
         assert_eq!(cmd, "npm");
         assert_eq!(args, &["ci"]);
     }
 
     #[test]
     fn install_command_yarn_berry() {
-        let (cmd, args) = PackageManager::Yarn.install_command();
+        let dir = TempDir::new().unwrap();
+        let (cmd, args) = PackageManager::Yarn.install_command(dir.path());
         assert_eq!(cmd, "yarn");
         assert_eq!(args, &["install", "--immutable"]);
     }
 
     #[test]
     fn install_command_yarn_classic() {
-        let (cmd, args) = PackageManager::YarnClassic.install_command();
+        let dir = TempDir::new().unwrap();
+        let (cmd, args) = PackageManager::YarnClassic.install_command(dir.path());
         assert_eq!(cmd, "yarn");
         assert_eq!(args, &["install", "--frozen-lockfile"]);
     }
 
     #[test]
     fn install_command_pnpm() {
-        let (cmd, args) = PackageManager::Pnpm.install_command();
+        let dir = TempDir::new().unwrap();
+        let (cmd, args) = PackageManager::Pnpm.install_command(dir.path());
         assert_eq!(cmd, "pnpm");
         assert_eq!(args, &["install", "--frozen-lockfile"]);
+    }
+
+    #[test]
+    fn install_command_uses_corepack_when_package_manager_field_present() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"test","packageManager":"yarn@4.5.0"}"#,
+        )
+        .unwrap();
+        let (cmd, args) = PackageManager::Yarn.install_command(dir.path());
+        assert_eq!(cmd, "corepack");
+        assert_eq!(args, &["yarn", "install", "--immutable"]);
+    }
+
+    #[test]
+    fn install_command_no_corepack_without_package_manager_field() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"test","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let (cmd, args) = PackageManager::Yarn.install_command(dir.path());
+        assert_eq!(cmd, "yarn");
+        assert_eq!(args, &["install", "--immutable"]);
+    }
+
+    #[test]
+    fn install_command_no_corepack_when_package_manager_field_mismatches() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"test","packageManager":"npm@10.0.0"}"#,
+        )
+        .unwrap();
+        let (cmd, args) = PackageManager::Yarn.install_command(dir.path());
+        assert_eq!(cmd, "yarn");
+        assert_eq!(args, &["install", "--immutable"]);
     }
 
     #[test]

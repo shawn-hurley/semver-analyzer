@@ -356,14 +356,15 @@ fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<(), WorktreeErro
 
 /// Run the package manager install command in the worktree directory.
 fn run_package_install(worktree_dir: &Path, pm: PackageManager) -> Result<(), WorktreeError> {
-    let (cmd, args) = pm.install_command();
+    let (cmd, args) = pm.install_command(worktree_dir);
+    let display_cmd = format!("{cmd} {}", args.join(" "));
 
     let output = Command::new(cmd)
         .args(args)
         .current_dir(worktree_dir)
         .output()
         .map_err(|e| WorktreeError::PackageInstallFailed {
-            command: format!("{cmd} {}", args.join(" ")),
+            command: display_cmd.clone(),
             reason: format!("Failed to execute: {e}"),
         })?;
 
@@ -372,7 +373,7 @@ fn run_package_install(worktree_dir: &Path, pm: PackageManager) -> Result<(), Wo
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(WorktreeError::PackageInstallFailed {
-            command: format!("{cmd} {}", args.join(" ")),
+            command: display_cmd,
             reason: stderr.trim().to_string(),
         })
     }
