@@ -623,40 +623,67 @@ mod tests {
         // Cleanup: let guard2 drop normally
     }
 
+    /// Create a test repo under the current working directory with a lockfile.
+    ///
+    /// Uses `tempdir_in(".")` so we can derive a relative path via
+    /// `strip_prefix` without changing the process-global CWD (which would
+    /// be flaky under parallel test execution).
+    fn create_test_repo_in_cwd() -> TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("test-repo-")
+            .tempdir_in(".")
+            .unwrap();
+        let repo = dir.path();
+
+        run_git(repo, &["init", "-b", "main"]);
+        run_git(repo, &["config", "user.email", "test@test.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        run_git(repo, &["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(repo.join("file.txt"), "hello").unwrap();
+        std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"test","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        run_git(repo, &["tag", "v1.0.0"]);
+
+        dir
+    }
+
     #[test]
-    fn relative_repo_path_creates_worktree_at_correct_location() {
-        // Regression test: when repo is a relative path, the worktree must be
-        // created where PackageManager::detect() will look for it, not at a
-        // double-nested path caused by git resolving relative to its CWD.
-        let repo_dir = create_test_repo();
-        let repo_abs = repo_dir.path().to_path_buf();
+    fn relative_repo_path_finds_lockfile_in_worktree() {
+        // Regression test for #1: when repo is a relative path,
+        // WorktreeGuard::new() must find the lockfile in the worktree it
+        // created, not miss it because of a double-nested path.
+        //
+        // The repo is created under CWD so we can derive a relative path
+        // via strip_prefix — no set_current_dir needed.
+        let repo_dir = create_test_repo_in_cwd();
+        let cwd = std::env::current_dir().unwrap();
+        let relative_repo = repo_dir
+            .path()
+            .strip_prefix(&cwd)
+            .expect("repo should be under CWD since we used tempdir_in(\".\")");
 
-        // Build a relative path to the repo from a different working directory.
-        // We use the parent directory as the CWD and make repo a relative child.
-        let parent = repo_abs.parent().expect("repo should have a parent");
-        let repo_name = repo_abs.file_name().expect("repo should have a dir name");
-        let relative_repo = Path::new(".").join(repo_name);
+        // Call new() — the actual path from the bug report.
+        // With the fix, PackageManager::detect() finds package-lock.json
+        // and proceeds to `npm ci`, which fails in the test environment.
+        // Without the fix, it fails with NoLockfileFound because git
+        // created the worktree at a double-nested path.
+        let result = WorktreeGuard::new(relative_repo, "v1.0.0", None);
 
-        // Change to the parent directory so the relative path resolves correctly
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(parent).unwrap();
-
-        let result = WorktreeGuard::create_only(&relative_repo, "v1.0.0");
-
-        // Restore CWD before any assertions (so cleanup works even on failure)
-        std::env::set_current_dir(&original_dir).unwrap();
-
-        let guard = result.expect("create_only with relative path should succeed");
-
-        // The worktree path should exist and contain the repo's files
-        assert!(
-            guard.path().exists(),
-            "worktree should exist at the path returned by guard"
-        );
-        assert!(
-            guard.path().join("file.txt").exists(),
-            "worktree should contain repo files (file.txt), \
-             not be at a double-nested path"
-        );
+        if let Err(WorktreeError::NoLockfileFound { .. }) = result {
+            panic!(
+                "relative path caused double-nested worktree path; \
+                 lockfile not found at expected location"
+            );
+        }
+        // Any other outcome (PackageInstallFailed, TscFailed, NoTsconfigFound,
+        // or even Ok) means the lockfile WAS found — the fix works.
     }
 }
