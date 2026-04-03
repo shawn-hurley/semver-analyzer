@@ -50,6 +50,18 @@ impl WorktreeGuard {
         git_ref: &str,
         build_command: Option<&str>,
     ) -> Result<Self, WorktreeError> {
+        // Canonicalize repo path to avoid relative path mismatches between
+        // git (which resolves paths relative to its CWD) and Rust filesystem
+        // calls (which resolve relative to the process CWD).
+        let repo = repo.canonicalize().map_err(|e| {
+            WorktreeError::CommandFailed(format!(
+                "Failed to canonicalize repo path {}: {}",
+                repo.display(),
+                e
+            ))
+        })?;
+        let repo = repo.as_path();
+
         // Validate repo is a git repository
         validate_git_repo(repo)?;
 
@@ -139,6 +151,15 @@ impl WorktreeGuard {
     /// This is useful for testing the RAII cleanup behavior, and as a
     /// building block for `new()`.
     pub fn create_only(repo: &Path, git_ref: &str) -> Result<Self, WorktreeError> {
+        let repo = repo.canonicalize().map_err(|e| {
+            WorktreeError::CommandFailed(format!(
+                "Failed to canonicalize repo path {}: {}",
+                repo.display(),
+                e
+            ))
+        })?;
+        let repo = repo.as_path();
+
         validate_git_repo(repo)?;
         validate_git_ref(repo, git_ref)?;
 
@@ -177,6 +198,14 @@ impl WorktreeGuard {
     /// Looks in `<repo>/.semver-worktrees/` for any existing directories
     /// and attempts to clean them up via `git worktree remove`.
     pub fn cleanup_stale(repo: &Path) -> Result<usize, WorktreeError> {
+        let repo = repo.canonicalize().map_err(|e| {
+            WorktreeError::CommandFailed(format!(
+                "Failed to canonicalize repo path {}: {}",
+                repo.display(),
+                e
+            ))
+        })?;
+        let repo = repo.as_path();
         let worktree_dir = repo.join(WORKTREE_DIR_NAME);
         if !worktree_dir.exists() {
             return Ok(0);
@@ -592,5 +621,69 @@ mod tests {
         assert_eq!(guard2.path(), path1); // same path
 
         // Cleanup: let guard2 drop normally
+    }
+
+    /// Create a test repo under the current working directory with a lockfile.
+    ///
+    /// Uses `tempdir_in(".")` so we can derive a relative path via
+    /// `strip_prefix` without changing the process-global CWD (which would
+    /// be flaky under parallel test execution).
+    fn create_test_repo_in_cwd() -> TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("test-repo-")
+            .tempdir_in(".")
+            .unwrap();
+        let repo = dir.path();
+
+        run_git(repo, &["init", "-b", "main"]);
+        run_git(repo, &["config", "user.email", "test@test.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        run_git(repo, &["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(repo.join("file.txt"), "hello").unwrap();
+        std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"test","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        run_git(repo, &["tag", "v1.0.0"]);
+
+        dir
+    }
+
+    #[test]
+    fn relative_repo_path_finds_lockfile_in_worktree() {
+        // Regression test for #1: when repo is a relative path,
+        // WorktreeGuard::new() must find the lockfile in the worktree it
+        // created, not miss it because of a double-nested path.
+        //
+        // The repo is created under CWD so we can derive a relative path
+        // via strip_prefix — no set_current_dir needed.
+        let repo_dir = create_test_repo_in_cwd();
+        let cwd = std::env::current_dir().unwrap();
+        let relative_repo = repo_dir
+            .path()
+            .strip_prefix(&cwd)
+            .expect("repo should be under CWD since we used tempdir_in(\".\")");
+
+        // Call new() — the actual path from the bug report.
+        // With the fix, PackageManager::detect() finds package-lock.json
+        // and proceeds to `npm ci`, which fails in the test environment.
+        // Without the fix, it fails with NoLockfileFound because git
+        // created the worktree at a double-nested path.
+        let result = WorktreeGuard::new(relative_repo, "v1.0.0", None);
+
+        if let Err(WorktreeError::NoLockfileFound { .. }) = result {
+            panic!(
+                "relative path caused double-nested worktree path; \
+                 lockfile not found at expected location"
+            );
+        }
+        // Any other outcome (PackageInstallFailed, TscFailed, NoTsconfigFound,
+        // or even Ok) means the lockfile WAS found — the fix works.
     }
 }
