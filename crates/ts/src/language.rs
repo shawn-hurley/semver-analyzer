@@ -246,6 +246,13 @@ impl LanguageSemantics<TsSymbolData> for TypeScript {
             Some(value)
         }
     }
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        // TypeScript: strip /deprecated/ and /next/ path segments from
+        // qualified names so relocated symbols match their original position.
+        qualified_name
+            .replace("/deprecated/", "/")
+            .replace("/next/", "/")
+    }
 }
 
 // ── MessageFormatter ────────────────────────────────────────────────────

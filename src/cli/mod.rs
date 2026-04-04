@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use semver_analyzer_core::cli::{DiffArgs, LoggingArgs};
+use semver_analyzer_java::cli::{JavaAnalyzeArgs, JavaExtractArgs, JavaKonveyorArgs};
 use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 
 /// Semantic Breaking Change Analyzer
@@ -21,13 +22,16 @@ impl Cli {
         match &self.command {
             Command::Analyze { language } => match language {
                 AnalyzeLanguage::Typescript(args) => &args.common.logging,
+                AnalyzeLanguage::Java(args) => &args.common.logging,
             },
             Command::Extract { language } => match language {
                 ExtractLanguage::Typescript(args) => &args.common.logging,
+                ExtractLanguage::Java(args) => &args.common.logging,
             },
             Command::Diff(args) => &args.logging,
             Command::Konveyor { language } => match language {
                 KonveyorLanguage::Typescript(args) => &args.common.logging,
+                KonveyorLanguage::Java(args) => &args.common.logging,
             },
             Command::Serve => {
                 // Serve has no logging args yet; return a static default.
@@ -76,6 +80,8 @@ pub enum Command {
 pub enum AnalyzeLanguage {
     /// Analyze a TypeScript/JavaScript project.
     Typescript(TsAnalyzeArgs),
+    /// Analyze a Java project.
+    Java(JavaAnalyzeArgs),
 }
 
 /// Language-specific subcommands for the `extract` action.
@@ -83,6 +89,8 @@ pub enum AnalyzeLanguage {
 pub enum ExtractLanguage {
     /// Extract API surface from a TypeScript/JavaScript project.
     Typescript(TsExtractArgs),
+    /// Extract API surface from a Java project.
+    Java(JavaExtractArgs),
 }
 
 /// Language-specific subcommands for the `konveyor` action.
@@ -90,4 +98,6 @@ pub enum ExtractLanguage {
 pub enum KonveyorLanguage {
     /// Generate Konveyor rules for a TypeScript/JavaScript project.
     Typescript(TsKonveyorArgs),
+    /// Generate Konveyor rules for a Java project.
+    Java(JavaKonveyorArgs),
 }

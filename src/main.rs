@@ -23,6 +23,8 @@ use semver_analyzer_core::{
     AnalysisReport, AnalysisSummary, ApiSurface, BehavioralChange, ChangeTypeCounts,
     ReportEnvelope, StructuralChange, StructuralChangeType,
 };
+use semver_analyzer_java::cli::{JavaAnalyzeArgs, JavaExtractArgs, JavaKonveyorArgs};
+use semver_analyzer_java::Java;
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
 use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 use semver_analyzer_ts::report::{count_unique_files, extract_suffix_renames};
@@ -39,16 +41,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Extract { language } => match language {
             ExtractLanguage::Typescript(args) => cmd_extract_ts(args, &reporter)?,
+            ExtractLanguage::Java(args) => cmd_extract_java(args, &reporter)?,
         },
 
         Command::Diff(args) => cmd_diff(args, &reporter)?,
 
         Command::Analyze { language } => match language {
             AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args, &reporter).await?,
+            AnalyzeLanguage::Java(args) => cmd_analyze_java(args, &reporter).await?,
         },
 
         Command::Konveyor { language } => match language {
             KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args, &reporter).await?,
+            KonveyorLanguage::Java(args) => cmd_konveyor_java(args, &reporter).await?,
         },
 
         Command::Serve => {
@@ -127,6 +132,123 @@ fn cmd_extract_ts(args: TsExtractArgs, reporter: &ProgressReporter) -> Result<()
     );
 
     write_json_output(&surface, common.output.as_deref(), reporter)?;
+    Ok(())
+}
+
+// ─── Extract command (Java) ─────────────────────────────────────────────
+
+fn cmd_extract_java(args: JavaExtractArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span =
+        info_span!("extract-java", repo = %args.common.repo.display(), git_ref = %args.common.git_ref)
+            .entered();
+    let common = &args.common;
+
+    let phase = reporter.start_phase(&format!(
+        "Extracting Java API surface from {} at ref {}",
+        common.repo.display(),
+        common.git_ref
+    ));
+
+    let java = Java;
+    let surface = java
+        .extract(&common.repo, &common.git_ref)
+        .context("Failed to extract Java API surface")?;
+
+    let sym_count = surface.symbols.len();
+    let member_count: usize = surface.symbols.iter().map(|s| s.members.len()).sum();
+    phase.finish_with_detail(
+        "Extracted Java API surface",
+        &format!("{} types, {} members", sym_count, member_count),
+    );
+    info!(
+        types = sym_count,
+        members = member_count,
+        "extraction complete"
+    );
+
+    write_json_output(&surface, common.output.as_deref(), reporter)?;
+    Ok(())
+}
+
+// ─── Analyze command (Java) ─────────────────────────────────────────────
+
+async fn cmd_analyze_java(args: JavaAnalyzeArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span = info_span!("analyze-java", repo = %args.common.repo.display(), from = %args.common.from, to = %args.common.to).entered();
+    let common = &args.common;
+
+    reporter.println(&format!(
+        "Analyzing Java project {} from {} to {}",
+        common.repo.display(),
+        common.from,
+        common.to
+    ));
+    reporter.println("Mode: static analysis only (Java does not use LLM currently)");
+
+    let analyzer = orchestrator::Analyzer {
+        lang: Arc::new(Java),
+    };
+
+    let result = analyzer
+        .run_v2(
+            &common.repo,
+            &common.from,
+            &common.to,
+            true, // no_llm — Java doesn't use LLM yet
+            None, // llm_command
+            None, // build_command
+            None, // dep_repo
+            reporter,
+        )
+        .await?;
+
+    // Print summary stats
+    let manifest_breaking = result
+        .manifest_changes
+        .iter()
+        .filter(|c| c.is_breaking)
+        .count();
+    if !result.manifest_changes.is_empty() {
+        info!(
+            total = result.manifest_changes.len(),
+            breaking = manifest_breaking,
+            "manifest changes"
+        );
+        reporter.println(&format!(
+            "  [TD] {} manifest changes ({} breaking)",
+            result.manifest_changes.len(),
+            manifest_breaking
+        ));
+    }
+
+    // Build report
+    let phase = reporter.start_phase("Building analysis report");
+    let report =
+        <Java as Language>::build_report(&result, &common.repo, &common.from, &common.to);
+    phase.finish("Report built");
+
+    let total_breaking = report.summary.total_breaking_changes;
+    reporter.println("");
+    if total_breaking == 0 {
+        reporter.println("No breaking changes detected.");
+        info!("no breaking changes detected");
+    } else {
+        reporter.println(&format!(
+            "BREAKING: {} total breaking change(s) detected.",
+            total_breaking
+        ));
+        reporter.println(&format!(
+            "  {} API changes, {} behavioral changes",
+            report.summary.breaking_api_changes, report.summary.breaking_behavioral_changes
+        ));
+        info!(
+            total = total_breaking,
+            api = report.summary.breaking_api_changes,
+            behavioral = report.summary.breaking_behavioral_changes,
+            "breaking changes detected"
+        );
+    }
+
+    write_json_output(&report, common.output.as_deref(), reporter)?;
     Ok(())
 }
 
@@ -344,6 +466,92 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
 }
 
 // ─── Konveyor command (TypeScript) ──────────────────────────────────────
+
+// ─── Konveyor command (Java) ─────────────────────────────────────────────
+
+async fn cmd_konveyor_java(args: JavaKonveyorArgs, reporter: &ProgressReporter) -> Result<()> {
+    let _span = info_span!("konveyor-java").entered();
+    let common = &args.common;
+
+    let report = if let Some(ref report_path) = common.from_report {
+        info!(path = %report_path.display(), "loading report from file");
+        reporter.println(&format!("Loading report from {}", report_path.display()));
+        let json = read_to_string(report_path)
+            .with_context(|| format!("Failed to read {}", report_path.display()))?;
+        serde_json::from_str::<AnalysisReport<Java>>(&json)
+            .with_context(|| format!("Failed to parse {} as AnalysisReport", report_path.display()))?
+    } else {
+        let repo = common
+            .repo
+            .as_ref()
+            .context("--repo is required when --from-report is not provided")?;
+        let from = common
+            .from
+            .as_ref()
+            .context("--from is required when --from-report is not provided")?;
+        let to = common
+            .to
+            .as_ref()
+            .context("--to is required when --from-report is not provided")?;
+
+        reporter.println(&format!(
+            "Analyzing {} from {} to {}",
+            repo.display(), from, to,
+        ));
+
+        let analyzer = orchestrator::Analyzer {
+            lang: Arc::new(Java),
+        };
+        let result = analyzer
+            .run_v2(repo, from, to, true, None, None, None, reporter)
+            .await?;
+        <Java as Language>::build_report(&result, repo, from, to)
+    };
+
+    // Generate rules
+    let phase = reporter.start_phase("Generating Konveyor rules (java.referenced)");
+    let rules = semver_analyzer_java::konveyor::generate_rules(&report);
+    let rule_count = rules.len();
+    phase.finish_with_detail("Rules generated", &format!("{} rules", rule_count));
+
+    // Extract fix strategies
+    let strategies = semver_analyzer_konveyor_core::extract_fix_strategies(&rules);
+
+    // Write output
+    let output_dir = &common.output_dir;
+    fs::create_dir_all(output_dir)?;
+
+    // Write ruleset.yaml
+    let from_ref = &report.comparison.from_ref;
+    let to_ref = &report.comparison.to_ref;
+    let ruleset = semver_analyzer_java::konveyor::ruleset(from_ref, to_ref);
+    let ruleset_yaml = serde_yaml::to_string(&ruleset)?;
+    fs::write(output_dir.join("ruleset.yaml"), &ruleset_yaml)?;
+
+    // Write rules YAML
+    let rules_yaml = serde_yaml::to_string(&rules)?;
+    fs::write(output_dir.join("rules.yaml"), &rules_yaml)?;
+
+    // Write fix strategies JSON
+    let strategies_json = serde_json::to_string_pretty(&strategies)?;
+    fs::write(output_dir.join("fix-strategies.json"), &strategies_json)?;
+
+    reporter.println(&format!(
+        "Output: {} ({} rules, {} fix strategies)",
+        output_dir.display(),
+        rule_count,
+        strategies.len(),
+    ));
+
+    info!(
+        rules = rule_count,
+        strategies = strategies.len(),
+        output = %output_dir.display(),
+        "konveyor rules generated"
+    );
+
+    Ok(())
+}
 
 async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> Result<()> {
     let _span = info_span!("konveyor").entered();

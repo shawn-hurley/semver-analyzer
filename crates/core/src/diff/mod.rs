@@ -103,7 +103,7 @@ pub fn diff_surfaces_with_semantics<M: Default + Clone, S: LanguageSemantics<M>>
     // Match removed+added symbols by canonical path (stripping /deprecated/
     // and /next/). This catches "moved to deprecated" patterns and runs
     // BEFORE rename detection to reduce the search space.
-    let (relocations, _skip_removed, _skip_added) = detect_relocations(&removed, &added);
+    let (relocations, _skip_removed, _skip_added) = detect_relocations(&removed, &added, semantics);
 
     let relocated_old: HashSet<&str> = relocations
         .iter()
@@ -702,5 +702,13 @@ impl<M: Default + Clone> LanguageSemantics<M> for MinimalSemantics {
 
     fn visibility_rank(&self, v: crate::types::Visibility) -> u8 {
         helpers::visibility_rank(v)
+    }
+
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        // MinimalSemantics: strip /deprecated/ and /next/ for backward
+        // compatibility with existing tests and the default diff behavior.
+        qualified_name
+            .replace("/deprecated/", "/")
+            .replace("/next/", "/")
     }
 }

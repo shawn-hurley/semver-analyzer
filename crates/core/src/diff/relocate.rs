@@ -10,6 +10,7 @@
 //! 3. It avoids the MAX_GROUP_SIZE cap that blocks thousands of Variable
 //!    symbols from being matched by fingerprint
 
+use crate::traits::LanguageSemantics;
 use crate::types::{Symbol, SymbolKind};
 use std::collections::HashMap;
 
@@ -37,26 +38,31 @@ pub(super) enum RelocationType {
 
 /// Detect symbol relocations among removed and added symbol lists.
 ///
-/// Matches removed and added symbols by canonical path — the qualified_name
-/// with `/deprecated/` and `/next/` segments stripped out. When the canonical
-/// paths match, the symbol moved rather than being removed+added.
+/// Uses `semantics.canonical_name_for_relocation()` to normalize qualified
+/// names for matching. When two symbols share the same canonical name and
+/// kind, they are considered relocated rather than removed+added.
+///
+/// - **TypeScript**: strips `/deprecated/` and `/next/` path segments.
+/// - **Java**: extracts the simple class name (package-independent matching).
 ///
 /// Returns: (matched relocations, indices of removed to skip, indices of added to skip)
-pub(super) fn detect_relocations<'a, M: Default + Clone>(
+pub(super) fn detect_relocations<'a, M: Default + Clone, S: LanguageSemantics<M>>(
     removed: &[&'a Symbol<M>],
     added: &[&'a Symbol<M>],
+    semantics: &S,
 ) -> (Vec<RelocationMatch<'a, M>>, Vec<usize>, Vec<usize>) {
     if removed.is_empty() || added.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new());
     }
 
-    // Build a map of added symbols by (canonical_path, kind)
-    // Multiple added symbols might share the same canonical path (rare but possible).
-    // We use Vec to handle that, and match greedily.
+    // Build a map of added symbols by (canonical_name, kind)
+    // Multiple added symbols might share the same canonical name (common in Java
+    // where the same class name can exist in different packages).
+    // We use Vec to handle that, and match greedily with name preference.
     let mut added_by_canonical: HashMap<(String, SymbolKind), Vec<(usize, &'a Symbol<M>)>> =
         HashMap::new();
     for (ai, sym) in added.iter().enumerate() {
-        let canonical = canonical_path(&sym.qualified_name);
+        let canonical = semantics.canonical_name_for_relocation(&sym.qualified_name);
         added_by_canonical
             .entry((canonical, sym.kind))
             .or_default()
@@ -68,7 +74,7 @@ pub(super) fn detect_relocations<'a, M: Default + Clone>(
     let mut skip_added = Vec::new();
 
     for (ri, rsym) in removed.iter().enumerate() {
-        let canonical = canonical_path(&rsym.qualified_name);
+        let canonical = semantics.canonical_name_for_relocation(&rsym.qualified_name);
         let key = (canonical, rsym.kind);
 
         if let Some(added_syms) = added_by_canonical.get_mut(&key) {
@@ -103,21 +109,9 @@ pub(super) fn detect_relocations<'a, M: Default + Clone>(
     (matches, skip_removed, skip_added)
 }
 
-/// Normalize a qualified_name by stripping `/deprecated/` and `/next/`
-/// path segments, producing a canonical path for matching relocations.
-///
-/// Examples:
-/// - `packages/react-core/dist/esm/deprecated/components/Chip/Chip.Chip`
-///   → `packages/react-core/dist/esm/components/Chip/Chip.Chip`
-/// - `packages/react-core/dist/esm/next/components/Modal/Modal.Modal`
-///   → `packages/react-core/dist/esm/components/Modal/Modal.Modal`
-/// - `packages/react-core/dist/esm/components/Button/Button.Button`
-///   → unchanged
-fn canonical_path(qualified_name: &str) -> String {
-    qualified_name
-        .replace("/deprecated/", "/")
-        .replace("/next/", "/")
-}
+// NOTE: canonical_path was removed. The LanguageSemantics::canonical_name_for_relocation
+// method now provides language-specific canonicalization. TypeScript strips /deprecated/
+// and /next/, Java returns the simple class name.
 
 /// Classify the type of relocation based on path changes.
 fn classify_relocation(old_qname: &str, new_qname: &str) -> RelocationType {
@@ -138,27 +132,22 @@ fn classify_relocation(old_qname: &str, new_qname: &str) -> RelocationType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::MinimalSemantics;
+
+    // The canonical_path tests now test the default MinimalSemantics
+    // behavior (returns qualified_name unchanged). Language-specific
+    // canonicalization is tested in each language crate.
 
     #[test]
-    fn canonical_strips_deprecated() {
-        assert_eq!(
-            canonical_path("pkg/dist/esm/deprecated/components/Chip/Chip.Chip"),
-            "pkg/dist/esm/components/Chip/Chip.Chip"
-        );
-    }
-
-    #[test]
-    fn canonical_strips_next() {
-        assert_eq!(
-            canonical_path("pkg/dist/esm/next/components/Modal/Modal.Modal"),
-            "pkg/dist/esm/components/Modal/Modal.Modal"
-        );
-    }
-
-    #[test]
-    fn canonical_preserves_normal_path() {
+    fn default_canonical_preserves_path() {
+        let semantics = MinimalSemantics;
         let path = "pkg/dist/esm/components/Button/Button.Button";
-        assert_eq!(canonical_path(path), path);
+        assert_eq!(
+            <MinimalSemantics as LanguageSemantics<()>>::canonical_name_for_relocation(
+                &semantics, path
+            ),
+            path
+        );
     }
 
     #[test]

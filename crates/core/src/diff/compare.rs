@@ -32,6 +32,14 @@ pub(super) fn diff_symbol<M: Default + Clone, S: LanguageSemantics<M>>(
     diff_hierarchy(old, new, changes);
     diff_signatures(old, new, changes, semantics);
     diff_members(old, new, changes, semantics);
+
+    // Ask the language for any additional changes from opaque language_data.
+    // This hook lets languages detect annotation changes, throws clause changes,
+    // rendered_components/css changes, etc. without leaking into core.
+    let lang_changes = semantics.diff_language_data(old, new);
+    if !lang_changes.is_empty() {
+        changes.extend(lang_changes);
+    }
 }
 
 // ─── Visibility diff ─────────────────────────────────────────────────────

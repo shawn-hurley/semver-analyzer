@@ -34,7 +34,7 @@ pub struct AnalysisReport<L: Language> {
     pub changes: Vec<FileChanges<L>>,
 
     /// Package manifest changes (e.g., package.json, go.mod, pom.xml).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manifest_changes: Vec<ManifestChange<L>>,
 
     /// Files added between from_ref and to_ref (new exports, new types).

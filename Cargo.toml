@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/ts", "crates/llm", "crates/konveyor-core"]
+members = ["crates/core", "crates/ts", "crates/java", "crates/llm", "crates/konveyor-core"]
 resolver = "2"
 
 [package]
@@ -13,6 +13,7 @@ description = "Deterministic semantic breaking change analyzer for TypeScript/Ja
 [dependencies]
 semver-analyzer-core = { version = "0.0.3", path = "crates/core" }
 semver-analyzer-ts = { version = "0.0.3", path = "crates/ts" }
+semver-analyzer-java = { version = "0.0.3", path = "crates/java" }
 semver-analyzer-llm = { version = "0.0.3", path = "crates/llm" }
 semver-analyzer-konveyor-core = { version = "0.0.3", path = "crates/konveyor-core" }
 

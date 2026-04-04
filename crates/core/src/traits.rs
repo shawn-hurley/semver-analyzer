@@ -202,6 +202,50 @@ pub trait LanguageSemantics<M: Default + Clone = ()> {
         None
     }
 
+    /// Compare language-specific metadata between two matched symbols.
+    ///
+    /// Called by the diff engine after it has compared all core fields
+    /// (visibility, modifiers, hierarchy, signatures, members). The language
+    /// can inspect `language_data` on both symbols and report additional
+    /// changes that the core engine doesn't understand.
+    ///
+    /// This is the hook that lets languages detect changes in opaque metadata
+    /// without leaking language-specific knowledge into core:
+    ///
+    /// - **Java**: annotation changes (`@Deprecated`, `@ConfigurationProperties`
+    ///   prefix), throws clause changes, sealed/final modifier changes.
+    /// - **TypeScript**: rendered_components changes (JSX render tree),
+    ///   CSS class reference changes.
+    ///
+    /// Default: no additional changes.
+    fn diff_language_data(
+        &self,
+        _old: &Symbol<M>,
+        _new: &Symbol<M>,
+    ) -> Vec<crate::types::StructuralChange> {
+        Vec::new()
+    }
+
+    /// Compute a canonical name for relocation detection.
+    ///
+    /// The diff engine uses this to match removed+added symbols that are
+    /// the same type but at a different path (package relocation).
+    ///
+    /// Two symbols with the same `(canonical_name, kind)` are considered
+    /// relocated rather than removed+added.
+    ///
+    /// - **TypeScript**: strips `/deprecated/` and `/next/` from the
+    ///   qualified name (file-path-based).
+    /// - **Java**: returns the simple class name (package-independent),
+    ///   so `org.springframework.boot.autoconfigure.cache.JCacheManagerCustomizer`
+    ///   and `org.springframework.boot.cache.autoconfigure.JCacheManagerCustomizer`
+    ///   match as a relocation.
+    ///
+    /// Default: returns the full qualified name unchanged (no normalization).
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        qualified_name.to_string()
+    }
+
     /// If this language supports component hierarchy inference (e.g., React,
     /// Vue, Django templates), return the hierarchy semantics implementation.
     ///
