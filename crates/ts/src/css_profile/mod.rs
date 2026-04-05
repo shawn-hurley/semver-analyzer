@@ -504,7 +504,11 @@ fn extract_selector_relationships(
                     if let Some(child_el) =
                         extract_element_from_selector(has_selector, class_prefix)
                     {
-                        if !parent_el.is_empty() && !child_el.is_empty() {
+                        // Include root-level :has() — parent_el == "" means
+                        // the block root itself. This is critical for detecting
+                        // that a child is a direct root child (not nested inside
+                        // a sibling element).
+                        if !child_el.is_empty() {
                             profile.has_containment.push((parent_el.clone(), child_el));
                         }
                     }
