@@ -783,11 +783,46 @@ pub fn generate_rules(
                 if cg.count < CONSTANT_COLLAPSE_THRESHOLD {
                     continue;
                 }
-                let symbol_names: Vec<&str> = cg.symbols.iter().map(|s| s.as_str()).collect();
+
+                // For Removed constants: exclude symbols that have explicit
+                // token_mappings overrides. These need individual Rename rules
+                // (e.g., global_Color_dark_100 → t_global_text_color_regular),
+                // not the generic CssVariablePrefix strategy that the collapsed
+                // group uses. The excluded symbols will fall through to the
+                // individual rule loop below, where api_change_to_strategy()
+                // correctly returns a Rename strategy from the token_mapping.
+                let group_symbols: Vec<&str> = if cg.change_type == ApiChangeType::Removed {
+                    cg.symbols
+                        .iter()
+                        .filter(|s| rename_patterns.get_token_mapping(s).is_none())
+                        .map(|s| s.as_str())
+                        .collect()
+                } else {
+                    cg.symbols.iter().map(|s| s.as_str()).collect()
+                };
+
+                let excluded_count = cg.symbols.len() - group_symbols.len();
+                if excluded_count > 0 {
+                    tracing::debug!(
+                        excluded = excluded_count,
+                        remaining = group_symbols.len(),
+                        package = %pkg.name,
+                        "Excluded constants with token_mappings from collapsed group \
+                         (will get individual Rename rules)"
+                    );
+                }
+
+                // After filtering, check if the remaining group still meets
+                // the collapse threshold.
+                if group_symbols.len() < CONSTANT_COLLAPSE_THRESHOLD {
+                    continue;
+                }
+
+                let symbol_names = &group_symbols;
                 // Always recompute the pattern from symbol names for precision.
                 // The pre-computed common_prefix_pattern may use overly broad
                 // heuristics (e.g., `.*`) that cause false positives.
-                let pattern = build_token_prefix_pattern(&symbol_names);
+                let pattern = build_token_prefix_pattern(symbol_names);
                 let strategy_name = if cg.strategy_hint.is_empty() {
                     "Manual".to_string()
                 } else {
@@ -804,9 +839,10 @@ pub fn generate_rules(
                 );
                 let rule_id = unique_id(base_id, &mut id_counts);
 
+                let group_count = symbol_names.len();
                 let mut message = format!(
                     "{} constants from `{}` had breaking changes ({}).\n",
-                    cg.count, pkg.name, change_type_str,
+                    group_count, pkg.name, change_type_str,
                 );
                 // Add a sample of the first few symbol names
                 let sample_count = 5.min(symbol_names.len());
@@ -915,7 +951,7 @@ pub fn generate_rules(
                     category: "mandatory".to_string(),
                     description: format!(
                         "{} constants from {} have breaking changes",
-                        cg.count, pkg.name
+                        group_count, pkg.name
                     ),
                     message,
                     links: Vec::new(),
@@ -950,8 +986,11 @@ pub fn generate_rules(
                     suppression_strategy,
                 ));
                 // Also track individual symbol names for precise suppression.
-                for sym in &cg.symbols {
-                    collapsed_symbols.insert((pkg.name.clone(), sym.clone()));
+                // Only add symbols that are actually in the collapsed group —
+                // symbols excluded due to token_mappings overrides need to
+                // remain unsuppressed so they get individual rules.
+                for sym in symbol_names {
+                    collapsed_symbols.insert((pkg.name.clone(), sym.to_string()));
                 }
             }
         }
