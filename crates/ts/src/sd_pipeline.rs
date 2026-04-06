@@ -1841,6 +1841,7 @@ export { DropdownList } from './DropdownList';
     use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree};
     use std::collections::BTreeMap;
 
+    #[allow(dead_code)]
     fn make_css_element(display: &str, is_flex: bool) -> CssElementInfo {
         let mut info = CssElementInfo::default();
         info.display_values.insert(display.to_string());

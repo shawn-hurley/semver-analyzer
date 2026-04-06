@@ -2087,10 +2087,18 @@ pub fn extract_name_from_summary(summary: &str) -> &str {
 /// `symbol_summary` string.  Import paths start with `@` or are simple
 /// identifiers (no `": "` separator that symbol summaries always contain).
 fn looks_like_import_path(s: &str) -> bool {
-    // Import paths start with @ or contain / (e.g., "@patternfly/react-core",
-    // "@patternfly/react-charts/victory"). Simple prop names like "chips"
-    // or "deleteChip" are NOT import paths.
-    (s.starts_with('@') || s.contains('/')) && !s.contains(": ")
+    // Reject symbol summaries like "variable: foo" immediately.
+    if s.contains(": ") || s.is_empty() {
+        return false;
+    }
+    // Scoped packages (@scope/name) or paths containing /
+    if s.starts_with('@') || s.contains('/') {
+        return true;
+    }
+    // Bare npm package names are all-lowercase with only [a-z0-9._-].
+    // This rejects camelCase prop names like "deleteChip".
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Extract the trailing PascalCase suffix from a snake_case token constant name.
