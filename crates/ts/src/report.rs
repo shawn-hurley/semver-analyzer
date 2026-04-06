@@ -104,14 +104,42 @@ fn build_report_inner(
     // Non-breaking changes (symbol_added, etc.) are excluded from the report.
     let mut file_api_map: BTreeMap<PathBuf, Vec<ApiChange>> = BTreeMap::new();
 
+    // Track (symbol, change_type) pairs from non-barrel files so we can
+    // suppress duplicates that appear in barrel index.d.ts re-exports.
+    let mut seen_in_submodule: HashSet<(String, String)> = HashSet::new();
+
     for change in structural_changes {
         if !change.is_breaking {
             continue;
         }
         let file = qualified_name_to_file(&change.qualified_name);
+        let is_barrel = file.file_name().map(|n| n == "index.d.ts").unwrap_or(false);
         let api_change = structural_to_api_change(change);
+
+        if !is_barrel {
+            seen_in_submodule.insert((
+                api_change.symbol.clone(),
+                format!("{:?}", api_change.change),
+            ));
+        }
+
         file_api_map.entry(file).or_default().push(api_change);
     }
+
+    // Remove barrel index.d.ts entries that duplicate a sub-module entry.
+    // When the same symbol+change appears in both a sub-module file and its
+    // barrel re-export, the sub-module entry is preferred because it carries
+    // richer type information and maps to the actual source file.
+    for (file, changes) in file_api_map.iter_mut() {
+        let is_barrel = file.file_name().map(|n| n == "index.d.ts").unwrap_or(false);
+        if is_barrel {
+            changes.retain(|c| {
+                !seen_in_submodule.contains(&(c.symbol.clone(), format!("{:?}", c.change)))
+            });
+        }
+    }
+    // Remove empty barrel files after deduplication.
+    file_api_map.retain(|_, changes| !changes.is_empty());
 
     // Merge LLM-detected API changes into the file map.
     // These catch type-level changes that static .d.ts analysis misses
@@ -767,8 +795,11 @@ fn build_package_summaries(
             .or_else(|| {
                 let props_name = format!("{}Props", component_name);
                 top_level_changes.iter().find_map(|c| {
-                    if c.symbol == props_name && c.migration_target.is_some() {
-                        let props_target = c.migration_target.as_ref().unwrap();
+                    if let Some(props_target) = c
+                        .migration_target
+                        .as_ref()
+                        .filter(|_| c.symbol == props_name)
+                    {
                         // Adapt the Props migration target for the component:
                         // - replacement_symbol: strip "Props" suffix
                         // - removed/replacement names: use component name

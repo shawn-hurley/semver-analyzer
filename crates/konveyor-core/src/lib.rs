@@ -700,6 +700,11 @@ pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMa
 }
 
 pub fn consolidation_key(rule: &KonveyorRule) -> String {
+    // Combined constant rules are already collapsed — never re-merge them.
+    if rule.rule_id.contains("-combined") {
+        return rule.rule_id.clone();
+    }
+
     let change_type = rule
         .labels
         .iter()
@@ -741,10 +746,9 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
         }
     }
 
-    if change_type == "type-changed" && kind == "constant" {
-        let package = extract_package_from_path(file_key);
-        return format!("{}-constant-type-changed", package);
-    }
+    // type-changed constants: fall through to the default file-based key
+    // so that unrelated components (e.g., Banner vs Card vs Truncate) are
+    // not grouped together.  Previously this grouped by package only.
 
     // Renamed properties with codemod data: keep as singleton.
     // These rules carry per-prop Rename mappings in their fix_strategy
@@ -898,8 +902,31 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
             .filter(|m| seen.insert(*m))
             .collect()
     };
+    /// Maximum number of steps before switching to a compact summary message.
+    /// Beyond this threshold, verbose "Step X of N" formatting becomes impractical.
+    const MAX_VERBOSE_STEPS: usize = 50;
+
     let message = if unique_messages.len() == 1 {
         unique_messages[0].to_string()
+    } else if unique_messages.len() > MAX_VERBOSE_STEPS {
+        // Use compact summary for very large groups instead of listing every step.
+        let sample_count = 5.min(unique_messages.len());
+        let mut msg = format!(
+            "{} related changes detected. Showing first {} of {}:\n\n",
+            unique_messages.len(),
+            sample_count,
+            unique_messages.len()
+        );
+        for (i, m) in unique_messages.iter().take(sample_count).enumerate() {
+            msg.push_str(&format!("{}. {}\n\n", i + 1, m));
+        }
+        if unique_messages.len() > sample_count {
+            msg.push_str(&format!(
+                "... and {} more changes.",
+                unique_messages.len() - sample_count
+            ));
+        }
+        msg
     } else {
         let total = unique_messages.len();
         let mut parts = Vec::new();
@@ -1548,6 +1575,13 @@ pub fn build_frontend_condition(
         ApiChangeKind::Class | ApiChangeKind::Interface
             if change.change == ApiChangeType::Renamed =>
         {
+            // Classes are JSX components; interfaces/types use TYPE_REFERENCE.
+            let primary_location = if change.kind == ApiChangeKind::Interface {
+                "TYPE_REFERENCE"
+            } else {
+                "JSX_COMPONENT"
+            };
+
             let mut conditions = vec![KonveyorCondition::FrontendReferenced {
                 referenced: FrontendReferencedFields {
                     pattern: pattern.clone(),
@@ -1568,7 +1602,7 @@ pub fn build_frontend_condition(
                     KonveyorCondition::FrontendReferenced {
                         referenced: FrontendReferencedFields {
                             pattern: pattern.clone(),
-                            location: "JSX_COMPONENT".to_string(),
+                            location: primary_location.to_string(),
                             component: None,
                             parent: None,
                             value: None,

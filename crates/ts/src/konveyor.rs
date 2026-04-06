@@ -695,6 +695,11 @@ pub fn generate_rules(
     // V2 path: when report.packages has pre-grouped constants, use those
     // directly instead of re-scanning the flat changes list.
     let mut collapsed_keys: HashSet<(String, ApiChangeType, String)> = HashSet::new();
+    // Track individual symbol names that were collapsed into combined rules.
+    // This is more reliable than strategy-based matching because the strategy
+    // name used when building the combined rule can differ from what
+    // api_change_to_strategy() computes for individual rules.
+    let mut collapsed_symbols: HashSet<(String, String)> = HashSet::new();
 
     // Pre-build an index: symbol_name → (ApiChange, file_path) for renamed
     // constants.  Used by the V2 constantgroup path to look up per-token
@@ -889,6 +894,10 @@ pub fn generate_rules(
                     cg.change_type.clone(),
                     suppression_strategy,
                 ));
+                // Also track individual symbol names for precise suppression.
+                for sym in &cg.symbols {
+                    collapsed_symbols.insert((pkg.name.clone(), sym.clone()));
+                }
             }
         }
     } else {
@@ -912,6 +921,10 @@ pub fn generate_rules(
                 key.change_type.clone(),
                 key.strategy.clone(),
             ));
+            // Track individual symbol names for precise suppression.
+            for (change, _, _) in changes {
+                collapsed_symbols.insert((key.package.clone(), change.symbol.clone()));
+            }
         }
     }
 
@@ -982,10 +995,16 @@ pub fn generate_rules(
 
         for api_change in &file_changes.breaking_api_changes {
             // Skip constants that were already collapsed into a combined rule.
-            // We check package + change_type + strategy to ensure only the exact
-            // group that was collapsed gets skipped.
+            // Primary check: does this exact (package, symbol) appear in a
+            // collapsed group?  This is more reliable than strategy-based
+            // matching because the V2 combined rule's strategy_hint can
+            // differ from what api_change_to_strategy() computes.
             if api_change.kind == ApiChangeKind::Constant && !api_change.symbol.contains('.') {
                 if let Some(ref pkg) = from_pkg {
+                    if collapsed_symbols.contains(&(pkg.clone(), api_change.symbol.clone())) {
+                        continue;
+                    }
+                    // Fallback: check by (package, change_type, strategy) tuple.
                     let file_path_str = file_changes.file.to_string_lossy();
                     if let Some(strat) = api_change_to_strategy(
                         api_change,
