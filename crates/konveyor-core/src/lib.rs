@@ -52,6 +52,23 @@ pub struct RenamePatternEntry {
     pub replace: String,
 }
 
+/// An explicit CSS custom property rename mapping.
+///
+/// Maps a v5 CSS variable name to its v6 equivalent. Used for global tokens
+/// where the entire variable name structure changed (not just the version prefix).
+/// For example: `--pf-v5-global--BackgroundColor--100` → `--pf-t--global--background--color--100`.
+///
+/// These are applied as individual `FrontendCssVar` rules during Konveyor rule
+/// generation, ensuring inline CSS variable string references (e.g., in style props)
+/// are correctly migrated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CssVarRenameEntry {
+    /// The old (v5) CSS custom property name.
+    pub from: String,
+    /// The new (v6) CSS custom property name.
+    pub to: String,
+}
+
 /// A composition rule: detect a child component inside a parent component.
 ///
 /// Generates rules with the `parent` constraint on `frontend.referenced`.
@@ -194,6 +211,15 @@ pub struct RenamePatternsFile {
     /// Format: `{ "global_success_color_100": "t_global_color_status_success_100" }`
     #[serde(default)]
     pub token_mappings: HashMap<String, String>,
+    /// Explicit CSS custom property renames (old CSS var → new CSS var).
+    ///
+    /// These generate individual `FrontendCssVar` rules that replace the full
+    /// CSS variable name in inline style references, SCSS files, etc.
+    /// Required because the broad `CssVariablePrefix` strategy only swaps
+    /// the version prefix (e.g., `--pf-v5-` → `--pf-v6-`) but global tokens
+    /// were entirely restructured in v6.
+    #[serde(default)]
+    pub css_var_renames: Vec<CssVarRenameEntry>,
 }
 
 /// Compiled rename patterns ready for matching.
@@ -208,6 +234,8 @@ pub struct RenamePatterns {
     /// Explicit token/constant rename mappings (old_name → new_name).
     /// These override algorithmic rename detection.
     pub token_mappings: HashMap<String, String>,
+    /// Explicit CSS custom property renames (old CSS var → new CSS var).
+    pub css_var_renames: Vec<CssVarRenameEntry>,
 }
 
 impl RenamePatterns {
@@ -259,6 +287,12 @@ impl RenamePatterns {
         if !file.token_mappings.is_empty() {
             tracing::info!(count = file.token_mappings.len(), "Loaded token mappings");
         }
+        if !file.css_var_renames.is_empty() {
+            tracing::info!(
+                count = file.css_var_renames.len(),
+                "Loaded CSS variable renames"
+            );
+        }
         Ok(Self {
             patterns,
             composition_rules: file.composition_rules,
@@ -267,6 +301,7 @@ impl RenamePatterns {
             missing_imports: file.missing_imports,
             component_warnings: file.component_warnings,
             token_mappings: file.token_mappings,
+            css_var_renames: file.css_var_renames,
         })
     }
 
@@ -305,6 +340,7 @@ impl RenamePatterns {
             missing_imports: Vec::new(),
             component_warnings: Vec::new(),
             token_mappings: HashMap::new(),
+            css_var_renames: Vec::new(),
         }
     }
 
