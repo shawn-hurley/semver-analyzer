@@ -827,16 +827,23 @@ fn validate_renames<'a>(
             continue;
         }
 
-        // ── Check 2: Cross-family type_alias/enum guard ────────────────
+        // ── Check 2: Cross-family sibling guard ─────────────────────────
         //
-        // For cross-family type aliases and enums that passed the 0.50
-        // similarity threshold, require a sibling rename between the same
-        // two directories to validate the match. Without this, high-
-        // similarity cross-family matches like TextListItemVariants →
-        // HelperTextItemVariant (0.714) slip through.
-        let is_type_or_enum = matches!(rm.old.kind, SymbolKind::TypeAlias | SymbolKind::Enum);
+        // For ANY cross-family rename that passed the 0.50 similarity
+        // threshold, require a sibling rename between the same two
+        // directories to validate the match. Without this, high-similarity
+        // cross-family matches slip through:
+        // - TextListItemVariants → HelperTextItemVariant (0.714, Enum)
+        // - TextProps → TruncateProps (0.69, Interface)
+        // - DropdownToggleActionProps → DrawerPanelDescriptionProps (Interface)
+        // - PageHeader → PageBody (Constant)
+        //
+        // True cross-family renames like TextVariants → ContentVariants
+        // pass because they have the sibling TextContent → Content.
 
-        if is_type_or_enum && !semantics.same_family(rm.old, rm.new) {
+        // Skip same-name matches — these are import path relocations, not
+        // cross-family renames. They're handled by the Relocated logic downstream.
+        if rm.old.name != rm.new.name && !semantics.same_family(rm.old, rm.new) {
             let old_dir = rm
                 .old
                 .file

@@ -1,13 +1,23 @@
 ---
 source: crates/ts/tests/baseline_migration.rs
+assertion_line: 203
 expression: "diff(&old, &new)"
 ---
 - symbol: FooProps
   qualified_name: components/Foo/Foo.d.ts.FooProps
   kind: Interface
-  change_type: "Renamed { from: Symbol { kind: Interface }, to: Symbol { kind: Interface } }"
+  change_type: "Removed(Symbol { kind: Interface })"
   is_breaking: true
-  description: "Exported interface `FooProps` was renamed to `BarProps`"
-  before: FooProps
-  after: BarProps
+  description: "Exported interface `FooProps` was removed — migrate to `BarProps`.\n  Matching props (use on `BarProps` instead): children, className\n  Removed props with no direct equivalent: onClick\n  NOTE: Only address removed props that your code actually uses. If a removed prop is not referenced in the file, ignore it."
+  before: "interface: FooProps"
+  after: ~
+  has_migration_target: true
+- symbol: BarProps
+  qualified_name: components/Bar/Bar.d.ts.BarProps
+  kind: Interface
+  change_type: "Added(Symbol { kind: Interface })"
+  is_breaking: false
+  description: "Exported interface `BarProps` was added"
+  before: ~
+  after: "interface: BarProps"
   has_migration_target: false
