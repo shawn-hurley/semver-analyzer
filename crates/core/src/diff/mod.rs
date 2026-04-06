@@ -317,11 +317,54 @@ pub fn diff_surfaces_with_semantics(
 
     let renames = detect_renames(&remaining_removed, &remaining_added);
 
-    let mut renamed_old: HashSet<&str> = renames
+    // Separate type-compatible renames from type-incompatible ones.
+    // Type-incompatible renames (e.g., splitButtonOptions: SplitButtonOptions →
+    // splitButtonItems: ReactNode[]) should NOT be emitted as Renamed — they
+    // need Removed + Added so the rule generator produces an LLM-assisted fix
+    // instead of a mechanical codemod.
+    let mut compatible_renames = Vec::new();
+    let mut incompatible_renames = Vec::new();
+
+    for rm in &renames {
+        let old_rt = rm
+            .old
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_deref());
+        let new_rt = rm
+            .new
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_deref());
+
+        let types_match = match (old_rt, new_rt) {
+            (Some(o), Some(n)) => {
+                rename::normalize_type_structure(o) == rename::normalize_type_structure(n)
+            }
+            _ => true, // No type info → assume compatible
+        };
+
+        if types_match {
+            compatible_renames.push(rm);
+        } else {
+            tracing::info!(
+                old = %rm.old.name,
+                new = %rm.new.name,
+                old_type = old_rt.unwrap_or("?"),
+                new_type = new_rt.unwrap_or("?"),
+                "Type-incompatible rename — emitting as Removed + Added instead of Renamed"
+            );
+            incompatible_renames.push(rm);
+        }
+    }
+
+    // Only type-compatible renames go into the renamed sets.
+    // Incompatible pairs stay as Removed + Added in the final output.
+    let mut renamed_old: HashSet<&str> = compatible_renames
         .iter()
         .map(|r| r.old.qualified_name.as_str())
         .collect();
-    let mut renamed_new: HashSet<&str> = renames
+    let mut renamed_new: HashSet<&str> = compatible_renames
         .iter()
         .map(|r| r.new.qualified_name.as_str())
         .collect();
@@ -365,8 +408,9 @@ pub fn diff_surfaces_with_semantics(
         map
     };
 
-    // Emit rename changes
-    for rm in &renames {
+    // Emit rename changes (type-compatible only — incompatible pairs
+    // stay as Removed + Added for LLM-assisted fixing)
+    for rm in &compatible_renames {
         // Same export name, different file path. Check whether the
         // consumer-facing import path changed (e.g., a symbol moved from
         // `@patternfly/react-charts` to `@patternfly/react-charts/victory`).

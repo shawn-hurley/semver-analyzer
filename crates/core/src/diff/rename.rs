@@ -95,7 +95,7 @@ impl MemberFingerprint {
 ///   `(ToolbarChip | string)[]` → `(_T_ | string)[]`
 ///   `(category: ToolbarChipGroup | string, chip: ToolbarChip | string) => void`
 ///   → `(_p_: _T_ | string, _p_: _T_ | string) => void`
-fn normalize_type_structure(type_str: &str) -> String {
+pub(crate) fn normalize_type_structure(type_str: &str) -> String {
     // Replace PascalCase identifiers (type references) with _T_
     let result = regex_replace_all_pascal_case(type_str, "_T_");
     // Replace parameter names (lowercase word before colon) with _p_

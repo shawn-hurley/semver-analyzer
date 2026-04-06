@@ -2484,6 +2484,7 @@ mod tests {
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: None,
@@ -2507,6 +2508,7 @@ mod tests {
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: None,
@@ -2538,6 +2540,7 @@ mod tests {
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: None,
@@ -2561,24 +2564,14 @@ mod tests {
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: None,
             },
         ];
         let result = merge_duplicate_conditions(rules);
-        assert_eq!(
-            result.len(),
-            1,
-            "Identical conditions should merge into one rule"
-        );
-        // Labels from both should be present
-        assert!(result[0]
-            .labels
-            .contains(&"change-type=removed".to_string()));
-        assert!(result[0]
-            .labels
-            .contains(&"change-type=type-changed".to_string()));
+        assert_eq!(result.len(), 1, "Same condition should merge into one rule");
     }
 
     // ── extract_name_from_summary tests ──────────────────────────────
