@@ -415,7 +415,24 @@ fn infer_ownership_by_name_prefix(
     };
 
     // Check if root name is a prefix of the children's block
-    if !child_block.to_lowercase().starts_with(&root_name_lower) {
+    let child_block_lower = child_block.to_lowercase();
+    if !child_block_lower.starts_with(&root_name_lower) {
+        return;
+    }
+
+    // Reject if the block boundary is at a hyphen — this indicates a
+    // separate BEM block, not a sub-element of the root's block.
+    // e.g., root "label" with child block "label-group":
+    //   remainder = "-group" → starts with '-' → separate block → reject
+    // vs. root "modal" with child block "modalBox":
+    //   remainder = "box" → no hyphen → camelCase element → allow
+    let remainder = &child_block_lower[root_name_lower.len()..];
+    if remainder.starts_with('-') {
+        debug!(
+            root = %root,
+            child_block = %child_block,
+            "Rejecting name-prefix ownership — hyphen boundary indicates separate BEM block"
+        );
         return;
     }
 
@@ -1693,5 +1710,183 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Hyphen boundary tests for infer_ownership_by_name_prefix ─────
+
+    #[test]
+    fn test_label_labelgroup_no_ownership_edge() {
+        // LabelGroup has BEM block "label-group" — a SEPARATE block from
+        // Label's "label" block. The hyphen boundary means Label should NOT
+        // own LabelGroup via name-prefix inference.
+        let mut label = make_profile("Label");
+        label.has_children_prop = true;
+        label.bem_block = Some("label".into());
+        label.css_tokens_used = [
+            "styles.label".to_string(),
+            "styles.labelText".to_string(),
+            "styles.labelIcon".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut label_group = make_profile("LabelGroup");
+        label_group.has_children_prop = true;
+        label_group.bem_block = Some("label-group".into());
+        label_group.css_tokens_used = [
+            "styles.labelGroup".to_string(),
+            "styles.labelGroupList".to_string(),
+            "styles.labelGroupMain".to_string(),
+            "styles.labelGroupClose".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Label".into(), label);
+        profiles.insert("LabelGroup".into(), label_group);
+
+        let family = vec!["Label".into(), "LabelGroup".into()];
+
+        let tree = build_composition_tree(&profiles, &family).unwrap();
+
+        // There should be NO edge from Label -> LabelGroup
+        let bad_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Label" && e.child == "LabelGroup");
+        assert!(
+            bad_edge.is_none(),
+            "Label should NOT own LabelGroup — 'label-group' is a separate BEM block \
+             (hyphen boundary after 'label'). Found edge: {:?}",
+            bad_edge
+        );
+    }
+
+    #[test]
+    fn test_alert_alertgroup_no_ownership_edge() {
+        // AlertGroup has BEM block "alert-group" — separate from Alert's
+        // "alert" block.
+        let mut alert = make_profile("Alert");
+        alert.has_children_prop = true;
+        alert.bem_block = Some("alert".into());
+        alert.css_tokens_used = ["styles.alert".to_string(), "styles.alertTitle".to_string()]
+            .into_iter()
+            .collect();
+
+        let mut alert_group = make_profile("AlertGroup");
+        alert_group.has_children_prop = true;
+        alert_group.bem_block = Some("alert-group".into());
+        alert_group.css_tokens_used = [
+            "styles.alertGroup".to_string(),
+            "styles.alertGroupItem".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Alert".into(), alert);
+        profiles.insert("AlertGroup".into(), alert_group);
+
+        let family = vec!["Alert".into(), "AlertGroup".into()];
+
+        let tree = build_composition_tree(&profiles, &family).unwrap();
+
+        let bad_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Alert" && e.child == "AlertGroup");
+        assert!(
+            bad_edge.is_none(),
+            "Alert should NOT own AlertGroup — 'alert-group' is a separate BEM block. \
+             Found edge: {:?}",
+            bad_edge
+        );
+    }
+
+    #[test]
+    fn test_modal_modalbox_ownership_allowed() {
+        // Modal owns ModalBox because "modalBox" has no hyphen at the
+        // boundary — it's a camelCase sub-block, not a separate BEM block.
+        let mut modal = make_profile("Modal");
+        modal.has_children_prop = true;
+        modal.bem_block = Some("backdrop".into()); // Modal's own block is different
+        modal.css_tokens_used = ["styles.backdrop".to_string()].into_iter().collect();
+
+        let mut modal_box = make_profile("ModalBox");
+        modal_box.has_children_prop = true;
+        modal_box.bem_block = Some("modalBox".into());
+        modal_box.css_tokens_used = [
+            "styles.modalBox".to_string(),
+            "styles.modalBoxBody".to_string(),
+            "styles.modalBoxHeader".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut modal_body = make_profile("ModalBoxBody");
+        modal_body.has_children_prop = true;
+        modal_body.bem_block = None; // Shares ModalBox's block
+        modal_body.css_tokens_used = ["styles.modalBoxBody".to_string()].into_iter().collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Modal".into(), modal);
+        profiles.insert("ModalBox".into(), modal_box);
+        profiles.insert("ModalBoxBody".into(), modal_body);
+
+        let family = vec!["Modal".into(), "ModalBox".into(), "ModalBoxBody".into()];
+
+        let tree = build_composition_tree(&profiles, &family).unwrap();
+
+        // Modal should own ModalBox (no hyphen at boundary: "modalBox")
+        // ModalBox and ModalBoxBody are camelCase elements
+        let modal_owns_box = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalBox");
+        assert!(
+            modal_owns_box,
+            "Modal should own ModalBox — 'modalBox' is a camelCase sub-block \
+             (no hyphen boundary). Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    #[test]
+    fn test_menu_menutoggle_no_ownership_edge() {
+        // MenuToggle has BEM block "menu-toggle" — separate from Menu.
+        let mut menu = make_profile("Menu");
+        menu.has_children_prop = true;
+        menu.bem_block = Some("menu".into());
+        menu.css_tokens_used = ["styles.menu".to_string()].into_iter().collect();
+
+        let mut menu_toggle = make_profile("MenuToggle");
+        menu_toggle.has_children_prop = true;
+        menu_toggle.bem_block = Some("menu-toggle".into());
+        menu_toggle.css_tokens_used = [
+            "styles.menuToggle".to_string(),
+            "styles.menuToggleIcon".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Menu".into(), menu);
+        profiles.insert("MenuToggle".into(), menu_toggle);
+
+        let family = vec!["Menu".into(), "MenuToggle".into()];
+
+        let tree = build_composition_tree(&profiles, &family).unwrap();
+
+        let bad_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Menu" && e.child == "MenuToggle");
+        assert!(
+            bad_edge.is_none(),
+            "Menu should NOT own MenuToggle — 'menu-toggle' is a separate BEM block. \
+             Found edge: {:?}",
+            bad_edge
+        );
     }
 }
