@@ -77,8 +77,14 @@ fn detect_collapsible_constant_groups<'a>(
         }
     }
 
-    // Only keep groups that exceed the threshold
-    groups.retain(|_, changes| changes.len() >= CONSTANT_COLLAPSE_THRESHOLD);
+    // Only keep groups that exceed the threshold.
+    // Exclude ImportPathChange groups — these are import-path relocations
+    // (e.g., Chart moved from @patternfly/react-charts to
+    // @patternfly/react-charts/victory) that need individual rules with
+    // the specific new import path, not a generic "N constants renamed" rule.
+    groups.retain(|key, changes| {
+        changes.len() >= CONSTANT_COLLAPSE_THRESHOLD && key.strategy != "ImportPathChange"
+    });
     groups
 }
 
@@ -8975,4 +8981,304 @@ mod tests {
     // NOTE: Full integration test for token rename pipeline lives in
     // crates/konveyor-core/tests/token_rename_pipeline.rs using real
     // fixture data (4028 token renames from PF v5→v6).
+
+    // ── Integration: import-path relocations must NOT be collapsed into constant groups ──
+
+    /// Simulates the PatternFly react-charts scenario where 15+ component
+    /// variables (Chart, ChartArea, ...) were relocated from
+    /// `@patternfly/react-charts` to `@patternfly/react-charts/victory`.
+    ///
+    /// These are import-path relocations (before/after are npm package paths,
+    /// not symbol summaries). They must NOT be collapsed into a combined
+    /// "N constants had breaking changes" rule — each component needs an
+    /// individual ImportPathChange rule so consumers know the new import path.
+    ///
+    /// Meanwhile, actual CSS token renames (with symbol_summary before/after)
+    /// in the same package SHOULD still be collapsed.
+    #[test]
+    fn test_import_path_relocations_not_collapsed_into_constant_group() {
+        // 15 import-path relocations (like Chart, ChartArea, etc.)
+        let mut import_path_changes: Vec<ApiChange> = Vec::new();
+        let chart_names = [
+            "Chart",
+            "ChartArea",
+            "ChartAxis",
+            "ChartBar",
+            "ChartBoxPlot",
+            "ChartBullet",
+            "ChartContainer",
+            "ChartDonut",
+            "ChartGroup",
+            "ChartLabel",
+            "ChartLegend",
+            "ChartLine",
+            "ChartPie",
+            "ChartScatter",
+            "ChartStack",
+        ];
+        for name in &chart_names {
+            import_path_changes.push(ApiChange {
+                symbol: name.to_string(),
+                qualified_name: format!(
+                    "packages/react-charts/src/components/{name}/{name}.{name}"
+                ),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Renamed,
+                before: Some("@patternfly/react-charts".to_string()),
+                after: Some("@patternfly/react-charts/victory".to_string()),
+                description: format!(
+                    "variable `{name}` moved from `@patternfly/react-charts` to `@patternfly/react-charts/victory`"
+                ),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        // 15 CSS token renames (symbol_summary before/after) in the same package
+        let mut token_changes: Vec<ApiChange> = Vec::new();
+        for i in 0..15 {
+            token_changes.push(ApiChange {
+                symbol: format!("chart_token_{}", i),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Renamed,
+                before: Some(format!("constant: chart_token_{}: {{ ... }}", i)),
+                after: Some(format!("variable: t_chart_token_{}: {{ ... }}", i)),
+                description: format!("Exported constant `chart_token_{}` was renamed", i),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        // Also add matching Props interface changes (these should always get
+        // individual rules regardless, since they're not Constants)
+        let mut props_changes: Vec<ApiChange> = Vec::new();
+        for name in &chart_names[..3] {
+            props_changes.push(ApiChange {
+                symbol: format!("{name}Props"),
+                qualified_name: format!(
+                    "packages/react-charts/src/components/{name}/{name}.{name}Props"
+                ),
+                kind: ApiChangeKind::Interface,
+                change: ApiChangeType::Renamed,
+                before: Some("@patternfly/react-charts".to_string()),
+                after: Some("@patternfly/react-charts/victory".to_string()),
+                description: format!(
+                    "interface `{name}Props` moved from `@patternfly/react-charts` to `@patternfly/react-charts/victory`"
+                ),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        let mut all_changes = import_path_changes;
+        all_changes.extend(token_changes);
+        all_changes.extend(props_changes);
+
+        let changes = vec![make_file_changes(
+            "packages/react-charts/src/components/Chart/Chart.d.ts",
+            all_changes,
+            vec![],
+        )];
+
+        let mut pkg_cache = HashMap::new();
+        pkg_cache.insert(
+            "react-charts".to_string(),
+            "@patternfly/react-charts".to_string(),
+        );
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // CSS tokens SHOULD be collapsed into a combined rule
+        let combined_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("combined"))
+            .collect();
+        assert!(
+            !combined_rules.is_empty(),
+            "CSS tokens should be collapsed into a combined rule"
+        );
+        // The combined rule should NOT mention Chart components
+        for cr in &combined_rules {
+            assert!(
+                !cr.message.contains("Chart,") && !cr.message.contains("ChartArea"),
+                "Combined rule should not include Chart component names: {}",
+                cr.message
+            );
+        }
+
+        // Each Chart component SHOULD have an individual import-path rule
+        for name in &chart_names {
+            let chart_rules: Vec<&KonveyorRule> = rules
+                .iter()
+                .filter(|r| {
+                    r.message.contains(name)
+                        && r.message.contains("@patternfly/react-charts/victory")
+                })
+                .collect();
+            assert!(
+                !chart_rules.is_empty(),
+                "Expected individual rule for {name} mentioning the new import path \
+                 @patternfly/react-charts/victory, but found none.\n\
+                 All rule IDs: {:?}",
+                rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+            );
+        }
+
+        // Props interfaces SHOULD also have individual rules
+        for name in &chart_names[..3] {
+            let props_name = format!("{name}Props");
+            let props_rules: Vec<&KonveyorRule> = rules
+                .iter()
+                .filter(|r| {
+                    r.message.contains(&props_name)
+                        && r.message.contains("@patternfly/react-charts/victory")
+                })
+                .collect();
+            assert!(
+                !props_rules.is_empty(),
+                "Expected individual rule for {props_name}"
+            );
+        }
+    }
+
+    /// Same test but via the V2 path (pre-populated report.packages).
+    /// This exercises the report.rs constant group building and the V2
+    /// rule generation path in generate_rules().
+    #[test]
+    fn test_import_path_relocations_not_collapsed_v2_path() {
+        let chart_names = [
+            "Chart",
+            "ChartArea",
+            "ChartAxis",
+            "ChartBar",
+            "ChartBoxPlot",
+            "ChartBullet",
+            "ChartContainer",
+            "ChartDonut",
+            "ChartGroup",
+            "ChartLabel",
+            "ChartLegend",
+            "ChartLine",
+            "ChartPie",
+            "ChartScatter",
+            "ChartStack",
+        ];
+
+        // Build ApiChanges for all components
+        let mut all_api_changes: Vec<ApiChange> = Vec::new();
+
+        // Import-path relocations for chart components
+        for name in &chart_names {
+            all_api_changes.push(ApiChange {
+                symbol: name.to_string(),
+                qualified_name: format!(
+                    "packages/react-charts/src/components/{name}/{name}.{name}"
+                ),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Renamed,
+                before: Some("@patternfly/react-charts".to_string()),
+                after: Some("@patternfly/react-charts/victory".to_string()),
+                description: format!(
+                    "variable `{name}` moved from `@patternfly/react-charts` to `@patternfly/react-charts/victory`"
+                ),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        // CSS token renames
+        for i in 0..15 {
+            all_api_changes.push(ApiChange {
+                symbol: format!("chart_token_{}", i),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Renamed,
+                before: Some(format!("constant: chart_token_{}: {{ ... }}", i)),
+                after: Some(format!("variable: t_chart_token_{}: {{ ... }}", i)),
+                description: format!("Exported constant `chart_token_{}` was renamed", i),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        let changes = vec![make_file_changes(
+            "packages/react-charts/src/components/Chart/Chart.d.ts",
+            all_api_changes,
+            vec![],
+        )];
+
+        // Pre-populate packages with a ConstantGroup for the CSS tokens ONLY.
+        // Import-path relocations should NOT appear here.
+        let token_symbols: Vec<String> = (0..15).map(|i| format!("chart_token_{}", i)).collect();
+        let packages = vec![PackageChanges {
+            name: "@patternfly/react-charts".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![],
+            constants: vec![ConstantGroup {
+                change_type: ApiChangeType::Renamed,
+                count: 15,
+                symbols: token_symbols,
+                common_prefix_pattern: "^chart_token_.*$".to_string(),
+                strategy_hint: "CssVariablePrefix".to_string(),
+                suffix_renames: vec![],
+            }],
+            added_exports: vec![],
+        }];
+
+        let mut pkg_cache = HashMap::new();
+        pkg_cache.insert(
+            "react-charts".to_string(),
+            "@patternfly/react-charts".to_string(),
+        );
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = packages;
+
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // CSS tokens should be collapsed
+        let combined_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("combined"))
+            .collect();
+        assert!(
+            !combined_rules.is_empty(),
+            "CSS tokens should be collapsed into combined rule"
+        );
+
+        // Chart components MUST have individual rules (not collapsed)
+        for name in &chart_names {
+            let chart_rules: Vec<&KonveyorRule> = rules
+                .iter()
+                .filter(|r| {
+                    r.message.contains(name)
+                        && r.message.contains("@patternfly/react-charts/victory")
+                })
+                .collect();
+            assert!(
+                !chart_rules.is_empty(),
+                "Expected individual rule for {name} with import path info (V2 path)"
+            );
+        }
+    }
 }

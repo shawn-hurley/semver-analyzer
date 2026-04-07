@@ -936,6 +936,13 @@ fn build_package_summaries(
         if change.kind != SymbolKind::Constant && change.kind != SymbolKind::Variable {
             continue;
         }
+        // Skip import-path relocations — these are component variables whose
+        // import path changed (e.g., Chart moved from @patternfly/react-charts
+        // to @patternfly/react-charts/victory). They need individual rules
+        // with the specific new import path, not a generic collapsed group.
+        if matches!(change.change_type, StructuralChangeType::Relocated { .. }) {
+            continue;
+        }
         // Skip symbols that have migration guidance — they get per-component rules.
         if symbols_with_migration.contains(&change.symbol) {
             continue;
