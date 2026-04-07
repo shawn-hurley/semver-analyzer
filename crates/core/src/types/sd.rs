@@ -508,6 +508,19 @@ pub struct SdPipelineResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_css_blocks: Vec<String>,
 
+    /// Deprecated component → replacement mappings detected via rendering swaps.
+    ///
+    /// When a component is relocated to `/deprecated/` and other components
+    /// in the codebase switched from rendering the old component to rendering
+    /// a new one (e.g., ToolbarFilter stopped rendering `Chip` and started
+    /// rendering `Label`), this records the replacement relationship.
+    ///
+    /// Populated by the orchestrator after both TD and SD pipelines complete.
+    /// Consumed by report building and rule generation to produce unified
+    /// migration entries instead of separate relocation + signature-changed rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deprecated_replacements: Vec<DeprecatedReplacement>,
+
     /// Extracted profiles keyed by component name, for both versions.
     /// Retained for downstream use (rule generation, debugging).
     /// Skipped during serialization — profiles contain tuple-keyed maps
@@ -516,4 +529,23 @@ pub struct SdPipelineResult {
     pub old_profiles: HashMap<String, ComponentSourceProfile>,
     #[serde(skip)]
     pub new_profiles: HashMap<String, ComponentSourceProfile>,
+}
+
+// ── Deprecated Replacement Detection ────────────────────────────────────
+
+/// A deprecated component that has a differently-named replacement,
+/// detected via rendering swap analysis.
+///
+/// When host components (e.g., ToolbarFilter) stopped rendering `Chip`
+/// and started rendering `Label` between versions, this establishes
+/// the `Chip → Label` replacement relationship.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeprecatedReplacement {
+    /// The deprecated component name (e.g., "Chip").
+    pub old_component: String,
+    /// The replacement component name (e.g., "Label").
+    pub new_component: String,
+    /// Host components that confirmed the swap
+    /// (e.g., \["ToolbarFilter", "MultiTypeaheadSelect"\]).
+    pub evidence_hosts: Vec<String>,
 }

@@ -134,6 +134,37 @@ Regression test:
 — uses real PatternFly `MenuToggleProps` data
 (`splitButtonOptions: SplitButtonOptions` → `splitButtonItems: ReactNode[]`).
 
+### Deprecated Replacement Detection
+
+When a component is relocated to `/deprecated/` AND a differently-named
+component replaces it (e.g., `Chip` → `Label`), the standard rename detector
+cannot find the relationship because:
+
+1. `Label` already exists in both v5 and v6 (never enters the "added" pool)
+2. Relocation detection claims `Chip` before rename detection runs
+3. "Chip" and "Label" have zero lexical similarity (LCS = 0)
+
+The **deprecated replacement detection** step in `src/orchestrator.rs` solves
+this by using **rendering swap** signals from the SD pipeline. After both TD and
+SD pipelines complete but before the report is assembled:
+
+1. `detect_deprecated_replacements()` finds relocated components where host
+   components stopped rendering the old component and started rendering a new
+   one (e.g., ToolbarFilter stopped rendering `Chip`, started rendering `Label`)
+2. `apply_deprecated_replacements()` transforms the structural changes:
+   - Relocation entries → `Changed` with `before="Chip"`, `after="Label"`
+   - Props relocations → `Changed` with `before="ChipProps"`, `after="LabelProps"`
+   - Suppresses redundant signature-changed entries (base class change)
+   - Preserves non-replaced relocations (Modal, Tile, etc.) unchanged
+
+The detection filters out Fragment, React.Fragment, other relocated components,
+and uses a Group-suffix tiebreaker when candidates have equal host evidence.
+
+Key type: `DeprecatedReplacement` in `crates/core/src/types/sd.rs`
+Key functions: `detect_deprecated_replacements()`, `apply_deprecated_replacements()`
+  in `src/orchestrator.rs`
+Tests: `deprecated_replacement_tests` module in `src/orchestrator.rs` (15 tests)
+
 ### Konveyor Rules
 
 - `crates/ts/src/konveyor.rs` — v1 rule generation (TD pipeline)
