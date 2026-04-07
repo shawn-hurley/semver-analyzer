@@ -225,15 +225,37 @@ pub fn parse_bem_structure(tokens: &[StyleToken], block_override: Option<&str>) 
 /// Map a rendered component to its BEM relationship based on the
 /// component's own style tokens vs the parent's block name.
 ///
-/// If the component's primary token is an element of the parent block
-/// (starts with parent block name), it's a BEM element relationship.
-/// If it has its own independent block, it's an independent block.
+/// If the child has its own distinct BEM block (extracted from its own
+/// CSS import), it is always classified as `Independent` — even if its
+/// camelCase tokens happen to share a prefix with the parent block.
+/// This prevents false positives from naming collisions like:
+///   - `label-group` → camelCase `labelGroup` → looks like element `Group` of block `label`
+///   - `alert-group` → camelCase `alertGroup` → looks like element `Group` of block `alert`
+///   - `menu-toggle` → camelCase `menuToggle` → looks like element `Toggle` of block `menu`
+///
+/// If the child does NOT have its own block (shares the parent's CSS file),
+/// token prefix matching determines whether it's a BEM element.
 pub fn classify_bem_relationship(
     child_block: Option<&str>,
     child_tokens: &BTreeSet<String>,
     parent_block: &str,
 ) -> BemRelationship {
-    // Check if any of the child's tokens are elements of the parent block
+    // If the child has its own distinct BEM block (from its own CSS import),
+    // it's an independent component regardless of token name coincidences.
+    // A component that imports its own stylesheet is by definition a separate
+    // BEM block, not an element of another block.
+    if let Some(block) = child_block {
+        if block != parent_block {
+            return BemRelationship::Independent {
+                block_name: block.to_string(),
+            };
+        }
+    }
+
+    // Only do token prefix matching when the child shares the parent's BEM
+    // block (or has no block of its own). In this case, tokens that start
+    // with the parent block name followed by an uppercase letter are BEM
+    // elements (e.g., `menuList` is element `list` of block `menu`).
     for token in child_tokens {
         if let Some(suffix) = token.strip_prefix(parent_block) {
             if suffix.starts_with(|c: char| c.is_uppercase()) {
@@ -241,15 +263,6 @@ pub fn classify_bem_relationship(
                     element_name: lowercase_first(suffix),
                 };
             }
-        }
-    }
-
-    // If the child has its own block, it's independent
-    if let Some(block) = child_block {
-        if block != parent_block {
-            return BemRelationship::Independent {
-                block_name: block.to_string(),
-            };
         }
     }
 
@@ -407,6 +420,195 @@ const Component = () => (
             BemRelationship::Independent {
                 block_name: "menuToggle".into()
             }
+        );
+    }
+
+    // ── BEM collision regression tests ──────────────────────────────────
+    //
+    // These tests verify that components with their own distinct BEM blocks
+    // are classified as Independent even when their camelCase tokens happen
+    // to share a prefix with the parent's block name.
+
+    #[test]
+    fn test_label_labelgroup_collision_returns_independent() {
+        // LabelGroup imports its own CSS: label-group.css → block "label-group"
+        // Its tokens like "labelGroup", "labelGroupList" share prefix "label"
+        // with the Label block. Without the fix, "labelGroup" stripped of
+        // "label" gives "Group" (uppercase) → falsely classified as Element.
+        let child_tokens: BTreeSet<String> = vec![
+            "labelGroup".to_string(),
+            "labelGroupLabel".to_string(),
+            "labelGroupList".to_string(),
+            "labelGroupListItem".to_string(),
+            "labelGroupClose".to_string(),
+            "labelGroupMain".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let rel = classify_bem_relationship(Some("label-group"), &child_tokens, "label");
+        assert_eq!(
+            rel,
+            BemRelationship::Independent {
+                block_name: "label-group".into()
+            },
+            "LabelGroup has its own BEM block 'label-group' — must be Independent, not Element"
+        );
+    }
+
+    #[test]
+    fn test_alert_alertgroup_collision_returns_independent() {
+        // AlertGroup imports its own CSS: alert-group.css → block "alert-group"
+        // Same collision pattern as Label/LabelGroup.
+        let child_tokens: BTreeSet<String> =
+            vec!["alertGroup".to_string(), "alertGroupItem".to_string()]
+                .into_iter()
+                .collect();
+
+        let rel = classify_bem_relationship(Some("alert-group"), &child_tokens, "alert");
+        assert_eq!(
+            rel,
+            BemRelationship::Independent {
+                block_name: "alert-group".into()
+            },
+            "AlertGroup has its own BEM block 'alert-group' — must be Independent, not Element"
+        );
+    }
+
+    #[test]
+    fn test_menu_menutoggle_collision_returns_independent() {
+        // MenuToggle imports its own CSS: menu-toggle.css → block "menu-toggle"
+        // "menuToggle" stripped of "menu" gives "Toggle" (uppercase) → collision.
+        let child_tokens: BTreeSet<String> = vec![
+            "menuToggle".to_string(),
+            "menuToggleIcon".to_string(),
+            "menuToggleCount".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        let rel = classify_bem_relationship(Some("menu-toggle"), &child_tokens, "menu");
+        assert_eq!(
+            rel,
+            BemRelationship::Independent {
+                block_name: "menu-toggle".into()
+            },
+            "MenuToggle has its own BEM block 'menu-toggle' — must be Independent, not Element"
+        );
+    }
+
+    #[test]
+    fn test_form_formcontrol_collision_returns_independent() {
+        // FormControl imports its own CSS: form-control.css → block "form-control"
+        let child_tokens: BTreeSet<String> =
+            vec!["formControl".to_string(), "formControlIcon".to_string()]
+                .into_iter()
+                .collect();
+
+        let rel = classify_bem_relationship(Some("form-control"), &child_tokens, "form");
+        assert_eq!(
+            rel,
+            BemRelationship::Independent {
+                block_name: "form-control".into()
+            },
+            "FormControl has its own BEM block 'form-control' — must be Independent, not Element"
+        );
+    }
+
+    // ── Ensure true BEM elements still work ─────────────────────────────
+
+    #[test]
+    fn test_true_bem_element_same_block() {
+        // MenuList shares the "menu" block (imports from menu.css, not its own CSS).
+        // child_block is None because it uses the parent's CSS file.
+        // Token "menuList" → element "list" of block "menu". This is correct.
+        let child_tokens: BTreeSet<String> =
+            vec!["menuList".to_string(), "menuListItem".to_string()]
+                .into_iter()
+                .collect();
+
+        let rel = classify_bem_relationship(None, &child_tokens, "menu");
+        assert_eq!(
+            rel,
+            BemRelationship::Element {
+                element_name: "list".into()
+            },
+            "MenuList without its own block should be classified as BEM element of menu"
+        );
+    }
+
+    #[test]
+    fn test_true_bem_element_with_same_block_name() {
+        // When child_block == parent_block, the child shares the parent's CSS.
+        // Token prefix matching should still identify elements.
+        let child_tokens: BTreeSet<String> = vec!["toolbarGroup".to_string()].into_iter().collect();
+
+        let rel = classify_bem_relationship(Some("toolbar"), &child_tokens, "toolbar");
+        assert_eq!(
+            rel,
+            BemRelationship::Element {
+                element_name: "group".into()
+            },
+            "ToolbarGroup with same block as parent should be a BEM element"
+        );
+    }
+
+    #[test]
+    fn test_no_matching_tokens_no_block_returns_unknown() {
+        // Child has no tokens matching parent block and no own block.
+        let child_tokens: BTreeSet<String> = vec!["divider".to_string()].into_iter().collect();
+
+        let rel = classify_bem_relationship(None, &child_tokens, "menu");
+        assert_eq!(
+            rel,
+            BemRelationship::Unknown,
+            "Unrelated tokens with no own block should be Unknown"
+        );
+    }
+
+    #[test]
+    fn test_independent_block_no_token_collision() {
+        // Child has its own block and tokens that DON'T share prefix with parent.
+        // This should be Independent regardless (no collision to worry about).
+        let child_tokens: BTreeSet<String> =
+            vec!["pagination".to_string(), "paginationNav".to_string()]
+                .into_iter()
+                .collect();
+
+        let rel = classify_bem_relationship(Some("pagination"), &child_tokens, "table");
+        assert_eq!(
+            rel,
+            BemRelationship::Independent {
+                block_name: "pagination".into()
+            },
+            "Component with own block unrelated to parent should be Independent"
+        );
+    }
+
+    #[test]
+    fn test_empty_tokens_with_own_block_returns_independent() {
+        // Edge case: child has a block but no tokens at all.
+        let child_tokens: BTreeSet<String> = BTreeSet::new();
+
+        let rel = classify_bem_relationship(Some("badge"), &child_tokens, "button");
+        assert_eq!(
+            rel,
+            BemRelationship::Independent {
+                block_name: "badge".into()
+            },
+            "Component with own block but no tokens should still be Independent"
+        );
+    }
+
+    #[test]
+    fn test_empty_tokens_no_block_returns_unknown() {
+        let child_tokens: BTreeSet<String> = BTreeSet::new();
+
+        let rel = classify_bem_relationship(None, &child_tokens, "button");
+        assert_eq!(
+            rel,
+            BemRelationship::Unknown,
+            "No tokens and no block should be Unknown"
         );
     }
 }

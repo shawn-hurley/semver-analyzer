@@ -8,7 +8,7 @@ description = "Shared types and utilities for Konveyor rule generation"
 
 [dependencies]
 semver-analyzer-core = { version = "0.0.4", path = "../core" }
-konveyor-core = "0.0.3"
+konveyor-core = { path = "../../../konveyor-core" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -210,117 +210,20 @@ fn generate_composition_change_rules(
 
     for change in &sd.composition_changes {
         match &change.change_type {
-            CompositionChangeType::NewRequiredChild {
-                parent,
-                new_child,
-                wraps,
-            } => {
-                let rule_id = format!(
-                    "sd-composition-{}-requires-{}",
-                    sanitize(parent),
-                    sanitize(new_child)
-                );
-
-                let mut message = format!(
-                    "<{}> now requires <{}> as a child component.\n",
-                    parent, new_child
-                );
-                if let Some(ref after) = change.after_pattern {
-                    message.push_str(&format!("\nExpected pattern:\n{}\n", after));
-                }
-                if !wraps.is_empty() {
-                    message.push_str(&format!("\n<{}> wraps: {}\n", new_child, wraps.join(", ")));
-                }
-
-                // Add warning about prop-passed family members
-                if let Some(prop_members) = prop_passed_members.get(parent) {
-                    message.push_str(&format!(
-                        "\nIMPORTANT: The following components are passed via props on <{}>, \
-                         NOT as JSX children. Do not move them into the children:\n",
-                        parent
-                    ));
-                    for pm in prop_members {
-                        message.push_str(&format!("  - {}\n", pm));
-                    }
-                }
-
-                let pkg = pkg_for(parent, component_packages);
-                rules.push(KonveyorRule {
-                    rule_id,
-                    labels: vec![
-                        "source=semver-analyzer".into(),
-                        "change-type=composition".into(),
-                        format!("package={}", pkg),
-                        format!("family={}", change.family),
-                    ],
-                    effort: 3,
-                    category: "mandatory".into(),
-                    description: change.description.clone(),
-                    message,
-                    links: vec![],
-                    when: KonveyorCondition::FrontendReferenced {
-                        referenced: FrontendReferencedFields {
-                            pattern: format!("^{}$", parent),
-                            location: "JSX_COMPONENT".into(),
-                            component: None,
-                            parent: None,
-                            parent_from: None,
-                            not_parent: None,
-                            not_child: None,
-                            value: None,
-                            from: Some(pkg.clone()),
-                            file_pattern: None,
-                        },
-                    },
-                    fix_strategy: Some(FixStrategyEntry {
-                        strategy: "CompositionChange".into(),
-                        component: Some(parent.clone()),
-                        replacement: Some(new_child.clone()),
-                        ..Default::default()
-                    }),
-                });
+            CompositionChangeType::NewRequiredChild { .. } => {
+                // Skip — conformance rules already validate parent-child
+                // relationships from the child's perspective (notParent).
+                // Generating a "requires" rule from the parent's perspective
+                // is redundant and produces false positives on code where the
+                // child component is already present.
             }
-            CompositionChangeType::FamilyMemberAdded { member } => {
-                let pkg = pkg_for(member, component_packages);
-                let rule_id = format!(
-                    "sd-composition-{}-new-member-{}",
-                    sanitize(&change.family),
-                    sanitize(member)
-                );
-
-                rules.push(KonveyorRule {
-                    rule_id,
-                    labels: vec![
-                        "source=semver-analyzer".into(),
-                        "change-type=composition".into(),
-                        format!("package={}", pkg),
-                        format!("family={}", change.family),
-                    ],
-                    effort: 1,
-                    category: "optional".into(),
-                    description: change.description.clone(),
-                    message: format!(
-                        "<{}> is a new component in the {} family.\n\
-                         Consider using it for better structure and semantics.",
-                        member, change.family
-                    ),
-                    links: vec![],
-                    when: KonveyorCondition::FrontendReferenced {
-                        referenced: FrontendReferencedFields {
-                            pattern: format!("^{}$", change.family),
-                            location: "JSX_COMPONENT".into(),
-                            component: None,
-                            parent: None,
-                            parent_from: None,
-                            not_parent: None,
-                            not_child: None,
-                            value: None,
-                            from: Some(pkg.to_string()),
-                            file_pattern: None,
-                        },
-                    },
-                    fix_strategy: None,
-                });
+            CompositionChangeType::FamilyMemberAdded { .. } => {
+                // Skip — the migration rule (component-import-deprecated)
+                // already lists new child components in its message with
+                // guidance on how to use them. Generating a new-member rule
+                // fires on every parent usage regardless of whether the new
+                // component is already in use, adding noise. If the new
+                // component is required, conformance rules handle it.
             }
             CompositionChangeType::FamilyMemberRemoved { member } => {
                 let pkg = pkg_for(member, component_packages);
@@ -355,6 +258,7 @@ fn generate_composition_change_rules(
                             parent: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                             value: None,
                             from: Some(pkg.to_string()),
@@ -546,6 +450,7 @@ fn generate_conformance_rules(
                             parent: Some(format!("^{}$", grandparent)),
                             parent_from: Some(pkg.to_string()),
                             not_parent: None,
+                            child: None,
                             not_child: None,
                             value: None,
                             from: Some(pkg.to_string()),
@@ -640,6 +545,7 @@ fn generate_conformance_rules(
                         component: None,
                         parent: None,
                         not_parent: Some(not_parent_pattern),
+                        child: None,
                         not_child: None,
                         parent_from: None,
                         value: None,
@@ -705,6 +611,7 @@ fn generate_conformance_rules(
                         component: None,
                         parent: None,
                         not_parent: None,
+                        child: None,
                         not_child: Some(allowed_pattern),
                         parent_from: None,
                         value: None,
@@ -792,6 +699,7 @@ fn generate_context_rules(
                     parent: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                     value: None,
                     from: Some(pkg.to_string()),
@@ -984,6 +892,7 @@ fn generate_prop_child_migration_rules(
                                 parent: None,
                                 parent_from: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                                 value: None,
                                 from: Some(pkg.to_string()),
@@ -1066,6 +975,7 @@ fn generate_prop_child_migration_rules(
                                         component: Some(format!("^{}$", tree.root)),
                                         parent: None,
                                         not_parent: None,
+                                        child: None,
                                         not_child: None,
                                         parent_from: None,
                                         value: None,
@@ -1226,6 +1136,7 @@ fn generate_prop_child_migration_rules(
                                 parent: Some(format!("^{}$", root)),
                                 parent_from: Some(pkg.clone()),
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                                 value: None,
                                 from: Some(pkg.clone()),
@@ -1454,6 +1365,7 @@ fn generate_cross_family_child_to_prop_rules(
                             parent: Some(format!("^{}$", root)),
                             parent_from: Some(pkg.clone()),
                             not_parent: None,
+                            child: None,
                             not_child: None,
                             value: None,
                             from: Some(comp_pkg),
@@ -1582,6 +1494,7 @@ fn generate_deprecated_migration_rules(
                             parent: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                             value: None,
                             from: Some(old_pkg.clone()),
@@ -1647,6 +1560,7 @@ fn generate_deprecated_migration_rules(
                         parent: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         value: None,
                         from: Some(deprecated_pkg.clone()),
@@ -1849,6 +1763,7 @@ fn generate_prop_value_conformance_rules(
                             component: Some(format!("^{}$", component)),
                             parent: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                             parent_from: None,
                             value: Some(format!("^{}$", regex::escape(value))),
@@ -1996,6 +1911,7 @@ fn generate_prop_value_conformance_rules(
                                 component: Some(format!("^{}$", component)),
                                 parent: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                                 parent_from: None,
                                 value: Some(format!("^{}$", regex::escape(value))),
@@ -2130,6 +2046,7 @@ fn generate_required_prop_added_rules(
                         component: None,
                         parent: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         parent_from: None,
                         value: None,
@@ -2284,6 +2201,7 @@ fn generate_test_impact_rules(
                                 component: None,
                                 parent: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                                 parent_from: None,
                                 value: Some(format!("^{}$", old_val)),
@@ -2373,6 +2291,7 @@ fn generate_test_impact_rules(
                                 component: None,
                                 parent: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                                 parent_from: None,
                                 value: Some(format!("^{}$", old_val)),
@@ -2438,6 +2357,7 @@ fn generate_test_impact_rules(
                                     component: None,
                                     parent: None,
                                     not_parent: None,
+                                    child: None,
                                     not_child: None,
                                     parent_from: None,
                                     value: Some(format!("^{}$", role)),
@@ -2620,6 +2540,7 @@ fn generate_composition_inversion_rules(
                             component: None,
                             parent: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                             parent_from: None,
                             value: None,
@@ -2727,6 +2648,7 @@ fn generate_prop_attribute_override_rules(
                         component: Some(format!("^{}$", regex_escape(&change.component))),
                         parent: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         parent_from: None,
                         value: None,

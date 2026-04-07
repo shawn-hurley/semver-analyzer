@@ -738,6 +738,7 @@ pub fn generate_rules(
                     parent: parent_field,
                     parent_from: parent_from_field,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                     value: None,
                     // Don't filter on the matched component's import source —
@@ -1033,6 +1034,7 @@ pub fn generate_rules(
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -1448,8 +1450,18 @@ pub fn generate_rules(
                         }
                     }
 
-                    // Use Or condition for types from deprecated directories
-                    // so the rule fires on both import paths.
+                    // Build a precise `when` clause based on component status:
+                    //
+                    // 1. Fully removed components (status=Removed): trigger on
+                    //    IMPORT — importing a removed component is itself the issue.
+                    //
+                    // 2. Modified components with removed props: trigger on
+                    //    JSX_PROP usage of any removed prop. This ensures the rule
+                    //    only fires when the code actually uses a deprecated prop,
+                    //    not on every file that imports the component.
+                    //    Additionally, if the component has new child components,
+                    //    add a structural trigger using the `child` filter to
+                    //    detect old-style internal components still used as children.
                     let is_from_deprecated = report.changes.iter().any(|fc| {
                         let file_str = fc.file.to_string_lossy();
                         file_str.contains("/deprecated/")
@@ -1460,40 +1472,143 @@ pub fn generate_rules(
                     });
 
                     let pattern = format!("^{}$", regex_escape(component_name));
-                    let when = if is_from_deprecated {
-                        KonveyorCondition::Or {
-                            or: vec![
-                                KonveyorCondition::FrontendReferenced {
+
+                    let when = if comp.status == ComponentStatus::Removed {
+                        // Fully removed — trigger on import (from either path)
+                        if is_from_deprecated {
+                            KonveyorCondition::Or {
+                                or: vec![
+                                    KonveyorCondition::FrontendReferenced {
+                                        referenced: FrontendReferencedFields {
+                                            pattern: pattern.clone(),
+                                            location: "IMPORT".to_string(),
+                                            component: None,
+                                            parent: None,
+                                            value: None,
+                                            from: Some(format!("{}/deprecated", pkg.name)),
+                                            file_pattern: None,
+                                            parent_from: None,
+                                            not_parent: None,
+                                            child: None,
+                                            not_child: None,
+                                        },
+                                    },
+                                    KonveyorCondition::FrontendReferenced {
+                                        referenced: FrontendReferencedFields {
+                                            pattern: pattern.clone(),
+                                            location: "IMPORT".to_string(),
+                                            component: None,
+                                            parent: None,
+                                            value: None,
+                                            from: Some(pkg.name.clone()),
+                                            file_pattern: None,
+                                            parent_from: None,
+                                            not_parent: None,
+                                            child: None,
+                                            not_child: None,
+                                        },
+                                    },
+                                ],
+                            }
+                        } else {
+                            KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern,
+                                    location: "IMPORT".to_string(),
+                                    component: None,
+                                    parent: None,
+                                    value: None,
+                                    from: Some(pkg.name.clone()),
+                                    file_pattern: None,
+                                    parent_from: None,
+                                    not_parent: None,
+                                    child: None,
+                                    not_child: None,
+                                },
+                            }
+                        }
+                    } else if !comp.removed_members.is_empty() {
+                        // Modified component with removed props — trigger on
+                        // usage of any removed prop (JSX_PROP location).
+                        // This is precise: only fires when the code actually
+                        // uses a deprecated prop, not on every import.
+                        let pkg_name = if is_from_deprecated {
+                            // Try both package paths
+                            pkg.name.clone()
+                        } else {
+                            pkg.name.clone()
+                        };
+
+                        let mut conditions: Vec<KonveyorCondition> = comp
+                            .removed_members
+                            .iter()
+                            .map(|prop| KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern: format!("^{}$", regex_escape(&prop.name)),
+                                    location: "JSX_PROP".to_string(),
+                                    component: Some(format!("^{}$", regex_escape(component_name))),
+                                    parent: None,
+                                    value: None,
+                                    from: Some(pkg_name.clone()),
+                                    file_pattern: None,
+                                    parent_from: None,
+                                    not_parent: None,
+                                    child: None,
+                                    not_child: None,
+                                },
+                            })
+                            .collect();
+
+                        // Add a structural trigger: if the component has
+                        // removed child components, detect old-style children
+                        // still used via the `child` filter. Build a regex
+                        // matching all removed family members (ModalBox,
+                        // ModalBoxBody, etc.).
+                        if !comp.child_components.is_empty() {
+                            // The removed family members are components that
+                            // the old API used internally but the new API removed.
+                            // We can infer them from the report — they're components
+                            // in the same package that were removed or deprecated.
+                            let removed_siblings: Vec<String> = pkg
+                                .type_summaries
+                                .iter()
+                                .filter(|sibling| {
+                                    sibling.status == ComponentStatus::Removed
+                                        && sibling.name != *component_name
+                                        && sibling.name.starts_with(component_name)
+                                })
+                                .map(|s| regex_escape(&s.name))
+                                .collect();
+
+                            if !removed_siblings.is_empty() {
+                                let child_pattern = format!("^({})$", removed_siblings.join("|"));
+                                conditions.push(KonveyorCondition::FrontendReferenced {
                                     referenced: FrontendReferencedFields {
-                                        pattern: pattern.clone(),
-                                        location: "IMPORT".to_string(),
+                                        pattern: format!("^{}$", regex_escape(component_name)),
+                                        location: "JSX_COMPONENT".to_string(),
                                         component: None,
                                         parent: None,
                                         value: None,
-                                        from: Some(format!("{}/deprecated", pkg.name)),
+                                        from: Some(pkg_name.clone()),
                                         file_pattern: None,
                                         parent_from: None,
                                         not_parent: None,
+                                        child: Some(child_pattern),
                                         not_child: None,
                                     },
-                                },
-                                KonveyorCondition::FrontendReferenced {
-                                    referenced: FrontendReferencedFields {
-                                        pattern: pattern.clone(),
-                                        location: "IMPORT".to_string(),
-                                        component: None,
-                                        parent: None,
-                                        value: None,
-                                        from: Some(pkg.name.clone()),
-                                        file_pattern: None,
-                                        parent_from: None,
-                                        not_parent: None,
-                                        not_child: None,
-                                    },
-                                },
-                            ],
+                                });
+                            }
+                        }
+
+                        if conditions.len() == 1 {
+                            conditions.into_iter().next().unwrap()
+                        } else {
+                            KonveyorCondition::Or { or: conditions }
                         }
                     } else {
+                        // No removed props, not fully removed — fall back to
+                        // IMPORT trigger (shouldn't happen for qualified P0-C
+                        // rules but defensive).
                         KonveyorCondition::FrontendReferenced {
                             referenced: FrontendReferencedFields {
                                 pattern,
@@ -1505,6 +1620,7 @@ pub fn generate_rules(
                                 file_pattern: None,
                                 parent_from: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                             },
                         }
@@ -1818,6 +1934,7 @@ pub fn generate_rules(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             },
@@ -1862,6 +1979,7 @@ pub fn generate_rules(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             },
@@ -1901,6 +2019,7 @@ pub fn generate_rules(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             },
@@ -1936,6 +2055,7 @@ pub fn generate_rules(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             },
@@ -2130,6 +2250,7 @@ pub fn generate_rules(
                                     file_pattern: None,
                                     parent_from: None,
                                     not_parent: None,
+                                    child: None,
                                     not_child: None,
                                 },
                             },
@@ -2281,6 +2402,7 @@ pub fn generate_rules(
                                     file_pattern: None,
                                     parent_from: None,
                                     not_parent: None,
+                                    child: None,
                                     not_child: None,
                                 },
                             },
@@ -3290,6 +3412,7 @@ fn api_change_to_rules(
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -3376,6 +3499,7 @@ fn behavioral_change_to_rule(
                 parent: None,
                 parent_from: None,
                 not_parent: None,
+                child: None,
                 not_child: None,
                 value: None,
                 from,
@@ -5056,6 +5180,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 },
@@ -5084,6 +5209,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 },
@@ -5116,6 +5242,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 },
@@ -5148,6 +5275,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 },
@@ -5789,6 +5917,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 },
@@ -5820,6 +5949,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 },
@@ -5872,6 +6002,7 @@ mod tests {
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             },
@@ -6134,6 +6265,7 @@ mod tests {
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 };
@@ -6861,16 +6993,45 @@ mod tests {
             p0c_rules[0].fix_strategy.as_ref().unwrap().strategy,
             "LlmAssisted"
         );
-        // Verify from field is set from pkg.name
+        // Verify the when clause uses JSX_PROP conditions (one per removed prop)
+        // for Modified components, or IMPORT for Removed components.
         match &p0c_rules[0].when {
+            KonveyorCondition::Or { or } => {
+                // Modified component with removed props — should have JSX_PROP conditions
+                assert!(
+                    !or.is_empty(),
+                    "Or condition should have at least one JSX_PROP condition"
+                );
+                // Verify each condition targets the right package
+                for cond in or {
+                    match cond {
+                        KonveyorCondition::FrontendReferenced { referenced } => {
+                            assert_eq!(
+                                referenced.from.as_deref(),
+                                Some("@patternfly/react-core"),
+                                "from should come from pkg.name"
+                            );
+                            assert!(
+                                referenced.location == "JSX_PROP"
+                                    || referenced.location == "JSX_COMPONENT",
+                                "Each condition should be JSX_PROP or JSX_COMPONENT, got {}",
+                                referenced.location
+                            );
+                        }
+                        _ => panic!("Expected FrontendReferenced inside Or"),
+                    }
+                }
+            }
             KonveyorCondition::FrontendReferenced { referenced } => {
+                // Removed component — should have IMPORT location
                 assert_eq!(
                     referenced.from.as_deref(),
                     Some("@patternfly/react-core"),
                     "from should come from pkg.name"
                 );
+                assert_eq!(referenced.location, "IMPORT");
             }
-            _ => panic!("Expected FrontendReferenced condition"),
+            _ => panic!("Expected Or or FrontendReferenced condition"),
         }
         // Verify message uses v2 migration message builder
         assert!(
@@ -7840,6 +8001,7 @@ mod tests {
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -7854,6 +8016,7 @@ mod tests {
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -7886,6 +8049,7 @@ mod tests {
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -7900,6 +8064,7 @@ mod tests {
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -7931,6 +8096,7 @@ mod tests {
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             },

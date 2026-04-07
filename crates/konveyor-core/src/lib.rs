@@ -494,6 +494,7 @@ pub fn build_combined_constant_rule(
                 file_pattern: None,
                 parent_from: None,
                 not_parent: None,
+                child: None,
                 not_child: None,
             },
         },
@@ -1009,6 +1010,7 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             }
@@ -1570,6 +1572,7 @@ pub fn build_frontend_condition(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             }];
@@ -1588,6 +1591,7 @@ pub fn build_frontend_condition(
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     });
@@ -1649,6 +1653,7 @@ pub fn build_frontend_condition(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             }];
@@ -1666,6 +1671,7 @@ pub fn build_frontend_condition(
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     },
@@ -1688,6 +1694,7 @@ pub fn build_frontend_condition(
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 });
@@ -1703,6 +1710,7 @@ pub fn build_frontend_condition(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             });
@@ -1720,6 +1728,7 @@ pub fn build_frontend_condition(
                             file_pattern: None,
                             parent_from: None,
                             not_parent: None,
+                            child: None,
                             not_child: None,
                         },
                     });
@@ -1742,6 +1751,7 @@ pub fn build_frontend_condition(
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 }
@@ -1757,6 +1767,7 @@ pub fn build_frontend_condition(
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 }
@@ -1775,6 +1786,7 @@ pub fn build_frontend_condition(
                 parent: None,
                 parent_from: None,
                 not_parent: None,
+                child: None,
                 not_child: None,
                 value: None,
                 from,
@@ -1796,6 +1808,7 @@ pub fn build_frontend_condition(
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 });
@@ -1811,6 +1824,7 @@ pub fn build_frontend_condition(
                     file_pattern: None,
                     parent_from: None,
                     not_parent: None,
+                    child: None,
                     not_child: None,
                 },
             });
@@ -1840,6 +1854,7 @@ pub fn build_frontend_condition(
                                 file_pattern: None,
                                 parent_from: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                             },
                         },
@@ -1854,6 +1869,7 @@ pub fn build_frontend_condition(
                                 file_pattern: None,
                                 parent_from: None,
                                 not_parent: None,
+                                child: None,
                                 not_child: None,
                             },
                         },
@@ -1871,6 +1887,7 @@ pub fn build_frontend_condition(
                         file_pattern: None,
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                     },
                 }
@@ -2581,6 +2598,7 @@ mod tests {
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         file_pattern: None,
                     },
@@ -2605,6 +2623,7 @@ mod tests {
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         file_pattern: None,
                     },
@@ -2637,6 +2656,7 @@ mod tests {
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         file_pattern: None,
                     },
@@ -2661,6 +2681,7 @@ mod tests {
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
                         not_parent: None,
+                        child: None,
                         not_child: None,
                         file_pattern: None,
                     },
