@@ -101,6 +101,10 @@ pub struct CommonAnalyzeArgs {
     /// Runs in the worktree before CSS extraction.
     #[arg(long)]
     pub dep_build_command: Option<String>,
+
+    /// Timeout in seconds for each LLM invocation.
+    #[arg(long, default_value = "120")]
+    pub llm_timeout: u64,
 }
 
 /// Common arguments for the `extract` command.
@@ -209,4 +213,8 @@ pub struct CommonKonveyorArgs {
     /// Path to a YAML file with regex-based rename patterns.
     #[arg(long)]
     pub rename_patterns: Option<PathBuf>,
+
+    /// Timeout in seconds for each LLM invocation.
+    #[arg(long, default_value = "120")]
+    pub llm_timeout: u64,
 }
