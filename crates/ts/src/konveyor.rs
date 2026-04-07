@@ -3105,22 +3105,32 @@ fn api_change_to_rules(
         change.change,
         ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
     ) {
-        // SignatureChanged/TypeChanged entries where the prop NAME also
-        // changed (e.g., chips → labels) cannot be handled by the fix
-        // engine's PropTypeChange strategy — it only changes types, not
-        // names. Route these to the LLM instead.
-        let name_changed = match (change.before.as_deref(), change.after.as_deref()) {
-            (Some(before), Some(after)) => {
-                let old_name = extract_prop_name_from_signature(before);
-                let new_name = extract_prop_name_from_signature(after);
-                match (old_name, new_name) {
-                    (Some(o), Some(n)) => o != n,
-                    _ => false,
+        // Deprecated replacement entries (e.g., Chip → Label) are component
+        // migrations that require understanding prop differences — not a
+        // mechanical codemod. Route to LLM.
+        if change
+            .description
+            .contains("was deprecated and replaced by")
+        {
+            false
+        } else {
+            // SignatureChanged/TypeChanged entries where the prop NAME also
+            // changed (e.g., chips → labels) cannot be handled by the fix
+            // engine's PropTypeChange strategy — it only changes types, not
+            // names. Route these to the LLM instead.
+            let name_changed = match (change.before.as_deref(), change.after.as_deref()) {
+                (Some(before), Some(after)) => {
+                    let old_name = extract_prop_name_from_signature(before);
+                    let new_name = extract_prop_name_from_signature(after);
+                    match (old_name, new_name) {
+                        (Some(o), Some(n)) => o != n,
+                        _ => false,
+                    }
                 }
-            }
-            _ => false,
-        };
-        !name_changed
+                _ => false,
+            };
+            !name_changed
+        }
     } else {
         matches!(change.change, ApiChangeType::Renamed)
             || matches!(

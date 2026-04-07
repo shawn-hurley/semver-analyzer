@@ -1313,6 +1313,18 @@ pub fn api_change_to_strategy(
             if let Some((fp, tp)) = detect_version_prefix(&change.description) {
                 return Some(FixStrategyEntry::with_from_to("CssVariablePrefix", fp, tp));
             }
+            // Deprecated component replacements (e.g., Chip → Label) need
+            // LLM-assisted fixing — the replacement component has a different
+            // prop surface, so this is not a mechanical type change.
+            if change
+                .description
+                .contains("was deprecated and replaced by")
+            {
+                let mut e = FixStrategyEntry::new("LlmAssisted");
+                e.from = change.before.clone();
+                e.to = change.after.clone();
+                return Some(e);
+            }
             let (component, prop) = extract_component_prop(&change.symbol);
             let mut e = FixStrategyEntry::new("PropTypeChange");
             e.from = change.before.clone();
