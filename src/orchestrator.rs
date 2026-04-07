@@ -68,6 +68,7 @@ impl<L: Language> Analyzer<L> {
         llm_command: Option<&str>,
         build_command: Option<&str>,
         llm_all_files: bool,
+        llm_timeout: u64,
         progress: &ProgressReporter,
     ) -> Result<AnalysisResult<L>> {
         let _span = info_span!("analyze_pipeline", %from_ref, %to_ref).entered();
@@ -170,6 +171,7 @@ impl<L: Language> Analyzer<L> {
                                     &llm_cmd_rename,
                                     &from_rename,
                                     &to_rename,
+                                    llm_timeout,
                                 );
                                 rename_phase.finish("Rename inference complete");
                                 result
@@ -187,6 +189,7 @@ impl<L: Language> Analyzer<L> {
                             &td.structural_changes,
                             &old_surface,
                             &new_surface,
+                            llm_timeout,
                             &progress_hierarchy,
                         ),
                     )
@@ -232,6 +235,7 @@ impl<L: Language> Analyzer<L> {
                         &phase1.files_for_llm,
                         &shared_bu_phase2,
                         &llm_api_entries_bu,
+                        llm_timeout,
                         &progress_bu_phase2,
                     )
                     .await;
@@ -325,6 +329,7 @@ impl<L: Language> Analyzer<L> {
         dep_from: Option<&str>,
         dep_to: Option<&str>,
         dep_build_command: Option<&str>,
+        llm_timeout: u64,
         progress: &ProgressReporter,
     ) -> Result<AnalysisResult<L>> {
         let _span = info_span!("analyze_pipeline_v2", %from_ref, %to_ref).entered();
@@ -414,6 +419,7 @@ impl<L: Language> Analyzer<L> {
                             &llm_cmd_rename,
                             &from_rename,
                             &to_rename,
+                            llm_timeout,
                         );
                         rename_phase.finish("Rename inference complete");
                         result
@@ -1172,6 +1178,7 @@ impl<L: Language> Analyzer<L> {
         llm_command: &str,
         from_ref: &str,
         to_ref: &str,
+        llm_timeout: u64,
     ) -> Option<InferredRenamePatterns> {
         let renames = lang.renames()?;
 
@@ -1230,7 +1237,7 @@ impl<L: Language> Analyzer<L> {
             let pkg_name = pkg.to_string();
 
             let _llm_span = info_span!("llm_constant_renames", %pkg_name).entered();
-            let analyzer = LlmBehaviorAnalyzer::new(llm_command);
+            let analyzer = LlmBehaviorAnalyzer::new(llm_command).with_timeout(llm_timeout);
             match analyzer.infer_constant_renames(
                 &removed_sample,
                 &added_sample,
@@ -1384,7 +1391,7 @@ impl<L: Language> Analyzer<L> {
                 .unwrap_or_default();
 
             let _llm_span = info_span!("llm_interface_renames").entered();
-            let analyzer = LlmBehaviorAnalyzer::new(llm_command);
+            let analyzer = LlmBehaviorAnalyzer::new(llm_command).with_timeout(llm_timeout);
             match analyzer.infer_interface_renames(
                 &removed_capped,
                 &added_capped,
@@ -1484,6 +1491,7 @@ impl<L: Language> Analyzer<L> {
         files: &[LlmFileTask],
         shared: &Arc<SharedFindings<L>>,
         llm_api_entries: &Arc<Mutex<Vec<LlmApiChange>>>,
+        llm_timeout: u64,
         progress: &ProgressReporter,
     ) -> (LlmPhaseStats, Vec<(String, Vec<ContainerChange>)>) {
         let _span = info_span!("bu_pipeline_phase2", file_count = files.len()).entered();
@@ -1530,7 +1538,7 @@ impl<L: Language> Analyzer<L> {
                     let file_path = file_path.clone();
                     move || {
                         let _llm_span = info_span!("llm_file_analysis", %file_path).entered();
-                        let analyzer = LlmBehaviorAnalyzer::new(&cmd);
+                        let analyzer = LlmBehaviorAnalyzer::new(&cmd).with_timeout(llm_timeout);
                         let first = analyzer.analyze_file_diff(
                             &file_path,
                             &diff_content,
@@ -1853,6 +1861,7 @@ impl<L: Language> Analyzer<L> {
         structural_changes: &[StructuralChange],
         old_surface: &ApiSurface,
         new_surface: &ApiSurface,
+        llm_timeout: u64,
         progress: &ProgressReporter,
     ) -> (
         Vec<HierarchyDelta>,
@@ -2091,7 +2100,7 @@ impl<L: Language> Analyzer<L> {
                         move || {
                             let _span = info_span!("llm_hierarchy", %family_name, version = "old")
                                 .entered();
-                            let a = LlmBehaviorAnalyzer::new(&analyzer_cmd);
+                            let a = LlmBehaviorAnalyzer::new(&analyzer_cmd).with_timeout(llm_timeout);
                             match a.infer_component_hierarchy(&family_name, &content, None) {
                                 Ok(h) => Some(h),
                                 Err(e) => {
@@ -2123,7 +2132,7 @@ impl<L: Language> Analyzer<L> {
                         move || {
                             let _span = info_span!("llm_hierarchy", %family_name, version = "new")
                                 .entered();
-                            let analyzer = LlmBehaviorAnalyzer::new(&llm_cmd);
+                            let analyzer = LlmBehaviorAnalyzer::new(&llm_cmd).with_timeout(llm_timeout);
                             match analyzer.infer_component_hierarchy(
                                 &family_name,
                                 &content,

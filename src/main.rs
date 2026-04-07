@@ -206,6 +206,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                 common.dep_from.as_deref(),
                 common.dep_to.as_deref(),
                 common.dep_build_command.as_deref(),
+                common.llm_timeout,
                 reporter,
             )
             .await?
@@ -219,6 +220,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                 common.llm_command.as_deref(),
                 None, // build_command already on TypeScript
                 common.llm_all_files,
+                common.llm_timeout,
                 reporter,
             )
             .await?
@@ -265,12 +267,13 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                     "extracted suffix inventory"
                 );
 
+                let llm_timeout = common.llm_timeout;
                 let suffix_result = tokio::task::spawn_blocking({
                     let cmd = llm_cmd.clone();
                     let removed: Vec<String> = removed_suffixes.into_iter().collect();
                     let added: Vec<String> = added_suffixes.into_iter().collect();
                     move || {
-                        let analyzer = LlmBehaviorAnalyzer::new(&cmd);
+                        let analyzer = LlmBehaviorAnalyzer::new(&cmd).with_timeout(llm_timeout);
                         let removed_refs: Vec<&str> = removed.iter().map(|s| s.as_str()).collect();
                         let added_refs: Vec<&str> = added.iter().map(|s| s.as_str()).collect();
                         analyzer.infer_suffix_renames(&removed_refs, &added_refs)
@@ -412,6 +415,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                     common.dep_from.as_deref(),
                     common.dep_to.as_deref(),
                     None, // konveyor reads from report, no dep build needed
+                    common.llm_timeout,
                     reporter,
                 )
                 .await?
@@ -425,6 +429,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                     common.llm_command.as_deref(),
                     None, // build_command already on TypeScript
                     common.llm_all_files,
+                    common.llm_timeout,
                     reporter,
                 )
                 .await?
