@@ -1218,6 +1218,34 @@ pub fn api_change_to_strategy(
                 return Some(FixStrategyEntry::rename(old_val, new_val));
             }
 
+            // Handle import path relocations where before/after are direct import
+            // specifiers (e.g., "@patternfly/react-charts" → "@patternfly/react-charts/victory").
+            // These come from Relocated changes detected by the diff engine when a symbol's
+            // import_path changed between versions.
+            // Guard: symbol_summary strings contain ": " (e.g., "variable: foo")
+            // and must not be treated as import paths.
+            //
+            // IMPORTANT: This check must come BEFORE the Constant/design-token
+            // branch below.  Relocated chart components (Variable → Constant kind)
+            // have import-path strings in before/after, not symbol summaries.
+            // If the Constant branch fires first it calls
+            // `extract_name_from_summary(after)` on the import path, producing a
+            // nonsensical `Rename { from: "Chart", to: "@patternfly/react-charts/victory" }`
+            // that corrupts every file containing "Chart".
+            if !before.is_empty()
+                && !after.is_empty()
+                && before != after
+                && !before.contains("packages/")
+                && !after.contains("packages/")
+                && looks_like_import_path(before)
+                && looks_like_import_path(after)
+            {
+                let mut e = FixStrategyEntry::new("ImportPathChange");
+                e.from = Some(before.to_string());
+                e.to = Some(after.to_string());
+                return Some(e);
+            }
+
             // Constants / design tokens: generate Rename directly from the symbol
             // name and the new name extracted from the after summary.
             // The before/after fields are symbol_summary strings (e.g.,
@@ -1233,26 +1261,6 @@ pub fn api_change_to_strategy(
                         extract_name_from_summary(after)
                     };
                 return Some(FixStrategyEntry::rename(&change.symbol, new_name));
-            }
-
-            // Handle import path relocations where before/after are direct import
-            // specifiers (e.g., "@patternfly/react-charts" → "@patternfly/react-charts/victory").
-            // These come from Relocated changes detected by the diff engine when a symbol's
-            // import_path changed between versions.
-            // Guard: symbol_summary strings contain ": " (e.g., "variable: foo")
-            // and must not be treated as import paths.
-            if !before.is_empty()
-                && !after.is_empty()
-                && before != after
-                && !before.contains("packages/")
-                && !after.contains("packages/")
-                && looks_like_import_path(before)
-                && looks_like_import_path(after)
-            {
-                let mut e = FixStrategyEntry::new("ImportPathChange");
-                e.from = Some(before.to_string());
-                e.to = Some(after.to_string());
-                return Some(e);
             }
 
             if after.contains("/deprecated/") && !before.contains("/deprecated/") {
