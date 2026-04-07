@@ -95,6 +95,18 @@ impact, CSS removal, prop-attribute-override).
   causes), the verification procedure, and threshold boundaries.
 - Run the verification procedure after any change to confirm no regressions.
 
+#### Generic Type Parameter Normalization
+
+The `normalize_type_structure()` function strips generic type parameters from
+normalized `_T_` placeholders. This ensures that types like `ReactElement` and
+`ReactElement<any>` produce identical normalized fingerprints (`_T_`), enabling
+rename detection when the only type difference is a default generic parameter.
+
+Without this, renamed props with trivially-different generic parameters (e.g.,
+`labelIcon: ReactElement` → `labelHelp: ReactElement<any>`) fail all four
+rename passes and are emitted as separate Removed + Added entries instead of
+a single Renamed.
+
 ### Source Profile Extraction
 
 Source profiles are extracted in `crates/ts/src/source_profile/`. Submodules:

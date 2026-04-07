@@ -118,11 +118,62 @@ impl MemberFingerprint {
 ///   `(ToolbarChip | string)[]` → `(_T_ | string)[]`
 ///   `(category: ToolbarChipGroup | string, chip: ToolbarChip | string) => void`
 ///   → `(_p_: _T_ | string, _p_: _T_ | string) => void`
+///   `ReactElement<any>` → `_T_` (generic params stripped after normalization)
 pub(crate) fn normalize_type_structure(type_str: &str) -> String {
     // Replace PascalCase identifiers (type references) with _T_
     let result = regex_replace_all_pascal_case(type_str, "_T_");
+    // Strip generic type parameters from normalized references.
+    // After PascalCase replacement, types like `ReactElement<any>` become
+    // `_T_<any>` and `ReactElement` becomes `_T_`.  These are semantically
+    // equivalent (the `<any>` is TypeScript's default generic parameter),
+    // but the literal string difference prevents fingerprint matching in
+    // Pass 2/3.  Stripping the generic params collapses both to `_T_`,
+    // allowing the rename detector to match them.
+    let result = strip_normalized_generics(&result);
     // Replace parameter names (lowercase word before colon) with _p_
     regex_replace_all_param_names(&result, "_p_")
+}
+
+/// Strip generic type parameters from `_T_` placeholders.
+///
+/// After PascalCase normalization, types like:
+///   `ReactElement<any>`       → `_T_<any>`       → `_T_`
+///   `RefObject<HTMLDivElement>` → `_T_<_T_>`     → `_T_`
+///   `Map<string, number>`     → `_T_<string, number>` → `_T_`
+///   `(ToolbarChip | string)[]` → `(_T_ | string)[]` → unchanged (no generics)
+///
+/// This only strips `<...>` that immediately follow `_T_`.  Standalone
+/// generics (e.g., in union/intersection/array positions) are not affected.
+fn strip_normalized_generics(s: &str) -> String {
+    let marker = "_T_";
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    let bytes = s.as_bytes();
+
+    while i < bytes.len() {
+        // Check for _T_ marker
+        if i + marker.len() <= bytes.len() && &s[i..i + marker.len()] == marker {
+            result.push_str(marker);
+            i += marker.len();
+            // If immediately followed by '<', skip the entire generic parameter list
+            if i < bytes.len() && bytes[i] == b'<' {
+                let mut depth = 1;
+                i += 1; // skip '<'
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'<' => depth += 1,
+                        b'>' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
 }
 
 /// Replace all PascalCase identifiers (starting with uppercase, containing
@@ -1620,6 +1671,125 @@ mod token_tests {
         assert_eq!(matches.len(), 1, "1:1 boolean rename should still match");
         assert_eq!(matches[0].old.name, "isActive");
         assert_eq!(matches[0].new.name, "isClicked");
+    }
+
+    // ── Generic parameter stripping in normalize_type_structure ──
+
+    #[test]
+    fn test_strip_normalized_generics_basic() {
+        // ReactElement<any> → _T_<any> → _T_
+        assert_eq!(normalize_type_structure("ReactElement<any>"), "_T_");
+        // ReactElement (no generics) → _T_
+        assert_eq!(normalize_type_structure("ReactElement"), "_T_");
+        // Both normalize to the same thing
+        assert_eq!(
+            normalize_type_structure("ReactElement"),
+            normalize_type_structure("ReactElement<any>"),
+        );
+    }
+
+    #[test]
+    fn test_strip_normalized_generics_nested() {
+        // RefObject<HTMLDivElement> → _T_<_T_> → _T_
+        assert_eq!(normalize_type_structure("RefObject<HTMLDivElement>"), "_T_");
+        // RefObject<HTMLDivElement | null> → _T_<_T_ | null> → _T_
+        assert_eq!(
+            normalize_type_structure("RefObject<HTMLDivElement | null>"),
+            "_T_"
+        );
+        // Both normalize to the same thing
+        assert_eq!(
+            normalize_type_structure("RefObject<HTMLDivElement>"),
+            normalize_type_structure("RefObject<HTMLDivElement | null>"),
+        );
+    }
+
+    #[test]
+    fn test_strip_normalized_generics_multiple_params() {
+        // Map<string, number> → _T_<string, number> → _T_
+        assert_eq!(normalize_type_structure("Map<string, number>"), "_T_");
+    }
+
+    #[test]
+    fn test_strip_normalized_generics_nested_angle_brackets() {
+        // Record<string, Set<number>> → _T_<string, _T_<number>> → _T_
+        assert_eq!(
+            normalize_type_structure("Record<string, Set<number>>"),
+            "_T_"
+        );
+    }
+
+    #[test]
+    fn test_strip_normalized_generics_preserves_non_generic_types() {
+        // Union types without generics should be unchanged
+        assert_eq!(
+            normalize_type_structure("(ToolbarChip | string)[]"),
+            "(_T_ | string)[]"
+        );
+        // Primitive types unchanged
+        assert_eq!(normalize_type_structure("string"), "string");
+        assert_eq!(normalize_type_structure("boolean"), "boolean");
+    }
+
+    #[test]
+    fn test_strip_normalized_generics_in_function_params() {
+        // Function type with generic params
+        // (cb: ReactElement<any>) => void
+        assert_eq!(
+            normalize_type_structure("(cb: ReactElement<any>) => void"),
+            "(_p_: _T_) => void"
+        );
+        // Same function without generics should match
+        assert_eq!(
+            normalize_type_structure("(cb: ReactElement) => void"),
+            "(_p_: _T_) => void"
+        );
+    }
+
+    #[test]
+    fn test_strip_normalized_generics_react_element_equivalence() {
+        // The specific case from FormGroupProps:
+        // labelIcon: ReactElement vs labelHelp: ReactElement<any>
+        let old_type = normalize_type_structure("ReactElement");
+        let new_type = normalize_type_structure("ReactElement<any>");
+        assert_eq!(
+            old_type, new_type,
+            "ReactElement and ReactElement<any> should produce identical normalized forms"
+        );
+    }
+
+    // ── Member rename detection with generic parameter differences ──
+
+    #[test]
+    fn test_member_rename_detected_despite_generic_param_difference() {
+        // Simulates FormGroup.labelIcon: ReactElement → labelHelp: ReactElement<any>
+        // The rename should be detected because after normalization,
+        // both types produce the same fingerprint.
+        let old_member = make_prop("labelIcon", "FormGroupProps", "ReactElement");
+        let new_member = make_prop("labelHelp", "FormGroupProps", "ReactElement<any>");
+
+        // Verify normalized fingerprints match
+        let old_fp = MemberFingerprint::from_symbol_normalized(&old_member);
+        let new_fp = MemberFingerprint::from_symbol_normalized(&new_member);
+        assert_eq!(
+            old_fp, new_fp,
+            "Normalized fingerprints should match: ReactElement and ReactElement<any> \
+             should produce the same normalized return type after generic stripping"
+        );
+
+        // Verify the rename is detected
+        let matches = detect_renames(
+            &[&old_member],
+            &[&new_member],
+            |_, _| true, // same family — both are on FormGroupProps
+        );
+        assert_eq!(
+            matches.len(),
+            1,
+            "labelIcon → labelHelp should be detected as a rename"
+        );
+        assert_eq!(matches[0].old.name, "labelIcon");
+        assert_eq!(matches[0].new.name, "labelHelp");
     }
 }
 
