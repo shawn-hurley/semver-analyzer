@@ -745,10 +745,11 @@ fn extract_from_path(line: &str) -> Option<String> {
 /// Algorithm:
 /// 1. Match CSS profile to tree via the BEM block name
 /// 2. Identify grid items (elements with `grid-column`) → direct children of root
-/// Convert a camelCase suffix to kebab-case for CSS element matching.
-/// "ContentSection" → "content-section"
-/// "item" → "item"
-/// "expandableContent" → "expandable-content"
+///    Convert a camelCase suffix to kebab-case for CSS element matching.
+///    "ContentSection" → "content-section"
+///    "item" → "item"
+///    "expandableContent" → "expandable-content"
+#[allow(dead_code)]
 fn camel_to_kebab(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 4);
     for (i, ch) in s.chars().enumerate() {
@@ -812,7 +813,7 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
         let mut new_edges = Vec::new();
         let mut made_progress = false;
 
-        if iteration % 10 == 0 || iteration <= 3 {
+        if iteration.is_multiple_of(10) || iteration <= 3 {
             tracing::debug!(
                 root = %tree.root,
                 iteration,

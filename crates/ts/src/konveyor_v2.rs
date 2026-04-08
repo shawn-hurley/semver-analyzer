@@ -396,7 +396,7 @@ fn generate_conformance_rules(
         // and InvalidDirectChild suggestions so that valid-but-not-required
         // placements don't trigger false positives.
 
-        for (child, _required_parents) in &required_child_to_parents {
+        for child in required_child_to_parents.keys() {
             let pkg = pkg_for(child, component_packages);
             let all_parents = all_valid_child_to_parents
                 .get(child)

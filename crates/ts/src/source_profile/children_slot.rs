@@ -341,6 +341,7 @@ pub fn has_children_prop(source: &str) -> bool {
 
 // ── Statement walking ───────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn find_children_in_statement<'a>(
     stmt: &'a Statement<'a>,
     source: &str,
@@ -411,6 +412,7 @@ fn find_children_in_statement<'a>(
     false
 }
 
+#[allow(dead_code)]
 fn find_children_in_declaration<'a>(
     decl: &'a Declaration<'a>,
     source: &str,
@@ -448,6 +450,7 @@ fn find_children_in_declaration<'a>(
 
 /// Walk a class body looking for a `render()` method and trace its return
 /// for `{children}` or `{this.props.children}`.
+#[allow(dead_code)]
 fn find_children_in_class_body<'a>(
     body: &'a ClassBody<'a>,
     source: &str,
@@ -475,6 +478,7 @@ fn find_children_in_class_body<'a>(
     false
 }
 
+#[allow(dead_code)]
 fn find_children_in_expression<'a>(
     expr: &'a Expression<'a>,
     source: &str,
@@ -537,6 +541,7 @@ fn find_children_in_expression<'a>(
 
 // ── JSX-specific walking ────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn find_children_in_jsx_element<'a>(
     el: &'a JSXElement<'a>,
     source: &str,
@@ -607,6 +612,7 @@ fn find_children_in_jsx_element<'a>(
     false
 }
 
+#[allow(dead_code)]
 fn find_children_in_jsx_child<'a>(
     child: &'a JSXChild<'a>,
     source: &str,

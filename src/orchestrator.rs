@@ -24,8 +24,8 @@ use semver_analyzer_core::{
     BehavioralChange, ChangeSubject, ChangedFunction, ContainerChange, DeprecatedReplacement,
     EvidenceType, ExpectedChild, HierarchyDelta, InferenceMetadata, InferredConstantPattern,
     InferredInterfaceMapping, InferredRenamePatterns, Language, LlmApiChange, ManifestChange,
-    SdPipelineResult, SharedFindings, SourceLevelCategory, StructuralChange,
-    StructuralChangeType, Symbol, Visibility,
+    SdPipelineResult, SharedFindings, SourceLevelCategory, StructuralChange, StructuralChangeType,
+    Symbol, Visibility,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
 
@@ -659,8 +659,7 @@ impl<L: Language> Analyzer<L> {
         // component to rendering a new one (e.g., ToolbarFilter stopped
         // rendering Chip and started rendering Label). If so, record
         // the replacement relationship for downstream report/rule generation.
-        let deprecated_replacements =
-            detect_deprecated_replacements(&td.structural_changes, &sd);
+        let deprecated_replacements = detect_deprecated_replacements(&td.structural_changes, &sd);
         if !deprecated_replacements.is_empty() {
             for dr in &deprecated_replacements {
                 info!(
@@ -681,10 +680,8 @@ impl<L: Language> Analyzer<L> {
         // replacement, convert the relocation entry into a TypeChanged
         // entry pointing to the replacement, and suppress the redundant
         // signature-changed entry (base class change).
-        let structural_changes = apply_deprecated_replacements(
-            td.structural_changes,
-            &sd.deprecated_replacements,
-        );
+        let structural_changes =
+            apply_deprecated_replacements(td.structural_changes, &sd.deprecated_replacements);
 
         Ok(AnalysisResult {
             structural_changes,
@@ -1199,6 +1196,7 @@ impl<L: Language> Analyzer<L> {
     /// Called between the TD and BU phases. Makes up to 2 LLM calls:
     /// 1. Constant rename patterns (when enough removed + added constants)
     /// 2. Interface rename mappings (when enough unmapped removed interfaces)
+    #[allow(clippy::too_many_arguments)]
     fn infer_rename_patterns(
         lang: &L,
         structural_changes: &[StructuralChange],
@@ -2129,7 +2127,8 @@ impl<L: Language> Analyzer<L> {
                         move || {
                             let _span = info_span!("llm_hierarchy", %family_name, version = "old")
                                 .entered();
-                            let a = LlmBehaviorAnalyzer::new(&analyzer_cmd).with_timeout(llm_timeout);
+                            let a =
+                                LlmBehaviorAnalyzer::new(&analyzer_cmd).with_timeout(llm_timeout);
                             match a.infer_component_hierarchy(&family_name, &content, None) {
                                 Ok(h) => Some(h),
                                 Err(e) => {
@@ -2161,7 +2160,8 @@ impl<L: Language> Analyzer<L> {
                         move || {
                             let _span = info_span!("llm_hierarchy", %family_name, version = "new")
                                 .entered();
-                            let analyzer = LlmBehaviorAnalyzer::new(&llm_cmd).with_timeout(llm_timeout);
+                            let analyzer =
+                                LlmBehaviorAnalyzer::new(&llm_cmd).with_timeout(llm_timeout);
                             match analyzer.infer_component_hierarchy(
                                 &family_name,
                                 &content,
@@ -2475,19 +2475,17 @@ fn detect_deprecated_replacements(
         // Tiebreaker: prefer candidates whose structural shape matches
         // (e.g., Chip → Label not LabelGroup; ChipGroup → LabelGroup not Label).
         let old_is_group = old_comp.ends_with("Group");
-        if let Some((best_replacement, hosts)) = candidate_counts
-            .into_iter()
-            .max_by(|(name_a, hosts_a), (name_b, hosts_b)| {
-                hosts_a
-                    .len()
-                    .cmp(&hosts_b.len())
-                    .then_with(|| {
+        if let Some((best_replacement, hosts)) =
+            candidate_counts
+                .into_iter()
+                .max_by(|(name_a, hosts_a), (name_b, hosts_b)| {
+                    hosts_a.len().cmp(&hosts_b.len()).then_with(|| {
                         // Prefer matching "Group" shape
                         let a_matches = name_a.ends_with("Group") == old_is_group;
                         let b_matches = name_b.ends_with("Group") == old_is_group;
                         a_matches.cmp(&b_matches)
                     })
-            })
+                })
         {
             replacements.push(DeprecatedReplacement {
                 old_component: old_comp.clone(),
@@ -2529,8 +2527,7 @@ fn apply_deprecated_replacements(
         .map(|r| format!("{}Props", r.old_component))
         .collect();
 
-    let original = Arc::try_unwrap(structural_changes)
-        .unwrap_or_else(|arc| (*arc).clone());
+    let original = Arc::try_unwrap(structural_changes).unwrap_or_else(|arc| (*arc).clone());
 
     let mut result = Vec::with_capacity(original.len());
 
@@ -2627,7 +2624,9 @@ mod deprecated_replacement_tests {
                 },
             },
             before: Some(format!("pkg/src/components/{name}/{name}.{name}")),
-            after: Some(format!("pkg/src/deprecated/components/{name}/{name}.{name}")),
+            after: Some(format!(
+                "pkg/src/deprecated/components/{name}/{name}.{name}"
+            )),
             description: format!("variable `{name}` moved to deprecated exports"),
             is_breaking: true,
             impact: None,
@@ -2675,9 +2674,7 @@ mod deprecated_replacement_tests {
             }),
             before: Some(old_base.to_string()),
             after: Some(new_base.to_string()),
-            description: format!(
-                "`{props_name}` base class changed from {old_base} to {new_base}"
-            ),
+            description: format!("`{props_name}` base class changed from {old_base} to {new_base}"),
             is_breaking: true,
             impact: None,
             migration_target: None,
@@ -2764,15 +2761,23 @@ mod deprecated_replacement_tests {
 
         let result = detect_deprecated_replacements(&structural_changes, &sd);
 
-        assert_eq!(result.len(), 2, "Should detect Chip→Label and ChipGroup→LabelGroup");
+        assert_eq!(
+            result.len(),
+            2,
+            "Should detect Chip→Label and ChipGroup→LabelGroup"
+        );
 
         let chip_repl = result.iter().find(|r| r.old_component == "Chip");
         assert!(chip_repl.is_some(), "Should find Chip replacement");
         let chip_repl = chip_repl.unwrap();
         assert_eq!(chip_repl.new_component, "Label");
         assert_eq!(chip_repl.evidence_hosts.len(), 2);
-        assert!(chip_repl.evidence_hosts.contains(&"ToolbarFilter".to_string()));
-        assert!(chip_repl.evidence_hosts.contains(&"MultiTypeaheadSelect".to_string()));
+        assert!(chip_repl
+            .evidence_hosts
+            .contains(&"ToolbarFilter".to_string()));
+        assert!(chip_repl
+            .evidence_hosts
+            .contains(&"MultiTypeaheadSelect".to_string()));
 
         let group_repl = result.iter().find(|r| r.old_component == "ChipGroup");
         assert!(group_repl.is_some(), "Should find ChipGroup replacement");
@@ -2802,7 +2807,10 @@ mod deprecated_replacement_tests {
         ]);
 
         let result = detect_deprecated_replacements(&structural_changes, &sd);
-        assert!(result.is_empty(), "Modal should not be detected — no rendering swap");
+        assert!(
+            result.is_empty(),
+            "Modal should not be detected — no rendering swap"
+        );
     }
 
     #[test]
@@ -2835,10 +2843,7 @@ mod deprecated_replacement_tests {
     #[test]
     fn test_tile_not_detected_no_swap() {
         // Tile relocated to deprecated with no rendering swap at all.
-        let structural_changes = vec![
-            relocated_component("Tile"),
-            relocated_props("Tile"),
-        ];
+        let structural_changes = vec![relocated_component("Tile"), relocated_props("Tile")];
 
         let sd = make_sd(vec![
             // No rendering changes involving Tile
@@ -2846,7 +2851,10 @@ mod deprecated_replacement_tests {
         ]);
 
         let result = detect_deprecated_replacements(&structural_changes, &sd);
-        assert!(result.is_empty(), "Tile should not be detected — no rendering swap");
+        assert!(
+            result.is_empty(),
+            "Tile should not be detected — no rendering swap"
+        );
     }
 
     #[test]
@@ -2936,10 +2944,7 @@ mod deprecated_replacement_tests {
         // Both OldA and OldB are relocated. Host stops rendering OldA
         // and starts rendering OldB. Since OldB is also relocated, it
         // should not be treated as a replacement.
-        let structural_changes = vec![
-            relocated_component("OldA"),
-            relocated_component("OldB"),
-        ];
+        let structural_changes = vec![relocated_component("OldA"), relocated_component("OldB")];
 
         let sd = make_sd(vec![
             stopped_rendering("Host", "OldA"),
@@ -2980,11 +2985,7 @@ mod deprecated_replacement_tests {
         let changes = Arc::new(vec![
             relocated_component("Chip"),
             relocated_props("Chip"),
-            signature_changed_props(
-                "Chip",
-                "React.HTMLProps<HTMLDivElement>",
-                "LabelProps",
-            ),
+            signature_changed_props("Chip", "React.HTMLProps<HTMLDivElement>", "LabelProps"),
         ]);
 
         let replacements = vec![DeprecatedReplacement {
@@ -2997,7 +2998,12 @@ mod deprecated_replacement_tests {
 
         // Should have 2 entries: transformed component + transformed props.
         // The signature-changed entry should be suppressed.
-        assert_eq!(result.len(), 2, "Expected 2 entries (component + props), got {}", result.len());
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 entries (component + props), got {}",
+            result.len()
+        );
 
         // Check the component entry was transformed
         let comp = &result[0];
@@ -3014,7 +3020,10 @@ mod deprecated_replacement_tests {
         // Check the props entry was transformed
         let props = &result[1];
         assert_eq!(props.symbol, "ChipProps");
-        assert!(matches!(props.change_type, StructuralChangeType::Changed(_)));
+        assert!(matches!(
+            props.change_type,
+            StructuralChangeType::Changed(_)
+        ));
         assert_eq!(props.before.as_deref(), Some("ChipProps"));
         assert_eq!(props.after.as_deref(), Some("LabelProps"));
         assert!(props.description.contains("replaced by `LabelProps`"));
@@ -3040,11 +3049,7 @@ mod deprecated_replacement_tests {
                 migration_target: None,
             },
             // This should be suppressed
-            signature_changed_props(
-                "Chip",
-                "React.HTMLProps<HTMLDivElement>",
-                "LabelProps",
-            ),
+            signature_changed_props("Chip", "React.HTMLProps<HTMLDivElement>", "LabelProps"),
         ]);
 
         let replacements = vec![DeprecatedReplacement {
@@ -3062,10 +3067,7 @@ mod deprecated_replacement_tests {
 
     #[test]
     fn test_apply_no_replacements_returns_unchanged() {
-        let original = vec![
-            relocated_component("Modal"),
-            relocated_props("Modal"),
-        ];
+        let original = vec![relocated_component("Modal"), relocated_props("Modal")];
         let changes = Arc::new(original.clone());
 
         let result = apply_deprecated_replacements(changes, &[]);
@@ -3156,12 +3158,22 @@ mod deprecated_replacement_tests {
 
         // Detection
         let replacements = detect_deprecated_replacements(&structural_changes, &sd);
-        assert_eq!(replacements.len(), 2, "Only Chip and ChipGroup should be detected");
+        assert_eq!(
+            replacements.len(),
+            2,
+            "Only Chip and ChipGroup should be detected"
+        );
 
-        let chip = replacements.iter().find(|r| r.old_component == "Chip").unwrap();
+        let chip = replacements
+            .iter()
+            .find(|r| r.old_component == "Chip")
+            .unwrap();
         assert_eq!(chip.new_component, "Label");
 
-        let group = replacements.iter().find(|r| r.old_component == "ChipGroup").unwrap();
+        let group = replacements
+            .iter()
+            .find(|r| r.old_component == "ChipGroup")
+            .unwrap();
         assert_eq!(group.new_component, "LabelGroup");
 
         // Transformation

@@ -405,22 +405,17 @@ pub struct CompositionEdge {
 }
 
 /// How strongly a composition edge is enforced.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeStrength {
     /// Valid nesting shown in CSS descendant selectors or examples,
     /// but not the only valid placement. No conformance rule generated.
+    #[default]
     Allowed = 0,
     /// Rendering breaks without this nesting — CSS layout, context,
     /// DOM semantics, or prop threading requires this parent.
     /// Conformance rules are generated for Required edges.
     Required = 1,
-}
-
-impl Default for EdgeStrength {
-    fn default() -> Self {
-        EdgeStrength::Allowed
-    }
 }
 
 /// How a child component relates to its parent in the composition tree.

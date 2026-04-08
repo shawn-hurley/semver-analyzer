@@ -207,7 +207,7 @@ pub fn build_composition_tree_v2(
                     && css_prof
                         .elements
                         .get(*el)
-                        .map_or(false, |info| info.has_grid_column || info.has_grid_row)
+                        .is_some_and(|info| info.has_grid_column || info.has_grid_row)
             })
             .copied()
             .collect();
@@ -295,9 +295,8 @@ pub fn build_composition_tree_v2(
         // grid-column so it goes under ToolbarContent, not Toolbar.
         let root_is_grid = {
             let root_css = css_prof.elements.get("");
-            root_css.map_or(false, |info| {
-                info.display_values.contains("grid") && info.has_grid_template
-            })
+            root_css
+                .is_some_and(|info| info.display_values.contains("grid") && info.has_grid_template)
         };
 
         if root_is_grid {
@@ -360,7 +359,7 @@ pub fn build_composition_tree_v2(
                     }
 
                     // Skip children whose CSS element has grid positioning
-                    let child_is_grid = profiles.get(child_name).map_or(false, |cp| {
+                    let child_is_grid = profiles.get(child_name).is_some_and(|cp| {
                         cp.css_tokens_used.iter().any(|token| {
                             // Strip "styles." prefix, skip modifiers
                             let raw = if let Some(rest) = token.strip_prefix("styles.") {

@@ -74,8 +74,8 @@ impl PackageManager {
             Self::Pnpm => ("pnpm", &["install", "--frozen-lockfile"]),
         };
 
-        let use_corepack = package_manager_from_field(dir)
-            .is_some_and(|pm_name| pm_name == base_cmd);
+        let use_corepack =
+            package_manager_from_field(dir).is_some_and(|pm_name| pm_name == base_cmd);
 
         if use_corepack {
             let mut full_args: Vec<String> = vec![base_cmd.to_string()];
