@@ -12,8 +12,44 @@
 //! 4. `CompositionChange` — a diff between old and new composition trees
 //! 5. `ConformanceCheck` — a structural validity rule derived from the composition tree
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// Serialize a BTreeMap<(String, String), String> as a JSON object with
+/// `"key1::key2"` string keys. This allows tuple-keyed maps to roundtrip
+/// through JSON.
+fn serialize_tuple_map<S>(
+    map: &BTreeMap<(String, String), String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut m = serializer.serialize_map(Some(map.len()))?;
+    for ((k1, k2), v) in map {
+        m.serialize_entry(&format!("{}::{}", k1, k2), v)?;
+    }
+    m.end()
+}
+
+/// Deserialize a JSON object with `"key1::key2"` string keys back into
+/// a BTreeMap<(String, String), String>.
+fn deserialize_tuple_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<(String, String), String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let string_map: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
+    let mut result = BTreeMap::new();
+    for (key, value) in string_map {
+        if let Some((k1, k2)) = key.split_once("::") {
+            result.insert((k1.to_string(), k2.to_string()), value);
+        }
+    }
+    Ok(result)
+}
 
 // ── Source Profile (extracted from a single component) ──────────────────
 
@@ -44,6 +80,10 @@ pub struct ComponentSourceProfile {
     /// ARIA attributes on rendered elements.
     /// Key: (element_tag, attribute_name), Value: attribute_value.
     /// e.g., { ("div", "aria-label"): "Navigation", ("button", "role"): "menuitem" }
+    #[serde(
+        serialize_with = "serialize_tuple_map",
+        deserialize_with = "deserialize_tuple_map"
+    )]
     pub aria_attributes: BTreeMap<(String, String), String>,
 
     /// `role` attributes on rendered elements.
@@ -52,6 +92,10 @@ pub struct ComponentSourceProfile {
 
     /// `data-*` attributes on rendered elements.
     /// Key: (element_tag, attribute_name), Value: attribute_value.
+    #[serde(
+        serialize_with = "serialize_tuple_map",
+        deserialize_with = "deserialize_tuple_map"
+    )]
     pub data_attributes: BTreeMap<(String, String), String>,
 
     // ── Prop defaults ───────────────────────────────────────────────
@@ -129,6 +173,14 @@ pub struct ComponentSourceProfile {
     /// Menu > MenuContent, rendered via Popper.
     pub children_slot_path: Vec<String>,
 
+    /// Enhanced children slot path with CSS token information.
+    /// Each entry is `(tag_name, css_token)` where css_token is the
+    /// `styles.xxx` token from the `className` attribute, if present.
+    /// e.g., [("div", Some("toolbarContent")), ("div", Some("toolbarContentSection"))]
+    /// tells us the component wraps children in `styles.toolbarContentSection`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children_slot_detail: Vec<(String, Option<String>)>,
+
     /// Whether the component accepts `children` at all.
     pub has_children_prop: bool,
 
@@ -146,6 +198,19 @@ pub struct ComponentSourceProfile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prop_types: BTreeMap<String, String>,
 
+    // ── cloneElement prop threading ──────────────────────────────────────
+    /// Props injected into children via `React.Children.map` + `cloneElement`.
+    /// Each entry lists the prop names passed in cloneElement's second argument.
+    ///
+    /// e.g., DataListItem does `cloneElement(child, { rowid: ariaLabelledBy })`
+    /// → `[CloneElementInjection { injected_props: ["rowid"] }]`
+    ///
+    /// Used to infer parent-child relationships: if component A injects
+    /// prop "rowid" and family member B declares "rowid" in its interface,
+    /// then B is a child of A.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clone_element_injections: Vec<CloneElementInjection>,
+
     // ── Managed attribute bindings ─────────────────────────────────────
     /// Props that the component extracts from rest, transforms via a helper
     /// function, and spreads back onto a JSX element after rest — overriding
@@ -156,6 +221,17 @@ pub struct ComponentSourceProfile {
     /// Any consumer passing `data-ouia-component-id` directly will be overridden.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_attributes: Vec<ManagedAttributeBinding>,
+}
+
+/// Props injected into children via `cloneElement`.
+///
+/// Detected by finding `cloneElement(child, { prop1, prop2, ... })` calls
+/// inside `Children.map` or `Children.forEach` callbacks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloneElementInjection {
+    /// The prop names passed in cloneElement's second argument.
+    /// e.g., ["rowid"] for DataListItem's `cloneElement(child, { rowid })`
+    pub injected_props: Vec<String>,
 }
 
 /// A prop-to-HTML-attribute override binding.
@@ -320,6 +396,31 @@ pub struct CompositionEdge {
     /// BEM evidence for this relationship, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bem_evidence: Option<String>,
+
+    /// How strongly this nesting is enforced.
+    /// `Required` = rendering breaks without it (conformance rules generated).
+    /// `Allowed` = valid placement but not the only option (no conformance rules).
+    #[serde(default)]
+    pub strength: EdgeStrength,
+}
+
+/// How strongly a composition edge is enforced.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeStrength {
+    /// Valid nesting shown in CSS descendant selectors or examples,
+    /// but not the only valid placement. No conformance rule generated.
+    Allowed = 0,
+    /// Rendering breaks without this nesting — CSS layout, context,
+    /// DOM semantics, or prop threading requires this parent.
+    /// Conformance rules are generated for Required edges.
+    Required = 1,
+}
+
+impl Default for EdgeStrength {
+    fn default() -> Self {
+        EdgeStrength::Allowed
+    }
 }
 
 /// How a child component relates to its parent in the composition tree.
@@ -542,11 +643,9 @@ pub struct SdPipelineResult {
 
     /// Extracted profiles keyed by component name, for both versions.
     /// Retained for downstream use (rule generation, debugging).
-    /// Skipped during serialization — profiles contain tuple-keyed maps
-    /// that can't be represented as JSON. Use source_level_changes instead.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub old_profiles: HashMap<String, ComponentSourceProfile>,
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub new_profiles: HashMap<String, ComponentSourceProfile>,
 }
 

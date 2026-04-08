@@ -33,24 +33,39 @@ use oxc_span::SourceType;
 /// Returns the chain of component/element names that wrap the children slot.
 /// Returns an empty vec if `{children}` is not found in the JSX tree.
 pub fn trace_children_slot(source: &str) -> Vec<String> {
+    // Use the combined function and discard the detail
+    trace_children_slot_both(source).0
+}
+
+/// Trace the path from JSX root to `{children}` with CSS token detail.
+///
+/// Like `trace_children_slot` but also captures `className={styles.xxx}`
+/// tokens at each level. Returns `Vec<(tag_name, Option<css_token>)>`.
+pub fn trace_children_slot_detail(source: &str) -> Vec<(String, Option<String>)> {
+    // Use the combined function and discard the path
+    trace_children_slot_both(source).1
+}
+
+/// Trace both the simple path and the CSS-token-detailed path in a single
+/// AST parse. Returns `(children_slot_path, children_slot_detail)`.
+pub fn trace_children_slot_both(source: &str) -> (Vec<String>, Vec<(String, Option<String>)>) {
     let allocator = Allocator::default();
     let source_type = SourceType::tsx();
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
-    // Build a map of dynamic component variable aliases, e.g.:
-    //   component = 'td'                       → component → "td"
-    //   component: MergedComponent = component  → MergedComponent → "td"
-    // This lets us resolve <MergedComponent> back to <td> in JSX.
     let aliases = collect_component_aliases(&parsed.program.body);
 
-    let mut path = Vec::new();
+    // Run the detail variant (which captures both tag name and CSS token).
+    // We derive the simple path from the detail path to avoid a second walk.
+    let mut detail_path: Vec<(String, Option<String>)> = Vec::new();
     for stmt in &parsed.program.body {
-        if find_children_in_statement(stmt, source, &mut path, &aliases) {
-            return path;
+        if find_children_in_statement_detail(stmt, source, &mut detail_path, &aliases) {
+            let simple_path: Vec<String> = detail_path.iter().map(|(tag, _)| tag.clone()).collect();
+            return (simple_path, detail_path);
         }
     }
 
-    path
+    (Vec::new(), Vec::new())
 }
 
 // ── Dynamic component alias resolution ──────────────────────────────────
@@ -703,6 +718,361 @@ fn jsx_member_object(obj: &JSXMemberExpressionObject) -> String {
     }
 }
 
+// ── Detail variants (track CSS tokens alongside tag names) ──────────────
+
+fn find_children_in_statement_detail<'a>(
+    stmt: &'a Statement<'a>,
+    source: &str,
+    path: &mut Vec<(String, Option<String>)>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match stmt {
+        Statement::FunctionDeclaration(f) => {
+            if let Some(body) = &f.body {
+                for inner in &body.statements {
+                    if find_children_in_statement_detail(inner, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+        }
+        Statement::ReturnStatement(ret) => {
+            if let Some(expr) = &ret.argument {
+                return find_children_in_expression_detail(expr, source, path, aliases);
+            }
+        }
+        Statement::VariableDeclaration(decl) => {
+            for declarator in &decl.declarations {
+                if let Some(init) = &declarator.init {
+                    if find_children_in_expression_detail(init, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+        }
+        Statement::ExpressionStatement(expr_stmt) => {
+            return find_children_in_expression_detail(
+                &expr_stmt.expression,
+                source,
+                path,
+                aliases,
+            );
+        }
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(decl) = &export.declaration {
+                return find_children_in_declaration_detail(decl, source, path, aliases);
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            if let Some(expr) = export.declaration.as_expression() {
+                return find_children_in_expression_detail(expr, source, path, aliases);
+            }
+        }
+        Statement::BlockStatement(block) => {
+            for inner in &block.body {
+                if find_children_in_statement_detail(inner, source, path, aliases) {
+                    return true;
+                }
+            }
+        }
+        Statement::IfStatement(if_stmt) => {
+            if find_children_in_statement_detail(&if_stmt.consequent, source, path, aliases) {
+                return true;
+            }
+            if let Some(alt) = &if_stmt.alternate {
+                if find_children_in_statement_detail(alt, source, path, aliases) {
+                    return true;
+                }
+            }
+        }
+        Statement::ClassDeclaration(class) => {
+            if find_children_in_class_body_detail(&class.body, source, path, aliases) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn find_children_in_declaration_detail<'a>(
+    decl: &'a Declaration<'a>,
+    source: &str,
+    path: &mut Vec<(String, Option<String>)>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(body) = &f.body {
+                for stmt in &body.statements {
+                    if find_children_in_statement_detail(stmt, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+        }
+        Declaration::VariableDeclaration(var_decl) => {
+            for declarator in &var_decl.declarations {
+                if let Some(init) = &declarator.init {
+                    if find_children_in_expression_detail(init, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+        }
+        Declaration::ClassDeclaration(class) => {
+            if find_children_in_class_body_detail(&class.body, source, path, aliases) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn find_children_in_class_body_detail<'a>(
+    body: &'a ClassBody<'a>,
+    source: &str,
+    path: &mut Vec<(String, Option<String>)>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    for element in &body.body {
+        if let ClassElement::MethodDefinition(method) = element {
+            let is_render = match &method.key {
+                PropertyKey::StaticIdentifier(id) => id.name == "render",
+                _ => false,
+            };
+            if is_render {
+                if let Some(body) = &method.value.body {
+                    for stmt in &body.statements {
+                        if find_children_in_statement_detail(stmt, source, path, aliases) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn find_children_in_expression_detail<'a>(
+    expr: &'a Expression<'a>,
+    source: &str,
+    path: &mut Vec<(String, Option<String>)>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match expr {
+        Expression::JSXElement(el) => {
+            find_children_in_jsx_element_detail(el, source, path, aliases)
+        }
+        Expression::JSXFragment(frag) => {
+            for child in &frag.children {
+                if find_children_in_jsx_child_detail(child, source, path, aliases) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            find_children_in_expression_detail(&paren.expression, source, path, aliases)
+        }
+        Expression::ConditionalExpression(cond) => {
+            find_children_in_expression_detail(&cond.consequent, source, path, aliases)
+                || find_children_in_expression_detail(&cond.alternate, source, path, aliases)
+        }
+        Expression::LogicalExpression(logical) => {
+            find_children_in_expression_detail(&logical.right, source, path, aliases)
+        }
+        Expression::CallExpression(call) => {
+            for arg in &call.arguments {
+                if let Some(expr) = arg.as_expression() {
+                    if find_children_in_expression_detail(expr, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Expression::ArrowFunctionExpression(arrow) => {
+            for stmt in &arrow.body.statements {
+                if find_children_in_statement_detail(stmt, source, path, aliases) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = &func.body {
+                for stmt in &body.statements {
+                    if find_children_in_statement_detail(stmt, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn find_children_in_jsx_element_detail<'a>(
+    el: &'a JSXElement<'a>,
+    source: &str,
+    path: &mut Vec<(String, Option<String>)>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    let raw_tag = jsx_element_name(&el.opening_element.name);
+    let tag_name = if raw_tag.starts_with(|c: char| c.is_uppercase()) {
+        aliases.get(&raw_tag).cloned().unwrap_or(raw_tag)
+    } else {
+        raw_tag
+    };
+
+    // Extract CSS token from className={styles.xxx}
+    let css_token = extract_styles_classname(&el.opening_element.attributes);
+
+    // Check JSX props/attributes for children passed as props
+    for attr_item in &el.opening_element.attributes {
+        if let JSXAttributeItem::Attribute(attr) = attr_item {
+            if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
+                if let Some(inner_expr) = container.expression.as_expression() {
+                    path.push((tag_name.clone(), css_token.clone()));
+                    if find_children_in_expression_detail(inner_expr, source, path, aliases) {
+                        return true;
+                    }
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    // Check direct JSX children
+    path.push((tag_name.clone(), css_token));
+
+    for child in &el.children {
+        match child {
+            JSXChild::ExpressionContainer(container) => {
+                if is_children_expression(&container.expression, source) {
+                    return true;
+                }
+                if let Some(expr) = container.expression.as_expression() {
+                    if find_children_in_expression_detail(expr, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+            JSXChild::Element(child_el) => {
+                if find_children_in_jsx_element_detail(child_el, source, path, aliases) {
+                    return true;
+                }
+            }
+            JSXChild::Fragment(frag) => {
+                for frag_child in &frag.children {
+                    if find_children_in_jsx_child_detail(frag_child, source, path, aliases) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    path.pop();
+    false
+}
+
+fn find_children_in_jsx_child_detail<'a>(
+    child: &'a JSXChild<'a>,
+    source: &str,
+    path: &mut Vec<(String, Option<String>)>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    match child {
+        JSXChild::Element(el) => find_children_in_jsx_element_detail(el, source, path, aliases),
+        JSXChild::ExpressionContainer(container) => {
+            if is_children_expression(&container.expression, source) {
+                return true;
+            }
+            if let Some(expr) = container.expression.as_expression() {
+                return find_children_in_expression_detail(expr, source, path, aliases);
+            }
+            false
+        }
+        JSXChild::Fragment(frag) => {
+            for c in &frag.children {
+                if find_children_in_jsx_child_detail(c, source, path, aliases) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Extract `styles.xxx` token from a JSX element's className attribute.
+///
+/// Handles patterns:
+/// - `className={styles.toolbarContent}` → Some("toolbarContent")
+/// - `className={css(styles.toolbarContent, ...)}` → Some("toolbarContent")
+/// - `className="static-class"` → None
+/// - No className → None
+fn extract_styles_classname(attrs: &[JSXAttributeItem]) -> Option<String> {
+    for attr_item in attrs {
+        if let JSXAttributeItem::Attribute(attr) = attr_item {
+            let is_classname = match &attr.name {
+                JSXAttributeName::Identifier(id) => id.name == "className",
+                _ => false,
+            };
+            if !is_classname {
+                continue;
+            }
+            if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
+                if let Some(expr) = container.expression.as_expression() {
+                    return extract_styles_token_from_expr(expr);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Recursively extract the first `styles.xxx` token from an expression.
+fn extract_styles_token_from_expr(expr: &Expression) -> Option<String> {
+    match expr {
+        // Direct: styles.toolbarContent
+        Expression::StaticMemberExpression(member) => {
+            if let Expression::Identifier(obj) = &member.object {
+                if obj.name == "styles" {
+                    return Some(member.property.name.to_string());
+                }
+            }
+            None
+        }
+        // Handle css(styles.foo, ...) or cx(styles.foo, ...)
+        Expression::CallExpression(call) => {
+            for arg in &call.arguments {
+                if let Some(expr) = arg.as_expression() {
+                    if let Some(token) = extract_styles_token_from_expr(expr) {
+                        return Some(token);
+                    }
+                }
+            }
+            None
+        }
+        // Handle (styles.foo)
+        Expression::ParenthesizedExpression(p) => extract_styles_token_from_expr(&p.expression),
+        // Handle condition && styles.foo or styles.foo && condition
+        Expression::LogicalExpression(logical) => extract_styles_token_from_expr(&logical.left)
+            .or_else(|| extract_styles_token_from_expr(&logical.right)),
+        // Handle condition ? styles.foo : styles.bar — take the first
+        Expression::ConditionalExpression(cond) => extract_styles_token_from_expr(&cond.consequent)
+            .or_else(|| extract_styles_token_from_expr(&cond.alternate)),
+        _ => None,
+    }
+}
+
 /// Check if any function parameter destructures `children`.
 fn check_children_in_statement<'a>(stmt: &'a Statement<'a>) -> bool {
     match stmt {
@@ -994,5 +1364,98 @@ mod tests {
         let aliases = collect_component_aliases(&parsed.program.body);
         assert_eq!(aliases.get("component"), Some(&"td".to_string()));
         assert_eq!(aliases.get("MergedComponent"), Some(&"td".to_string()));
+    }
+
+    // ── Detail trace tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_detail_simple_styles() {
+        let source = r#"
+            const MyComponent = ({ children }: Props) => (
+                <div className={styles.wrapper}>
+                    {children}
+                </div>
+            );
+        "#;
+        let detail = trace_children_slot_detail(source);
+        assert_eq!(
+            detail,
+            vec![("div".to_string(), Some("wrapper".to_string()))]
+        );
+    }
+
+    #[test]
+    fn test_detail_nested_styles() {
+        let source = r#"
+            const ToolbarContent = ({ children }: Props) => (
+                <div className={styles.toolbarContent}>
+                    <div className={styles.toolbarContentSection}>
+                        {children}
+                    </div>
+                </div>
+            );
+        "#;
+        let detail = trace_children_slot_detail(source);
+        assert_eq!(
+            detail,
+            vec![
+                ("div".to_string(), Some("toolbarContent".to_string())),
+                ("div".to_string(), Some("toolbarContentSection".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_detail_css_function() {
+        // PF uses css() helper: className={css(styles.toolbar, className)}
+        let source = r#"
+            const Toolbar = ({ children }: Props) => (
+                <div className={css(styles.toolbar, className)}>
+                    {children}
+                </div>
+            );
+        "#;
+        let detail = trace_children_slot_detail(source);
+        assert_eq!(
+            detail,
+            vec![("div".to_string(), Some("toolbar".to_string()))]
+        );
+    }
+
+    #[test]
+    fn test_detail_no_classname() {
+        let source = r#"
+            const Plain = ({ children }: Props) => (
+                <div>
+                    <span>{children}</span>
+                </div>
+            );
+        "#;
+        let detail = trace_children_slot_detail(source);
+        assert_eq!(
+            detail,
+            vec![("div".to_string(), None), ("span".to_string(), None),]
+        );
+    }
+
+    #[test]
+    fn test_detail_mixed_styles_and_plain() {
+        let source = r#"
+            const Content = ({ children }: Props) => (
+                <div className={styles.drawerContent}>
+                    <div>
+                        {children}
+                    </div>
+                </div>
+            );
+        "#;
+        let detail = trace_children_slot_detail(source);
+        assert_eq!(
+            detail,
+            vec![
+                ("div".to_string(), Some("drawerContent".to_string())),
+                ("div".to_string(), None),
+            ]
+        );
     }
 }

@@ -442,16 +442,45 @@ impl<L: Language> Analyzer<L> {
                     // If a dep CSS repo is provided with a ref and build command,
                     // create a worktree, build it, and use the built path for CSS
                     // profile extraction. Otherwise fall back to the raw dir path.
+                    // Create a worktree for the dep repo (e.g., CSS repo).
+                    // Use `create_only` — the dep repo may not be a TypeScript
+                    // project (no tsconfig.json, no package manager detection).
+                    // The caller-provided build command handles install + build.
                     let dep_worktree_guard = if let (Some(dep_dir), Some(dep_to)) =
                         (&dep_css_dir_sd, &dep_to_sd)
                     {
                         use semver_analyzer_ts::WorktreeGuard;
-                        match WorktreeGuard::new(
-                            dep_dir,
-                            dep_to,
-                            dep_build_cmd_sd.as_deref(),
-                        ) {
+                        match WorktreeGuard::create_only(dep_dir, dep_to) {
                             Ok(guard) => {
+                                // Run the user-provided build command in the worktree
+                                if let Some(cmd) = &dep_build_cmd_sd {
+                                    tracing::info!(
+                                        command = %cmd,
+                                        worktree = %guard.path().display(),
+                                        "Running dep repo build command"
+                                    );
+                                    match std::process::Command::new("sh")
+                                        .args(["-c", cmd])
+                                        .current_dir(guard.path())
+                                        .output()
+                                    {
+                                        Ok(output) if output.status.success() => {
+                                            tracing::info!("Dep repo build succeeded");
+                                        }
+                                        Ok(output) => {
+                                            let stderr = String::from_utf8_lossy(&output.stderr);
+                                            let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                                            tracing::warn!(
+                                                exit_code = ?output.status.code(),
+                                                stderr = %tail,
+                                                "Dep repo build failed"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, "Failed to run dep repo build command");
+                                        }
+                                    }
+                                }
                                 tracing::info!(
                                     dep_repo = %dep_dir.display(),
                                     dep_ref = %dep_to,

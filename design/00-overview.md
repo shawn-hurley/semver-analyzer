@@ -54,6 +54,7 @@ In practice, TypeScript-specific concepts have bled into all layers:
 | [02-types.md](./02-types.md) | Core types: `Symbol`, `SymbolKind`, `Signature`, `StructuralChangeType`, `ChangeSubject`, and report types |
 | [03-report-envelope.md](./03-report-envelope.md) | The `ReportEnvelope` architecture: two-tier report with language-agnostic and language-specific sections |
 | [04-language-implementation-guide.md](./04-language-implementation-guide.md) | How to implement `Language` for a new language, with TypeScript and Go as examples |
+| [05-composition-tree-v2.md](./05-composition-tree-v2.md) | V2 composition tree builder: evidence-based signals, EdgeStrength, verification scorecard |
 
 ## Crate Structure (Target)
 

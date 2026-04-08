@@ -9,30 +9,40 @@
 //! The resulting tree describes the expected JSX composition structure
 //! for consumers of the component family.
 
-use crate::source_profile::bem::{classify_bem_relationship, BemRelationship};
+use crate::css_profile::CssBlockProfile;
 use semver_analyzer_core::types::sd::{
-    ChildRelationship, ComponentSourceProfile, CompositionEdge, CompositionTree,
+    ChildRelationship, ComponentSourceProfile, CompositionEdge, CompositionTree, EdgeStrength,
 };
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
-/// Build a composition tree from a set of component profiles in the same family.
+// ── Evidence-based composition tree builder ─────────────────────────────
+
+/// Build a composition tree using CSS structure, React patterns, and HTML
+/// semantics instead of BEM-based edge creation.
 ///
-/// `profiles` contains the extracted profile for each family member.
-/// `family_exports` is the list of component names exported from the family's
-/// index file (e.g., ["Dropdown", "DropdownList", "DropdownItem", "DropdownGroup"]).
-///
-/// The root is typically the first export or the component matching the
-/// directory name.
-pub fn build_composition_tree(
+/// BEM determines family membership only. All parent-child edges come from:
+/// 1. Internal rendering (A renders B in JSX)
+/// 2. CSS direct-child selectors (`.A > .B`)
+/// 3. CSS grid parent-child (`A` has grid-template, `B` has grid-column)
+/// 4. CSS flex context (A wraps children in flex container, B is not a grid child)
+/// 5. CSS descendant selectors (`.A .B`)
+/// 6. React context (A provides, B consumes)
+/// 7. DOM nesting (A wraps children in `<ul>`, B renders `<li>`)
+/// 8. cloneElement threading (A injects props into children that B declares)
+/// 9. Default root (unparented members → root→member)
+/// 10. Suppress root edges when intermediate exists
+pub fn build_composition_tree_v2(
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
+    css_profile: Option<&CssBlockProfile>,
 ) -> Option<CompositionTree> {
     if family_exports.is_empty() {
         return None;
     }
 
     let root = family_exports[0].clone();
+    let family_set: HashSet<&str> = family_exports.iter().map(|s| s.as_str()).collect();
 
     let mut tree = CompositionTree {
         root: root.clone(),
@@ -40,459 +50,585 @@ pub fn build_composition_tree(
         edges: Vec::new(),
     };
 
-    let family_set: HashSet<&str> = family_exports.iter().map(|s| s.as_str()).collect();
+    // Track existing edges for O(1) dedup lookups instead of linear scan
+    let mut edge_set: HashSet<(String, String)> = HashSet::new();
 
-    // For each family member, determine its expected children from:
-    // 1. Its rendered_components (which family members it renders internally)
-    // 2. BEM relationships between its tokens and child tokens
-    // 3. Whether the child is internal or consumer-provided
+    // Build CSS element → component mapping for CSS-based steps.
+    // Maps a CSS BEM element name (e.g., "content-section") to the component
+    // that uses the corresponding `styles.xxx` token.
+    let css_to_component = if let Some(css_prof) = css_profile {
+        build_css_element_to_component_map(profiles, family_exports, &css_prof.block)
+    } else {
+        HashMap::new()
+    };
+
+    // ── Step 1: Internal rendering ──────────────────────────────────
     for parent_name in family_exports {
         let Some(parent_profile) = profiles.get(parent_name) else {
             continue;
         };
-
-        // Which family members does this component render?
-        let internal_children: Vec<&str> = parent_profile
-            .rendered_components
-            .iter()
-            .filter(|c| family_set.contains(c.as_str()))
-            .map(|s| s.as_str())
-            .collect();
-
-        // For each rendered family member, classify the relationship
-        for child_name in &internal_children {
-            let child_profile = profiles.get(*child_name);
-
-            let (relationship, bem_evidence) = if let Some(child_prof) = child_profile {
-                classify_child_relationship(parent_profile, child_prof)
-            } else {
-                (ChildRelationship::Unknown, None)
-            };
-
-            tree.edges.push(CompositionEdge {
-                parent: parent_name.clone(),
-                child: child_name.to_string(),
-                relationship: relationship.clone(),
-                required: relationship == ChildRelationship::BemElement,
-                bem_evidence,
-            });
-        }
-
-        // Also check: which family members does this component NOT render
-        // internally, but could accept as children (via the children slot)?
-        // These are the consumer-provided children.
-        //
-        // We only add an edge when there's positive evidence for the
-        // parent→child relationship (BEM tokens). Without evidence, we
-        // skip — wrapper families like Dropdown (wraps Menu) will get
-        // their edges projected from the delegate family's tree in a
-        // separate post-processing pass (see `project_delegate_trees`).
-        if parent_profile.has_children_prop {
-            for sibling_name in family_exports {
-                if sibling_name == parent_name {
-                    continue;
-                }
-                if internal_children.contains(&sibling_name.as_str()) {
-                    continue;
-                }
-                if is_transitively_internal(sibling_name, parent_name, profiles, &family_set) {
-                    continue;
-                }
-
-                let child_profile = profiles.get(sibling_name);
-                let (relationship, bem_evidence) = if let Some(child_prof) = child_profile {
-                    classify_child_relationship(parent_profile, child_prof)
-                } else {
-                    (ChildRelationship::Unknown, None)
-                };
-
-                debug!(
-                    parent = %parent_name,
-                    child = %sibling_name,
-                    ?relationship,
-                    ?bem_evidence,
-                    parent_block = ?parent_profile.bem_block,
-                    "consumer-child BEM classification"
-                );
-
-                // Only add edge with BEM element evidence.
-                // IndependentBlock means the child has its OWN block —
-                // that doesn't imply containment (it could go anywhere).
-                // Only BemElement proves the child IS a structural part
-                // of the parent's block.
-                if matches!(relationship, ChildRelationship::BemElement) {
-                    // Skip components that are passed via a ReactNode prop
-                    // on the parent rather than placed as JSX children.
-                    // e.g., AlertActionCloseButton is passed via Alert's
-                    // `actionClose` prop, not as a child of <Alert>.
-                    if is_prop_passed_component(parent_profile, sibling_name, parent_name) {
-                        debug!(
-                            parent = %parent_name,
-                            child = %sibling_name,
-                            "skipping BEM edge — child is prop-passed, not a JSX child"
-                        );
-                        continue;
-                    }
-
-                    // BEM evidence proves structural membership in the
-                    // parent's block but NOT that the child is required.
-                    // Only internally rendered children are required.
-                    // Consumer-provided children (via {children} slot) are
-                    // optional unless proven otherwise (e.g., DropdownGroup
-                    // is optional; DropdownList is conventional but not
-                    // enforced by the component).
+        for rendered in &parent_profile.rendered_components {
+            if family_set.contains(rendered.as_str()) {
+                let key = (parent_name.clone(), rendered.clone());
+                if edge_set.insert(key) {
                     tree.edges.push(CompositionEdge {
                         parent: parent_name.clone(),
-                        child: sibling_name.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence,
+                        child: rendered.clone(),
+                        relationship: ChildRelationship::Internal,
+                        required: true,
+                        bem_evidence: Some("internally rendered".to_string()),
+                        strength: EdgeStrength::Required,
                     });
                 }
             }
         }
     }
 
-    // ── Block ownership by name prefix ────────────────────────────
-    //
-    // When the root component doesn't share a BEM block with its children
-    // (e.g., Modal imports from Backdrop, but ModalHeader/Body/Footer
-    // import from ModalBox), check if the root's name is a prefix of the
-    // children's shared block. If so, claim them as BEM elements.
-    infer_ownership_by_name_prefix(&mut tree, profiles, family_exports, &root);
+    if let Some(css_prof) = css_profile {
+        // ── Step 2: CSS direct-child selectors ──────────────────────
+        for (css_parent, css_child) in &css_prof.direct_child_nesting {
+            if let (Some(parent_comp), Some(child_comp)) = (
+                css_to_component.get(css_parent.as_str()),
+                css_to_component.get(css_child.as_str()),
+            ) {
+                let key = (parent_comp.clone(), child_comp.clone());
+                if parent_comp != child_comp && edge_set.insert(key) {
+                    tree.edges.push(CompositionEdge {
+                        parent: parent_comp.clone(),
+                        child: child_comp.clone(),
+                        relationship: ChildRelationship::DirectChild,
+                        required: false,
+                        bem_evidence: Some(format!(
+                            "CSS direct child: .{} > .{}",
+                            css_parent, css_child
+                        )),
+                        strength: EdgeStrength::Required,
+                    });
+                }
+            }
+        }
 
-    // ── DOM + Context nesting inference ────────────────────────────
-    //
-    // Infer nesting from two signals BEM can't express:
-    //
-    // 1. HTML element semantics: If parent wraps children in <ul> and
-    //    child renders <li> → child goes inside parent. Catches
-    //    MenuList → MenuItem (ul → li).
-    //
-    // 2. React Context: If parent renders <XContext.Provider> and
-    //    child calls useContext(XContext) → child must be nested
-    //    somewhere under parent.
-    infer_dom_nesting(&mut tree, profiles, family_exports);
+        // ── Step 3: CSS grid parent-child ───────────────────────────
+        // Find grid containers (has_grid_template) and grid children
+        // (has_grid_column/grid_row). Map to components.
+        let grid_containers: Vec<(&str, &str)> = css_prof
+            .elements
+            .iter()
+            .filter(|(_, info)| info.has_grid_template && info.display_values.contains("grid"))
+            .filter_map(|(el, _)| {
+                css_to_component
+                    .get(el.as_str())
+                    .map(|comp| (el.as_str(), comp.as_str()))
+            })
+            .collect();
+
+        for (child_el, child_info) in &css_prof.elements {
+            if !child_info.has_grid_column && !child_info.has_grid_row {
+                continue;
+            }
+            let Some(child_comp) = css_to_component.get(child_el.as_str()) else {
+                continue;
+            };
+
+            // Find the best grid container for this child.
+            // Prefer CSS selector evidence, then fall back to the most
+            // specific (longest name) grid container.
+            let mut best_parent: Option<&str> = None;
+
+            // Check direct-child selectors first
+            for (container_el, container_comp) in &grid_containers {
+                if *container_comp == child_comp.as_str() {
+                    continue;
+                }
+                if css_prof
+                    .direct_child_nesting
+                    .contains(&(container_el.to_string(), child_el.clone()))
+                {
+                    best_parent = Some(container_comp);
+                    break;
+                }
+            }
+
+            // Then check descendant selectors
+            if best_parent.is_none() {
+                for (container_el, container_comp) in &grid_containers {
+                    if *container_comp == child_comp.as_str() {
+                        continue;
+                    }
+                    if css_prof
+                        .descendant_nesting
+                        .contains(&(container_el.to_string(), child_el.clone()))
+                    {
+                        best_parent = Some(container_comp);
+                        break;
+                    }
+                }
+            }
+
+            // Fall back to most specific grid container
+            if best_parent.is_none() && grid_containers.len() == 1 {
+                let (_, container_comp) = grid_containers[0];
+                if container_comp != child_comp.as_str() {
+                    best_parent = Some(container_comp);
+                }
+            }
+
+            if let Some(parent_comp) = best_parent {
+                let key = (parent_comp.to_string(), child_comp.clone());
+                if edge_set.insert(key) {
+                    tree.edges.push(CompositionEdge {
+                        parent: parent_comp.to_string(),
+                        child: child_comp.clone(),
+                        relationship: ChildRelationship::DirectChild,
+                        required: false,
+                        bem_evidence: Some(format!(
+                            "CSS grid: {} has grid-template, {} has grid-column/row",
+                            parent_comp, child_comp
+                        )),
+                        strength: EdgeStrength::Required,
+                    });
+                }
+            }
+        }
+
+        // Step 3b: Implicit grid children — elements inside a non-root
+        // grid container that don't have explicit grid-column/grid-row.
+        // Example: DescriptionListTerm and DescriptionListDescription are
+        // implicit grid children of DescriptionListGroup (which has
+        // grid-template-rows).
+        //
+        // Only applies to non-root grid containers (containers that are
+        // themselves grid children of the root grid).
+        let non_root_grid_containers: Vec<(&str, &str)> = grid_containers
+            .iter()
+            .filter(|(el, _)| {
+                // Must not be root and must itself be a grid child
+                !el.is_empty()
+                    && css_prof
+                        .elements
+                        .get(*el)
+                        .map_or(false, |info| info.has_grid_column || info.has_grid_row)
+            })
+            .copied()
+            .collect();
+
+        if !non_root_grid_containers.is_empty() {
+            for (child_el, child_info) in &css_prof.elements {
+                // Skip elements that already have grid positioning (handled above)
+                if child_info.has_grid_column || child_info.has_grid_row {
+                    continue;
+                }
+                // Skip root element
+                if child_el.is_empty() {
+                    continue;
+                }
+                // Skip elements that are grid containers themselves
+                if child_info.has_grid_template {
+                    continue;
+                }
+                let Some(child_comp) = css_to_component.get(child_el.as_str()) else {
+                    continue;
+                };
+                // Skip if already has a non-root parent
+                if tree
+                    .edges
+                    .iter()
+                    .any(|e| e.child == *child_comp && e.parent != root)
+                {
+                    continue;
+                }
+
+                // Find the best non-root grid container for this element.
+                // Use CSS selector evidence, then fall back.
+                let mut best_parent: Option<&str> = None;
+
+                for (container_el, container_comp) in &non_root_grid_containers {
+                    if *container_comp == child_comp.as_str() {
+                        continue;
+                    }
+                    if css_prof
+                        .direct_child_nesting
+                        .contains(&(container_el.to_string(), child_el.clone()))
+                        || css_prof
+                            .descendant_nesting
+                            .contains(&(container_el.to_string(), child_el.clone()))
+                    {
+                        best_parent = Some(container_comp);
+                        break;
+                    }
+                }
+
+                // Fall back: if only one non-root grid container, use it
+                if best_parent.is_none() && non_root_grid_containers.len() == 1 {
+                    let (_, comp) = non_root_grid_containers[0];
+                    if comp != child_comp.as_str() {
+                        best_parent = Some(comp);
+                    }
+                }
+
+                if let Some(parent_comp) = best_parent {
+                    let key = (parent_comp.to_string(), child_comp.clone());
+                    if edge_set.insert(key) {
+                        tree.edges.push(CompositionEdge {
+                            parent: parent_comp.to_string(),
+                            child: child_comp.clone(),
+                            relationship: ChildRelationship::DirectChild,
+                            required: false,
+                            bem_evidence: Some(format!(
+                                "CSS grid: {} is grid container, {} is implicit grid child",
+                                parent_comp, child_comp
+                            )),
+                            strength: EdgeStrength::Required,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── Step 4: CSS flex context ────────────────────────────────
+        // Only fires when the ROOT component's CSS slot is a grid container.
+        // In that case, family members WITHOUT grid positioning can't be
+        // direct children of root — they need a flex intermediary.
+        //
+        // Example: Toolbar root is display:grid. ToolbarContent wraps
+        // children in content-section (display:flex). ToolbarItem has no
+        // grid-column so it goes under ToolbarContent, not Toolbar.
+        let root_is_grid = {
+            let root_css = css_prof.elements.get("");
+            root_css.map_or(false, |info| {
+                info.display_values.contains("grid") && info.has_grid_template
+            })
+        };
+
+        if root_is_grid {
+            // Find non-root components whose children_slot is a flex container
+            let flex_parents: Vec<(String, String)> = family_exports
+                .iter()
+                .filter(|name| **name != root)
+                .filter_map(|name| {
+                    let prof = profiles.get(name)?;
+                    if !prof.has_children_prop {
+                        return None;
+                    }
+                    let innermost_token = prof
+                        .children_slot_detail
+                        .iter()
+                        .rev()
+                        .find_map(|(_, token)| token.as_ref())?;
+
+                    let block_camel = &css_prof.block;
+                    let element_camel = innermost_token.strip_prefix(block_camel.as_str())?;
+                    if element_camel.is_empty() {
+                        return None;
+                    }
+                    let element_camel_lower = {
+                        let mut s = element_camel.to_string();
+                        if let Some(c) = s.get_mut(0..1) {
+                            c.make_ascii_lowercase();
+                        }
+                        s
+                    };
+                    let element_kebab = camel_to_kebab(&element_camel_lower);
+
+                    let css_info = css_prof.elements.get(&element_kebab)?;
+                    if css_info.display_values.contains("flex") {
+                        Some((name.clone(), element_kebab))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !flex_parents.is_empty() {
+                for child_name in family_exports {
+                    if child_name == &root {
+                        continue;
+                    }
+
+                    // Skip children that already have a non-root parent
+                    if tree
+                        .edges
+                        .iter()
+                        .any(|e| e.child == *child_name && e.parent != root)
+                    {
+                        continue;
+                    }
+
+                    // Skip flex parents themselves (they're grid children of root)
+                    if flex_parents.iter().any(|(p, _)| p == child_name) {
+                        continue;
+                    }
+
+                    // Skip children whose CSS element has grid positioning
+                    let child_is_grid = profiles.get(child_name).map_or(false, |cp| {
+                        cp.css_tokens_used.iter().any(|token| {
+                            // Strip "styles." prefix, skip modifiers
+                            let raw = if let Some(rest) = token.strip_prefix("styles.") {
+                                if rest.starts_with("modifiers.") {
+                                    return false;
+                                }
+                                rest
+                            } else {
+                                token.as_str()
+                            };
+                            let block_camel = &css_prof.block;
+                            if let Some(suffix) = raw.strip_prefix(block_camel.as_str()) {
+                                if suffix.is_empty() {
+                                    return false;
+                                }
+                                let mut el = suffix.to_string();
+                                if let Some(c) = el.get_mut(0..1) {
+                                    c.make_ascii_lowercase();
+                                }
+                                let el_kebab = camel_to_kebab(&el);
+                                if let Some(info) = css_prof.elements.get(&el_kebab) {
+                                    return info.has_grid_column || info.has_grid_row;
+                                }
+                            }
+                            false
+                        })
+                    });
+
+                    if child_is_grid {
+                        continue;
+                    }
+
+                    // Match to best flex parent. Prefer one with existing edge
+                    // from another signal, then longest CSS element name.
+                    let best = flex_parents
+                        .iter()
+                        .filter(|(p, _)| p != child_name)
+                        .max_by_key(|(p, el)| {
+                            let has_other_edge = tree
+                                .edges
+                                .iter()
+                                .any(|e| e.parent == *p && e.child == *child_name);
+                            (has_other_edge as usize, el.len())
+                        });
+
+                    if let Some((best_parent, _)) = best {
+                        let key = (best_parent.clone(), child_name.clone());
+                        if edge_set.insert(key) {
+                            tree.edges.push(CompositionEdge {
+                                parent: best_parent.clone(),
+                                child: child_name.clone(),
+                                relationship: ChildRelationship::DirectChild,
+                                required: false,
+                                bem_evidence: Some(format!(
+                                    "CSS flex context: {} wraps children in flex, root is grid",
+                                    best_parent
+                                )),
+                                strength: EdgeStrength::Allowed,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 5: CSS descendant selectors ────────────────────────
+        for (css_parent, css_child) in &css_prof.descendant_nesting {
+            if let (Some(parent_comp), Some(child_comp)) = (
+                css_to_component.get(css_parent.as_str()),
+                css_to_component.get(css_child.as_str()),
+            ) {
+                let key = (parent_comp.clone(), child_comp.clone());
+                if parent_comp != child_comp && edge_set.insert(key) {
+                    tree.edges.push(CompositionEdge {
+                        parent: parent_comp.clone(),
+                        child: child_comp.clone(),
+                        relationship: ChildRelationship::DirectChild,
+                        required: false,
+                        bem_evidence: Some(format!(
+                            "CSS descendant: .{} .{}",
+                            css_parent, css_child
+                        )),
+                        strength: EdgeStrength::Allowed,
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Step 6: React context ───────────────────────────────────────
     infer_context_nesting(&mut tree, profiles, family_exports);
 
-    // Remove edges where the child is internal to a parent that is itself
-    // internal. We want consumer-facing edges only.
-    deduplicate_edges(&mut tree);
+    // ── Step 7: DOM nesting ─────────────────────────────────────────
+    infer_dom_nesting(&mut tree, profiles, family_exports);
 
-    // Suppress BEM-derived root→child edges when a more specific
-    // intermediate→child edge exists from DOM nesting, React context,
-    // or delegation projection. BEM tells us a component uses CSS tokens
-    // from the root's block, but that doesn't mean it's a direct JSX
-    // child of the root — it may be nested inside an intermediate wrapper.
-    //
-    // Example: BEM says Accordion→AccordionContent (uses accordion
-    // block tokens), but context nesting proves AccordionItem is the
-    // actual JSX parent. We suppress the root edge so conformance rules
-    // generate "must be in AccordionItem" instead of "must be in Accordion".
-    //
-    // Only suppresses when the child has a direct_child edge from BOTH
-    // the root AND a non-root intermediate family member.
+    // ── Step 8: cloneElement threading ──────────────────────────────
+    infer_clone_element_nesting(&mut tree, profiles, family_exports);
+
+    // ── Step 9: Suppress + dedup ───────────────────────────────────
+    deduplicate_edges(&mut tree);
     suppress_root_edges_with_intermediate(&mut tree);
+
+    // ── Step 10: Drop unconnected members ───────────────────────────
+    // Members with no incoming edge from any signal are dropped from
+    // the tree entirely. No "default to root" guessing — every edge
+    // must have structural evidence. Unconnected members may be
+    // standalone components, context objects, type exports, or members
+    // that need stronger signals to connect.
+    let parented: HashSet<&str> = tree.edges.iter().map(|e| e.child.as_str()).collect();
+    tree.family_members
+        .retain(|m| m == &root || parented.contains(m.as_str()));
 
     Some(tree)
 }
 
-/// Classify the BEM relationship between a parent and child component.
+/// Infer parent→child edges from cloneElement prop injection chains.
 ///
-/// BEM element edges are only valid when the parent IS the block owner
-/// (has a raw token that exactly equals its block name, e.g., `styles.masthead`
-/// for block "masthead"). Components that only have element-level tokens
-/// (e.g., `styles.mastheadBrand`) are elements themselves and should not
-/// claim other elements as children.
-fn classify_child_relationship(
-    parent: &ComponentSourceProfile,
-    child: &ComponentSourceProfile,
-) -> (ChildRelationship, Option<String>) {
-    let parent_block = match &parent.bem_block {
-        Some(b) => b.as_str(),
-        None => {
-            if parent.rendered_components.contains(&child.name) {
-                return (ChildRelationship::Internal, None);
-            }
-            return (ChildRelationship::Unknown, None);
-        }
-    };
-
-    // Only allow BEM element classification if the parent is the block
-    // OWNER — its component name matches (or is a prefix of) the block name.
-    //
-    // In PF (and BEM generally), the root component IS named after the
-    // block: Menu → "menu", Masthead → "masthead", Modal → "modalBox".
-    // Element components have suffixed names: MenuItem, MastheadBrand.
-    //
-    // We check that the block name starts with the component name
-    // (case-insensitive), so "modal" matches "modalBox" but "menuItem"
-    // does not match "menu".
-    let parent_name_lower = parent.name.to_lowercase();
-    let block_lower = parent_block.to_lowercase();
-    let parent_is_block_owner = block_lower.starts_with(&parent_name_lower);
-
-    if !parent_is_block_owner {
-        // Parent is itself a BEM element — it cannot claim children
-        if parent.rendered_components.contains(&child.name) {
-            return (ChildRelationship::Internal, None);
-        }
-        return (ChildRelationship::Unknown, None);
-    }
-
-    // Get child's raw tokens for BEM analysis
-    let child_raw_tokens = &child
-        .css_tokens_used
-        .iter()
-        .filter(|t| t.starts_with("styles.") && !t.contains("modifiers"))
-        .map(|t| t.strip_prefix("styles.").unwrap_or(t).to_string())
-        .collect();
-
-    let bem_rel =
-        classify_bem_relationship(child.bem_block.as_deref(), child_raw_tokens, parent_block);
-
-    match bem_rel {
-        BemRelationship::Element { element_name } => {
-            let evidence = format!(
-                "{} is BEM element '{}' of {} block",
-                child.name, element_name, parent_block
-            );
-            (ChildRelationship::BemElement, Some(evidence))
-        }
-        BemRelationship::Independent { block_name } => {
-            let evidence = format!("{} has independent BEM block '{}'", child.name, block_name);
-            (ChildRelationship::IndependentBlock, Some(evidence))
-        }
-        BemRelationship::Unknown => {
-            if parent.rendered_components.contains(&child.name) {
-                (ChildRelationship::Internal, None)
-            } else {
-                (ChildRelationship::Unknown, None)
-            }
-        }
-    }
-}
-
-/// Check if a component is transitively internal (rendered by a component
-/// that is itself rendered internally by the parent).
-/// Check if a child component is passed via a ReactNode/ComponentType prop
-/// on the parent rather than placed as a JSX child.
-///
-/// Matches by stripping the parent name prefix from the child name and
-/// checking if any ReactNode prop on the parent starts with the remainder.
-///
-/// Example: parent="Alert", child="AlertActionCloseButton"
-///   → suffix = "ActionCloseButton" → lowercase = "actionclosebutton"
-///   → Alert has prop "actionClose: React.ReactNode"
-///   → "actionclosebutton" starts with "actionclose" → match → prop-passed
-fn is_prop_passed_component(
-    parent_profile: &ComponentSourceProfile,
-    child_name: &str,
-    parent_name: &str,
-) -> bool {
-    // Strip parent name prefix to get the child's role suffix
-    let suffix = if let Some(stripped) = child_name.strip_prefix(parent_name) {
-        stripped
-    } else {
-        return false;
-    };
-
-    if suffix.is_empty() {
-        return false;
-    }
-
-    let suffix_lower = suffix.to_lowercase();
-
-    // Check if any ReactNode/ComponentType prop matches
-    for (prop_name, prop_type) in &parent_profile.prop_types {
-        if prop_name == "children" || prop_name == "className" {
-            continue;
-        }
-        if !is_react_renderable_type(prop_type) {
-            continue;
-        }
-        let prop_lower = prop_name.to_lowercase();
-        // Check bidirectionally: "actionclosebutton" starts with "actionclose"
-        // OR "actionlinks" starts with "actionlink"
-        if suffix_lower.starts_with(&prop_lower) || prop_lower.starts_with(&suffix_lower) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check if a type string represents a React renderable type
-/// (ReactNode, ReactElement, ComponentType, JSX.Element).
-fn is_react_renderable_type(type_str: &str) -> bool {
-    let t = type_str.trim();
-    t.contains("ReactNode")
-        || t.contains("ReactElement")
-        || t.contains("ComponentType")
-        || t.contains("JSX.Element")
-}
-
-fn is_transitively_internal(
-    target: &str,
-    parent: &str,
-    profiles: &HashMap<String, ComponentSourceProfile>,
-    family_set: &HashSet<&str>,
-) -> bool {
-    let Some(parent_profile) = profiles.get(parent) else {
-        return false;
-    };
-
-    for internal_comp in &parent_profile.rendered_components {
-        if !family_set.contains(internal_comp.as_str()) {
-            continue;
-        }
-        if let Some(internal_profile) = profiles.get(internal_comp.as_str()) {
-            if internal_profile
-                .rendered_components
-                .iter()
-                .any(|c| c == target)
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-/// Infer block ownership when the root component's BEM block differs
-/// from its children's block but the root name is a prefix of the
-/// children's block name.
-///
-/// Example: Modal (block "backdrop") with children ModalHeader, ModalBody,
-/// ModalFooter (block "modalBox"). "modal" is a prefix of "modalBox", so
-/// Modal is the owner of the modalBox block for composition purposes.
-fn infer_ownership_by_name_prefix(
+/// If component A uses `cloneElement(child, { prop1 })` and family member B
+/// declares `prop1` in its interface, then B is a child of A.
+fn infer_clone_element_nesting(
     tree: &mut CompositionTree,
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
-    root: &str,
 ) {
-    let _root_profile = match profiles.get(root) {
-        Some(p) => p,
-        None => return,
-    };
+    let mut new_edges = Vec::new();
 
-    let root_name_lower = root.to_lowercase();
-
-    // Check if root already has BEM edges — if so, skip
-    let has_bem_edges = tree.edges.iter().any(|e| {
-        e.parent == root
-            && matches!(
-                e.relationship,
-                ChildRelationship::DirectChild | ChildRelationship::BemElement
-            )
-    });
-    if has_bem_edges {
-        return;
-    }
-
-    // Find the most common BEM block among non-root family members
-    let mut block_counts: HashMap<&str, usize> = HashMap::new();
-    for name in family_exports {
-        if name == root {
+    for parent_name in family_exports {
+        let Some(parent_profile) = profiles.get(parent_name) else {
+            continue;
+        };
+        if parent_profile.clone_element_injections.is_empty() {
             continue;
         }
-        if let Some(profile) = profiles.get(name) {
-            if let Some(ref block) = profile.bem_block {
-                *block_counts.entry(block.as_str()).or_default() += 1;
+
+        // Collect all injected prop names, filtering out universal props
+        // that every component declares (children, className, style, etc.)
+        // — these create false edges because they match everything.
+        let universal_props: HashSet<&str> =
+            ["children", "className", "style", "id", "key", "ref"].into();
+
+        let injected_props: HashSet<&str> = parent_profile
+            .clone_element_injections
+            .iter()
+            .flat_map(|inj| inj.injected_props.iter().map(|s| s.as_str()))
+            .filter(|p| !universal_props.contains(p))
+            .collect();
+
+        if injected_props.is_empty() {
+            continue;
+        }
+
+        // Find family members that declare any of these props
+        for child_name in family_exports {
+            if child_name == parent_name {
+                continue;
+            }
+            if edge_exists(tree, parent_name, child_name) {
+                continue;
+            }
+
+            let Some(child_profile) = profiles.get(child_name) else {
+                continue;
+            };
+
+            // Check if child declares any of the injected props
+            let matching_props: Vec<&str> = injected_props
+                .iter()
+                .filter(|prop| child_profile.all_props.contains(**prop))
+                .copied()
+                .collect();
+
+            if !matching_props.is_empty() {
+                new_edges.push(CompositionEdge {
+                    parent: parent_name.clone(),
+                    child: child_name.clone(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some(format!(
+                        "cloneElement: {} injects [{}], {} declares them",
+                        parent_name,
+                        matching_props.join(", "),
+                        child_name
+                    )),
+                    strength: EdgeStrength::Required,
+                });
             }
         }
     }
 
-    let dominant_block = block_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(block, _)| block);
+    tree.edges.extend(new_edges);
+}
 
-    let Some(child_block) = dominant_block else {
-        return;
-    };
+/// Build a mapping from CSS BEM element names to component names.
+///
+/// Uses `css_tokens_used` on each component to determine which CSS elements
+/// it renders. The mapping strips the BEM block prefix from tokens.
+///
+/// Example: ToolbarContent uses `styles.toolbarContentSection`. Block is
+/// "toolbar". Strip prefix → "ContentSection" → kebab → "content-section".
+/// Maps "content-section" → "ToolbarContent".
+fn build_css_element_to_component_map(
+    profiles: &HashMap<String, ComponentSourceProfile>,
+    family_exports: &[String],
+    block_name: &str,
+) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
 
-    // Check if root name is a prefix of the children's block.
-    //
-    // BEM blocks are stored in camelCase (e.g., "labelGroup" from
-    // "label-group"). We need to distinguish:
-    //   - "labelGroup" from "label-group" → separate BEM block (reject)
-    //   - "modalBox" from "modal-box" → sub-block of "modal" (allow)
-    //
-    // Both look the same in camelCase! The difference is whether the
-    // original CSS file name was a hyphenated extension of the root
-    // (e.g., "label" + "-group" = separate block) vs a genuine sub-block.
-    //
-    // Since camelCase erases the hyphen boundary, we instead check
-    // whether the child_block exactly equals the root name (same block)
-    // or starts with it followed by an uppercase letter (sub-element
-    // in the SAME block). When child_block == root_name_lower, the
-    // child shares the root's block. When child_block starts with
-    // root_name + uppercase, it COULD be a sub-block OR a separate
-    // block — we can't tell from camelCase alone.
-    //
-    // The safe approach: only proceed when the child's BEM block is
-    // the SAME as the root's block (child_block == root_name). This
-    // avoids false ownership from naming collisions.
-    let child_block_lower = child_block.to_lowercase();
-    if child_block_lower != root_name_lower {
-        // Child has a different BEM block name — even if the root name
-        // is a prefix (e.g., "label" prefix of "labelGroup"), we cannot
-        // determine ownership because the camelCase form is ambiguous
-        // between sub-element and separate block.
-        debug!(
-            root = %root,
-            child_block = %child_block,
-            "Skipping name-prefix ownership — child block differs from root block"
-        );
-        return;
-    }
-
-    // Root owns this block — add edges for all children that are
-    // BEM elements of the children's block
-    let existing: HashSet<(String, String)> = tree
-        .edges
-        .iter()
-        .map(|e| (e.parent.clone(), e.child.clone()))
-        .collect();
-
-    for child_name in family_exports {
-        if child_name == root {
-            continue;
-        }
-        if existing.contains(&(root.to_string(), child_name.clone())) {
-            continue;
-        }
-        let Some(child_profile) = profiles.get(child_name) else {
+    for comp_name in family_exports {
+        let Some(profile) = profiles.get(comp_name) else {
             continue;
         };
 
-        // Check if child has tokens that are elements of the children's block
-        let is_element = child_profile.css_tokens_used.iter().any(|t| {
-            if let Some(token) = t.strip_prefix("styles.") {
-                token.starts_with(child_block)
-                    && token.len() > child_block.len()
-                    && token[child_block.len()..].starts_with(|c: char| c.is_uppercase())
+        for token in &profile.css_tokens_used {
+            // Tokens are stored as "styles.drawerBody" or "styles.modifiers.expanded".
+            // Strip the "styles." prefix to get the raw token (e.g., "drawerBody").
+            // Skip modifier tokens ("styles.modifiers.*") — they don't map to BEM elements.
+            let raw_token = if let Some(rest) = token.strip_prefix("styles.") {
+                if rest.starts_with("modifiers.") {
+                    continue;
+                }
+                rest
             } else {
-                false
-            }
-        });
+                token.as_str()
+            };
 
-        if is_element {
-            tree.edges.push(CompositionEdge {
-                parent: root.to_string(),
-                child: child_name.clone(),
-                relationship: ChildRelationship::DirectChild,
-                required: false,
-                bem_evidence: Some(format!(
-                    "{} name is prefix of {} block, {} uses {} tokens",
-                    root, child_block, child_name, child_block
-                )),
-            });
+            if let Some(suffix) = raw_token.strip_prefix(block_name) {
+                let element_name = if suffix.is_empty() {
+                    // Root element — token matches block exactly
+                    String::new()
+                } else {
+                    // Element — strip block prefix, lowercase first char,
+                    // convert to kebab-case
+                    let mut camel = suffix.to_string();
+                    if let Some(c) = camel.get_mut(0..1) {
+                        c.make_ascii_lowercase();
+                    }
+                    camel_to_kebab(&camel)
+                };
+
+                // Don't overwrite — first component to claim an element wins.
+                // This handles cases where multiple components use the same
+                // block token (e.g., both Toolbar and ToolbarContent use
+                // styles.toolbar for the root).
+                map.entry(element_name).or_insert_with(|| comp_name.clone());
+            }
         }
     }
+
+    map
+}
+
+/// Convert camelCase to kebab-case.
+fn camel_to_kebab(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('-');
+        }
+        result.push(ch.to_ascii_lowercase());
+    }
+    result
+}
+
+/// Check if an edge from parent to child already exists in the tree.
+fn edge_exists(tree: &CompositionTree, parent: &str, child: &str) -> bool {
+    tree.edges
+        .iter()
+        .any(|e| e.parent == parent && e.child == child)
 }
 
 /// Infer parent→child edges from HTML DOM nesting rules.
@@ -579,6 +715,7 @@ fn infer_dom_nesting(
                             "DOM nesting: {} wraps children in <{}>, {} renders <{}> as root",
                             parent_name, slot_el, child_name, root_el
                         )),
+                        strength: EdgeStrength::Required,
                     });
                 }
             }
@@ -705,6 +842,7 @@ fn infer_dom_nesting(
                 "Flow container nesting: {} renders <ul>/<ol>, {} wraps {{children}} in flow container",
                 child, parent
             )),
+            strength: EdgeStrength::Allowed,
         });
     }
 }
@@ -804,6 +942,7 @@ fn infer_context_nesting(
                             "Context nesting: {} provides {}, {} consumes it via useContext",
                             provider_name, consumed_ctx, child_name
                         )),
+                        strength: EdgeStrength::Required,
                     });
                 }
             }
@@ -949,236 +1088,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dropdown_tree_no_bem_edges() {
-        // Dropdown family is a thin wrapper over Menu — no BEM tokens,
-        // no internal rendering of family members. The builder alone
-        // produces an empty tree; edges are filled in by
-        // `project_delegate_trees` at the pipeline level.
-        let mut dropdown = make_profile("Dropdown");
-        dropdown.has_children_prop = true;
-        dropdown.rendered_components = vec!["Menu".into(), "MenuContent".into(), "Popper".into()];
-
-        let mut dropdown_list = make_profile("DropdownList");
-        dropdown_list.has_children_prop = true;
-        dropdown_list.rendered_components = vec!["MenuList".into()];
-
-        let mut dropdown_item = make_profile("DropdownItem");
-        dropdown_item.has_children_prop = true;
-        dropdown_item.rendered_components = vec!["MenuItem".into()];
-
-        let mut dropdown_group = make_profile("DropdownGroup");
-        dropdown_group.has_children_prop = true;
-        dropdown_group.rendered_components = vec!["MenuGroup".into()];
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Dropdown".into(), dropdown);
-        profiles.insert("DropdownList".into(), dropdown_list);
-        profiles.insert("DropdownItem".into(), dropdown_item);
-        profiles.insert("DropdownGroup".into(), dropdown_group);
-
-        let family = vec![
-            "Dropdown".into(),
-            "DropdownList".into(),
-            "DropdownItem".into(),
-            "DropdownGroup".into(),
-        ];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        assert_eq!(tree.root, "Dropdown");
-        assert_eq!(tree.family_members.len(), 4);
-        // No BEM evidence → no edges from the builder alone
-        // (delegation projection fills these in at the pipeline level)
-        assert!(tree.edges.is_empty());
-    }
-
-    #[test]
-    fn test_build_modal_tree() {
-        // Simulate the v6 Modal family
-        let mut modal = make_profile("Modal");
-        modal.has_children_prop = true;
-        modal.rendered_components = vec!["ModalContent".into()];
-        modal.uses_portal = true;
-        // Modal has no styles.* tokens
-
-        let mut modal_header = make_profile("ModalHeader");
-        modal_header.has_children_prop = true;
-        modal_header
-            .css_tokens_used
-            .insert("styles.modalBoxHeader".into());
-        modal_header
-            .css_tokens_used
-            .insert("styles.modalBoxHeaderMain".into());
-        modal_header.bem_block = Some("modalBox".into());
-        modal_header.bem_elements.insert("header".into());
-
-        let mut modal_body = make_profile("ModalBody");
-        modal_body.has_children_prop = true;
-        modal_body
-            .css_tokens_used
-            .insert("styles.modalBoxBody".into());
-        modal_body.bem_block = Some("modalBox".into());
-        modal_body.bem_elements.insert("body".into());
-
-        let mut modal_footer = make_profile("ModalFooter");
-        modal_footer.has_children_prop = true;
-        modal_footer
-            .css_tokens_used
-            .insert("styles.modalBoxFooter".into());
-        modal_footer.bem_block = Some("modalBox".into());
-        modal_footer.bem_elements.insert("footer".into());
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Modal".into(), modal);
-        profiles.insert("ModalHeader".into(), modal_header);
-        profiles.insert("ModalBody".into(), modal_body);
-        profiles.insert("ModalFooter".into(), modal_footer);
-
-        let family = vec![
-            "Modal".into(),
-            "ModalHeader".into(),
-            "ModalBody".into(),
-            "ModalFooter".into(),
-        ];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        assert_eq!(tree.root, "Modal");
-        assert_eq!(tree.family_members.len(), 4);
-        // Modal doesn't render ModalHeader/Body/Footer internally,
-        // they should appear as consumer-provided children
-    }
-
-    #[test]
-    fn test_only_block_owner_parents_bem_elements() {
-        // Only the block owner (component name == block name) should
-        // create BEM element edges. Sub-components like MastheadBrand
-        // share the same import-derived block but are NOT owners.
-        let mut masthead = make_profile("Masthead");
-        masthead.has_children_prop = true;
-        masthead.bem_block = Some("masthead".into());
-        masthead.css_tokens_used.insert("styles.masthead".into());
-
-        let mut brand = make_profile("MastheadBrand");
-        brand.has_children_prop = true;
-        brand.bem_block = Some("masthead".into()); // same import-derived block
-        brand.css_tokens_used.insert("styles.mastheadBrand".into());
-
-        let mut content = make_profile("MastheadContent");
-        content.has_children_prop = true;
-        content.bem_block = Some("masthead".into());
-        content
-            .css_tokens_used
-            .insert("styles.mastheadContent".into());
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Masthead".into(), masthead);
-        profiles.insert("MastheadBrand".into(), brand);
-        profiles.insert("MastheadContent".into(), content);
-
-        let family = vec![
-            "Masthead".into(),
-            "MastheadBrand".into(),
-            "MastheadContent".into(),
-        ];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        // Masthead → MastheadBrand (BEM element "brand" of block "masthead")
-        // BEM edges are not required — BEM proves structural membership only.
-        assert!(tree
-            .edges
-            .iter()
-            .any(|e| e.parent == "Masthead" && e.child == "MastheadBrand" && !e.required));
-        // Masthead → MastheadContent
-        assert!(tree
-            .edges
-            .iter()
-            .any(|e| e.parent == "Masthead" && e.child == "MastheadContent" && !e.required));
-
-        // MastheadBrand should NOT parent MastheadContent (Brand is not the block owner)
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "MastheadBrand" && e.child == "MastheadContent"),
-            "Non-owner MastheadBrand should not claim MastheadContent as child"
-        );
-        // MastheadContent should NOT parent MastheadBrand
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "MastheadContent" && e.child == "MastheadBrand"),
-            "Non-owner MastheadContent should not claim MastheadBrand as child"
-        );
-    }
-
-    #[test]
-    fn test_element_with_block_token_is_not_owner() {
-        // MenuItem references styles.menu for flyout detection
-        // (classList.contains), but it's NOT the block owner — Menu is.
-        // The block owner check uses component name == block name.
-        let mut menu = make_profile("Menu");
-        menu.has_children_prop = true;
-        menu.bem_block = Some("menu".into());
-        menu.css_tokens_used.insert("styles.menu".into());
-
-        let mut menu_item = make_profile("MenuItem");
-        menu_item.has_children_prop = true;
-        menu_item.bem_block = Some("menu".into());
-        menu_item.css_tokens_used.insert("styles.menuItem".into());
-        menu_item
-            .css_tokens_used
-            .insert("styles.menuListItem".into());
-        // MenuItem also has styles.menu (for flyout classList check)
-        menu_item.css_tokens_used.insert("styles.menu".into());
-
-        let mut menu_list = make_profile("MenuList");
-        menu_list.has_children_prop = true;
-        menu_list.bem_block = Some("menu".into());
-        menu_list.css_tokens_used.insert("styles.menuList".into());
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Menu".into(), menu);
-        profiles.insert("MenuItem".into(), menu_item);
-        profiles.insert("MenuList".into(), menu_list);
-
-        let family = vec!["Menu".into(), "MenuItem".into(), "MenuList".into()];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        // Menu → MenuItem (Menu is the block owner, name matches block)
-        assert!(tree
-            .edges
-            .iter()
-            .any(|e| e.parent == "Menu" && e.child == "MenuItem"));
-
-        // Menu → MenuList
-        assert!(tree
-            .edges
-            .iter()
-            .any(|e| e.parent == "Menu" && e.child == "MenuList"));
-
-        // MenuItem should NOT parent MenuList or Menu — it has styles.menu
-        // in its tokens but its name "MenuItem" != block "menu"
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "MenuItem" && e.child == "MenuList"),
-            "MenuItem should not claim MenuList — it's not the block owner"
-        );
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "MenuItem" && e.child == "Menu"),
-            "MenuItem should not claim Menu — it's not the block owner"
-        );
-    }
-
-    #[test]
     fn test_context_nesting_provider_consumer() {
         // Menu renders <MenuContext.Provider>, MenuList calls
         // useContext(MenuContext). MenuList must be nested under Menu.
@@ -1196,7 +1105,7 @@ mod tests {
 
         let family = vec!["Menu".into(), "MenuList".into()];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         let menu_to_list = tree
             .edges
@@ -1237,7 +1146,7 @@ mod tests {
 
         let family = vec!["MenuList".into(), "MenuItem".into()];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         let list_to_item = tree
             .edges
@@ -1254,126 +1163,6 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("DOM nesting"));
-    }
-
-    #[test]
-    fn test_build_menu_tree_bem_elements() {
-        // Menu has block "menu" and IS the block owner (has styles.menu).
-        // MenuList has import-derived block "menu" but only has element
-        // token styles.menuList → NOT the block owner.
-        // Menu renders {children}, not MenuList directly, so the edge
-        // comes from consumer-provided BEM element evidence.
-        let mut menu = make_profile("Menu");
-        menu.has_children_prop = true;
-        menu.bem_block = Some("menu".into());
-        menu.css_tokens_used.insert("styles.menu".into());
-        menu.css_tokens_used.insert("styles.divider".into());
-
-        let mut menu_list = make_profile("MenuList");
-        menu_list.has_children_prop = true;
-        menu_list.bem_block = Some("menu".into()); // import-derived, not "menuList"
-        menu_list.css_tokens_used.insert("styles.menuList".into());
-
-        let mut menu_item = make_profile("MenuItem");
-        menu_item.has_children_prop = true;
-        menu_item.bem_block = Some("menu".into()); // import-derived
-        menu_item
-            .css_tokens_used
-            .insert("styles.menuListItem".into());
-        menu_item
-            .css_tokens_used
-            .insert("styles.menuItemMain".into());
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Menu".into(), menu);
-        profiles.insert("MenuList".into(), menu_list);
-        profiles.insert("MenuItem".into(), menu_item);
-
-        let family = vec!["Menu".into(), "MenuList".into(), "MenuItem".into()];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        // Menu → MenuList (BEM element "list" of block "menu")
-        let menu_to_list = tree
-            .edges
-            .iter()
-            .find(|e| e.parent == "Menu" && e.child == "MenuList");
-        assert!(
-            menu_to_list.is_some(),
-            "Expected Menu → MenuList edge, got edges: {:?}",
-            tree.edges
-        );
-        // BEM edges are no longer required — BEM proves structural membership
-        // but not that the child is required for the parent to function.
-        assert!(!menu_to_list.unwrap().required);
-
-        // Menu → MenuItem (also a BEM element of "menu" block)
-        // BEM only tells us both are children of Menu, not that
-        // MenuItem goes inside MenuList specifically.
-        let menu_to_item = tree
-            .edges
-            .iter()
-            .find(|e| e.parent == "Menu" && e.child == "MenuItem");
-        assert!(
-            menu_to_item.is_some(),
-            "Expected Menu → MenuItem edge, got edges: {:?}",
-            tree.edges
-        );
-
-        // MenuList should NOT parent MenuItem — MenuList is not the
-        // block owner (it only has styles.menuList, not styles.menu)
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "MenuList" && e.child == "MenuItem"),
-            "MenuList is not the block owner and should not claim MenuItem"
-        );
-    }
-
-    #[test]
-    fn test_is_prop_passed_component() {
-        // Alert has actionClose: React.ReactNode
-        let mut alert = make_profile("Alert");
-        alert
-            .prop_types
-            .insert("actionClose".into(), "React.ReactNode".into());
-        alert
-            .prop_types
-            .insert("actionLinks".into(), "React.ReactNode".into());
-        alert
-            .prop_types
-            .insert("children".into(), "React.ReactNode".into());
-        alert
-            .prop_types
-            .insert("variant".into(), "'success' | 'danger'".into());
-
-        // AlertActionCloseButton → strip "Alert" → "ActionCloseButton"
-        // → lowercase "actionclosebutton" starts with "actionclose" → match
-        assert!(
-            is_prop_passed_component(&alert, "AlertActionCloseButton", "Alert"),
-            "AlertActionCloseButton should be detected as prop-passed via actionClose"
-        );
-
-        // AlertActionLink → strip "Alert" → "ActionLink"
-        // → lowercase "actionlink", prop "actionLinks" → lowercase "actionlinks"
-        // → "actionlinks".starts_with("actionlink") → match (bidirectional check)
-        assert!(
-            is_prop_passed_component(&alert, "AlertActionLink", "Alert"),
-            "AlertActionLink should be detected as prop-passed via actionLinks"
-        );
-
-        // Non-matching: AlertGroup has no prop suffix match
-        assert!(
-            !is_prop_passed_component(&alert, "AlertGroup", "Alert"),
-            "AlertGroup should not be detected as prop-passed"
-        );
-
-        // Non-family child (doesn't start with parent name)
-        assert!(
-            !is_prop_passed_component(&alert, "Button", "Alert"),
-            "Button should not match (no parent prefix)"
-        );
     }
 
     #[test]
@@ -1397,6 +1186,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: Some("BEM element of accordion block".into()),
+                    strength: EdgeStrength::Allowed,
                 },
                 CompositionEdge {
                     parent: "Accordion".into(),
@@ -1404,6 +1194,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: Some("BEM element of accordion block".into()),
+                    strength: EdgeStrength::Allowed,
                 },
                 // Correct root edge (no intermediate for AccordionItem)
                 CompositionEdge {
@@ -1412,6 +1203,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: Some("BEM element of accordion block".into()),
+                    strength: EdgeStrength::Allowed,
                 },
                 // Context-derived intermediate edges (should be kept)
                 CompositionEdge {
@@ -1420,6 +1212,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("Context nesting".into()),
+                    strength: EdgeStrength::Allowed,
                 },
                 CompositionEdge {
                     parent: "AccordionItem".into(),
@@ -1427,6 +1220,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("Context nesting".into()),
+                    strength: EdgeStrength::Allowed,
                 },
             ],
         };
@@ -1495,6 +1289,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
                 },
                 CompositionEdge {
                     parent: "Masthead".into(),
@@ -1502,6 +1297,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
                 },
                 CompositionEdge {
                     parent: "Masthead".into(),
@@ -1509,6 +1305,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
                 },
             ],
         };
@@ -1519,166 +1316,6 @@ mod tests {
             tree.edges.len(),
             3,
             "No edges should be suppressed for Masthead"
-        );
-    }
-
-    /// Build a full composition tree where BEM creates root→child edges
-    /// but context nesting proves an intermediate parent. Verify that
-    /// suppress_root_edges_with_intermediate removes the root edge.
-    ///
-    /// Simulates: Accordion → AccordionContent (BEM) should be suppressed
-    /// because AccordionItem → AccordionContent (context) exists.
-    #[test]
-    fn test_full_tree_build_suppresses_root_bem_when_context_intermediate() {
-        // Accordion: block owner, has children prop
-        let mut accordion = make_profile("Accordion");
-        accordion.has_children_prop = true;
-        accordion.bem_block = Some("accordion".into());
-        accordion.css_tokens_used.insert("styles.accordion".into());
-
-        // AccordionItem: intermediate wrapper, provides AccordionItemContext
-        let mut item = make_profile("AccordionItem");
-        item.has_children_prop = true;
-        item.bem_block = Some("accordion".into());
-        item.css_tokens_used.insert("styles.accordionItem".into());
-        // Context providers are detected from rendered_components entries
-        item.rendered_components
-            .push("AccordionItemContext.Provider".into());
-
-        // AccordionContent: consumes AccordionItemContext, uses accordion BEM tokens
-        let mut content = make_profile("AccordionContent");
-        content.has_children_prop = true;
-        content.bem_block = Some("accordion".into());
-        content
-            .css_tokens_used
-            .insert("styles.accordionExpandableContent".into());
-        content
-            .consumed_contexts
-            .push("AccordionItemContext".into());
-
-        // AccordionToggle: also consumes AccordionItemContext
-        let mut toggle = make_profile("AccordionToggle");
-        toggle.has_children_prop = true;
-        toggle.bem_block = Some("accordion".into());
-        toggle
-            .css_tokens_used
-            .insert("styles.accordionToggle".into());
-        toggle.consumed_contexts.push("AccordionItemContext".into());
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Accordion".into(), accordion);
-        profiles.insert("AccordionItem".into(), item);
-        profiles.insert("AccordionContent".into(), content);
-        profiles.insert("AccordionToggle".into(), toggle);
-
-        let family = vec![
-            "Accordion".into(),
-            "AccordionItem".into(),
-            "AccordionContent".into(),
-            "AccordionToggle".into(),
-        ];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        // AccordionItem should be a direct child of Accordion (no intermediate)
-        assert!(
-            tree.edges
-                .iter()
-                .any(|e| e.parent == "Accordion" && e.child == "AccordionItem"),
-            "Accordion → AccordionItem should exist"
-        );
-
-        // AccordionContent should be under AccordionItem (context nesting),
-        // NOT under Accordion (BEM was suppressed)
-        assert!(
-            tree.edges
-                .iter()
-                .any(|e| e.parent == "AccordionItem" && e.child == "AccordionContent"),
-            "AccordionItem → AccordionContent should exist (context nesting)"
-        );
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "Accordion" && e.child == "AccordionContent"),
-            "Accordion → AccordionContent should be suppressed (intermediate exists)"
-        );
-
-        // Same for AccordionToggle
-        assert!(
-            tree.edges
-                .iter()
-                .any(|e| e.parent == "AccordionItem" && e.child == "AccordionToggle"),
-            "AccordionItem → AccordionToggle should exist (context nesting)"
-        );
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "Accordion" && e.child == "AccordionToggle"),
-            "Accordion → AccordionToggle should be suppressed (intermediate exists)"
-        );
-    }
-
-    /// Build a tree where a component is passed via a ReactNode prop
-    /// on the parent. Verify it does NOT get a BEM edge.
-    ///
-    /// Simulates: Alert has actionClose: ReactNode prop.
-    /// AlertActionCloseButton uses alert BEM tokens but should NOT
-    /// be a child of Alert — it's prop-passed.
-    #[test]
-    fn test_full_tree_build_skips_prop_passed_bem_component() {
-        let mut alert = make_profile("Alert");
-        alert.has_children_prop = true;
-        alert.bem_block = Some("alert".into());
-        alert.css_tokens_used.insert("styles.alert".into());
-        alert
-            .prop_types
-            .insert("actionClose".into(), "React.ReactNode".into());
-        alert
-            .prop_types
-            .insert("children".into(), "React.ReactNode".into());
-
-        // AlertActionCloseButton uses alert BEM tokens
-        let mut close_btn = make_profile("AlertActionCloseButton");
-        close_btn.bem_block = Some("alert".into());
-        close_btn
-            .css_tokens_used
-            .insert("styles.alertActionClose".into());
-
-        // AlertBody — a regular child (not prop-passed)
-        let mut body = make_profile("AlertBody");
-        body.bem_block = Some("alert".into());
-        body.css_tokens_used.insert("styles.alertBody".into());
-
-        let mut profiles = HashMap::new();
-        profiles.insert("Alert".into(), alert);
-        profiles.insert("AlertActionCloseButton".into(), close_btn);
-        profiles.insert("AlertBody".into(), body);
-
-        let family = vec![
-            "Alert".into(),
-            "AlertActionCloseButton".into(),
-            "AlertBody".into(),
-        ];
-
-        let tree = build_composition_tree(&profiles, &family).unwrap();
-
-        // AlertActionCloseButton should NOT be a child of Alert (prop-passed)
-        assert!(
-            !tree
-                .edges
-                .iter()
-                .any(|e| e.parent == "Alert" && e.child == "AlertActionCloseButton"),
-            "AlertActionCloseButton should be skipped — it's prop-passed via actionClose"
-        );
-
-        // AlertBody SHOULD be a child of Alert (not prop-passed)
-        assert!(
-            tree.edges
-                .iter()
-                .any(|e| e.parent == "Alert" && e.child == "AlertBody"),
-            "AlertBody should be a child of Alert (regular BEM element)"
         );
     }
 
@@ -1712,7 +1349,7 @@ mod tests {
             "DropdownGroup".into(),
         ];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         // All BEM-derived edges should be required=false
         for edge in &tree.edges {
@@ -1762,7 +1399,7 @@ mod tests {
 
         let family = vec!["Label".into(), "LabelGroup".into()];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         // There should be NO edge from Label -> LabelGroup
         let bad_edge = tree
@@ -1804,7 +1441,7 @@ mod tests {
 
         let family = vec!["Alert".into(), "AlertGroup".into()];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         let bad_edge = tree
             .edges
@@ -1857,7 +1494,7 @@ mod tests {
 
         let family = vec!["Modal".into(), "ModalBox".into(), "ModalBoxBody".into()];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         // Name-prefix inference should NOT create Modal → ModalBox because
         // "modalBox" != "modal" (different block). ModalBox → ModalBoxBody
@@ -1900,7 +1537,7 @@ mod tests {
 
         let family = vec!["Menu".into(), "MenuToggle".into()];
 
-        let tree = build_composition_tree(&profiles, &family).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
 
         let bad_edge = tree
             .edges

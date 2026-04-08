@@ -348,11 +348,19 @@ fn generate_conformance_rules(
         // ── Phase 1: collect valid (non-internal, non-back-edge) edges,
         //    grouped by child → [parents].
         //
+        // Two maps are built in a single pass:
+        //  - `required_child_to_parents`: only Required edges — determines
+        //    which children get conformance rules generated.
+        //  - `all_valid_child_to_parents`: both Required and Allowed edges —
+        //    used for the notParent regex so valid-but-not-required placements
+        //    don't trigger false positives.
+        //
         // When a child has multiple valid parents (e.g., Tr can be in Thead
         // OR Tbody), we generate ONE merged rule with a combined notParent
         // regex (e.g., ^(Thead|Tbody)$) instead of separate per-parent rules
         // that false-positive against each other.
-        let mut filtered_child_to_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut required_child_to_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut all_valid_child_to_parents: HashMap<&str, Vec<&str>> = HashMap::new();
         for edge in &tree.edges {
             // Skip internal rendering edges — not consumer-facing
             if edge.relationship == ChildRelationship::Internal {
@@ -366,23 +374,41 @@ fn generate_conformance_rules(
                     continue;
                 }
             }
-            filtered_child_to_parents
+            // All non-internal, non-back-edge parents are valid placements
+            all_valid_child_to_parents
                 .entry(edge.child.as_str())
                 .or_default()
                 .push(edge.parent.as_str());
+            // Only Required edges determine which children get conformance rules
+            if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required {
+                required_child_to_parents
+                    .entry(edge.child.as_str())
+                    .or_default()
+                    .push(edge.parent.as_str());
+            }
         }
 
         // ── Phase 2: generate rules from the grouped edges.
+        //
+        // Iterate children that have at least one Required edge (conformance
+        // rules are only generated for required nesting). But use the full
+        // set of valid parents (Required + Allowed) for the notParent regex
+        // and InvalidDirectChild suggestions so that valid-but-not-required
+        // placements don't trigger false positives.
 
-        for (child, parents) in &filtered_child_to_parents {
+        for (child, _required_parents) in &required_child_to_parents {
             let pkg = pkg_for(child, component_packages);
+            let all_parents = all_valid_child_to_parents
+                .get(child)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
             // ── InvalidDirectChild: child inside grandparent, skipping parent.
             // Group by (grandparent, child) to merge when multiple parents
             // share the same grandparent (e.g., Tr in Table needs either
             // Thead or Tbody, not separate rules for each).
             let mut grandparent_to_expected: HashMap<&str, Vec<&str>> = HashMap::new();
-            for parent in parents {
+            for parent in all_parents {
                 if let Some(grandparents) = child_to_parents.get(parent) {
                     for grandparent in grandparents {
                         grandparent_to_expected
@@ -497,19 +523,24 @@ fn generate_conformance_rules(
             //    as ancestor. Uses `notParent` regex to fire only when the
             //    child is NOT inside ANY of its valid parents.
             //
+            //    The parent list includes both Required and Allowed edges so
+            //    valid-but-not-required placements don't trigger false positives.
+            //
             //    Single parent:   notParent: ^Tbody$
             //    Multi-parent:    notParent: ^(Thead|Tbody)$
-            let not_parent_pattern = if parents.len() == 1 {
-                format!("^{}$", parents[0])
+            let not_parent_pattern = if all_parents.len() == 1 {
+                format!("^{}$", all_parents[0])
             } else {
-                let mut sorted = parents.clone();
+                let mut sorted = all_parents.to_vec();
                 sorted.sort();
+                sorted.dedup();
                 format!("^({})$", sorted.join("|"))
             };
 
             let rule_id_suffix = {
-                let mut sorted = parents.clone();
+                let mut sorted = all_parents.to_vec();
                 sorted.sort();
+                sorted.dedup();
                 sorted
                     .iter()
                     .map(|p| sanitize(p))
@@ -523,21 +554,23 @@ fn generate_conformance_rules(
             );
 
             let parent_list = {
-                let mut sorted = parents.clone();
+                let mut sorted = all_parents.to_vec();
                 sorted.sort();
+                sorted.dedup();
                 sorted.join(" or ")
             };
 
-            let message = if parents.len() == 1 {
+            let message = if all_parents.len() == 1 {
                 format!(
                     "<{}> must be used inside <{}>.\n\n\
                      Correct usage:\n  <{}>\n    <{} />\n  </{}>",
-                    child, parents[0], parents[0], child, parents[0],
+                    child, all_parents[0], all_parents[0], child, all_parents[0],
                 )
             } else {
                 let examples: Vec<String> = {
-                    let mut sorted = parents.clone();
+                    let mut sorted = all_parents.to_vec();
                     sorted.sort();
+                    sorted.dedup();
                     sorted
                         .iter()
                         .map(|p| format!("  <{}>\n    <{} />\n  </{}>", p, child, p))
@@ -583,7 +616,7 @@ fn generate_conformance_rules(
                 fix_strategy: Some(FixStrategyEntry {
                     strategy: "LlmAssisted".into(),
                     component: Some(child.to_string()),
-                    replacement: Some(parents[0].to_string()),
+                    replacement: Some(all_parents[0].to_string()),
                     ..Default::default()
                 }),
             });
@@ -3019,6 +3052,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "DropdownList".into(),
@@ -3026,6 +3060,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -3070,6 +3105,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 // Back-edge: nested tabs pattern
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -3078,6 +3114,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -3143,6 +3180,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Table".into(),
@@ -3150,6 +3188,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Thead".into(),
@@ -3157,6 +3196,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tbody".into(),
@@ -3164,6 +3204,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tr".into(),
@@ -3171,6 +3212,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tr".into(),
@@ -3178,6 +3220,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -3264,6 +3307,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Table".into(),
@@ -3271,6 +3315,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Thead".into(),
@@ -3278,6 +3323,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tbody".into(),
@@ -3285,6 +3331,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -3333,6 +3380,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "DropdownList".into(),
@@ -3340,6 +3388,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -3619,6 +3668,132 @@ mod tests {
         assert_eq!(
             deprecated_pkg_from_migration_path("some/random/path.tsx"),
             "@patternfly/react-core/deprecated"
+        );
+    }
+
+    /// When a child has one Required parent and one Allowed parent, the
+    /// notParent regex should include BOTH parents so that placement inside
+    /// the Allowed parent doesn't trigger a false positive.
+    #[test]
+    fn test_allowed_parent_included_in_not_parent_regex() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Table".into(), "@patternfly/react-table".into());
+        pkgs.insert("Thead".into(), "@patternfly/react-table".into());
+        pkgs.insert("Tbody".into(), "@patternfly/react-table".into());
+        pkgs.insert("Tr".into(), "@patternfly/react-table".into());
+
+        let tree = CompositionTree {
+            root: "Table".into(),
+            family_members: vec!["Table".into(), "Thead".into(), "Tbody".into(), "Tr".into()],
+            edges: vec![
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Table".into(),
+                    child: "Thead".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Table".into(),
+                    child: "Tbody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                // Tbody→Tr is Required (e.g., CSS direct-child selector)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Tbody".into(),
+                    child: "Tr".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                // Thead→Tr is Allowed (e.g., CSS descendant selector)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Thead".into(),
+                    child: "Tr".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // A conformance rule SHOULD be generated (because Tbody→Tr is Required)
+        let tr_must_be_in = rules.iter().find(|r| r.rule_id.contains("tr-must-be-in"));
+        assert!(tr_must_be_in.is_some(), "Expected a must-be-in rule for Tr");
+
+        let rule = tr_must_be_in.unwrap();
+
+        // The rule ID should include both parents
+        assert!(
+            rule.rule_id.contains("tbody") && rule.rule_id.contains("thead"),
+            "Rule ID should include both parents: {}",
+            rule.rule_id
+        );
+
+        // The notParent regex should include both parents
+        if let KonveyorCondition::FrontendReferenced { referenced } = &rule.when {
+            let not_parent = referenced.not_parent.as_deref().unwrap();
+            assert!(
+                not_parent.contains("Tbody") && not_parent.contains("Thead"),
+                "notParent regex should include both Required and Allowed parents: {}",
+                not_parent
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+
+        // Description should mention both parents
+        assert!(
+            rule.description.contains("Tbody") && rule.description.contains("Thead"),
+            "Description should mention both parents: {}",
+            rule.description
+        );
+
+        // InvalidDirectChild rule should also mention both parents
+        let tr_not_in_table = rules.iter().find(|r| r.rule_id.contains("tr-not-in-table"));
+        if let Some(idc_rule) = tr_not_in_table {
+            assert!(
+                idc_rule.description.contains("Tbody") && idc_rule.description.contains("Thead"),
+                "InvalidDirectChild description should mention both parents: {}",
+                idc_rule.description
+            );
+        }
+    }
+
+    /// When a child has ONLY Allowed parents (no Required edges), no
+    /// conformance rule should be generated.
+    #[test]
+    fn test_only_allowed_parents_no_rule_generated() {
+        let tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec!["Menu".into(), "MenuContent".into()],
+            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+                parent: "Menu".into(),
+                child: "MenuContent".into(),
+                relationship: ChildRelationship::DirectChild,
+                required: false,
+                bem_evidence: None,
+                strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+            }],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &test_pkg_map());
+
+        // No must-be-in rule should be generated for MenuContent
+        let mc_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("menucontent-must-be-in"));
+        assert!(
+            mc_rule.is_none(),
+            "No conformance rule should be generated when child only has Allowed parents"
         );
     }
 }

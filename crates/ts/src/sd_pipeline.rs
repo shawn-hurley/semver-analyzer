@@ -20,7 +20,7 @@
 //!
 //! All analysis is deterministic — no LLM, no confidence scores.
 
-use crate::composition::build_composition_tree;
+use crate::composition::build_composition_tree_v2;
 use crate::source_profile::{self, diff::diff_profiles};
 
 use semver_analyzer_core::types::sd::{
@@ -269,7 +269,36 @@ pub fn run_sd(
             }
         }
 
-        let full_tree = build_composition_tree(&all_family_profiles, &all_members_for_tree);
+        // Find the CSS profile for this family (by dominant BEM block)
+        let family_css_profile = css_profiles.and_then(|css_profs| {
+            // Try root component's bem_block first
+            let root_name = new_exports.first()?;
+            if let Some(root_prof) = all_family_profiles.get(root_name) {
+                if let Some(ref block) = root_prof.bem_block {
+                    if let Some(css_prof) = css_profs.get(block) {
+                        return Some(css_prof);
+                    }
+                }
+            }
+            // Fall back to dominant bem_block among all members
+            let mut block_counts: HashMap<&str, usize> = HashMap::new();
+            for prof in all_family_profiles.values() {
+                if let Some(ref block) = prof.bem_block {
+                    *block_counts.entry(block.as_str()).or_default() += 1;
+                }
+            }
+            let dominant = block_counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(block, _)| block)?;
+            css_profs.get(dominant)
+        });
+
+        let full_tree = build_composition_tree_v2(
+            &all_family_profiles,
+            &all_members_for_tree,
+            family_css_profile,
+        );
 
         if let Some(mut tree) = full_tree {
             // Collapse non-exported nodes: remove internal components
@@ -294,16 +323,10 @@ pub fn run_sd(
     let trees_snapshot: Vec<CompositionTree> = composition_trees.clone();
     project_delegate_trees(&mut composition_trees, &new_profiles, &trees_snapshot);
 
-    // ── B2.5: CSS grid nesting enrichment ─────────────────────────────
-    //
-    // If CSS profiles are available (from a dependency CSS repo), use
-    // grid layout signals to refine nesting:
-    //   - Elements with grid-column → direct children of block grid
-    //   - Elements WITHOUT grid-column → must be nested inside a grid item
-    //   - Variable child refs (--block__main--toggle--...) → explicit containment
-    if let Some(css_profs) = css_profiles {
-        enrich_trees_with_css(&mut composition_trees, css_profs, &new_profiles);
-    }
+    // ── B2.5: CSS enrichment is now handled by build_composition_tree_v2 ──
+    // The v2 tree builder integrates CSS direct-child selectors, grid
+    // parent-child, flex context, and descendant selectors directly into
+    // tree construction. The old enrich_trees_with_css is no longer called.
 
     // ── B3: Composition diff + conformance checks ───────────────────
     //
@@ -320,7 +343,7 @@ pub fn run_sd(
         let checks = generate_conformance_checks(family_name, tree, &new_profiles);
         conformance_checks.extend(checks);
 
-        // Composition diff only for families with changes
+        // Composition diff: build old tree with v2 and compare
         if changed_families.contains(family_name) {
             if let Some(family_files) = all_families.get(family_name) {
                 let new_exports = family_exports_map
@@ -331,7 +354,7 @@ pub fn run_sd(
                     read_family_exports_from_dir(repo, from_ref, family_name, family_files);
                 let old_family_profiles =
                     extract_family_profiles_at_ref(repo, from_ref, &old_exports, family_files);
-                let old_tree = build_composition_tree(&old_family_profiles, &old_exports);
+                let old_tree = build_composition_tree_v2(&old_family_profiles, &old_exports, None);
 
                 let changes = diff_composition_trees(
                     family_name,
@@ -342,7 +365,6 @@ pub fn run_sd(
                 );
                 composition_changes.extend(changes);
 
-                // Persist old tree for downstream cross-family analysis
                 if let Some(ot) = old_tree {
                     old_composition_trees.push(ot);
                 }
@@ -585,28 +607,24 @@ fn collect_family_profiles(
         .collect()
 }
 
-/// Extract profiles for family members at a specific git ref by reading source.
+/// Extract source profiles for a family at a specific git ref.
+/// Used for building old-version trees for composition diffing.
 fn extract_family_profiles_at_ref(
     repo: &Path,
     git_ref: &str,
-    family_exports: &[String],
+    exports: &[String],
     family_files: &[&ComponentFile],
 ) -> HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile> {
     let mut profiles = HashMap::new();
-
-    let family_dir = family_files
-        .first()
-        .and_then(|f| f.path.rsplit_once('/').map(|(dir, _)| dir.to_string()))
-        .unwrap_or_default();
-
-    for component_name in family_exports {
-        let file_path = format!("{}/{}.tsx", family_dir, component_name);
-        if let Some(source) = read_git_file(repo, git_ref, &file_path) {
-            let profile = source_profile::extract_profile(component_name, &file_path, &source);
-            profiles.insert(component_name.clone(), profile);
+    for name in exports {
+        // Find the component file for this export
+        if let Some(cf) = family_files.iter().find(|f| f.component_name == *name) {
+            if let Some(source) = read_git_file(repo, git_ref, &cf.path) {
+                let profile = crate::source_profile::extract_profile(name, &cf.path, &source);
+                profiles.insert(name.clone(), profile);
+            }
         }
     }
-
     profiles
 }
 
@@ -727,480 +745,23 @@ fn extract_from_path(line: &str) -> Option<String> {
 /// Algorithm:
 /// 1. Match CSS profile to tree via the BEM block name
 /// 2. Identify grid items (elements with `grid-column`) → direct children of root
-/// 3. Identify non-grid elements → must be nested inside a grid item
-/// 4. Use `variable_child_refs` to determine which grid item contains which non-grid element
-/// 5. For unresolved non-grid elements, assign to the nearest flex container
-fn enrich_trees_with_css(
-    trees: &mut [CompositionTree],
-    css_profiles: &HashMap<String, crate::css_profile::CssBlockProfile>,
-    react_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
-) {
-    for tree in trees.iter_mut() {
-        // Match CSS profile by finding the BEM block used by the root or
-        // its children. Try the root's bem_block first, then the dominant
-        // block among family members.
-        let css_profile = find_matching_css_profile(tree, react_profiles, css_profiles);
-        let Some(css_prof) = css_profile else {
-            continue;
-        };
-
-        debug!(
-            family = %tree.root,
-            css_block = %css_prof.block,
-            elements = css_prof.elements.len(),
-            "enriching tree with CSS grid layout"
-        );
-
-        // Map family member names → their BEM element name (kebab-case)
-        // e.g., "MastheadMain" → "main", "MastheadBrand" → "brand"
-        let root_lower = tree.root.to_lowercase();
-        let member_to_element: HashMap<&str, String> = tree
-            .family_members
-            .iter()
-            .filter_map(|name| {
-                let lower = name.to_lowercase();
-                if lower == root_lower {
-                    return None; // Root maps to "" (block itself)
-                }
-                // Strip the root prefix to get the element suffix
-                let suffix = lower.strip_prefix(&root_lower)?;
-                // Convert to kebab-case for CSS matching
-                // "main" → "main", "brand" → "brand"
-                // For multi-word: "expandablecontent" → need to match "expandable-content"
-                Some((name.as_str(), suffix.to_string()))
-            })
-            .collect();
-
-        // Reverse map: element → member name
-        let element_to_member: HashMap<&str, &str> = member_to_element
-            .iter()
-            .map(|(member, element)| (element.as_str(), *member))
-            .collect();
-
-        // Helper: look up CSS element info with kebab fallback
-        let lookup_css_el = |element: &str| -> Option<&crate::css_profile::CssElementInfo> {
-            css_prof.elements.get(element).or_else(|| {
-                css_prof
-                    .elements
-                    .iter()
-                    .find(|(k, _)| k.replace('-', "") == element)
-                    .map(|(_, v)| v)
-            })
-        };
-
-        // Classify members into three categories:
-        //
-        // 1. stable_grid: has grid-column that NEVER reverts → direct child of root
-        // 2. promoted_grid: has grid-column but reverts in some mode → inside mode-switcher
-        // 3. non_grid: no grid-column at all → inside some container
-        let mut stable_grid: HashSet<&str> = HashSet::new();
-        let mut promoted_grid: HashSet<&str> = HashSet::new();
-        let mut non_grid: HashSet<&str> = HashSet::new();
-
-        for (member, element) in &member_to_element {
-            if let Some(info) = lookup_css_el(element) {
-                if info.has_grid_column {
-                    if info.grid_column_reverts {
-                        promoted_grid.insert(member);
-                    } else {
-                        stable_grid.insert(member);
-                    }
-                } else {
-                    non_grid.insert(member);
-                }
+/// Convert a camelCase suffix to kebab-case for CSS element matching.
+/// "ContentSection" → "content-section"
+/// "item" → "item"
+/// "expandableContent" → "expandable-content"
+fn camel_to_kebab(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                result.push('-');
             }
-        }
-
-        if stable_grid.is_empty() && promoted_grid.is_empty() && non_grid.is_empty() {
-            continue;
-        }
-
-        // Find the mode-switching container (display: contents ↔ flex)
-        let mode_switcher: Option<&str> = member_to_element
-            .iter()
-            .find(|(_, element)| {
-                lookup_css_el(element).is_some_and(|info| {
-                    info.is_mode_switcher
-                        || (info.display_values.contains("var") && info.has_grid_column)
-                })
-            })
-            .map(|(member, _)| *member);
-
-        debug!(
-            family = %tree.root,
-            stable_grid = ?stable_grid,
-            promoted_grid = ?promoted_grid,
-            non_grid = ?non_grid,
-            mode_switcher = ?mode_switcher,
-            "CSS grid classification"
-        );
-
-        // Build a set of sibling pairs from CSS `+` / `~` selectors.
-        // If two elements have a sibling relationship in CSS, they must NOT
-        // be nested — the flex-container heuristic must not create a
-        // parent→child edge between them.
-        let css_siblings: HashSet<(String, String)> = css_prof
-            .sibling_relationships
-            .iter()
-            .flat_map(|(a, b)| {
-                let a_norm = a.replace('-', "");
-                let b_norm = b.replace('-', "");
-                vec![(a_norm.clone(), b_norm.clone()), (b_norm, a_norm)]
-            })
-            .collect();
-
-        // Build a set of elements that :has() selectors prove are direct
-        // children of the block root (parent == ""). When :has(> .child)
-        // appears on the block root, the child is root-level and must NOT
-        // be nested inside a sibling element.
-        let root_level_children: HashSet<String> = css_prof
-            .has_containment
-            .iter()
-            .filter(|(parent, _)| parent.is_empty())
-            .map(|(_, child)| child.replace('-', ""))
-            .collect();
-
-        // Helper: check if two elements are CSS siblings
-        let are_css_siblings = |parent_member: &str, child_member: &str| -> bool {
-            let parent_el = member_to_element.get(parent_member);
-            let child_el = member_to_element.get(child_member);
-            if let (Some(p), Some(c)) = (parent_el, child_el) {
-                css_siblings.contains(&(p.clone(), c.clone()))
-            } else {
-                false
-            }
-        };
-
-        // Helper: check if a member is proven to be a root-level child via :has()
-        let is_root_level_child = |member: &str| -> bool {
-            member_to_element
-                .get(member)
-                .is_some_and(|el| root_level_children.contains(el))
-        };
-
-        // Move promoted_grid items under the mode-switcher (skip self)
-        if let Some(switcher) = mode_switcher {
-            for &member in &promoted_grid {
-                if member == switcher {
-                    continue; // Don't move the mode-switcher under itself
-                }
-                tree.edges
-                    .retain(|e| !(e.parent == tree.root && e.child == member));
-                if !tree
-                    .edges
-                    .iter()
-                    .any(|e| e.parent == switcher && e.child == member)
-                {
-                    tree.edges.push(semver_analyzer_core::types::sd::CompositionEdge {
-                        parent: switcher.to_string(),
-                        child: member.to_string(),
-                        relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "CSS grid nesting: {} grid-column reverts in some mode → inside {} (mode-switcher)",
-                            member, switcher
-                        )),
-                    });
-                }
-            }
-        }
-
-        // Move non-grid items using variable_child_refs from the mode-switcher
-        if let Some(switcher) = mode_switcher {
-            let switcher_element = &member_to_element[switcher];
-            if let Some(info) = lookup_css_el(switcher_element) {
-                for child_ref in &info.variable_child_refs {
-                    let child_member = element_to_member.get(child_ref.as_str()).or_else(|| {
-                        let no_hyphen = child_ref.replace('-', "");
-                        element_to_member
-                            .iter()
-                            .find(|(k, _)| k.replace('-', "") == no_hyphen)
-                            .map(|(_, v)| v)
-                    });
-
-                    if let Some(child) = child_member {
-                        // Only move non-grid items via var refs
-                        // (stable_grid items stay as direct children of root)
-                        if !non_grid.contains(child) {
-                            continue;
-                        }
-                        tree.edges
-                            .retain(|e| !(e.parent == tree.root && e.child == *child));
-                        if !tree
-                            .edges
-                            .iter()
-                            .any(|e| e.parent == switcher && e.child == *child)
-                        {
-                            tree.edges.push(semver_analyzer_core::types::sd::CompositionEdge {
-                                parent: switcher.to_string(),
-                                child: child.to_string(),
-                                relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                                required: false,
-                                bem_evidence: Some(format!(
-                                    "CSS grid nesting: {} (no grid-column) → {} (var ref --{}__{}--{})",
-                                    child, switcher, css_prof.block, switcher_element, child_ref
-                                )),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // For remaining non-grid items not yet assigned, find their container.
-        // A non-grid item must be inside SOME flex/grid container that IS a
-        // grid item or promoted_grid item. Among the containers, pick the one
-        // that is itself a flex container (display: flex).
-        //
-        // GUARD: Only run this heuristic when there IS a grid context (at
-        // least one element has grid-column). Without grid signals, the
-        // layout is not grid-based and BEM siblings should stay as direct
-        // children of root. The flex-container heuristic was designed for
-        // Masthead-style CSS grid layouts; applying it to pure-flex families
-        // like Card, EmptyState, or Toolbar incorrectly nests siblings.
-        if stable_grid.is_empty() && promoted_grid.is_empty() {
-            debug!(
-                family = %tree.root,
-                non_grid = ?non_grid,
-                "Skipping flex-container fallback — no grid context"
-            );
-            // Fall through to CSS descendant nesting below
+            result.push(ch.to_ascii_lowercase());
         } else {
-            let unassigned: Vec<&str> = non_grid
-                .iter()
-                .filter(|member| {
-                    !tree
-                        .edges
-                        .iter()
-                        .any(|e| e.child == **member && e.parent != tree.root)
-                })
-                .copied()
-                .collect();
-
-            if !unassigned.is_empty() {
-                // For each unassigned non-grid item, find which flex container
-                // it belongs to. Prefer the promoted_grid container (e.g., brand
-                // is a flex container inside main) over stable_grid containers
-                // (e.g., content is a flex container at root level).
-                //
-                // Heuristic: a non-grid item likely belongs in a flex container
-                // whose BEM element name is a prefix of the non-grid item's
-                // element name (e.g., "logo" could go in "brand" or "content",
-                // but if we can't determine, pick the most specific container).
-                let all_flex_containers: Vec<(&str, &str)> = member_to_element
-                    .iter()
-                    .filter(|(member, element)| {
-                        **member != tree.root
-                            && (mode_switcher != Some(**member))
-                            && lookup_css_el(element)
-                                .is_some_and(|info| info.display_values.contains("flex"))
-                    })
-                    .map(|(member, element)| (*member, element.as_str()))
-                    .collect();
-
-                for &member in &unassigned {
-                    let member_element = &member_to_element[member];
-
-                    // Try to find a container whose variable_child_refs include this element
-                    let via_var_ref = all_flex_containers.iter().find(|(_, el)| {
-                        lookup_css_el(el).is_some_and(|info| {
-                            info.variable_child_refs.contains(member_element.as_str())
-                        })
-                    });
-
-                    let container = if let Some((c, _)) = via_var_ref {
-                        Some(*c)
-                    } else if all_flex_containers.len() == 1 {
-                        Some(all_flex_containers[0].0)
-                    } else {
-                        // Multiple flex containers — use sizing heuristic:
-                        // A sized non-grid element (width/max-height) goes in
-                        // the rigid flex container (flex-shrink: 0), not in
-                        // the wrapping one (flex-wrap: wrap).
-                        let child_has_sizing =
-                            lookup_css_el(member_element).is_some_and(|info| info.has_sizing);
-
-                        if child_has_sizing {
-                            // Find the rigid (non-wrapping) flex container
-                            all_flex_containers
-                                .iter()
-                                .find(|(_, el)| {
-                                    lookup_css_el(el).is_some_and(|info| {
-                                        info.flex_shrink_zero && !info.flex_wrap
-                                    })
-                                })
-                                .map(|(c, _)| *c)
-                        } else {
-                            // Non-sized element → prefer the wrapping container
-                            all_flex_containers
-                                .iter()
-                                .find(|(_, el)| {
-                                    lookup_css_el(el).is_some_and(|info| info.flex_wrap)
-                                })
-                                .map(|(c, _)| *c)
-                        }
-                    };
-
-                    if let Some(container) = container {
-                        // Guard: skip self-referential edges
-                        if container == member {
-                            continue;
-                        }
-                        // Guard: skip if CSS proves they are siblings
-                        if are_css_siblings(container, member) {
-                            debug!(
-                                family = %tree.root,
-                                parent = %container,
-                                child = %member,
-                                "CSS siblings — skipping flex container nesting"
-                            );
-                            continue;
-                        }
-                        // Guard: skip if :has() proves child is root-level
-                        if is_root_level_child(member) {
-                            debug!(
-                                family = %tree.root,
-                                parent = %container,
-                                child = %member,
-                                "CSS :has() proves root-level child — skipping flex container nesting"
-                            );
-                            continue;
-                        }
-                        tree.edges
-                            .retain(|e| !(e.parent == tree.root && e.child == member));
-                        if !tree
-                            .edges
-                            .iter()
-                            .any(|e| e.parent == container && e.child == member)
-                        {
-                            tree.edges
-                                .push(semver_analyzer_core::types::sd::CompositionEdge {
-                                parent: container.to_string(),
-                                child: member.to_string(),
-                                relationship:
-                                    semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                                required: false,
-                                bem_evidence: Some(format!(
-                                "CSS grid nesting: {} (no grid-column) inside {} (flex container)",
-                                member, container
-                            )),
-                            });
-                        }
-                    }
-                }
-            }
-        } // end else: has grid context
-
-        // ── CSS descendant nesting ──────────────────────────────────────
-        //
-        // Use `descendant_nesting` from the CSS profile to discover
-        // parent→child relationships between BEM elements that aren't
-        // captured by grid analysis, React context, or DOM nesting.
-        //
-        // CSS selectors like `.pf-v6-c-menu__content > .pf-v6-c-menu__list`
-        // prove that `content` wraps `list`. If both map to family members
-        // (MenuContent and MenuList), create an intermediate edge and
-        // suppress the root edge.
-        for (css_parent, css_child) in &css_prof.descendant_nesting {
-            // Normalize: CSS uses kebab-case, member_to_element uses lowercase
-            let parent_normalized = css_parent.replace('-', "");
-            let child_normalized = css_child.replace('-', "");
-
-            let parent_member = element_to_member
-                .get(css_parent.as_str())
-                .or_else(|| {
-                    element_to_member
-                        .iter()
-                        .find(|(k, _)| k.replace('-', "") == parent_normalized)
-                        .map(|(_, v)| v)
-                })
-                .copied();
-
-            let child_member = element_to_member
-                .get(css_child.as_str())
-                .or_else(|| {
-                    element_to_member
-                        .iter()
-                        .find(|(k, _)| k.replace('-', "") == child_normalized)
-                        .map(|(_, v)| v)
-                })
-                .copied();
-
-            if let (Some(parent), Some(child)) = (parent_member, child_member) {
-                // Skip self-referential edges
-                if parent == child {
-                    continue;
-                }
-                // Skip if this edge already exists
-                if tree
-                    .edges
-                    .iter()
-                    .any(|e| e.parent == parent && e.child == child)
-                {
-                    continue;
-                }
-
-                debug!(
-                    family = %tree.root,
-                    parent = %parent,
-                    child = %child,
-                    css_parent = %css_parent,
-                    css_child = %css_child,
-                    "CSS descendant nesting: adding intermediate edge"
-                );
-
-                // Remove any root→child edge that this intermediate replaces
-                tree.edges
-                    .retain(|e| !(e.parent == tree.root && e.child == child));
-
-                tree.edges
-                    .push(semver_analyzer_core::types::sd::CompositionEdge {
-                        parent: parent.to_string(),
-                        child: child.to_string(),
-                        relationship:
-                            semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "CSS descendant nesting: .{}__{}  .{}__{}",
-                            css_prof.block, css_parent, css_prof.block, css_child
-                        )),
-                    });
-            }
+            result.push(ch);
         }
     }
-}
-
-/// Find the CSS profile matching a composition tree's component family.
-fn find_matching_css_profile<'a>(
-    tree: &CompositionTree,
-    react_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
-    css_profiles: &'a HashMap<String, crate::css_profile::CssBlockProfile>,
-) -> Option<&'a crate::css_profile::CssBlockProfile> {
-    // Try matching by the root component's bem_block
-    if let Some(root_profile) = react_profiles.get(&tree.root) {
-        if let Some(ref block) = root_profile.bem_block {
-            if let Some(css_prof) = css_profiles.get(block) {
-                return Some(css_prof);
-            }
-        }
-    }
-
-    // Try matching by the dominant bem_block among family members
-    let mut block_counts: HashMap<&str, usize> = HashMap::new();
-    for member in &tree.family_members {
-        if let Some(profile) = react_profiles.get(member) {
-            if let Some(ref block) = profile.bem_block {
-                *block_counts.entry(block.as_str()).or_default() += 1;
-            }
-        }
-    }
-
-    let dominant = block_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(block, _)| block)?;
-
-    css_profiles.get(dominant)
+    result
 }
 
 // ── Internal node collapsing ────────────────────────────────────────────
@@ -1245,45 +806,68 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
     // becomes Modal → ModalBody).
     //
     // We iterate until no more edges reference internal nodes.
+    let mut iteration = 0usize;
     loop {
+        iteration += 1;
         let mut new_edges = Vec::new();
         let mut made_progress = false;
 
-        for internal in &internal_nodes {
-            // Find parents of this internal node (may include other internals)
-            let parents: Vec<String> = tree
-                .edges
-                .iter()
-                .filter(|e| e.child == *internal)
-                .map(|e| e.parent.clone())
-                .collect();
+        if iteration % 10 == 0 || iteration <= 3 {
+            tracing::debug!(
+                root = %tree.root,
+                iteration,
+                edge_count = tree.edges.len(),
+                internal_count = internal_nodes.len(),
+                "collapse_internal_nodes iteration"
+            );
+        }
 
-            // Find children of this internal node
-            let children: Vec<(String, semver_analyzer_core::types::sd::CompositionEdge)> = tree
+        if iteration > 100 {
+            tracing::warn!(
+                root = %tree.root,
+                iteration,
+                edge_count = tree.edges.len(),
+                "collapse_internal_nodes: exceeded 100 iterations, breaking"
+            );
+            break;
+        }
+
+        for internal in &internal_nodes {
+            // Find parent edges INTO this internal node
+            let parent_edges: Vec<&semver_analyzer_core::types::sd::CompositionEdge> =
+                tree.edges.iter().filter(|e| e.child == *internal).collect();
+
+            // Find child edges OUT OF this internal node
+            let child_edges: Vec<&semver_analyzer_core::types::sd::CompositionEdge> = tree
                 .edges
                 .iter()
                 .filter(|e| e.parent == *internal)
-                .map(|e| (e.child.clone(), e.clone()))
                 .collect();
 
-            if !parents.is_empty() && !children.is_empty() {
+            if !parent_edges.is_empty() && !child_edges.is_empty() {
                 made_progress = true;
             }
 
-            for parent in &parents {
-                for (child, original_edge) in &children {
-                    if parent == child {
+            for parent_edge in &parent_edges {
+                for child_edge in &child_edges {
+                    if parent_edge.parent == child_edge.child {
                         continue;
                     }
+                    // Inherit the STRONGER strength of the two edges in the chain.
+                    // Required > Allowed. If either hop is Required, the
+                    // transitive edge is Required.
+                    let strength =
+                        std::cmp::max(parent_edge.strength.clone(), child_edge.strength.clone());
                     new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
-                        parent: parent.clone(),
-                        child: child.clone(),
-                        relationship: original_edge.relationship.clone(),
-                        required: original_edge.required,
+                        parent: parent_edge.parent.clone(),
+                        child: child_edge.child.clone(),
+                        relationship: child_edge.relationship.clone(),
+                        required: child_edge.required,
                         bem_evidence: Some(format!(
                             "Collapsed through internal {}: {} → {} → {}",
-                            internal, parent, internal, child
+                            internal, parent_edge.parent, internal, child_edge.child
                         )),
+                        strength,
                     });
                 }
             }
@@ -1438,6 +1022,7 @@ fn project_delegate_trees(
                         "Projected from {} tree: {} extends {}, {} extends {}",
                         delegate_tree.root, wrapper_parent, edge.parent, wrapper_child, edge.child,
                     )),
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
                 });
         }
     }
@@ -1576,6 +1161,13 @@ fn generate_conformance_checks(
     for edge in &tree.edges {
         // Skip internal edges (not consumer-facing)
         if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal {
+            continue;
+        }
+
+        // Skip Allowed edges — only Required edges generate conformance
+        // checks. Allowed edges (from CSS descendant selectors, flex context)
+        // document valid placements but don't enforce nesting.
+        if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Allowed {
             continue;
         }
 
@@ -1908,6 +1500,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 CompositionEdge {
                     parent: "DropdownList".to_string(),
@@ -1915,6 +1508,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -1958,6 +1552,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
                 // Back-edge: Tab → Tabs (for nested tabs)
                 CompositionEdge {
@@ -1966,6 +1561,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
             ],
         };
@@ -2024,6 +1620,7 @@ export { DropdownList } from './DropdownList';
                 relationship: ChildRelationship::DirectChild,
                 required: false,
                 bem_evidence: None,
+                strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
             }],
         };
 
@@ -2041,6 +1638,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
                 },
                 // New internal edge (collapsed from Tab → OverflowTab → TabTitleText)
                 CompositionEdge {
@@ -2052,6 +1650,7 @@ export { DropdownList } from './DropdownList';
                         "Collapsed through internal OverflowTab: Tab → OverflowTab → TabTitleText"
                             .to_string(),
                     ),
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
                 },
             ],
         };
@@ -2125,332 +1724,16 @@ export { DropdownList } from './DropdownList';
     /// (PageSidebar → PageSidebar) from the CSS enrichment because
     /// the sidebar element is a flex container and also appears as a
     /// non-grid element. The self-referential guard must block this.
-    #[test]
-    fn test_self_referential_edge_blocked_page_sidebar() {
-        // Simulate the Page family: PageSidebar and PageSidebarBody
-        let mut trees = vec![CompositionTree {
-            root: "Page".into(),
-            family_members: vec![
-                "Page".into(),
-                "PageSidebar".into(),
-                "PageSidebarBody".into(),
-            ],
-            edges: vec![
-                CompositionEdge {
-                    parent: "Page".into(),
-                    child: "PageSidebar".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-                CompositionEdge {
-                    parent: "Page".into(),
-                    child: "PageSidebarBody".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-            ],
-        }];
-
-        // CSS profile: sidebar is a flex container, sidebar-body has no grid-column
-        let mut elements = BTreeMap::new();
-        elements.insert("sidebar".to_string(), {
-            let mut info = CssElementInfo::default();
-            info.display_values.insert("flex".to_string());
-            info
-        });
-        elements.insert("sidebar-body".to_string(), CssElementInfo::default());
-
-        let css_profile = CssBlockProfile {
-            block: "page".into(),
-            elements,
-            has_containment: vec![],
-            descendant_nesting: vec![],
-            sibling_relationships: vec![],
-        };
-
-        let mut css_profiles = HashMap::new();
-        css_profiles.insert("page".to_string(), css_profile);
-
-        let mut react_profiles = HashMap::new();
-        react_profiles.insert(
-            "Page".to_string(),
-            make_source_profile_with_block("Page", "page"),
-        );
-        react_profiles.insert(
-            "PageSidebar".to_string(),
-            make_source_profile("PageSidebar"),
-        );
-        react_profiles.insert(
-            "PageSidebarBody".to_string(),
-            make_source_profile("PageSidebarBody"),
-        );
-
-        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
-
-        // There must NOT be a PageSidebar → PageSidebar edge
-        let self_edges: Vec<_> = trees[0]
-            .edges
-            .iter()
-            .filter(|e| e.parent == e.child)
-            .collect();
-        assert!(
-            self_edges.is_empty(),
-            "Self-referential edges must be blocked. Found: {:?}",
-            self_edges
-        );
-    }
 
     /// Real PatternFly case: TextInputGroupMain and TextInputGroupUtilities
     /// are siblings under TextInputGroup. CSS has
     /// `.pf-v6-c-text-input-group:has(> .pf-v6-c-text-input-group__utilities)`
     /// proving utilities is a root-level direct child, NOT inside main.
-    #[test]
-    fn test_has_containment_prevents_sibling_nesting_textinputgroup() {
-        let mut trees = vec![CompositionTree {
-            root: "TextInputGroup".into(),
-            family_members: vec![
-                "TextInputGroup".into(),
-                "TextInputGroupMain".into(),
-                "TextInputGroupUtilities".into(),
-            ],
-            edges: vec![
-                CompositionEdge {
-                    parent: "TextInputGroup".into(),
-                    child: "TextInputGroupMain".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-                CompositionEdge {
-                    parent: "TextInputGroup".into(),
-                    child: "TextInputGroupUtilities".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-            ],
-        }];
-
-        let mut elements = BTreeMap::new();
-        elements.insert("main".to_string(), {
-            let mut info = CssElementInfo::default();
-            info.display_values.insert("flex".to_string());
-            info
-        });
-        elements.insert("utilities".to_string(), {
-            let mut info = CssElementInfo::default();
-            info.display_values.insert("flex".to_string());
-            info
-        });
-
-        let css_profile = CssBlockProfile {
-            block: "text-input-group".into(),
-            elements,
-            has_containment: vec![("".to_string(), "utilities".to_string())],
-            descendant_nesting: vec![],
-            sibling_relationships: vec![],
-        };
-
-        let mut css_profiles = HashMap::new();
-        css_profiles.insert("text-input-group".to_string(), css_profile);
-
-        let mut react_profiles = HashMap::new();
-        react_profiles.insert(
-            "TextInputGroup".into(),
-            make_source_profile_with_block("TextInputGroup", "text-input-group"),
-        );
-        react_profiles.insert(
-            "TextInputGroupMain".into(),
-            make_source_profile("TextInputGroupMain"),
-        );
-        react_profiles.insert(
-            "TextInputGroupUtilities".into(),
-            make_source_profile("TextInputGroupUtilities"),
-        );
-
-        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
-
-        let bad_nesting: Vec<_> = trees[0]
-            .edges
-            .iter()
-            .filter(|e| e.parent == "TextInputGroupMain" && e.child == "TextInputGroupUtilities")
-            .collect();
-        assert!(
-            bad_nesting.is_empty(),
-            "TextInputGroupUtilities must NOT be nested inside TextInputGroupMain. Found: {:?}",
-            bad_nesting
-        );
-
-        let root_edges: Vec<_> = trees[0]
-            .edges
-            .iter()
-            .filter(|e| e.parent == "TextInputGroup" && e.child == "TextInputGroupUtilities")
-            .collect();
-        assert!(
-            !root_edges.is_empty(),
-            "TextInputGroupUtilities should remain as a child of TextInputGroup"
-        );
-    }
 
     /// Real PatternFly case: Card header contains title (proven by CSS
     /// `.pf-v6-c-card__header .pf-v6-c-card__title`). Valid nesting.
-    #[test]
-    fn test_css_descendant_nesting_card_header_title() {
-        let mut trees = vec![CompositionTree {
-            root: "Card".into(),
-            family_members: vec![
-                "Card".into(),
-                "CardHeader".into(),
-                "CardTitle".into(),
-                "CardBody".into(),
-            ],
-            edges: vec![
-                CompositionEdge {
-                    parent: "Card".into(),
-                    child: "CardHeader".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-                CompositionEdge {
-                    parent: "Card".into(),
-                    child: "CardTitle".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-                CompositionEdge {
-                    parent: "Card".into(),
-                    child: "CardBody".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-            ],
-        }];
-
-        let mut elements = BTreeMap::new();
-        elements.insert("header".to_string(), {
-            let mut info = CssElementInfo::default();
-            info.display_values.insert("flex".to_string());
-            info
-        });
-        elements.insert("title".to_string(), CssElementInfo::default());
-        elements.insert("body".to_string(), CssElementInfo::default());
-
-        let css_profile = CssBlockProfile {
-            block: "card".into(),
-            elements,
-            has_containment: vec![],
-            descendant_nesting: vec![("header".to_string(), "title".to_string())],
-            sibling_relationships: vec![],
-        };
-
-        let mut css_profiles = HashMap::new();
-        css_profiles.insert("card".to_string(), css_profile);
-
-        let mut react_profiles = HashMap::new();
-        react_profiles.insert(
-            "Card".into(),
-            make_source_profile_with_block("Card", "card"),
-        );
-        react_profiles.insert("CardHeader".into(), make_source_profile("CardHeader"));
-        react_profiles.insert("CardTitle".into(), make_source_profile("CardTitle"));
-        react_profiles.insert("CardBody".into(), make_source_profile("CardBody"));
-
-        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
-
-        let header_title: Vec<_> = trees[0]
-            .edges
-            .iter()
-            .filter(|e| e.parent == "CardHeader" && e.child == "CardTitle")
-            .collect();
-        assert!(
-            !header_title.is_empty(),
-            "CardHeader → CardTitle should be created from CSS descendant selector"
-        );
-
-        let root_title: Vec<_> = trees[0]
-            .edges
-            .iter()
-            .filter(|e| e.parent == "Card" && e.child == "CardTitle")
-            .collect();
-        assert!(
-            root_title.is_empty(),
-            "Card → CardTitle root edge should be removed (subsumed by CardHeader → CardTitle)"
-        );
-    }
 
     /// CSS sibling selectors prevent nesting.
-    #[test]
-    fn test_css_sibling_selector_prevents_nesting() {
-        let mut trees = vec![CompositionTree {
-            root: "Page".into(),
-            family_members: vec![
-                "Page".into(),
-                "PageSidebar".into(),
-                "PageMainContainer".into(),
-            ],
-            edges: vec![
-                CompositionEdge {
-                    parent: "Page".into(),
-                    child: "PageSidebar".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-                CompositionEdge {
-                    parent: "Page".into(),
-                    child: "PageMainContainer".into(),
-                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("BEM element".into()),
-                },
-            ],
-        }];
-
-        let mut elements = BTreeMap::new();
-        elements.insert("sidebar".to_string(), {
-            let mut info = CssElementInfo::default();
-            info.display_values.insert("flex".to_string());
-            info
-        });
-        elements.insert("main-container".to_string(), CssElementInfo::default());
-
-        let css_profile = CssBlockProfile {
-            block: "page".into(),
-            elements,
-            has_containment: vec![],
-            descendant_nesting: vec![],
-            sibling_relationships: vec![("sidebar".to_string(), "main-container".to_string())],
-        };
-
-        let mut css_profiles = HashMap::new();
-        css_profiles.insert("page".to_string(), css_profile);
-
-        let mut react_profiles = HashMap::new();
-        react_profiles.insert(
-            "Page".into(),
-            make_source_profile_with_block("Page", "page"),
-        );
-        react_profiles.insert("PageSidebar".into(), make_source_profile("PageSidebar"));
-        react_profiles.insert(
-            "PageMainContainer".into(),
-            make_source_profile("PageMainContainer"),
-        );
-
-        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
-
-        let bad_nesting: Vec<_> = trees[0]
-            .edges
-            .iter()
-            .filter(|e| e.parent == "PageSidebar" && e.child == "PageMainContainer")
-            .collect();
-        assert!(bad_nesting.is_empty(),
-            "CSS sibling selector proves PageMainContainer is a sibling of PageSidebar. Found: {:?}", bad_nesting);
-    }
 
     // ── Deprecated migration diffing tests ──────────────────────────
 

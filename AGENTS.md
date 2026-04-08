@@ -111,14 +111,100 @@ a single Renamed.
 
 Source profiles are extracted in `crates/ts/src/source_profile/`. Submodules:
 
-- `mod.rs` — Main extraction, JSX walking
+- `mod.rs` — Main extraction, JSX walking (also detects cloneElement inline)
 - `prop_defaults.rs` — Default value extraction from destructuring
 - `prop_style.rs` — Prop-to-CSS-class binding detection
 - `managed_attrs.rs` — Prop-overrides-attribute dataflow tracing
 - `diff.rs` — Profile diffing to produce SourceLevelChange entries
 - `bem.rs` — BEM CSS structure parsing
-- `children_slot.rs` — Children wrapper path tracing
+- `children_slot.rs` — Children wrapper path tracing + CSS token detail
+- `clone_element.rs` — cloneElement prop injection detection
 - `react_api.rs` — React API usage detection (portal, memo, forwardRef)
+
+### Composition Tree V2 Architecture (CRITICAL)
+
+The v2 composition tree builder (`build_composition_tree_v2` in
+`composition/mod.rs`) replaces BEM-based edge creation with evidence-based
+signals. **BEM determines family membership only. All parent-child edges come
+from structural evidence.**
+
+#### Signal Steps (in order)
+
+| Step | Signal | Strength | Rationale |
+|------|--------|----------|-----------|
+| 1 | Internal rendering | Required | Component literally renders the child |
+| 2 | CSS direct-child `>` | Required | Styles require exact parent-child DOM |
+| 3 | CSS grid parent-child | Required | Layout breaks without grid container |
+| 3b | CSS implicit grid child | Required | Same — grid layout dependency |
+| 4 | CSS flex context | Allowed | Layout preference, not strict |
+| 5 | CSS descendant ` ` | Allowed | Works at any depth |
+| 6 | React context | Required | Null context = crash/broken behavior |
+| 7 | DOM nesting | Required | Invalid HTML without correct parent |
+| 8 | cloneElement | Required | Missing injected props breaks functionality |
+
+After all steps, members with zero incoming edges are dropped from the tree
+(no "default to root" guessing).
+
+#### EdgeStrength: Required vs Allowed
+
+Every edge has a `strength: EdgeStrength` field:
+
+- **Required** — Rendering breaks without this nesting. Generates conformance
+  rules (`notParent` checks in the scanner).
+- **Allowed** — Valid placement documented in CSS but not the only option. Stays
+  in the tree for migration guidance but produces zero conformance rules.
+
+Conformance rule generation (`konveyor_v2.rs` and `sd_pipeline.rs`) filters
+edges by `strength == Required` before generating `notParent` rules.
+
+Collapsed edges (from `collapse_internal_nodes`) inherit the **stronger** of
+the two edges in the chain.
+
+#### CSS Element → Component Mapping (CRITICAL)
+
+`build_css_element_to_component_map` maps CSS BEM element names to React
+components via `css_tokens_used`. **Tokens are stored with the `"styles."`
+prefix** (e.g., `"styles.drawerBody"`). The mapping function must strip
+`"styles."` before matching against the BEM block name. Skip `"styles.modifiers."`
+tokens — they don't map to BEM elements.
+
+#### CSS Profile Loading
+
+CSS profiles are loaded from a dependency repo (e.g., `@patternfly/patternfly`).
+The orchestrator uses `WorktreeGuard::create_only` for the dep repo (not
+`WorktreeGuard::new`, which requires tsconfig.json). The caller-provided build
+command (e.g., `yarn install && npx gulp buildPatternfly`) runs directly in
+the worktree.
+
+Multiple CSS files per component directory are all read and merged via
+`merge_css_profile`. The old `enrich_trees_with_css` function is no longer
+called — CSS enrichment is integrated into the v2 builder.
+
+#### children_slot_detail
+
+A parallel field to `children_slot_path` that captures CSS tokens alongside
+tag names. Each entry is `(tag_name, Option<css_token>)`. Used by the flex
+context step (step 4) to determine what CSS element wraps `{children}`:
+
+```
+children_slot_path:   ["div", "div"]
+children_slot_detail: [("div", Some("toolbarContent")), ("div", Some("toolbarContentSection"))]
+```
+
+Extraction uses a single AST parse via `trace_children_slot_both` (not separate
+parses for path and detail).
+
+#### Known Issues
+
+- **Shared CSS token**: Multiple components render the same CSS class (e.g.,
+  `DrawerContentBody` and `DrawerPanelBody` both render `__body`). First
+  component registered wins in the mapping. Needs multi-component token map
+  with parent-context disambiguation.
+- **Non-component exports**: Context objects, type exports may appear as family
+  members if they have any structural signal. Need filtering.
+- **Prop-based composition**: Components passed via props (e.g., `panelContent`
+  on DrawerContent) create collapsed edges that look like children composition.
+  The TD pipeline handles these separately.
 
 ### BEM Block Independence (CRITICAL)
 
@@ -162,6 +248,13 @@ The rule generator in `konveyor_v2.rs` creates three types of composition rules:
 - **`new-member`** — Removed. The migration rule (`component-import-deprecated`)
   already lists new child components in its message. New-member rules fired on
   every parent usage regardless of whether the new child was already present.
+
+**Conformance rules are filtered by `EdgeStrength::Required`.** Only edges
+where rendering actually breaks (CSS `>` selectors, grid layout, context,
+DOM nesting, cloneElement) generate `notParent` conformance rules. Edges from
+CSS descendant selectors and flex context (tagged `Allowed`) stay in the tree
+for documentation but don't generate scanner rules. This prevents false
+positives from CSS descendant selectors that match at any depth.
 
 **Migration rule `when` clauses** (`component-import-deprecated`) use:
 - `JSX_PROP` conditions (one per removed prop) for Modified components — only
@@ -239,7 +332,7 @@ Tests: `deprecated_replacement_tests` module in `src/orchestrator.rs` (15 tests)
 ### Testing
 
 ```sh
-cargo test -p semver-analyzer-ts --lib    # ~589 unit tests
+cargo test -p semver-analyzer-ts --lib    # ~650 unit tests
 cargo test -p semver-analyzer-ts          # + integration tests
 cargo test                                # full suite
 ```

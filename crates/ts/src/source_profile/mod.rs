@@ -12,6 +12,7 @@
 
 pub mod bem;
 pub mod children_slot;
+pub mod clone_element;
 pub mod diff;
 pub mod managed_attrs;
 pub mod prop_defaults;
@@ -19,7 +20,9 @@ pub mod prop_style;
 pub mod react_api;
 
 use bem::{extract_style_tokens, parse_bem_structure, StyleToken};
-use children_slot::{has_children_prop, trace_children_slot};
+use children_slot::{has_children_prop, trace_children_slot_both};
+// clone_element detection is done inline during the main AST walk
+// (via clone_element::try_extract_clone_element_from_call)
 use managed_attrs::extract_managed_attributes;
 use prop_defaults::extract_prop_defaults;
 use prop_style::extract_prop_style_bindings;
@@ -104,9 +107,11 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
     // 4. Prop defaults
     profile.prop_defaults = extract_prop_defaults(source);
 
-    // 5. Children slot
+    // 5. Children slot (single parse for both path and detail)
     profile.has_children_prop = has_children_prop(source);
-    profile.children_slot_path = trace_children_slot(source);
+    let (slot_path, slot_detail) = trace_children_slot_both(source);
+    profile.children_slot_path = slot_path;
+    profile.children_slot_detail = slot_detail;
 
     // 6. Props extends — from AST interface declarations
     profile.extends_props = ast_info.extends_props;
@@ -119,16 +124,26 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
     // 8. Prop-to-style bindings — trace which props gate CSS class application
     profile.prop_style_bindings = extract_prop_style_bindings(source, &profile.all_props);
 
-    // 7. Provided contexts — derived from rendered_components
-    profile.provided_contexts = profile
-        .rendered_components
-        .iter()
-        .filter_map(|rc| rc.strip_suffix(".Provider").map(|s| s.to_string()))
-        .collect();
+    // 7. Provided contexts — from AST-detected <XContext.Provider> JSX elements
+    profile.provided_contexts = ast_info.context_providers;
+
+    // 7b. Consumed contexts — merge useContext() hook calls (from react_api)
+    //     with <XContext.Consumer> JSX elements (from AST).
+    //     Class components use <Context.Consumer> render-prop pattern;
+    //     function components use useContext() hooks. Both mean "I need this
+    //     context provider above me."
+    for ctx_name in ast_info.context_consumers {
+        if !profile.consumed_contexts.contains(&ctx_name) {
+            profile.consumed_contexts.push(ctx_name);
+        }
+    }
 
     // 9. Managed attribute bindings — detect prop-overrides-attribute patterns
     profile.managed_attributes =
         extract_managed_attributes(source, name, &profile.all_props, &profile.data_attributes);
+
+    // 10. cloneElement injections — detected during the main AST walk above
+    profile.clone_element_injections = ast_info.clone_element_injections;
 
     profile
 }
@@ -166,6 +181,14 @@ struct FullSourceInfo {
     role_attrs: BTreeMap<String, String>,
     data_attrs: BTreeMap<(String, String), String>,
 
+    // ── React Context (from JSX AST) ────────────────────────────────
+    /// Context names provided via `<XContext.Provider>` JSX elements.
+    /// Detected from JSX member expressions with `.Provider` property.
+    context_providers: Vec<String>,
+    /// Context names consumed via `<XContext.Consumer>` JSX elements.
+    /// Detected from JSX member expressions with `.Consumer` property.
+    context_consumers: Vec<String>,
+
     // ── Imports ─────────────────────────────────────────────────────
     /// BEM block name derived from the primary `styles` import path.
     /// e.g., `import styles from '@patternfly/react-styles/css/components/Menu/menu'`
@@ -184,6 +207,10 @@ struct FullSourceInfo {
     required_props: BTreeSet<String>,
     /// Prop name → type annotation string.
     prop_types: BTreeMap<String, String>,
+
+    // ── cloneElement ────────────────────────────────────────────────
+    /// Props injected via cloneElement, detected during AST walk.
+    clone_element_injections: Vec<semver_analyzer_core::types::sd::CloneElementInjection>,
 }
 
 /// Extract all AST-level info from a full source file in a single parse.
@@ -500,6 +527,10 @@ fn walk_expr_for_jsx<'a>(expr: &'a Expression<'a>, source: &str, info: &mut Full
             walk_expr_for_jsx(&logical.right, source, info);
         }
         Expression::CallExpression(call) => {
+            // Detect cloneElement(child, { prop1, prop2 }) calls
+            if let Some(injection) = clone_element::try_extract_clone_element_from_call(call) {
+                info.clone_element_injections.push(injection);
+            }
             for arg in &call.arguments {
                 if let Some(expr) = arg.as_expression() {
                     walk_expr_for_jsx(expr, source, info);
@@ -539,6 +570,24 @@ fn visit_jsx_element_info<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut F
     let tag_name = jsx_element_name_str(&el.opening_element.name);
 
     *info.element_tags.entry(tag_name.clone()).or_insert(0) += 1;
+
+    // Detect React Context usage from JSX member expressions:
+    //   <XContext.Provider ...>  → context_providers += "XContext"
+    //   <XContext.Consumer>      → context_consumers += "XContext"
+    if let JSXElementName::MemberExpression(member) = &el.opening_element.name {
+        let prop = member.property.name.as_str();
+        if prop == "Provider" || prop == "Consumer" {
+            let ctx_name = jsx_member_obj_str(&member.object);
+            let list = if prop == "Provider" {
+                &mut info.context_providers
+            } else {
+                &mut info.context_consumers
+            };
+            if !list.contains(&ctx_name) {
+                list.push(ctx_name);
+            }
+        }
+    }
 
     // Extract attributes
     for attr_item in &el.opening_element.attributes {
@@ -807,6 +856,162 @@ mod tests {
         assert_eq!(
             profile.prop_defaults.get("isDisabled"),
             Some(&"false".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_profile_class_component_consumer() {
+        // Class component using <XContext.Consumer> render-prop pattern.
+        // This is how Toolbar family components consume context.
+        let source = r#"
+            import { Component } from 'react';
+            import { ToolbarContentContext, ToolbarContext } from './ToolbarUtils';
+            import { PageContext } from '../Page/PageContext';
+
+            class ToolbarToggleGroup extends Component<ToolbarToggleGroupProps> {
+                render() {
+                    return (
+                        <PageContext.Consumer>
+                            {({ width }) => (
+                                <ToolbarContext.Consumer>
+                                    {({ isExpanded }) => (
+                                        <ToolbarContentContext.Consumer>
+                                            {({ expandableContentRef }) => (
+                                                <div>{this.props.children}</div>
+                                            )}
+                                        </ToolbarContentContext.Consumer>
+                                    )}
+                                </ToolbarContext.Consumer>
+                            )}
+                        </PageContext.Consumer>
+                    );
+                }
+            }
+            export { ToolbarToggleGroup };
+        "#;
+
+        let profile = extract_profile("ToolbarToggleGroup", "ToolbarToggleGroup.tsx", source);
+        assert!(
+            profile
+                .consumed_contexts
+                .contains(&"ToolbarContentContext".to_string()),
+            "Expected ToolbarContentContext in consumed_contexts, got: {:?}",
+            profile.consumed_contexts
+        );
+        assert!(
+            profile
+                .consumed_contexts
+                .contains(&"ToolbarContext".to_string()),
+            "Expected ToolbarContext in consumed_contexts, got: {:?}",
+            profile.consumed_contexts
+        );
+        assert!(
+            profile
+                .consumed_contexts
+                .contains(&"PageContext".to_string()),
+            "Expected PageContext in consumed_contexts, got: {:?}",
+            profile.consumed_contexts
+        );
+    }
+
+    #[test]
+    fn test_extract_profile_class_component_provider_and_consumer() {
+        // ToolbarContent: provides ToolbarContentContext, consumes ToolbarContext.
+        // This is the "bridge" component that the context nesting inference
+        // should detect as a required intermediate.
+        let source = r#"
+            import { Component } from 'react';
+            import { ToolbarContentContext, ToolbarContext } from './ToolbarUtils';
+
+            export interface ToolbarContentProps {
+                children?: React.ReactNode;
+            }
+
+            class ToolbarContent extends Component<ToolbarContentProps> {
+                render() {
+                    return (
+                        <ToolbarContext.Consumer>
+                            {({ clearAllFilters }) => (
+                                <ToolbarContentContext.Provider
+                                    value={{
+                                        expandableContentRef: this.expandableContentRef,
+                                        isExpanded: this.props.isExpanded,
+                                    }}
+                                >
+                                    <div>{this.props.children}</div>
+                                </ToolbarContentContext.Provider>
+                            )}
+                        </ToolbarContext.Consumer>
+                    );
+                }
+            }
+            export { ToolbarContent };
+        "#;
+
+        let profile = extract_profile("ToolbarContent", "ToolbarContent.tsx", source);
+
+        // Should PROVIDE ToolbarContentContext
+        assert!(
+            profile
+                .provided_contexts
+                .contains(&"ToolbarContentContext".to_string()),
+            "Expected ToolbarContentContext in provided_contexts, got: {:?}",
+            profile.provided_contexts
+        );
+
+        // Should CONSUME ToolbarContext
+        assert!(
+            profile
+                .consumed_contexts
+                .contains(&"ToolbarContext".to_string()),
+            "Expected ToolbarContext in consumed_contexts, got: {:?}",
+            profile.consumed_contexts
+        );
+
+        // Should have children prop
+        assert!(profile.has_children_prop);
+    }
+
+    #[test]
+    fn test_extract_profile_usecontext_and_consumer_merged() {
+        // Component that uses BOTH useContext() and <X.Consumer> —
+        // consumed_contexts should contain both without duplicates.
+        let source = r#"
+            import { useContext } from 'react';
+            import { AccordionItemContext } from './AccordionItemContext';
+            import { AccordionContext } from './AccordionContext';
+
+            export const AccordionToggle = ({ children }: Props) => {
+                const { isExpanded } = useContext(AccordionItemContext);
+                return (
+                    <AccordionContext.Consumer>
+                        {({ displaySize }) => (
+                            <button>{children}</button>
+                        )}
+                    </AccordionContext.Consumer>
+                );
+            };
+        "#;
+
+        let profile = extract_profile("AccordionToggle", "AccordionToggle.tsx", source);
+        assert!(
+            profile
+                .consumed_contexts
+                .contains(&"AccordionItemContext".to_string()),
+            "Should detect useContext(AccordionItemContext)"
+        );
+        assert!(
+            profile
+                .consumed_contexts
+                .contains(&"AccordionContext".to_string()),
+            "Should detect <AccordionContext.Consumer>"
+        );
+        // No duplicates
+        let unique: std::collections::HashSet<_> = profile.consumed_contexts.iter().collect();
+        assert_eq!(
+            unique.len(),
+            profile.consumed_contexts.len(),
+            "consumed_contexts should have no duplicates"
         );
     }
 

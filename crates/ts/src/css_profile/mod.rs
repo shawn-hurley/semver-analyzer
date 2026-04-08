@@ -39,12 +39,29 @@ pub struct CssBlockProfile {
     /// Key: parent element, Value: child element that must be inside it.
     pub has_containment: Vec<(String, String)>,
 
-    /// Descendant relationships from CSS descendant combinators.
-    /// `parent__element child__element` → parent contains child.
+    /// Direct-child relationships from CSS `>` (child) combinators.
+    /// `.block__parent > .block__child` → child is a direct child of parent.
+    /// Stronger signal than descendant nesting.
+    pub direct_child_nesting: Vec<(String, String)>,
+
+    /// Descendant relationships from CSS space (descendant) combinators.
+    /// `.block__parent .block__child` → child is somewhere inside parent.
+    /// Weaker signal — proves ancestor-descendant but not direct parent-child.
     pub descendant_nesting: Vec<(String, String)>,
 
     /// Sibling relationships from `~` or `+` combinators.
     pub sibling_relationships: Vec<(String, String)>,
+
+    /// Layout container → child relationships inferred from CSS display model.
+    ///
+    /// When BEM elements share a CSS rule (are CSS siblings) and one of them
+    /// is a layout container (has `flex-wrap`, `gap`, or is `display: grid`
+    /// with layout properties), the container wraps the others.
+    ///
+    /// Example: `.toolbar__content-section, .toolbar__group, .toolbar__item`
+    /// share a rule. `content-section` has `flex-wrap: wrap` → it's the
+    /// container. So `(content-section, group)` and `(content-section, item)`.
+    pub layout_children: Vec<(String, String)>,
 }
 
 /// Layout-relevant CSS properties for a BEM element.
@@ -61,6 +78,11 @@ pub struct CssElementInfo {
 
     /// Whether this element has a `grid-row` assignment.
     pub has_grid_row: bool,
+
+    /// Whether this element defines a grid layout via `grid-template-columns`
+    /// or `grid-template-rows`. This makes it a grid **container** (as opposed
+    /// to a grid child which has `grid-column`/`grid-row`).
+    pub has_grid_template: bool,
 
     /// Display values seen (may vary by mode/breakpoint).
     pub display_values: BTreeSet<String>,
@@ -113,9 +135,16 @@ pub fn extract_css_profiles(
                     block = %profile.block,
                     elements = profile.elements.len(),
                     has_rules = profile.has_containment.len(),
+                    file = %css_path,
                     "CSS profile extracted"
                 );
-                profiles.insert(profile.block.clone(), profile);
+                // Merge into existing profile if we've already seen this block
+                // (multiple CSS files per component directory)
+                if let Some(existing) = profiles.get_mut(&profile.block) {
+                    merge_css_profile(existing, profile);
+                } else {
+                    profiles.insert(profile.block.clone(), profile);
+                }
             }
             Err(e) => {
                 warn!(file = %css_path, %e, "failed to parse CSS");
@@ -161,7 +190,8 @@ pub fn extract_css_profiles_from_dir(dir: &Path) -> Result<HashMap<String, CssBl
         }
         let component_dir_name = entry.file_name().to_string_lossy().to_string();
 
-        // Find the main CSS file in this component directory
+        // Read ALL CSS files in this component directory — each may contribute
+        // structural signals to the same block profile.
         for css_entry in std::fs::read_dir(entry.path())? {
             let css_entry = css_entry?;
             let css_path = css_entry.path();
@@ -183,8 +213,11 @@ pub fn extract_css_profiles_from_dir(dir: &Path) -> Result<HashMap<String, CssBl
                             file = %css_path.display(),
                             "CSS profile extracted from dir"
                         );
-                        profiles.insert(profile.block.clone(), profile);
-                        break; // One CSS file per component dir
+                        if let Some(existing) = profiles.get_mut(&profile.block) {
+                            merge_css_profile(existing, profile);
+                        } else {
+                            profiles.insert(profile.block.clone(), profile);
+                        }
                     }
                     Err(e) => {
                         warn!(file = %css_path.display(), %e, "failed to parse CSS");
@@ -226,41 +259,126 @@ fn find_component_css_files(repo: &Path, git_ref: &str) -> Result<Vec<(String, S
         anyhow::bail!("git ls-tree failed");
     }
 
-    let mut seen_dirs = std::collections::HashSet::new();
-    let files: Vec<(String, String)> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let path = line.trim();
-            if !path.ends_with(".css") {
-                return None;
-            }
-            // Skip minified, sourcemap, example, and test files
-            if path.contains(".min.css")
-                || path.contains(".map")
-                || path.contains("/examples/")
-                || path.contains("/test")
-            {
-                return None;
-            }
+    // Collect ALL CSS files per component directory — each one may contribute
+    // structural signals to the same block profile.
+    let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
 
-            // Look for CSS files under a components/ or dist/components/ directory
-            let parts: Vec<&str> = path.split('/').collect();
-            let comp_idx = parts.iter().position(|&p| p == "components")?;
-            if comp_idx + 2 >= parts.len() {
-                return None;
-            }
-            let component_dir = parts[comp_idx + 1].to_string();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let path = line.trim();
+        if !path.ends_with(".css") {
+            continue;
+        }
+        // Skip minified, sourcemap, example, and test files
+        if path.contains(".min.css")
+            || path.contains(".map")
+            || path.contains("/examples/")
+            || path.contains("/test")
+        {
+            continue;
+        }
 
-            // Only take one CSS file per component directory (the main one)
-            if !seen_dirs.insert(component_dir.clone()) {
-                return None;
-            }
+        // Look for CSS files under a components/ or dist/components/ directory
+        let parts: Vec<&str> = path.split('/').collect();
+        let Some(comp_idx) = parts.iter().position(|&p| p == "components") else {
+            continue;
+        };
+        if comp_idx + 2 >= parts.len() {
+            continue;
+        }
+        let component_dir = parts[comp_idx + 1].to_string();
 
-            Some((component_dir, path.to_string()))
-        })
-        .collect();
+        candidates
+            .entry(component_dir)
+            .or_default()
+            .push(path.to_string());
+    }
+
+    // Flatten: return all CSS files, sorted so the main file (matching dir name)
+    // comes first per directory. The caller reads all of them and merges profiles.
+    let mut files = Vec::new();
+    for (dir, mut paths) in candidates {
+        let expected_stem = pascal_to_kebab(&dir);
+        let expected_name = format!("{}.css", expected_stem);
+
+        // Sort: main file first, then by name length (shorter = more primary)
+        paths.sort_by(|a, b| {
+            let a_name = a.rsplit('/').next().unwrap_or(a);
+            let b_name = b.rsplit('/').next().unwrap_or(b);
+            let a_match = a_name == expected_name;
+            let b_match = b_name == expected_name;
+            b_match
+                .cmp(&a_match)
+                .then_with(|| a_name.len().cmp(&b_name.len()))
+        });
+
+        for path in paths {
+            files.push((dir.clone(), path));
+        }
+    }
 
     Ok(files)
+}
+
+/// Convert PascalCase to kebab-case.
+/// e.g., "DescriptionList" → "description-list"
+fn pascal_to_kebab(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('-');
+        }
+        result.push(ch.to_ascii_lowercase());
+    }
+    result
+}
+
+/// Merge a secondary CSS profile into an existing one.
+///
+/// Combines elements, nesting relationships, and containment data from
+/// multiple CSS files for the same component (e.g., `description-list.css`
+/// and `description-list-order.css`).
+fn merge_css_profile(existing: &mut CssBlockProfile, other: CssBlockProfile) {
+    // Merge elements: combine layout properties
+    for (name, info) in other.elements {
+        let entry = existing.elements.entry(name).or_default();
+        entry.has_grid_column |= info.has_grid_column;
+        entry.grid_column_reverts |= info.grid_column_reverts;
+        entry.has_grid_row |= info.has_grid_row;
+        entry.has_grid_template |= info.has_grid_template;
+        entry.display_values.extend(info.display_values);
+        entry.is_mode_switcher |= info.is_mode_switcher;
+        entry.flex_shrink_zero |= info.flex_shrink_zero;
+        entry.flex_wrap |= info.flex_wrap;
+        entry.has_sizing |= info.has_sizing;
+        entry.variable_child_refs.extend(info.variable_child_refs);
+    }
+
+    // Merge relationships (deduplicate)
+    for pair in other.has_containment {
+        if !existing.has_containment.contains(&pair) {
+            existing.has_containment.push(pair);
+        }
+    }
+    for pair in other.direct_child_nesting {
+        if !existing.direct_child_nesting.contains(&pair) {
+            existing.direct_child_nesting.push(pair);
+        }
+    }
+    for pair in other.descendant_nesting {
+        if !existing.descendant_nesting.contains(&pair) {
+            existing.descendant_nesting.push(pair);
+        }
+    }
+    for pair in other.sibling_relationships {
+        if !existing.sibling_relationships.contains(&pair) {
+            existing.sibling_relationships.push(pair);
+        }
+    }
+    for pair in other.layout_children {
+        if !existing.layout_children.contains(&pair) {
+            existing.layout_children.push(pair);
+        }
+    }
 }
 
 /// Extract a CSS block profile from a CSS source string.
@@ -288,9 +406,11 @@ fn extract_css_block_profile(source: &str, _component_dir: &str) -> Result<CssBl
         ..Default::default()
     };
 
-    // Step 2: Walk all rules using the detected block class as prefix
+    // Step 2: Walk all rules using the detected block class as prefix.
+    // Also collect selector groups (multi-element rules) for layout inference.
+    let mut selector_groups: Vec<BTreeSet<String>> = Vec::new();
     for rule in &stylesheet.rules.0 {
-        extract_from_rule(rule, &block_class, &mut profile);
+        extract_from_rule(rule, &block_class, &mut profile, &mut selector_groups);
     }
 
     // Step 3: Detect mode-switchers (display: contents ↔ flex/grid)
@@ -311,6 +431,19 @@ fn extract_css_block_profile(source: &str, _component_dir: &str) -> Result<CssBl
     // Step 5: Detect elements whose grid-column reverts in some mode.
     // Pattern: --{block}--m-*__{element}--GridColumn: initial/unset/revert
     detect_grid_column_reverts(source, &block_class, &mut profile);
+
+    // Step 6: Infer layout container → child relationships from CSS display model.
+    //
+    // When BEM elements share a CSS rule (selector_groups), they're at the same
+    // "CSS level" — they receive the same display/visibility treatment. Among
+    // these siblings, elements with `flex-wrap` (or `display: grid` + grid
+    // properties) are layout containers; the others are layout children.
+    //
+    // Example: `.toolbar__content-section, .toolbar__group, .toolbar__item`
+    // share a rule. `content-section` has `flex-wrap: wrap` in another rule →
+    // container. `group` and `item` don't → they're flex children of
+    // `content-section`.
+    infer_layout_children(&mut profile, &selector_groups);
 
     Ok(profile)
 }
@@ -362,12 +495,40 @@ fn derive_block_name(block_class: &str) -> String {
 }
 
 /// Walk a CSS rule, extracting layout properties and selector relationships.
-fn extract_from_rule(rule: &CssRule, class_prefix: &str, profile: &mut CssBlockProfile) {
+///
+/// `selector_groups` collects sets of BEM elements that appear together in
+/// the same CSS rule's selector list (CSS siblings). After all rules are
+/// processed, these groups are used to infer layout container → child
+/// relationships.
+fn extract_from_rule(
+    rule: &CssRule,
+    class_prefix: &str,
+    profile: &mut CssBlockProfile,
+    selector_groups: &mut Vec<BTreeSet<String>>,
+) {
     match rule {
         CssRule::Style(style_rule) => {
             // Extract selector relationships
             for selector in style_rule.selectors.0.iter() {
                 extract_selector_relationships(selector, class_prefix, profile);
+            }
+
+            // Collect BEM elements from ALL selectors in this rule.
+            // When multiple elements share a rule, they're CSS siblings
+            // (same display behavior, same modifiers, same layout level).
+            let mut rule_elements = BTreeSet::new();
+            for selector in style_rule.selectors.0.iter() {
+                if let Some(element_name) = extract_element_from_selector(selector, class_prefix) {
+                    if !element_name.is_empty() {
+                        rule_elements.insert(element_name);
+                    }
+                }
+            }
+            if rule_elements.len() > 1 {
+                // Multiple BEM elements share this rule → CSS siblings
+                if !selector_groups.contains(&rule_elements) {
+                    selector_groups.push(rule_elements);
+                }
             }
 
             // Extract layout properties per element
@@ -382,6 +543,12 @@ fn extract_from_rule(rule: &CssRule, class_prefix: &str, profile: &mut CssBlockP
                             }
                             Property::GridRow(..) => {
                                 info.has_grid_row = true;
+                            }
+                            Property::GridTemplateColumns(..) => {
+                                info.has_grid_template = true;
+                            }
+                            Property::GridTemplateRows(..) => {
+                                info.has_grid_template = true;
                             }
                             Property::Display(display) => {
                                 let display_str = match display {
@@ -434,6 +601,10 @@ fn extract_from_rule(rule: &CssRule, class_prefix: &str, profile: &mut CssBlockP
                                     || prop_name == "grid-row-end"
                                 {
                                     info.has_grid_row = true;
+                                } else if prop_name == "grid-template-columns"
+                                    || prop_name == "grid-template-rows"
+                                {
+                                    info.has_grid_template = true;
                                 } else if prop_name == "display" {
                                     info.display_values.insert("var".to_string());
                                 } else if prop_name == "width"
@@ -451,10 +622,77 @@ fn extract_from_rule(rule: &CssRule, class_prefix: &str, profile: &mut CssBlockP
         }
         CssRule::Media(media_rule) => {
             for inner_rule in &media_rule.rules.0 {
-                extract_from_rule(inner_rule, class_prefix, profile);
+                extract_from_rule(inner_rule, class_prefix, profile, selector_groups);
             }
         }
         _ => {}
+    }
+}
+
+/// Infer layout container → child relationships from CSS display model.
+///
+/// Uses two signals:
+/// 1. **Shared selector groups**: BEM elements that appear together in the
+///    same CSS rule are "CSS siblings" — designed for the same layout level.
+/// 2. **Container properties**: Among CSS siblings, elements with `flex-wrap`
+///    are flex containers; elements with `display: grid` + grid properties
+///    are grid containers.
+///
+/// When a group has exactly one container and other siblings, those siblings
+/// are layout children of the container.
+fn infer_layout_children(profile: &mut CssBlockProfile, selector_groups: &[BTreeSet<String>]) {
+    let mut seen = std::collections::HashSet::new();
+
+    // Determine which elements are layout containers.
+    // A container has flex-wrap (flex container) or display:grid + grid
+    // template/columns (grid container). The block root ("") is always
+    // a container and is excluded from child inference.
+    let is_container = |el: &str| -> bool {
+        if el.is_empty() {
+            return true; // block root is always a container
+        }
+        let Some(info) = profile.elements.get(el) else {
+            return false;
+        };
+        // Flex container: has flex-wrap
+        if info.flex_wrap {
+            return true;
+        }
+        // Grid container: has display:grid AND defines a grid template
+        if info.display_values.contains("grid") && info.has_grid_template {
+            return true;
+        }
+        false
+    };
+
+    for group in selector_groups {
+        // Find containers and non-containers within this group
+        let containers: Vec<&String> = group.iter().filter(|el| is_container(el)).collect();
+        let children: Vec<&String> = group.iter().filter(|el| !is_container(el)).collect();
+
+        // If no containers in this group, skip — these elements are all
+        // at the same level with no clear parent.
+        if containers.is_empty() || children.is_empty() {
+            continue;
+        }
+
+        // For each container, record its children.
+        // Prefer the most specific container (longest element name) if
+        // multiple containers exist in the same group.
+        let best_container = containers.iter().max_by_key(|c| c.len()).unwrap();
+
+        for child in &children {
+            let pair = (best_container.to_string(), child.to_string());
+            if seen.insert(pair.clone()) {
+                debug!(
+                    container = %pair.0,
+                    child = %pair.1,
+                    block = %profile.block,
+                    "CSS layout container → child inferred"
+                );
+                profile.layout_children.push(pair);
+            }
+        }
     }
 }
 
@@ -514,11 +752,16 @@ fn extract_selector_relationships(
     }
 
     // Look for descendant combinator (space) and sibling combinator (~)
-    // Selectors iterate right-to-left, so we need to track pairs
+    // Selectors iterate right-to-left, so we need to track pairs.
+    //
+    // IMPORTANT: `selector.iter()` silently drops `Component::Combinator`
+    // items — the `SelectorIter` consumes them internally and never yields
+    // them. We must use `iter_raw_match_order()` which yields ALL
+    // components including combinators in right-to-left order.
     let mut prev_element: Option<String> = None;
     let mut prev_combinator: Option<Combinator> = None;
 
-    for component in selector.iter() {
+    for component in selector.iter_raw_match_order() {
         match component {
             Component::Combinator(comb) => {
                 prev_combinator = Some(*comb);
@@ -535,11 +778,20 @@ fn extract_selector_relationships(
                     };
 
                     if let (Some(child_el), Some(combinator)) = (&prev_element, &prev_combinator) {
-                        if !element.is_empty() && !child_el.is_empty() {
+                        // Allow root ("") as parent or child — e.g.,
+                        // `.drawer > .drawer__main` is root→main.
+                        // Only skip self-referencing root (both empty).
+                        if !(element.is_empty() && child_el.is_empty()) {
                             match combinator {
-                                Combinator::Descendant | Combinator::Child => {
-                                    // parent (current) → child (prev)
+                                Combinator::Child => {
+                                    // Direct child: parent > child
                                     // Note: selector iterates right-to-left
+                                    profile
+                                        .direct_child_nesting
+                                        .push((element.clone(), child_el.clone()));
+                                }
+                                Combinator::Descendant => {
+                                    // Descendant: parent child (space)
                                     profile
                                         .descendant_nesting
                                         .push((element.clone(), child_el.clone()));
@@ -852,5 +1104,364 @@ mod integration_tests {
         // logo: no grid-column, brand is flex → logo inside brand
         // brand: has grid-column → direct grid child (but var_child_ref from main → also inside main)
         // content: has grid-column → direct grid child, sibling of main
+    }
+}
+
+#[cfg(test)]
+mod selector_relationship_tests {
+    use super::*;
+
+    /// Parse CSS and return the extracted profile for selector relationship tests.
+    fn profile_from_css(css: &str) -> CssBlockProfile {
+        extract_css_block_profile(css, "test").unwrap()
+    }
+
+    #[test]
+    fn test_descendant_combinator_extracts_nesting() {
+        let css = r#"
+            .pf-v6-c-toolbar { display: flex; }
+            .pf-v6-c-toolbar__group .pf-v6-c-toolbar__item { flex: 1; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .descendant_nesting
+                .contains(&("group".to_string(), "item".to_string())),
+            "Should extract group → item from descendant selector. Got: {:?}",
+            profile.descendant_nesting
+        );
+    }
+
+    #[test]
+    fn test_child_combinator_extracts_direct_child_nesting() {
+        let css = r#"
+            .pf-v6-c-drawer { display: flex; }
+            .pf-v6-c-drawer__content > .pf-v6-c-drawer__body { overflow: auto; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .direct_child_nesting
+                .contains(&("content".to_string(), "body".to_string())),
+            "Should extract content → body from child combinator into direct_child_nesting. Got: {:?}",
+            profile.direct_child_nesting
+        );
+        assert!(
+            !profile
+                .descendant_nesting
+                .contains(&("content".to_string(), "body".to_string())),
+            "Child combinator should NOT go into descendant_nesting. Got: {:?}",
+            profile.descendant_nesting
+        );
+    }
+
+    #[test]
+    fn test_sibling_combinator_extracts_relationship() {
+        let css = r#"
+            .pf-v6-c-card { display: flex; }
+            .pf-v6-c-card__actions + .pf-v6-c-card__title { margin: 0; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .sibling_relationships
+                .contains(&("actions".to_string(), "title".to_string())),
+            "Should extract actions ~ title from sibling selector. Got: {:?}",
+            profile.sibling_relationships
+        );
+    }
+
+    #[test]
+    fn test_later_sibling_combinator() {
+        let css = r#"
+            .pf-v6-c-data-list { display: flex; }
+            .pf-v6-c-data-list__cell ~ .pf-v6-c-data-list__cell { border: 0; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .sibling_relationships
+                .contains(&("cell".to_string(), "cell".to_string())),
+            "Should extract cell ~ cell from later-sibling selector. Got: {:?}",
+            profile.sibling_relationships
+        );
+    }
+
+    #[test]
+    fn test_multiple_descendant_selectors() {
+        let css = r#"
+            .pf-v6-c-toolbar { display: flex; }
+            .pf-v6-c-toolbar__expandable-content .pf-v6-c-toolbar__group { flex: 1; }
+            .pf-v6-c-toolbar__expandable-content .pf-v6-c-toolbar__item { flex: 0; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .descendant_nesting
+                .contains(&("expandable-content".to_string(), "group".to_string())),
+            "Should extract expandable-content → group. Got: {:?}",
+            profile.descendant_nesting
+        );
+        assert!(
+            profile
+                .descendant_nesting
+                .contains(&("expandable-content".to_string(), "item".to_string())),
+            "Should extract expandable-content → item. Got: {:?}",
+            profile.descendant_nesting
+        );
+    }
+
+    #[test]
+    fn test_modifier_on_parent_still_extracts_element() {
+        // Selectors like .toolbar__group:where(.pf-m-toggle-group) .toolbar__item
+        // should extract group → item (the :where() modifier doesn't change the element)
+        let css = r#"
+            .pf-v6-c-toolbar { display: flex; }
+            .pf-v6-c-toolbar__group:where(.pf-m-toggle-group) .pf-v6-c-toolbar__item { display: none; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .descendant_nesting
+                .contains(&("group".to_string(), "item".to_string())),
+            "Should extract group → item even with :where() modifier. Got: {:?}",
+            profile.descendant_nesting
+        );
+    }
+
+    #[test]
+    fn test_no_nesting_without_combinators() {
+        // A selector with just one class shouldn't produce nesting
+        let css = r#"
+            .pf-v6-c-card { display: flex; }
+            .pf-v6-c-card__header { padding: 0; }
+            .pf-v6-c-card__title { font-weight: bold; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile.descendant_nesting.is_empty(),
+            "Should have no descendant nesting for single-class selectors. Got: {:?}",
+            profile.descendant_nesting
+        );
+    }
+
+    #[test]
+    fn test_layout_container_flex_wrap() {
+        // Toolbar-like pattern: content-section, group, and item share a rule.
+        // content-section has flex-wrap: wrap → it's the container.
+        let css = r#"
+            .pf-v6-c-toolbar { display: grid; }
+            .pf-v6-c-toolbar__content-section,
+            .pf-v6-c-toolbar__group,
+            .pf-v6-c-toolbar__item {
+                display: flex;
+            }
+            .pf-v6-c-toolbar__content-section {
+                flex-wrap: wrap;
+                row-gap: 8px;
+                column-gap: 16px;
+            }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .layout_children
+                .contains(&("content-section".to_string(), "group".to_string())),
+            "content-section should be container of group. Got: {:?}",
+            profile.layout_children
+        );
+        assert!(
+            profile
+                .layout_children
+                .contains(&("content-section".to_string(), "item".to_string())),
+            "content-section should be container of item. Got: {:?}",
+            profile.layout_children
+        );
+    }
+
+    #[test]
+    fn test_layout_container_no_false_positives() {
+        // Elements that share a rule but NONE is a container → no layout_children
+        let css = r#"
+            .pf-v6-c-card { display: flex; }
+            .pf-v6-c-card__header,
+            .pf-v6-c-card__body,
+            .pf-v6-c-card__footer {
+                padding: 16px;
+            }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile.layout_children.is_empty(),
+            "No container in shared rule → no layout_children. Got: {:?}",
+            profile.layout_children
+        );
+    }
+
+    #[test]
+    fn test_layout_container_description_list_grid() {
+        // DescriptionList-like: root is grid with template, group is also grid
+        // with template → group is a grid container. term and description are
+        // grid children of group.
+        let css = r#"
+            .pf-v6-c-description-list {
+                display: grid;
+                grid-template-columns: 1fr;
+            }
+            .pf-v6-c-description-list__group {
+                display: grid;
+                grid-template-rows: auto 1fr;
+                grid-column: 1;
+            }
+            .pf-v6-c-description-list__group,
+            .pf-v6-c-description-list__term,
+            .pf-v6-c-description-list__description {
+                padding: 8px;
+            }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .layout_children
+                .contains(&("group".to_string(), "term".to_string())),
+            "group should be container of term. Got: {:?}",
+            profile.layout_children
+        );
+        assert!(
+            profile
+                .layout_children
+                .contains(&("group".to_string(), "description".to_string())),
+            "group should be container of description. Got: {:?}",
+            profile.layout_children
+        );
+    }
+
+    #[test]
+    fn test_layout_container_empty_state() {
+        // EmptyState-like: footer has flex-wrap, actions is a sibling
+        let css = r#"
+            .pf-v6-c-empty-state { display: flex; }
+            .pf-v6-c-empty-state__footer {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 16px;
+            }
+            .pf-v6-c-empty-state__footer,
+            .pf-v6-c-empty-state__actions {
+                display: flex;
+            }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .layout_children
+                .contains(&("footer".to_string(), "actions".to_string())),
+            "footer should be container of actions. Got: {:?}",
+            profile.layout_children
+        );
+    }
+
+    #[test]
+    fn test_card_header_title_nesting() {
+        // Real-world Card CSS pattern
+        let css = r#"
+            .pf-v6-c-card { display: flex; }
+            .pf-v6-c-card__header .pf-v6-c-card__title { padding: 0; }
+        "#;
+        let profile = profile_from_css(css);
+        assert!(
+            profile
+                .descendant_nesting
+                .contains(&("header".to_string(), "title".to_string())),
+            "Card: header → title. Got: {:?}",
+            profile.descendant_nesting
+        );
+    }
+
+    #[test]
+    fn test_grid_template_detection() {
+        let css = r#"
+            .pf-v6-c-description-list {
+                display: grid;
+                grid-template-columns: repeat(1, 1fr);
+            }
+            .pf-v6-c-description-list__group {
+                display: grid;
+                grid-template-rows: auto 1fr;
+                grid-column: 1;
+            }
+        "#;
+        let profile = profile_from_css(css);
+
+        // Root should be a grid container (has grid-template)
+        let root = profile.elements.get("").unwrap();
+        assert!(root.has_grid_template, "Root should have grid-template");
+        assert!(!root.has_grid_column, "Root should NOT have grid-column");
+
+        // Group should be both a grid container AND a grid child
+        let group = profile.elements.get("group").unwrap();
+        assert!(group.has_grid_template, "Group should have grid-template");
+        assert!(
+            group.has_grid_column,
+            "Group should have grid-column (it's a child of root grid)"
+        );
+    }
+
+    #[test]
+    fn test_direct_child_vs_descendant_separation() {
+        let css = r#"
+            .pf-v6-c-drawer { display: flex; }
+            .pf-v6-c-drawer__content > .pf-v6-c-drawer__body { padding: 0; }
+            .pf-v6-c-drawer__panel .pf-v6-c-drawer__head { display: grid; }
+        "#;
+        let profile = profile_from_css(css);
+
+        // content > body should be in direct_child_nesting only
+        assert!(
+            profile
+                .direct_child_nesting
+                .contains(&("content".to_string(), "body".to_string())),
+            "content > body should be direct child. Got direct: {:?}",
+            profile.direct_child_nesting
+        );
+        assert!(
+            !profile
+                .descendant_nesting
+                .contains(&("content".to_string(), "body".to_string())),
+            "content > body should NOT be descendant"
+        );
+
+        // panel head should be in descendant_nesting only
+        assert!(
+            profile
+                .descendant_nesting
+                .contains(&("panel".to_string(), "head".to_string())),
+            "panel head should be descendant. Got descendant: {:?}",
+            profile.descendant_nesting
+        );
+        assert!(
+            !profile
+                .direct_child_nesting
+                .contains(&("panel".to_string(), "head".to_string())),
+            "panel head should NOT be direct child"
+        );
+    }
+
+    #[test]
+    fn test_grid_template_from_unparsed_var() {
+        // PF often uses var() for grid-template-columns which gets parsed as Unparsed
+        let css = r#"
+            .pf-v6-c-toolbar {
+                display: grid;
+                grid-template-columns: var(--pf-v6-c-toolbar--GridTemplateColumns);
+            }
+        "#;
+        let profile = profile_from_css(css);
+        let root = profile.elements.get("").unwrap();
+        assert!(
+            root.has_grid_template,
+            "Should detect grid-template from unparsed var(). Got: {:?}",
+            root
+        );
     }
 }
