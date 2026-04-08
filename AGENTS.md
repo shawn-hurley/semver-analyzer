@@ -210,15 +210,55 @@ collapsed by `collapse_internal_nodes`.
 Every edge has a `strength: EdgeStrength` field:
 
 - **Required** — Rendering breaks without this nesting. Generates conformance
-  rules (`notParent` checks in the scanner).
+  rules.
 - **Allowed** — Valid placement documented in CSS but not the only option. Stays
   in the tree for migration guidance but produces zero conformance rules.
-
-Conformance rule generation (`konveyor_v2.rs` and `sd_pipeline.rs`) filters
-edges by `strength == Required` before generating `notParent` rules.
+  Included in the `notParent` regex to prevent false positives on valid
+  placements.
 
 Collapsed edges (from `collapse_internal_nodes`) inherit the **stronger** of
 the two edges in the chain.
+
+#### Conformance Rule Generation (CRITICAL)
+
+Conformance rule generation in `konveyor_v2.rs::generate_conformance_rules()`
+uses a simple algorithm based on edge direction and incoming edges:
+
+```
+has_required_incoming: members with ≥1 incoming Required non-internal edge
+parent_to_req_children: Required non-internal edges grouped by parent
+child_to_all_parents: ALL non-internal edges grouped by child (for regex)
+
+for (parent, children) in parent_to_req_children:
+    if parent NOT in has_required_incoming:
+        → requiresChild rule on parent (parent must contain children)
+    else:
+        → notParent rule on each child (child must be inside parent)
+```
+
+**Three rule types are generated:**
+
+| Rule | Scanner Field | When | Example |
+|------|--------------|------|---------|
+| `requiresChild` | `requires_child` | Parent has no Required incoming edges (root/secondary root) | `AlertGroup` must contain `Alert` |
+| `notParent` | `not_parent` | Child has a Required parent with incoming edges | `Td` must be inside `Tr` |
+| `invalidDirectChild` | `parent` | Child skips required intermediate parent | `Td` directly in `Table` (needs `Tr`) |
+
+**Key design decisions:**
+
+- Only **Required** incoming edges determine `has_required_incoming`. Allowed
+  back-edges (e.g., Tab→Tabs for recursive nesting) don't make the child
+  mandatory, so they don't prevent the parent from getting `requiresChild`.
+- Internal edges (`ChildRelationship::Internal`) are excluded from all maps.
+  They represent parent-renders-child relationships that the consumer doesn't
+  control.
+- The `notParent` regex includes ALL non-internal parents (Required + Allowed)
+  so that valid-but-not-required placements don't trigger false positives.
+- Children that only have `no_incoming` parents get no `notParent` rule (they
+  can exist standalone). The parent gets a `requiresChild` rule instead.
+- Cycles (A→B Required + B→A Required) are tree accuracy bugs. Both edges
+  should not be Required — the recursive direction should be `Allowed`.
+  The rule generator does not handle cycles; fix the tree instead.
 
 #### CSS Element → Component Mapping (CRITICAL)
 
@@ -265,6 +305,22 @@ parses for path and detail).
 - **Prop-based composition**: Components passed via props (e.g., `panelContent`
   on DrawerContent) create collapsed edges that look like children composition.
   The TD pipeline handles these separately.
+
+#### Single-Component Families (Skip for Composition)
+
+The following 51 families are genuinely single-component — one file in the
+directory, no sub-components, no composition tree needed. Skip these during
+composition tree validation:
+
+Avatar, BackToTop, Backdrop, BackgroundImage, Badge, Banner, Brand, Button,
+CalendarMonth, Chart, ChartArea, ChartAxis, ChartBar, ChartBoxPlot,
+ChartContainer, ChartCursorContainer, ChartDonut, ChartGroup, ChartLabel,
+ChartLegend, ChartLine, ChartPie, ChartPoint, ChartScatter, ChartStack,
+ChartThreshold, ChartTooltip, ChartVoronoiContainer, Charts, Checkbox,
+Content, DatePicker, Divider, FormControl, Icon, Line, NotificationBadge,
+NumberInput, Radio, Sankey, Skeleton, SkipToContent, Spinner, Switch,
+TextArea, TextInput, Timestamp, Title, Truncate, deprecated/DragDrop,
+deprecated/Tile.
 
 #### Family Grouping and Deprecated Separation
 
