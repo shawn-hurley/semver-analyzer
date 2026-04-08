@@ -786,11 +786,33 @@ fn build_css_element_to_component_map(
                     camel_to_kebab(&camel)
                 };
 
-                // Don't overwrite — first component to claim an element wins.
-                // This handles cases where multiple components use the same
-                // block token (e.g., both Toolbar and ToolbarContent use
-                // styles.toolbar for the root).
-                map.entry(element_name).or_insert_with(|| comp_name.clone());
+                // Prefer non-root components for non-root elements.
+                //
+                // The root component often uses child CSS tokens (e.g.,
+                // JumpLinks uses `styles.jumpLinksList`) because it renders
+                // those elements internally. But JumpLinksList is the
+                // dedicated component for that element. If we let the root
+                // claim "list", JumpLinksList becomes invisible in the map
+                // and Signal B / CSS nesting steps can't create edges to it.
+                //
+                // For the root element (""), first wins (both root and
+                // sub-components may use the block token).
+                let root_name = family_exports.first().map(|s| s.as_str());
+                let existing = map.get(&element_name);
+                let should_insert = match existing {
+                    None => true,
+                    Some(current) => {
+                        // Allow non-root to overwrite root for non-root elements.
+                        // Root keeps the root element ("") and anything no one
+                        // else claims.
+                        !element_name.is_empty()
+                            && root_name == Some(current.as_str())
+                            && root_name != Some(comp_name.as_str())
+                    }
+                };
+                if should_insert {
+                    map.insert(element_name, comp_name.clone());
+                }
             }
         }
     }
