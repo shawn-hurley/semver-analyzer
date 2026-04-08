@@ -27,11 +27,13 @@ use tracing::debug;
 /// 3. CSS grid parent-child (`A` has grid-template, `B` has grid-column)
 /// 4. CSS flex context (A wraps children in flex container, B is not a grid child)
 /// 5. CSS descendant selectors (`.A .B`)
+/// 5.5. CSS layout children (shared CSS rule with flex-wrap/gap implies containment)
 /// 6. React context (A provides, B consumes)
 /// 7. DOM nesting (A wraps children in `<ul>`, B renders `<li>`)
 /// 8. cloneElement threading (A injects props into children that B declares)
-/// 9. Default root (unparented members → root→member)
-/// 10. Suppress root edges when intermediate exists
+/// 8.5. BEM element orphan fallback (orphan BEM elements → root→member)
+/// 9. Suppress root edges when intermediate exists
+/// 10. Drop unconnected members
 pub fn build_composition_tree_v2(
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
@@ -467,6 +469,37 @@ pub fn build_composition_tree_v2(
                 }
             }
         }
+
+        // ── Step 5.5: CSS layout children ───────────────────────────
+        // Consume `layout_children` from the CSS profile — pairs of BEM
+        // elements where one is a layout container (has flex-wrap/gap/grid)
+        // and the other is a co-rule sibling. Maps both to components and
+        // creates an edge.
+        //
+        // This data was previously computed but never consumed. It catches
+        // intermediate nesting within families (e.g., EmptyStateFooter →
+        // EmptyStateActions from a shared CSS rule with flex-wrap).
+        for (css_container, css_child) in &css_prof.layout_children {
+            if let (Some(container_comp), Some(child_comp)) = (
+                css_to_component.get(css_container.as_str()),
+                css_to_component.get(css_child.as_str()),
+            ) {
+                let key = (container_comp.clone(), child_comp.clone());
+                if container_comp != child_comp && edge_set.insert(key) {
+                    tree.edges.push(CompositionEdge {
+                        parent: container_comp.clone(),
+                        child: child_comp.clone(),
+                        relationship: ChildRelationship::DirectChild,
+                        required: false,
+                        bem_evidence: Some(format!(
+                            "CSS layout container: .{} wraps .{} (shared CSS rule with flex-wrap/gap)",
+                            css_container, css_child
+                        )),
+                        strength: EdgeStrength::Allowed,
+                    });
+                }
+            }
+        }
     }
 
     // ── Step 6: React context ───────────────────────────────────────
@@ -477,6 +510,95 @@ pub fn build_composition_tree_v2(
 
     // ── Step 8: cloneElement threading ──────────────────────────────
     infer_clone_element_nesting(&mut tree, profiles, family_exports);
+
+    // ── Step 8.5: BEM element orphan fallback ──────────────────────
+    // For family members with zero incoming edges after all structural
+    // signals, connect them to the root if they are BEM elements of the
+    // root's block. This catches children-passthrough families where the
+    // parent renders `{children}` and sub-components are placed by the
+    // consumer in JSX (e.g., EmptyState → EmptyStateBody).
+    //
+    // Guards:
+    // 1. Zero incoming edges (orphan gate — prevents creating wrong edges
+    //    for already-connected components in Category 3 families)
+    // 2. Member appears in css_element_to_component_map (has BEM element
+    //    CSS tokens of the root's block)
+    // 3. BEM independence check: member must NOT have its own distinct
+    //    BEM block (prevents false edges for collision families like
+    //    Label/LabelGroup, Menu/MenuToggle)
+    // 4. Root has has_children_prop (root must accept children)
+    {
+        let root_has_children = profiles.get(&root).is_some_and(|p| p.has_children_prop);
+        let root_bem_block = profiles
+            .get(&root)
+            .and_then(|p| p.bem_block.as_deref())
+            .map(|s| s.to_string());
+
+        if root_has_children && !css_to_component.is_empty() {
+            // Collect all members that currently have incoming edges (owned to avoid borrow)
+            let parented: HashSet<String> = tree.edges.iter().map(|e| e.child.clone()).collect();
+
+            // Collect the set of components that are BEM elements (values in the map)
+            let bem_element_components: HashSet<&str> =
+                css_to_component.values().map(|s| s.as_str()).collect();
+
+            let mut fallback_edges = Vec::new();
+
+            for member in family_exports {
+                if member == &root {
+                    continue;
+                }
+                // Guard 1: only orphans (no incoming edges)
+                if parented.contains(member) {
+                    continue;
+                }
+                // Guard 2: must be a BEM element of the root's block
+                if !bem_element_components.contains(member.as_str()) {
+                    continue;
+                }
+                // Guard 3: BEM independence — skip if member has its own
+                // distinct BEM block (e.g., LabelGroup has block "labelGroup"
+                // which differs from Label's "label")
+                if let Some(member_bem) = profiles.get(member).and_then(|p| p.bem_block.as_deref())
+                {
+                    if let Some(ref root_block) = root_bem_block {
+                        if member_bem != root_block.as_str() {
+                            debug!(
+                                root = %root,
+                                member = %member,
+                                member_bem = %member_bem,
+                                root_block = %root_block,
+                                "BEM orphan fallback: skipping independent block"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                let key = (root.clone(), member.clone());
+                if edge_set.insert(key) {
+                    debug!(
+                        root = %root,
+                        member = %member,
+                        "BEM orphan fallback: connecting orphan to root"
+                    );
+                    fallback_edges.push(CompositionEdge {
+                        parent: root.clone(),
+                        child: member.clone(),
+                        relationship: ChildRelationship::DirectChild,
+                        required: false,
+                        bem_evidence: Some(format!(
+                            "BEM element fallback: {} is a BEM element of {}'s block with no other parent",
+                            member, root
+                        )),
+                        strength: EdgeStrength::Allowed,
+                    });
+                }
+            }
+
+            tree.edges.extend(fallback_edges);
+        }
+    }
 
     // ── Step 9: Suppress + dedup ───────────────────────────────────
     deduplicate_edges(&mut tree);
@@ -1143,12 +1265,18 @@ fn deduplicate_edges(tree: &mut CompositionTree) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn make_profile(name: &str) -> ComponentSourceProfile {
         ComponentSourceProfile {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// Helper to create a BTreeSet<String> from a slice of &str.
+    fn tokens(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -1836,6 +1964,492 @@ mod tests {
             bad_edge.is_none(),
             "Sub → Root should be skipped (reverse of prior Root → Sub). Edges: {:?}",
             tree.edges
+        );
+    }
+
+    // ── Signal A (Step 5.5): CSS layout_children tests ──────────────
+
+    #[test]
+    fn test_layout_children_creates_intermediate_edge() {
+        // EmptyState scenario: CSS shows footer wraps actions (shared
+        // rule with flex-wrap). Signal A should create
+        // EmptyStateFooter → EmptyStateActions.
+        let mut root_prof = make_profile("EmptyState");
+        root_prof.has_children_prop = true;
+        root_prof.bem_block = Some("emptyState".into());
+        root_prof.css_tokens_used = tokens(&["styles.emptyState"]);
+
+        let mut footer = make_profile("EmptyStateFooter");
+        footer.has_children_prop = true;
+        footer.bem_block = Some("emptyState".into());
+        footer.css_tokens_used = tokens(&["styles.emptyStateFooter"]);
+
+        let mut actions = make_profile("EmptyStateActions");
+        actions.bem_block = Some("emptyState".into());
+        actions.css_tokens_used = tokens(&["styles.emptyStateActions"]);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("EmptyState".into(), root_prof);
+        profiles.insert("EmptyStateFooter".into(), footer);
+        profiles.insert("EmptyStateActions".into(), actions);
+
+        let family = vec![
+            "EmptyState".into(),
+            "EmptyStateFooter".into(),
+            "EmptyStateActions".into(),
+        ];
+
+        // CSS profile with layout_children: footer wraps actions
+        let css_prof = CssBlockProfile {
+            block: "emptyState".into(),
+            layout_children: vec![("footer".into(), "actions".into())],
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // Signal A: EmptyStateFooter → EmptyStateActions (from layout_children)
+        let footer_to_actions = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "EmptyStateFooter" && e.child == "EmptyStateActions");
+        assert!(
+            footer_to_actions.is_some(),
+            "Expected EmptyStateFooter → EmptyStateActions from layout_children. Edges: {:?}",
+            tree.edges
+        );
+        assert_eq!(footer_to_actions.unwrap().strength, EdgeStrength::Allowed);
+        assert!(footer_to_actions
+            .unwrap()
+            .bem_evidence
+            .as_ref()
+            .unwrap()
+            .contains("CSS layout container"));
+
+        // Signal B: EmptyStateFooter should get root edge (orphan with outgoing
+        // from Signal A but no incoming). EmptyStateActions should NOT get
+        // root edge (already has parent from Signal A).
+        let root_to_footer = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "EmptyState" && e.child == "EmptyStateFooter");
+        assert!(
+            root_to_footer.is_some(),
+            "Expected EmptyState → EmptyStateFooter from BEM orphan fallback. Edges: {:?}",
+            tree.edges
+        );
+
+        // EmptyStateActions should NOT be a direct child of root (has parent from Signal A)
+        let root_to_actions = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "EmptyState" && e.child == "EmptyStateActions");
+        assert!(
+            root_to_actions.is_none(),
+            "EmptyState → EmptyStateActions should NOT exist (has parent from Signal A). Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    // ── Signal B (Step 8.5): BEM element orphan fallback tests ──────
+
+    #[test]
+    fn test_bem_orphan_fallback_connects_orphans_to_root() {
+        // Panel scenario: root has children, sub-components are BEM
+        // elements with no other signals connecting them.
+        let mut root_prof = make_profile("Panel");
+        root_prof.has_children_prop = true;
+        root_prof.bem_block = Some("panel".into());
+        root_prof.css_tokens_used = tokens(&["styles.panel"]);
+
+        let mut header = make_profile("PanelHeader");
+        header.bem_block = Some("panel".into());
+        header.css_tokens_used = tokens(&["styles.panelHeader"]);
+
+        let mut main = make_profile("PanelMain");
+        main.has_children_prop = true;
+        main.bem_block = Some("panel".into());
+        main.css_tokens_used = tokens(&["styles.panelMain"]);
+
+        let mut footer = make_profile("PanelFooter");
+        footer.bem_block = Some("panel".into());
+        footer.css_tokens_used = tokens(&["styles.panelFooter"]);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Panel".into(), root_prof);
+        profiles.insert("PanelHeader".into(), header);
+        profiles.insert("PanelMain".into(), main);
+        profiles.insert("PanelFooter".into(), footer);
+
+        let family = vec![
+            "Panel".into(),
+            "PanelHeader".into(),
+            "PanelMain".into(),
+            "PanelFooter".into(),
+        ];
+
+        // Minimal CSS profile — just the block name, no nesting selectors
+        let css_prof = CssBlockProfile {
+            block: "panel".into(),
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // All 3 sub-components should be connected to root
+        for child in &["PanelHeader", "PanelMain", "PanelFooter"] {
+            let edge = tree
+                .edges
+                .iter()
+                .find(|e| e.parent == "Panel" && e.child == *child);
+            assert!(
+                edge.is_some(),
+                "Expected Panel → {} from BEM orphan fallback. Edges: {:?}",
+                child,
+                tree.edges
+            );
+            assert_eq!(edge.unwrap().strength, EdgeStrength::Allowed);
+            assert!(edge
+                .unwrap()
+                .bem_evidence
+                .as_ref()
+                .unwrap()
+                .contains("BEM element fallback"));
+        }
+
+        // All 3 should be retained as family members
+        for member in &["PanelHeader", "PanelMain", "PanelFooter"] {
+            assert!(
+                tree.family_members.contains(&member.to_string()),
+                "{} should be in family_members. Members: {:?}",
+                member,
+                tree.family_members
+            );
+        }
+    }
+
+    #[test]
+    fn test_bem_orphan_fallback_skips_independent_block() {
+        // Label/LabelGroup scenario: LabelGroup has its own BEM block
+        // ("labelGroup") different from Label's ("label"). Signal B
+        // should NOT create Label → LabelGroup.
+        let mut label = make_profile("Label");
+        label.has_children_prop = true;
+        label.bem_block = Some("label".into());
+        label.css_tokens_used = tokens(&["styles.label"]);
+
+        let mut label_group = make_profile("LabelGroup");
+        label_group.has_children_prop = true;
+        label_group.bem_block = Some("labelGroup".into());
+        // This token would match the prefix strip: "labelGroup" starts
+        // with "label", producing false map entry "group" → "LabelGroup"
+        label_group.css_tokens_used = tokens(&["styles.labelGroup"]);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Label".into(), label);
+        profiles.insert("LabelGroup".into(), label_group);
+
+        let family = vec!["Label".into(), "LabelGroup".into()];
+
+        let css_prof = CssBlockProfile {
+            block: "label".into(),
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // Label → LabelGroup should NOT exist (independent BEM block)
+        let bad_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Label" && e.child == "LabelGroup");
+        assert!(
+            bad_edge.is_none(),
+            "Label → LabelGroup should NOT exist (independent BEM block). Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    #[test]
+    fn test_bem_orphan_fallback_skips_already_parented() {
+        // If a component already has a parent from another signal,
+        // Signal B should not create a duplicate root edge.
+        let mut root_prof = make_profile("Menu");
+        root_prof.has_children_prop = true;
+        root_prof.bem_block = Some("menu".into());
+        root_prof.css_tokens_used = tokens(&["styles.menu"]);
+        root_prof.rendered_components = vec!["MenuContext.Provider".into()];
+
+        let mut menu_list = make_profile("MenuList");
+        menu_list.has_children_prop = true;
+        menu_list.bem_block = Some("menu".into());
+        menu_list.css_tokens_used = tokens(&["styles.menuList"]);
+        menu_list.consumed_contexts = vec!["MenuContext".into()];
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Menu".into(), root_prof);
+        profiles.insert("MenuList".into(), menu_list);
+
+        let family = vec!["Menu".into(), "MenuList".into()];
+
+        let css_prof = CssBlockProfile {
+            block: "menu".into(),
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // MenuList should have a parent from context nesting (Step 6)
+        let context_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Menu" && e.child == "MenuList");
+        assert!(
+            context_edge.is_some(),
+            "Expected Menu → MenuList from context nesting. Edges: {:?}",
+            tree.edges
+        );
+
+        // Should be exactly ONE edge from Menu → MenuList (not duplicated
+        // by Signal B)
+        let edge_count = tree
+            .edges
+            .iter()
+            .filter(|e| e.parent == "Menu" && e.child == "MenuList")
+            .count();
+        assert_eq!(
+            edge_count, 1,
+            "Should have exactly 1 Menu → MenuList edge, not duplicated by Signal B. Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    #[test]
+    fn test_bem_orphan_fallback_skips_when_root_has_no_children() {
+        // If root doesn't have has_children_prop, Signal B should not fire.
+        let mut root_prof = make_profile("Widget");
+        root_prof.has_children_prop = false; // no children!
+        root_prof.bem_block = Some("widget".into());
+        root_prof.css_tokens_used = tokens(&["styles.widget"]);
+
+        let mut sub = make_profile("WidgetBody");
+        sub.bem_block = Some("widget".into());
+        sub.css_tokens_used = tokens(&["styles.widgetBody"]);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Widget".into(), root_prof);
+        profiles.insert("WidgetBody".into(), sub);
+
+        let family = vec!["Widget".into(), "WidgetBody".into()];
+
+        let css_prof = CssBlockProfile {
+            block: "widget".into(),
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // WidgetBody should NOT be connected (root has no children prop)
+        let edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Widget" && e.child == "WidgetBody");
+        assert!(
+            edge.is_none(),
+            "Widget → WidgetBody should NOT exist (root has no children). Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    #[test]
+    fn test_bem_orphan_fallback_promotes_secondary_root() {
+        // JumpLinks scenario: JumpLinksList is a secondary root (has
+        // outgoing edge to JumpLinksItem via DOM nesting but no incoming).
+        // Signal B should create JumpLinks → JumpLinksList.
+        let mut root_prof = make_profile("JumpLinks");
+        root_prof.has_children_prop = true;
+        root_prof.bem_block = Some("jumpLinks".into());
+        root_prof.css_tokens_used = tokens(&["styles.jumpLinks"]);
+
+        let mut list = make_profile("JumpLinksList");
+        list.has_children_prop = true;
+        list.bem_block = Some("jumpLinks".into());
+        list.css_tokens_used = tokens(&["styles.jumpLinksList"]);
+        list.children_slot_path = vec!["ul".into()];
+        list.rendered_elements.insert("ul".into(), 1);
+
+        let mut item = make_profile("JumpLinksItem");
+        item.bem_block = Some("jumpLinks".into());
+        item.css_tokens_used = tokens(&["styles.jumpLinksItem"]);
+        item.children_slot_path = vec!["li".into(), "button".into()];
+        item.rendered_elements.insert("li".into(), 1);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("JumpLinks".into(), root_prof);
+        profiles.insert("JumpLinksList".into(), list);
+        profiles.insert("JumpLinksItem".into(), item);
+
+        let family = vec![
+            "JumpLinks".into(),
+            "JumpLinksList".into(),
+            "JumpLinksItem".into(),
+        ];
+
+        let css_prof = CssBlockProfile {
+            block: "jumpLinks".into(),
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // JumpLinksList → JumpLinksItem from DOM nesting (Step 7)
+        let list_to_item = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "JumpLinksList" && e.child == "JumpLinksItem");
+        assert!(
+            list_to_item.is_some(),
+            "Expected JumpLinksList → JumpLinksItem from DOM nesting. Edges: {:?}",
+            tree.edges
+        );
+
+        // JumpLinks → JumpLinksList from Signal B (secondary root promotion)
+        let root_to_list = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "JumpLinks" && e.child == "JumpLinksList");
+        assert!(
+            root_to_list.is_some(),
+            "Expected JumpLinks → JumpLinksList from BEM orphan fallback. Edges: {:?}",
+            tree.edges
+        );
+
+        // The full chain: JumpLinks → JumpLinksList → JumpLinksItem
+        // After Step 9 (suppress), root→JumpLinksItem should not exist
+        // (because JumpLinksList is an intermediate).
+        let root_to_item = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "JumpLinks" && e.child == "JumpLinksItem");
+        assert!(
+            root_to_item.is_none(),
+            "JumpLinks → JumpLinksItem should not exist (JumpLinksList is intermediate). Edges: {:?}",
+            tree.edges
+        );
+
+        // All 3 should be retained
+        assert_eq!(tree.family_members.len(), 3);
+    }
+
+    #[test]
+    fn test_layout_children_and_orphan_fallback_interaction() {
+        // Verifies Signal A runs before Signal B. With layout_children
+        // creating an intermediate edge, Signal B should not create a
+        // redundant root→leaf edge.
+        let mut root_prof = make_profile("EmptyState");
+        root_prof.has_children_prop = true;
+        root_prof.bem_block = Some("emptyState".into());
+        root_prof.css_tokens_used = tokens(&["styles.emptyState"]);
+
+        let mut body = make_profile("EmptyStateBody");
+        body.bem_block = Some("emptyState".into());
+        body.css_tokens_used = tokens(&["styles.emptyStateBody"]);
+
+        let mut footer = make_profile("EmptyStateFooter");
+        footer.has_children_prop = true;
+        footer.bem_block = Some("emptyState".into());
+        footer.css_tokens_used = tokens(&["styles.emptyStateFooter"]);
+
+        let mut actions = make_profile("EmptyStateActions");
+        actions.bem_block = Some("emptyState".into());
+        actions.css_tokens_used = tokens(&["styles.emptyStateActions"]);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("EmptyState".into(), root_prof);
+        profiles.insert("EmptyStateBody".into(), body);
+        profiles.insert("EmptyStateFooter".into(), footer);
+        profiles.insert("EmptyStateActions".into(), actions);
+
+        let family = vec![
+            "EmptyState".into(),
+            "EmptyStateBody".into(),
+            "EmptyStateFooter".into(),
+            "EmptyStateActions".into(),
+        ];
+
+        let css_prof = CssBlockProfile {
+            block: "emptyState".into(),
+            layout_children: vec![("footer".into(), "actions".into())],
+            ..Default::default()
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+
+        // Expected tree:
+        // EmptyState
+        // ├── EmptyStateBody       (Signal B: orphan)
+        // └── EmptyStateFooter     (Signal B: orphan with outgoing from Signal A)
+        //     └── EmptyStateActions (Signal A: layout_children)
+
+        // Signal A: Footer → Actions
+        assert!(tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "EmptyStateFooter" && e.child == "EmptyStateActions"));
+
+        // Signal B: Root → Body (orphan)
+        assert!(tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "EmptyState" && e.child == "EmptyStateBody"));
+
+        // Signal B: Root → Footer (orphan — no incoming, only outgoing from A)
+        assert!(tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "EmptyState" && e.child == "EmptyStateFooter"));
+
+        // Signal B should NOT create Root → Actions (already parented by Footer)
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "EmptyState" && e.child == "EmptyStateActions"),
+            "EmptyState → EmptyStateActions should NOT exist. Edges: {:?}",
+            tree.edges
+        );
+
+        // All 4 members retained
+        assert_eq!(tree.family_members.len(), 4);
+    }
+
+    #[test]
+    fn test_bem_orphan_fallback_no_css_profile() {
+        // When no CSS profile is provided, Signal B should not fire
+        // (css_to_component is empty).
+        let mut root_prof = make_profile("Panel");
+        root_prof.has_children_prop = true;
+        root_prof.bem_block = Some("panel".into());
+        root_prof.css_tokens_used = tokens(&["styles.panel"]);
+
+        let mut header = make_profile("PanelHeader");
+        header.bem_block = Some("panel".into());
+        header.css_tokens_used = tokens(&["styles.panelHeader"]);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Panel".into(), root_prof);
+        profiles.insert("PanelHeader".into(), header);
+
+        let family = vec!["Panel".into(), "PanelHeader".into()];
+
+        // No CSS profile — Signal B should not fire
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+
+        // PanelHeader should be dropped (no edges, no CSS profile)
+        assert!(
+            !tree.family_members.contains(&"PanelHeader".to_string()),
+            "PanelHeader should be dropped without CSS profile. Members: {:?}",
+            tree.family_members
         );
     }
 }

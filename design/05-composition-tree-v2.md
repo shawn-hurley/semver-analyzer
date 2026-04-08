@@ -18,9 +18,9 @@ incorrect conformance rules that fire as false positive incidents.
 
 **BEM determines family membership. CSS + React source determine hierarchy.**
 
-Every edge in the tree must have structural evidence from one of 8 signals.
-Components with zero edges are dropped from the tree entirely — no "default to
-root" guessing.
+Every edge in the tree must have structural evidence from one of 10 signals
+(8 structural + 2 fallback). Components with zero edges are dropped from the
+tree entirely — no "default to root" guessing.
 
 ### EdgeStrength: Required vs Allowed
 
@@ -52,9 +52,11 @@ steps in order:
 | 3b | CSS implicit grid child | Required | B is in same block as non-root grid container A, has no grid positioning |
 | 4 | CSS flex context | Allowed | Root is grid, A wraps children in flex, B has no grid positioning |
 | 5 | CSS descendant | Allowed | `.block__A .block__B` selector in CSS |
+| 5.5 | CSS layout children | Allowed | Shared CSS rule with flex-wrap/gap implies containment |
 | 6 | React context | Required | A provides XContext, B consumes XContext |
 | 7 | DOM nesting | Required | A wraps children in `<ul>`, B renders `<li>` |
 | 8 | cloneElement | Required | A uses `Children.map + cloneElement({ prop })`, B declares `prop` |
+| 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
 
 After all steps: deduplicate, suppress root edges when intermediate exists,
 drop members with zero edges. Members with outgoing edges but no incoming
@@ -64,6 +66,39 @@ children, but nothing is above JumpLinksList in the hierarchy). Non-exported
 secondary roots are then properly handled by `collapse_internal_nodes`:
 since they have no incoming edges, collapsing removes their outgoing edges
 cleanly with zero transitive edges created.
+
+### CSS Layout Children (Step 5.5)
+
+Step 5.5 consumes `layout_children` from `CssBlockProfile` — pairs of BEM
+elements where one is a layout container (has `flex-wrap`, `gap`, or is a
+grid container) and the other is a co-rule sibling. These pairs are mapped
+through `css_element_to_component_map` to produce component edges.
+
+This data was previously computed by `infer_layout_children()` in the CSS
+profile module but never consumed by the composition tree builder. It catches
+intermediate nesting within families (e.g., EmptyStateFooter → EmptyStateActions
+from a shared CSS rule with flex-wrap).
+
+### BEM Element Orphan Fallback (Step 8.5)
+
+Step 8.5 connects orphan BEM elements to the family root as a last resort.
+It fires for family members with zero incoming edges after all structural
+signals (Steps 1-8 + 5.5) if the member appears in `css_element_to_component_map`
+(has BEM element CSS tokens of the root's block) and the root has
+`has_children_prop`. Three guards prevent false edges:
+
+1. **Orphan gate**: Only fires for members with zero incoming edges, preventing
+   wrong edges for already-connected components in Category 3 families.
+2. **CSS element map membership**: Member must have CSS tokens that are BEM
+   elements of the root's block (filters out context objects, type exports).
+3. **BEM independence**: Member must NOT have its own distinct BEM block
+   (prevents false edges for collision families like Label/LabelGroup,
+   Menu/MenuToggle, Alert/AlertGroup where camelCase naming creates false
+   prefix matches in the CSS element map).
+
+This step recovers children-passthrough families (e.g., EmptyState, Panel,
+HelperText, Sidebar) where the parent renders `{children}` and sub-components
+are placed by consumers in JSX with no structural signal connecting them.
 
 ### Prop-Default JSX Detection (Step 1 enhancement)
 

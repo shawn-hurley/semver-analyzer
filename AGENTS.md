@@ -139,9 +139,11 @@ from structural evidence.**
 | 3b | CSS implicit grid child | Required* | Same — grid layout dependency |
 | 4 | CSS flex context | Allowed | Layout preference, not strict |
 | 5 | CSS descendant ` ` | Allowed | Works at any depth |
+| 5.5 | CSS layout children | Allowed | Shared CSS rule with flex-wrap/gap implies containment |
 | 6 | React context | Required | Null context = crash/broken behavior |
 | 7 | DOM nesting | Required | Invalid HTML without correct parent |
 | 8 | cloneElement | Required | Missing injected props breaks functionality |
+| 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
 
 *Steps 2, 3, 3b use `Allowed` instead of `Required` when the child component
 equals the family root — this indicates recursive/self-nesting (e.g., DataList
@@ -153,10 +155,30 @@ Step 1 detects JSX elements in **parameter destructuring defaults**
 This is critical for components like ChartBullet that receive sub-components
 as props with JSX defaults.
 
+Step 5.5 consumes `layout_children` from `CssBlockProfile` — pairs of BEM
+elements where one is a layout container (has flex-wrap/gap/grid) and the
+other is a co-rule sibling. This data was previously computed but never
+consumed. It catches intermediate nesting within families (e.g.,
+EmptyStateFooter → EmptyStateActions from a shared CSS rule with flex-wrap).
+
 Step 8 has two filters to prevent false edges from shared prop vocabularies:
 (1) skip creating A→B if B→A already exists from a prior step (prevents
 reverse-of-existing cycles), and (2) remove bidirectional cloneElement pairs
 (A→B + B→A both from cloneElement = peers, not hierarchy).
+
+Step 8.5 connects orphan BEM elements to the family root as a last resort.
+It fires for family members with zero incoming edges after all structural
+signals (Steps 1-8 + 5.5) if the member appears in `css_element_to_component_map`
+(has BEM element CSS tokens of the root's block). Three guards prevent false
+edges:
+1. **Orphan gate**: Only fires for members with zero incoming edges, preventing
+   wrong edges for already-connected components in Category 3 families.
+2. **CSS element map membership**: Member must have CSS tokens that are BEM
+   elements of the root's block (filters out context objects, type exports).
+3. **BEM independence**: Member must NOT have its own distinct BEM block
+   (prevents false edges for collision families like Label/LabelGroup,
+   Menu/MenuToggle, Alert/AlertGroup where camelCase naming creates false
+   prefix matches in the CSS element map).
 
 After all steps, members with zero edges (no incoming AND no outgoing) are
 dropped from the tree (no "default to root" guessing). Members with outgoing
