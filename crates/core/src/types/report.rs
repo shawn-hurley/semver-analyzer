@@ -77,8 +77,8 @@ pub struct AnalysisReport<L: Language> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hierarchy_deltas: Vec<HierarchyDelta>,
 
-    /// v2 SD (Source-Level Diff) pipeline results.
-    /// Populated when `--pipeline-v2` is used; None otherwise.
+    /// SD (Source-Level Diff) pipeline results.
+    /// Populated by default; None when `--behavioral` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sd_result: Option<super::sd::SdPipelineResult>,
 
@@ -961,7 +961,7 @@ pub struct AnalysisResult<L: Language> {
     pub hierarchy_deltas: Vec<HierarchyDelta>,
     pub new_hierarchies: HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 
-    // ── v2 SD pipeline results (populated only with --pipeline-v2) ──
+    // ── SD pipeline results (populated by default; None with --behavioral) ──
     /// Source-level changes from the SD pipeline.
     /// Empty when running the v1 (BU) pipeline.
     pub sd_result: Option<super::sd::SdPipelineResult>,

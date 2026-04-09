@@ -15,12 +15,12 @@ use std::path::PathBuf;
 pub struct LoggingArgs {
     /// Path to a log file for debug/trace output.
     /// When set, all tracing events at the configured level are written here.
-    #[arg(long)]
+    #[arg(long, help_heading = "Logging")]
     pub log_file: Option<PathBuf>,
 
     /// Log level filter (trace, debug, info, warn, error).
     /// Controls file output verbosity. Stderr progress display is always shown.
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "info", help_heading = "Logging")]
     pub log_level: String,
 }
 
@@ -49,61 +49,37 @@ pub struct CommonAnalyzeArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Use the behavioral analysis (BU) pipeline instead of the default
+    /// source-level diff (SD) pipeline.
+    ///
+    /// The BU pipeline uses test-delta heuristics and optional LLM inference
+    /// to detect behavioral breaking changes. The default SD pipeline produces
+    /// deterministic, AST-based source-level change facts.
+    #[arg(long, help_heading = "Pipeline")]
+    pub behavioral: bool,
+
+    /// Backwards-compatible alias for the default pipeline (no-op).
+    /// The SD pipeline is now the default; this flag is accepted but ignored.
+    #[arg(long, hide = true)]
+    pub pipeline_v2: bool,
+
     /// Skip LLM-based behavioral analysis (static analysis only).
-    #[arg(long)]
+    #[arg(long, help_heading = "LLM Options")]
     pub no_llm: bool,
 
     /// Command to invoke for LLM analysis.
     /// The prompt is passed as the final argument.
-    /// Examples:
-    ///   --llm-command "goose run --no-session -q -t"
-    ///   --llm-command "opencode run"
-    #[arg(long)]
+    #[arg(long, help_heading = "LLM Options")]
     pub llm_command: Option<String>,
-
-    /// Maximum LLM cost in USD before circuit breaker triggers.
-    #[arg(long, default_value = "5.0")]
-    pub max_llm_cost: f64,
 
     /// Send ALL files with changed exported functions to the LLM,
     /// not just files that have associated test changes.
-    #[arg(long)]
+    /// Only used with --behavioral pipeline.
+    #[arg(long, requires = "behavioral", help_heading = "LLM Options")]
     pub llm_all_files: bool,
 
-    /// Use the v2 Source-Level Diff (SD) pipeline instead of the
-    /// Bottom-Up (BU) behavioral analysis pipeline.
-    ///
-    /// SD produces deterministic, AST-based source-level change facts
-    /// (portal usage, BEM tokens, prop defaults, DOM structure, etc.)
-    /// instead of relying on test-delta heuristics and LLM inference.
-    #[arg(long)]
-    pub pipeline_v2: bool,
-
-    /// Path to a dependency git repository (e.g., @patternfly/patternfly CSS repo).
-    ///
-    /// When provided, the SD pipeline extracts CSS profiles from this repo
-    /// and uses them to enrich composition trees (grid nesting, :has() selectors)
-    /// and generate CSS-level migration rules.
-    #[arg(long)]
-    pub dep_repo: Option<PathBuf>,
-
-    /// Git ref for the "old" version of the dependency repo.
-    /// Required when --dep-repo is set.
-    #[arg(long)]
-    pub dep_from: Option<String>,
-
-    /// Git ref for the "new" version of the dependency repo.
-    /// Required when --dep-repo is set.
-    #[arg(long)]
-    pub dep_to: Option<String>,
-
-    /// Build command for the dependency repo (e.g., "npm install && npx gulp compileSASS").
-    /// Runs in the worktree before CSS extraction.
-    #[arg(long)]
-    pub dep_build_command: Option<String>,
-
     /// Timeout in seconds for each LLM invocation.
-    #[arg(long, default_value = "120")]
+    #[arg(long, default_value = "120", help_heading = "LLM Options")]
     pub llm_timeout: u64,
 }
 
@@ -172,49 +148,38 @@ pub struct CommonKonveyorArgs {
     #[arg(long)]
     pub output_dir: PathBuf,
 
+    /// Use the behavioral analysis (BU) pipeline instead of the default
+    /// source-level diff (SD) pipeline. Only used in --repo mode.
+    #[arg(long, help_heading = "Pipeline")]
+    pub behavioral: bool,
+
+    /// Backwards-compatible alias for the default pipeline (no-op).
+    #[arg(long, hide = true)]
+    pub pipeline_v2: bool,
+
     /// Skip LLM-based behavioral analysis (static analysis only).
     /// Only used when running analysis internally (--repo mode).
-    #[arg(long)]
+    #[arg(long, help_heading = "LLM Options")]
     pub no_llm: bool,
 
     /// Command to invoke for LLM analysis.
-    #[arg(long)]
+    #[arg(long, help_heading = "LLM Options")]
     pub llm_command: Option<String>,
 
-    /// Maximum LLM cost in USD before circuit breaker triggers.
-    #[arg(long, default_value = "5.0")]
-    pub max_llm_cost: f64,
-
     /// Send ALL files with changed exported functions to the LLM.
-    #[arg(long)]
+    /// Only used with --behavioral pipeline.
+    #[arg(long, requires = "behavioral", help_heading = "LLM Options")]
     pub llm_all_files: bool,
 
-    /// Use the v2 Source-Level Diff (SD) pipeline instead of the
-    /// Bottom-Up (BU) behavioral analysis pipeline.
-    #[arg(long)]
-    pub pipeline_v2: bool,
-
-    /// Path to a dependency git repository (e.g., @patternfly/patternfly CSS repo).
-    #[arg(long)]
-    pub dep_repo: Option<PathBuf>,
-
-    /// Git ref for the "old" version of the dependency repo.
-    #[arg(long)]
-    pub dep_from: Option<String>,
-
-    /// Git ref for the "new" version of the dependency repo.
-    #[arg(long)]
-    pub dep_to: Option<String>,
+    /// Timeout in seconds for each LLM invocation.
+    #[arg(long, default_value = "120", help_heading = "LLM Options")]
+    pub llm_timeout: u64,
 
     /// Disable rule consolidation (keep one rule per declaration change).
-    #[arg(long)]
+    #[arg(long, help_heading = "Rule Generation")]
     pub no_consolidate: bool,
 
     /// Path to a YAML file with regex-based rename patterns.
-    #[arg(long)]
+    #[arg(long, help_heading = "Rule Generation")]
     pub rename_patterns: Option<PathBuf>,
-
-    /// Timeout in seconds for each LLM invocation.
-    #[arg(long, default_value = "120")]
-    pub llm_timeout: u64,
 }

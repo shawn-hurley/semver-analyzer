@@ -18,8 +18,9 @@ migration rules with fix strategies.
 
 ### Three Pipelines
 
-The analyzer has three pipelines. The `--pipeline-v2` flag controls which
-combination runs.
+The analyzer has three pipelines. The `--behavioral` flag controls which
+combination runs. By default, the SD pipeline runs; `--behavioral` switches
+to the BU pipeline instead.
 
 #### TD (Top-Down) — Structural API Diff
 
@@ -35,22 +36,9 @@ them to detect:
 Key files: `crates/core/src/diff/` (mod.rs, rename.rs, compare.rs, relocate.rs,
 migration.rs)
 
-#### BU (Bottom-Up) — Behavioral Analysis (v1 only)
+#### SD (Source-Level Diff) — Deterministic Source Analysis (default)
 
-**Runs when `--pipeline-v2` is NOT set.** Walks the git diff bottom-up:
-
-1. Parse changed functions from git diff
-2. For each changed function, find associated test files
-3. Check test assertion changes → behavioral break
-4. If private function has behavioral break → walk UP call graph to public API
-5. Optionally runs LLM analysis on changed files for deeper behavioral insights
-
-Key files: `src/orchestrator.rs` (run() method, lines 56–305)
-
-#### SD (Source-Level Diff) — Deterministic Source Analysis (v2 only)
-
-**Runs when `--pipeline-v2` IS set.** Replaces BU with deterministic AST-based
-analysis:
+**Runs by default.** Replaces BU with deterministic AST-based analysis:
 
 1. Extract `ComponentSourceProfile` for each component at both refs
 2. Diff profiles to produce `SourceLevelChange` entries:
@@ -66,23 +54,37 @@ analysis:
 Key files: `crates/ts/src/source_profile/`, `crates/ts/src/sd_pipeline.rs`,
 `crates/ts/src/composition/`
 
+#### BU (Bottom-Up) — Behavioral Analysis (opt-in)
+
+**Runs when `--behavioral` is set.** Walks the git diff bottom-up:
+
+1. Parse changed functions from git diff
+2. For each changed function, find associated test files
+3. Check test assertion changes → behavioral break
+4. If private function has behavioral break → walk UP call graph to public API
+5. Optionally runs LLM analysis on changed files for deeper behavioral insights
+
+Key files: `src/orchestrator.rs` (run() method, lines 56–305)
+
 ### Pipeline Selection
 
 ```sh
-# v1: TD + BU (structural + behavioral)
+# Default: TD + SD (structural + source-level)
 semver-analyzer analyze typescript --repo ... --from v5 --to v6
 
-# v2: TD + SD (structural + source-level) — default for pipeline runs
-semver-analyzer analyze typescript --repo ... --from v5 --to v6 --pipeline-v2
+# Opt-in: TD + BU (structural + behavioral)
+semver-analyzer analyze typescript --repo ... --from v5 --to v6 --behavioral
 ```
 
-Both produce an `AnalysisReport` with the same top-level structure. v1 populates
-`breaking_behavioral_changes`, v2 populates `sd_result` (source_level_changes,
-composition_trees, conformance_checks, etc.).
+Both produce an `AnalysisReport` with the same top-level structure. The default
+pipeline populates `sd_result` (source_level_changes, composition_trees,
+conformance_checks, etc.). The `--behavioral` pipeline populates
+`breaking_behavioral_changes` instead.
 
-Rule generation (`konveyor` subcommand) also accepts `--pipeline-v2` to enable
-v2-specific rules (composition, conformance, prop-to-child migration, test
-impact, CSS removal, prop-attribute-override).
+Rule generation (`konveyor` subcommand) generates SD-specific rules
+(composition, conformance, prop-to-child migration, test impact, CSS removal,
+prop-attribute-override) by default. With `--behavioral`, only TD-based rules
+are generated.
 
 ## Key Rules for Agents
 

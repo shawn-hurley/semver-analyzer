@@ -9,7 +9,22 @@ use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 /// Deterministic, structured analysis of breaking changes between two git refs.
 /// Combines static API surface extraction with optional LLM-based behavioral analysis.
 #[derive(Parser, Debug)]
-#[command(name = "semver-analyzer", version, about)]
+#[command(
+    name = "semver-analyzer",
+    version,
+    about,
+    after_help = "\
+QUICK START:
+    # Analyze breaking changes between two tags
+    semver-analyzer analyze typescript \\
+        --repo ./my-lib --from v1.0.0 --to v2.0.0 -o report.json
+
+    # Generate Konveyor migration rules from a report
+    semver-analyzer konveyor typescript \\
+        --from-report report.json --output-dir ./rules
+
+    Run '<command> --help' for detailed usage and examples."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -43,7 +58,7 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Full pipeline: extract -> diff -> impact -> behavioral analysis.
+    /// Full pipeline: extract API surfaces, diff, and detect breaking changes.
     Analyze {
         #[command(subcommand)]
         language: AnalyzeLanguage,

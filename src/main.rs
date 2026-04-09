@@ -192,25 +192,8 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
     let analyzer = orchestrator::Analyzer {
         lang: Arc::new(TypeScript::new(args.build_command)),
     };
-    let result = if common.pipeline_v2 {
-        reporter.println("Pipeline: v2 (TD+SD, no BU)");
-        analyzer
-            .run_v2(
-                &common.repo,
-                &common.from,
-                &common.to,
-                common.no_llm,
-                common.llm_command.as_deref(),
-                None,
-                common.dep_repo.as_deref(),
-                common.dep_from.as_deref(),
-                common.dep_to.as_deref(),
-                common.dep_build_command.as_deref(),
-                common.llm_timeout,
-                reporter,
-            )
-            .await?
-    } else {
+    let result = if common.behavioral {
+        reporter.println("Pipeline: behavioral (TD+BU)");
         analyzer
             .run(
                 &common.repo,
@@ -220,6 +203,24 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                 common.llm_command.as_deref(),
                 None, // build_command already on TypeScript
                 common.llm_all_files,
+                common.llm_timeout,
+                reporter,
+            )
+            .await?
+    } else {
+        reporter.println("Pipeline: source-level diff (TD+SD)");
+        analyzer
+            .run_v2(
+                &common.repo,
+                &common.from,
+                &common.to,
+                common.no_llm,
+                common.llm_command.as_deref(),
+                None,
+                args.dep_repo.as_deref(),
+                args.dep_from.as_deref(),
+                args.dep_to.as_deref(),
+                args.dep_build_command.as_deref(),
                 common.llm_timeout,
                 reporter,
             )
@@ -401,25 +402,8 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         let analyzer = orchestrator::Analyzer {
             lang: Arc::new(TypeScript::new(args.build_command.clone())),
         };
-        let result = if common.pipeline_v2 {
-            reporter.println("Pipeline: v2 (TD+SD, no BU)");
-            analyzer
-                .run_v2(
-                    repo,
-                    from,
-                    to,
-                    common.no_llm,
-                    common.llm_command.as_deref(),
-                    None,
-                    common.dep_repo.as_deref(),
-                    common.dep_from.as_deref(),
-                    common.dep_to.as_deref(),
-                    None, // konveyor reads from report, no dep build needed
-                    common.llm_timeout,
-                    reporter,
-                )
-                .await?
-        } else {
+        let result = if common.behavioral {
+            reporter.println("Pipeline: behavioral (TD+BU)");
             analyzer
                 .run(
                     repo,
@@ -429,6 +413,24 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                     common.llm_command.as_deref(),
                     None, // build_command already on TypeScript
                     common.llm_all_files,
+                    common.llm_timeout,
+                    reporter,
+                )
+                .await?
+        } else {
+            reporter.println("Pipeline: source-level diff (TD+SD)");
+            analyzer
+                .run_v2(
+                    repo,
+                    from,
+                    to,
+                    common.no_llm,
+                    common.llm_command.as_deref(),
+                    None,
+                    args.dep_repo.as_deref(),
+                    args.dep_from.as_deref(),
+                    args.dep_to.as_deref(),
+                    args.dep_build_command.as_deref(),
                     common.llm_timeout,
                     reporter,
                 )
@@ -557,10 +559,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let mut all_rules = rules;
     all_rules.extend(dep_update_rules);
 
-    // v2 SD rules — composition, conformance, context, prop↔child migration
-    if common.pipeline_v2 {
+    // SD rules — composition, conformance, context, prop↔child migration
+    if !common.behavioral {
         if let Some(ref sd) = report.sd_result {
-            let sd_rule_phase = reporter.start_phase("Generating v2 SD rules");
+            let sd_rule_phase = reporter.start_phase("Generating SD rules");
             let sd_rules =
                 semver_analyzer_ts::konveyor_v2::generate_sd_rules(&report, sd, &pkg_cache);
             let sd_count = sd_rules.len();
