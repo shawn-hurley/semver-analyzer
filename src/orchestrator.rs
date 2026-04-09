@@ -810,13 +810,15 @@ impl<L: Language> Analyzer<L> {
         // Step 1: Extract API surface at old ref
         let phase =
             progress.start_phase(&format!("[TD] Extracting API surface at {} ...", from_ref));
-        let old_surface =
-            {
-                let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
-                Arc::new(lang.extract(repo, from_ref, Some(shared.degradation())).with_context(|| {
-                    format!("Failed to extract API surface at ref {}", from_ref)
-                })?)
-            };
+        let old_surface = {
+            let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
+            Arc::new(
+                lang.extract(repo, from_ref, Some(shared.degradation()))
+                    .with_context(|| {
+                        format!("Failed to extract API surface at ref {}", from_ref)
+                    })?,
+            )
+        };
         let old_count = old_surface.symbols.len();
         phase.finish_with_detail(
             &format!("[TD] Extracted API surface at {}", from_ref),

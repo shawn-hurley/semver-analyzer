@@ -325,8 +325,18 @@ fn emit_type(source: &str, imports: Option<&ImportMap>, ts_type: &TSType, ctx: C
                 return "ReadonlyArray".to_string();
             }
 
-            // Generic type reference: Foo<A, B>
-            if let Some(type_args) = &r.type_arguments {
+            // Rule 7: Strip default generic parameters.
+            // When ALL type arguments are `any`, the generic parameters are
+            // TypeScript defaults and can be omitted.  For example,
+            // `ReactElement<any>` is identical to `ReactElement` because
+            // `any` is the default type parameter.  Stripping these avoids
+            // false positive type-change detections when a `.d.ts` file
+            // makes the default explicit.
+            if let Some(type_args) = r.type_arguments.as_ref().filter(|ta| {
+                !ta.params
+                    .iter()
+                    .all(|a| matches!(a, TSType::TSAnyKeyword(_)))
+            }) {
                 let args: Vec<String> = type_args
                     .params
                     .iter()
@@ -1464,9 +1474,11 @@ mod tests {
             r#"React.ForwardRefExoticComponent<Omit<FooProps, "ref"> & React.RefAttributes<any>>"#,
             &imports,
         );
+        // Rule 7: RefAttributes<any> is stripped to RefAttributes since
+        // <any> is the default generic parameter.
         assert_eq!(
             result,
-            r#"ForwardRefExoticComponent<Omit<FooProps, "ref"> & RefAttributes<any>>"#
+            r#"ForwardRefExoticComponent<Omit<FooProps, "ref"> & RefAttributes>"#
         );
     }
 
@@ -1560,5 +1572,50 @@ mod tests {
         m.add_named("FC", "FunctionComponent", "react");
         assert_eq!(m.len(), 2);
         assert_eq!(m.iter().count(), 2);
+    }
+
+    // ── Rule 7: Default generic parameter stripping ──────────────────
+
+    #[test]
+    fn strip_all_any_generic_params() {
+        assert_eq!(canon("ReactElement<any>"), "ReactElement");
+    }
+
+    #[test]
+    fn strip_multiple_any_generic_params() {
+        assert_eq!(canon("Map<any, any>"), "Map");
+    }
+
+    #[test]
+    fn preserve_non_any_generic_params() {
+        assert_eq!(canon("ReactElement<string>"), "ReactElement<string>");
+    }
+
+    #[test]
+    fn preserve_mixed_generic_params() {
+        assert_eq!(canon("Map<string, any>"), "Map<string, any>");
+    }
+
+    #[test]
+    fn no_type_args_unchanged() {
+        assert_eq!(canon("ReactElement"), "ReactElement");
+    }
+
+    #[test]
+    fn strip_any_in_union_member() {
+        assert_eq!(canon("ReactElement<any> | string"), "ReactElement | string");
+    }
+
+    #[test]
+    fn strip_any_in_array() {
+        assert_eq!(canon("ReactElement<any>[]"), "ReactElement[]");
+    }
+
+    #[test]
+    fn strip_any_in_function_return() {
+        assert_eq!(
+            canon("(props: Foo) => ReactElement<any>"),
+            "(props: Foo) => ReactElement"
+        );
     }
 }

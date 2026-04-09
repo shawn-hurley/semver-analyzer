@@ -152,7 +152,7 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
 ///
 /// The CSS file path uses kebab-case (`modal-box`) but the JS token names
 /// use camelCase (`modalBox`). This conversion aligns them.
-fn kebab_to_camel_case(s: &str) -> String {
+pub(crate) fn kebab_to_camel_case(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut capitalize_next = false;
     for ch in s.chars() {

@@ -1013,7 +1013,7 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             }
         } else {
@@ -1576,7 +1576,7 @@ pub fn build_frontend_condition(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             }];
 
@@ -1596,7 +1596,7 @@ pub fn build_frontend_condition(
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     });
                 }
@@ -1659,7 +1659,7 @@ pub fn build_frontend_condition(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             }];
             if !is_subpath_scoped {
@@ -1678,7 +1678,7 @@ pub fn build_frontend_condition(
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                 );
@@ -1702,7 +1702,7 @@ pub fn build_frontend_condition(
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 });
             }
@@ -1719,7 +1719,7 @@ pub fn build_frontend_condition(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             });
             if let Some(component_name) = match_name.strip_suffix("Props") {
@@ -1738,7 +1738,7 @@ pub fn build_frontend_condition(
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     });
                 }
@@ -1762,7 +1762,7 @@ pub fn build_frontend_condition(
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 }
             } else {
@@ -1779,7 +1779,7 @@ pub fn build_frontend_condition(
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 }
             }
@@ -1822,7 +1822,7 @@ pub fn build_frontend_condition(
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 });
             }
@@ -1839,7 +1839,7 @@ pub fn build_frontend_condition(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             });
             if conditions.len() == 1 {
@@ -1870,7 +1870,7 @@ pub fn build_frontend_condition(
                                 not_parent: None,
                                 child: None,
                                 not_child: None,
-                requires_child: None,
+                                requires_child: None,
                             },
                         },
                         KonveyorCondition::FrontendReferenced {
@@ -1886,7 +1886,7 @@ pub fn build_frontend_condition(
                                 not_parent: None,
                                 child: None,
                                 not_child: None,
-                requires_child: None,
+                                requires_child: None,
                             },
                         },
                     ],
@@ -1905,7 +1905,7 @@ pub fn build_frontend_condition(
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 }
             }
@@ -2617,7 +2617,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                         file_pattern: None,
                     },
                 },
@@ -2643,7 +2643,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                         file_pattern: None,
                     },
                 },
@@ -2677,7 +2677,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                         file_pattern: None,
                     },
                 },
@@ -2703,7 +2703,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                         file_pattern: None,
                     },
                 },

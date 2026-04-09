@@ -91,7 +91,42 @@ pub fn extract_style_tokens(source: &str) -> Vec<StyleToken> {
                 }
             } else {
                 // styles.xxx (a block or element token)
-                let token = first.to_string();
+                //
+                // Template literal detection: in patterns like
+                // `${styles.form}__alert`, the component constructs a BEM
+                // element class via string interpolation. The actual rendered
+                // class is `pf-v6-c-form__alert`, NOT `pf-v6-c-form` (the
+                // root). Record the composed camelCase token (e.g.,
+                // `formAlert`) so the CSS element map correctly maps this
+                // component to its BEM element instead of the root.
+                let token = if first_end < len
+                    && bytes[first_end] == b'}'
+                    && first_end + 3 <= len
+                    && bytes[first_end + 1] == b'_'
+                    && bytes[first_end + 2] == b'_'
+                {
+                    // Read the BEM element suffix after `}__`
+                    let suffix_start = first_end + 3;
+                    // BEM suffixes can contain hyphens (kebab-case), so read
+                    // until we hit a non-ident, non-hyphen character.
+                    let mut suffix_end = suffix_start;
+                    while suffix_end < len
+                        && (is_ident_char(bytes[suffix_end]) || bytes[suffix_end] == b'-')
+                    {
+                        suffix_end += 1;
+                    }
+                    if suffix_end > suffix_start {
+                        let suffix = &source[suffix_start..suffix_end];
+                        // Convert kebab-case suffix to camelCase with leading
+                        // uppercase: "helper-text" → "HelperText"
+                        let camel_suffix = super::kebab_to_camel_case(&capitalize_first(suffix));
+                        format!("{first}{camel_suffix}")
+                    } else {
+                        first.to_string()
+                    }
+                } else {
+                    first.to_string()
+                };
                 if seen.insert(token.clone()) {
                     tokens.push(StyleToken::ClassToken(token));
                 }
@@ -305,6 +340,14 @@ fn lowercase_first(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_lowercase().to_string() + chars.as_str(),
+    }
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
     }
 }
 
@@ -609,6 +652,80 @@ const Component = () => (
             rel,
             BemRelationship::Unknown,
             "No tokens and no block should be Unknown"
+        );
+    }
+
+    // ── Template literal BEM token extraction ───────────────────────
+
+    #[test]
+    fn template_literal_composes_bem_element() {
+        // `${styles.form}__alert` → "formAlert", not "form"
+        let source = r#"<div className={css(`${styles.form}__alert`, className)}>"#;
+        let tokens = extract_style_tokens(source);
+        assert!(
+            tokens.contains(&StyleToken::ClassToken("formAlert".into())),
+            "Expected 'formAlert' from template literal. Got: {:?}",
+            tokens
+        );
+        assert!(
+            !tokens.contains(&StyleToken::ClassToken("form".into())),
+            "Should NOT record bare 'form' when used in template literal"
+        );
+    }
+
+    #[test]
+    fn template_literal_kebab_suffix() {
+        // `${styles.fileUpload}__helper-text` → "fileUploadHelperText"
+        let source = r#"<div className={css(`${styles.fileUpload}__helper-text`)}>"#;
+        let tokens = extract_style_tokens(source);
+        assert!(
+            tokens.contains(&StyleToken::ClassToken("fileUploadHelperText".into())),
+            "Expected 'fileUploadHelperText' from kebab suffix. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn direct_styles_ref_unchanged() {
+        // css(styles.form, className) → "form" (no template literal)
+        let source = r#"<div className={css(styles.form, className)}>"#;
+        let tokens = extract_style_tokens(source);
+        assert!(
+            tokens.contains(&StyleToken::ClassToken("form".into())),
+            "Direct styles.form should still record 'form'. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn both_direct_and_template_in_same_file() {
+        // A file using styles.form directly AND ${styles.form}__alert
+        let source = r#"
+            <form className={css(styles.form, className)}>
+                <div className={css(`${styles.form}__alert`)}>
+        "#;
+        let tokens = extract_style_tokens(source);
+        assert!(
+            tokens.contains(&StyleToken::ClassToken("form".into())),
+            "Direct use should record 'form'. Got: {:?}",
+            tokens
+        );
+        assert!(
+            tokens.contains(&StyleToken::ClassToken("formAlert".into())),
+            "Template use should record 'formAlert'. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn template_literal_single_word_suffix() {
+        // `${styles.emptyState}__header` → "emptyStateHeader"
+        let source = r#"<div className={css(`${styles.emptyState}__header`)}>"#;
+        let tokens = extract_style_tokens(source);
+        assert!(
+            tokens.contains(&StyleToken::ClassToken("emptyStateHeader".into())),
+            "Expected 'emptyStateHeader'. Got: {:?}",
+            tokens
         );
     }
 }

@@ -370,10 +370,18 @@ fn generate_conformance_rules(
         // conformance rules and what type:
         //   - Parent in no_incoming → requiresChild rule on the parent
         //   - Parent NOT in no_incoming → notParent rule on each child
+        //
+        // PropPassed edges are excluded because the requiresChild scanner
+        // only checks direct JSX children (el.children), not prop value
+        // expressions. A prop-passed child like <Tab actions={<TabAction/>}/>
+        // is invisible to the scanner and would cause guaranteed FPs.
+        // notParent rules still work for prop-passed children because the
+        // scanner correctly tracks parent_name through prop expressions.
         let mut parent_to_req_children: HashMap<&str, Vec<&str>> = HashMap::new();
         for edge in &tree.edges {
             if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
                 && edge.relationship != ChildRelationship::Internal
+                && edge.relationship != ChildRelationship::PropPassed
             {
                 parent_to_req_children
                     .entry(edge.parent.as_str())
@@ -394,6 +402,28 @@ fn generate_conformance_rules(
                     .entry(edge.child.as_str())
                     .or_default()
                     .push(edge.parent.as_str());
+            }
+        }
+
+        // ── Step 3b: Build parent → all children map (Required + Allowed).
+        //
+        // Used for the requiresChild scanner regex. Including Allowed children
+        // prevents false positives when a parent has valid-but-not-required
+        // children (e.g., ToolbarContent with ToolbarGroup/ToolbarItem).
+        // The `parent_to_req_children` map still determines WHICH parents get
+        // requiresChild rules — this map only expands the scanner regex.
+        //
+        // PropPassed edges are excluded (same reason as Step 2 — the scanner
+        // can only see direct JSX children, not prop values).
+        let mut parent_to_all_children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &tree.edges {
+            if edge.relationship != ChildRelationship::Internal
+                && edge.relationship != ChildRelationship::PropPassed
+            {
+                parent_to_all_children
+                    .entry(edge.parent.as_str())
+                    .or_default()
+                    .push(edge.child.as_str());
             }
         }
 
@@ -637,6 +667,11 @@ fn generate_conformance_rules(
         //
         // For parents in no_incoming (roots / secondary roots), the constraint
         // is "if you use this component, it must contain these children."
+        //
+        // The scanner regex uses ALL children (Required + Allowed) so that
+        // valid-but-optional children don't trigger false positives. The rule
+        // still only fires on parents that have Required children (from
+        // parent_to_req_children), and the description lists the Required ones.
         for (parent, children) in &parent_to_req_children {
             if has_required_incoming.contains(parent) {
                 continue; // handled above as notParent
@@ -647,10 +682,19 @@ fn generate_conformance_rules(
             sorted_children.sort();
             sorted_children.dedup();
 
-            let children_pattern = format!("^({})$", sorted_children.join("|"));
-            let children_list = sorted_children.join(" or ");
+            // Use ALL children (Required + Allowed) for the scanner regex to
+            // avoid false positives when valid-but-Allowed children are present.
+            let all_children = parent_to_all_children
+                .get(parent)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let mut sorted_all: Vec<&str> = all_children.to_vec();
+            sorted_all.sort();
+            sorted_all.dedup();
+            let children_pattern = format!("^({})$", sorted_all.join("|"));
+            let children_list = sorted_all.join(" or ");
 
-            let rule_id_suffix = sorted_children
+            let rule_id_suffix = sorted_all
                 .iter()
                 .map(|c| short_component_id(c, &tree.root))
                 .collect::<Vec<_>>()
@@ -665,7 +709,7 @@ fn generate_conformance_rules(
             let message = format!(
                 "<{}> must contain at least one {} child component.\n\n\
                  Correct usage:\n  <{}>\n    <{} />\n  </{}>",
-                parent, children_list, parent, sorted_children[0], parent,
+                parent, children_list, parent, sorted_all[0], parent,
             );
 
             rules.push(KonveyorRule {
@@ -700,7 +744,7 @@ fn generate_conformance_rules(
                 fix_strategy: Some(FixStrategyEntry {
                     strategy: "LlmAssisted".into(),
                     component: Some(parent.to_string()),
-                    replacement: Some(sorted_children[0].to_string()),
+                    replacement: Some(sorted_all.join(", ")),
                     ..Default::default()
                 }),
             });
@@ -4196,5 +4240,289 @@ mod tests {
             "Internal edges should not generate conformance rules. Got: {:?}",
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
+    }
+
+    // ── Fix B: requiresChild includes all valid children ────────────────
+
+    /// Helper: create a Required non-internal edge.
+    fn req_edge(parent: &str, child: &str) -> semver_analyzer_core::types::sd::CompositionEdge {
+        semver_analyzer_core::types::sd::CompositionEdge {
+            parent: parent.into(),
+            child: child.into(),
+            relationship: ChildRelationship::DirectChild,
+            required: true,
+            bem_evidence: None,
+            strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+            prop_name: None,
+        }
+    }
+
+    /// Helper: create an Allowed non-internal edge.
+    fn allowed_edge(parent: &str, child: &str) -> semver_analyzer_core::types::sd::CompositionEdge {
+        semver_analyzer_core::types::sd::CompositionEdge {
+            parent: parent.into(),
+            child: child.into(),
+            relationship: ChildRelationship::DirectChild,
+            required: false,
+            bem_evidence: None,
+            strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+            prop_name: None,
+        }
+    }
+
+    /// requiresChild scanner regex should include Allowed children so
+    /// they don't trigger false positives. For example, ToolbarContent
+    /// has Required edges to ToolbarFilter/ToolbarToggleGroup but also
+    /// Allowed edges to ToolbarGroup/ToolbarItem. The scanner regex
+    /// should match ALL of them.
+    #[test]
+    fn test_requires_child_includes_allowed_children() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("ToolbarContent".into(), "@patternfly/react-core".into());
+        pkgs.insert("ToolbarFilter".into(), "@patternfly/react-core".into());
+        pkgs.insert("ToolbarToggleGroup".into(), "@patternfly/react-core".into());
+        pkgs.insert("ToolbarGroup".into(), "@patternfly/react-core".into());
+        pkgs.insert("ToolbarItem".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Toolbar".into(),
+            family_members: vec![
+                "Toolbar".into(),
+                "ToolbarContent".into(),
+                "ToolbarFilter".into(),
+                "ToolbarToggleGroup".into(),
+                "ToolbarGroup".into(),
+                "ToolbarItem".into(),
+            ],
+            edges: vec![
+                // Required context edges
+                req_edge("ToolbarContent", "ToolbarFilter"),
+                req_edge("ToolbarContent", "ToolbarToggleGroup"),
+                // Allowed CSS descendant edges
+                allowed_edge("ToolbarContent", "ToolbarGroup"),
+                allowed_edge("ToolbarContent", "ToolbarItem"),
+                // ToolbarContent itself hangs off Toolbar (Allowed)
+                allowed_edge("Toolbar", "ToolbarContent"),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // ToolbarContent has no Required incoming → gets requiresChild
+        let req_rule = rules.iter().find(|r| r.rule_id.contains("content-req-"));
+        assert!(
+            req_rule.is_some(),
+            "Expected requiresChild rule for ToolbarContent. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // The scanner regex should include ALL children (Required + Allowed)
+        if let KonveyorCondition::FrontendReferenced { referenced } = &req_rule.unwrap().when {
+            let pattern = referenced.requires_child.as_deref().unwrap();
+            assert!(
+                pattern.contains("ToolbarFilter"),
+                "requiresChild should include Required child ToolbarFilter: {}",
+                pattern
+            );
+            assert!(
+                pattern.contains("ToolbarGroup"),
+                "requiresChild should include Allowed child ToolbarGroup: {}",
+                pattern
+            );
+            assert!(
+                pattern.contains("ToolbarItem"),
+                "requiresChild should include Allowed child ToolbarItem: {}",
+                pattern
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+
+        // The message should mention all valid children
+        let msg = &req_rule.unwrap().message;
+        assert!(
+            msg.contains("ToolbarGroup"),
+            "Message should mention Allowed child ToolbarGroup: {}",
+            msg
+        );
+    }
+
+    /// When a parent has only Required children and no Allowed ones,
+    /// requiresChild should still work identically (no regression).
+    #[test]
+    fn test_requires_child_only_required_children_unchanged() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("List".into(), "@patternfly/react-core".into());
+        pkgs.insert("ListItem".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "List".into(),
+            family_members: vec!["List".into(), "ListItem".into()],
+            edges: vec![req_edge("List", "ListItem")],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        let req_rule = rules.iter().find(|r| r.rule_id.contains("list-req-"));
+        assert!(req_rule.is_some(), "Expected requiresChild rule for List");
+
+        if let KonveyorCondition::FrontendReferenced { referenced } = &req_rule.unwrap().when {
+            let pattern = referenced.requires_child.as_deref().unwrap();
+            assert_eq!(
+                pattern, "^(ListItem)$",
+                "With only Required children, regex should be unchanged"
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+    }
+
+    /// The fix strategy replacement field should list all valid children,
+    /// not just the first one.
+    #[test]
+    fn test_requires_child_fix_strategy_lists_all_children() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Menu".into(), "@patternfly/react-core".into());
+        pkgs.insert("MenuItem".into(), "@patternfly/react-core".into());
+        pkgs.insert("MenuContent".into(), "@patternfly/react-core".into());
+        pkgs.insert("MenuList".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec![
+                "Menu".into(),
+                "MenuItem".into(),
+                "MenuContent".into(),
+                "MenuList".into(),
+            ],
+            edges: vec![
+                req_edge("Menu", "MenuItem"),
+                allowed_edge("Menu", "MenuContent"),
+                allowed_edge("Menu", "MenuList"),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        let req_rule = rules.iter().find(|r| r.rule_id.contains("menu-req-"));
+        assert!(req_rule.is_some(), "Expected requiresChild rule for Menu");
+
+        let fix = req_rule.unwrap().fix_strategy.as_ref().unwrap();
+        let replacement = fix.replacement.as_deref().unwrap();
+        assert!(
+            replacement.contains("MenuContent") && replacement.contains("MenuItem"),
+            "Fix strategy replacement should list all valid children: {}",
+            replacement
+        );
+    }
+
+    // ── Fix C: prop-passed children excluded from requiresChild ─────────
+
+    /// Helper: create a PropPassed edge (child passed via a named prop).
+    fn prop_passed_edge(
+        parent: &str,
+        child: &str,
+        prop_name: &str,
+    ) -> semver_analyzer_core::types::sd::CompositionEdge {
+        semver_analyzer_core::types::sd::CompositionEdge {
+            parent: parent.into(),
+            child: child.into(),
+            relationship: ChildRelationship::PropPassed,
+            required: true,
+            bem_evidence: None,
+            strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+            prop_name: Some(prop_name.into()),
+        }
+    }
+
+    /// When ALL Required children of a parent are prop-passed, no
+    /// requiresChild rule should be generated — the scanner only sees
+    /// direct JSX children and would always report a false positive.
+    #[test]
+    fn test_requires_child_skipped_when_all_prop_passed() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("ChartBullet".into(), "@patternfly/react-charts".into());
+        pkgs.insert("ChartBulletTitle".into(), "@patternfly/react-charts".into());
+        pkgs.insert(
+            "ChartBulletQualitativeRange".into(),
+            "@patternfly/react-charts".into(),
+        );
+
+        let tree = CompositionTree {
+            root: "ChartBullet".into(),
+            family_members: vec![
+                "ChartBullet".into(),
+                "ChartBulletTitle".into(),
+                "ChartBulletQualitativeRange".into(),
+            ],
+            edges: vec![
+                prop_passed_edge("ChartBullet", "ChartBulletTitle", "titleComponent"),
+                prop_passed_edge(
+                    "ChartBullet",
+                    "ChartBulletQualitativeRange",
+                    "qualitativeRangeComponent",
+                ),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("req-")),
+            "All-prop-passed parent should not get requiresChild rule. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// When a parent has a mix of direct and prop-passed Required children,
+    /// only the direct children should appear in the requiresChild regex.
+    /// The prop-passed children are invisible to the scanner.
+    #[test]
+    fn test_requires_child_excludes_prop_passed_children() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Tab".into(), "@patternfly/react-core".into());
+        pkgs.insert("TabAction".into(), "@patternfly/react-core".into());
+        pkgs.insert("TabContent".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Tabs".into(),
+            family_members: vec![
+                "Tabs".into(),
+                "Tab".into(),
+                "TabAction".into(),
+                "TabContent".into(),
+            ],
+            edges: vec![
+                // Direct child — scanner CAN see this
+                req_edge("Tab", "TabContent"),
+                // Prop-passed — scanner CANNOT see this
+                prop_passed_edge("Tab", "TabAction", "actions"),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        let req_rule = rules.iter().find(|r| r.rule_id.contains("tab-req-"));
+        assert!(
+            req_rule.is_some(),
+            "Tab should still get requiresChild for its direct child. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        if let KonveyorCondition::FrontendReferenced { referenced } = &req_rule.unwrap().when {
+            let pattern = referenced.requires_child.as_deref().unwrap();
+            assert!(
+                pattern.contains("TabContent"),
+                "requiresChild should include direct child TabContent: {}",
+                pattern
+            );
+            assert!(
+                !pattern.contains("TabAction"),
+                "requiresChild should NOT include prop-passed child TabAction: {}",
+                pattern
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
     }
 }

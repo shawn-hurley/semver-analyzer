@@ -96,9 +96,7 @@ fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) -> Result<()
 
         let file = fs::File::create(path)
             .with_context(|| format!("Cannot create log file '{}'", path.display()))
-            .with_diagnosis(
-                "Check that the directory exists and you have write permissions.",
-            )?;
+            .with_diagnosis("Check that the directory exists and you have write permissions.")?;
         let file_layer = fmt::layer()
             .with_writer(file)
             .with_ansi(false)

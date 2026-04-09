@@ -1420,7 +1420,14 @@ fn generate_conformance_checks(
         })
     });
 
-    if has_generic_wrapper && !bem_children.is_empty() {
+    // Guard R1: Need at least 2 BEM element wrappers for an exclusive wrapper
+    // pattern. A single wrapper (e.g., ClipboardCopyAction) is too restrictive —
+    // it would require every child to be that one component.
+    // Guard R2: Skip if root has non-BEM direct children. Those are primary
+    // children that the heuristic misses (e.g., Drawer→DrawerContent, Tabs→Tab),
+    // proving the root is not a "wrapper-only" component.
+    let non_bem_count = direct_child_edges.len() - bem_children.len();
+    if has_generic_wrapper && bem_children.len() >= 2 && non_bem_count == 0 {
         // The allowed set starts with all BEM direct children
         let mut allowed: Vec<String> = bem_children.iter().map(|s| s.to_string()).collect();
 
@@ -2481,6 +2488,152 @@ export { DropdownList } from './DropdownList';
                 "No edges should reference internal node {}. Edges: {:?}",
                 name,
                 tree.edges
+            );
+        }
+    }
+
+    // ── Fix A: ExclusiveWrapper heuristic guard tests ────────────────────
+
+    /// Helper: create a BEM element edge from parent to child.
+    fn bem_edge(parent: &str, child: &str) -> semver_analyzer_core::types::sd::CompositionEdge {
+        semver_analyzer_core::types::sd::CompositionEdge {
+            parent: parent.into(),
+            child: child.into(),
+            relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+            required: false,
+            bem_evidence: Some(format!(
+                "BEM element fallback: {} is a BEM element of root's block",
+                child
+            )),
+            strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+            prop_name: None,
+        }
+    }
+
+    /// Helper: create a non-BEM edge (CSS descendant, context, etc.)
+    fn non_bem_edge(
+        parent: &str,
+        child: &str,
+        strength: semver_analyzer_core::types::sd::EdgeStrength,
+    ) -> semver_analyzer_core::types::sd::CompositionEdge {
+        semver_analyzer_core::types::sd::CompositionEdge {
+            parent: parent.into(),
+            child: child.into(),
+            relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+            required: strength == semver_analyzer_core::types::sd::EdgeStrength::Required,
+            bem_evidence: Some("CSS descendant: . .child".into()),
+            strength,
+            prop_name: None,
+        }
+    }
+
+    /// Helper: create a profile with has_children_prop and a div wrapper.
+    fn wrapper_profile() -> ComponentSourceProfile {
+        ComponentSourceProfile {
+            has_children_prop: true,
+            children_slot_path: vec!["div".into()],
+            ..Default::default()
+        }
+    }
+
+    /// Guard R1: ExclusiveWrapper requires at least 2 BEM children.
+    /// A single BEM child (like ClipboardCopyAction) should NOT trigger
+    /// ExclusiveWrapper because requiring every child to be that one
+    /// component is too restrictive.
+    #[test]
+    fn test_exclusive_wrapper_skipped_with_single_bem_child() {
+        let tree = CompositionTree {
+            root: "ClipboardCopy".into(),
+            family_members: vec!["ClipboardCopy".into(), "ClipboardCopyAction".into()],
+            edges: vec![bem_edge("ClipboardCopy", "ClipboardCopyAction")],
+        };
+        let mut profiles = HashMap::new();
+        profiles.insert("ClipboardCopyAction".to_string(), wrapper_profile());
+
+        let checks = generate_conformance_checks("ClipboardCopy", &tree, &profiles);
+
+        assert!(
+            !checks
+                .iter()
+                .any(|c| matches!(&c.check_type, ConformanceCheckType::ExclusiveWrapper { .. })),
+            "Single BEM child should not trigger ExclusiveWrapper"
+        );
+    }
+
+    /// Guard R2: ExclusiveWrapper should be skipped when root has non-BEM
+    /// direct children. For Toolbar, ToolbarContent is a non-BEM child
+    /// (CSS descendant), proving the root accepts non-wrapper children.
+    #[test]
+    fn test_exclusive_wrapper_skipped_with_non_bem_children() {
+        use semver_analyzer_core::types::sd::EdgeStrength;
+
+        let tree = CompositionTree {
+            root: "Toolbar".into(),
+            family_members: vec![
+                "Toolbar".into(),
+                "ToolbarContent".into(),
+                "ToolbarExpandIconWrapper".into(),
+            ],
+            edges: vec![
+                // Non-BEM direct child (CSS descendant signal)
+                non_bem_edge("Toolbar", "ToolbarContent", EdgeStrength::Allowed),
+                // BEM element child
+                bem_edge("Toolbar", "ToolbarExpandIconWrapper"),
+            ],
+        };
+        let mut profiles = HashMap::new();
+        profiles.insert("ToolbarExpandIconWrapper".to_string(), wrapper_profile());
+
+        let checks = generate_conformance_checks("Toolbar", &tree, &profiles);
+
+        assert!(
+            !checks
+                .iter()
+                .any(|c| matches!(&c.check_type, ConformanceCheckType::ExclusiveWrapper { .. })),
+            "Non-BEM direct children should prevent ExclusiveWrapper"
+        );
+    }
+
+    /// ExclusiveWrapper should fire for genuine wrapper families like
+    /// ActionList where ALL direct children are BEM element wrappers.
+    #[test]
+    fn test_exclusive_wrapper_kept_for_valid_wrapper_family() {
+        let tree = CompositionTree {
+            root: "ActionList".into(),
+            family_members: vec![
+                "ActionList".into(),
+                "ActionListGroup".into(),
+                "ActionListItem".into(),
+            ],
+            edges: vec![
+                bem_edge("ActionList", "ActionListGroup"),
+                bem_edge("ActionList", "ActionListItem"),
+            ],
+        };
+        let mut profiles = HashMap::new();
+        profiles.insert("ActionListItem".to_string(), wrapper_profile());
+
+        let checks = generate_conformance_checks("ActionList", &tree, &profiles);
+
+        let ew = checks
+            .iter()
+            .find(|c| matches!(&c.check_type, ConformanceCheckType::ExclusiveWrapper { .. }));
+        assert!(
+            ew.is_some(),
+            "Genuine wrapper family with >=2 BEM children should produce ExclusiveWrapper"
+        );
+
+        if let ConformanceCheckType::ExclusiveWrapper {
+            allowed_children, ..
+        } = &ew.unwrap().check_type
+        {
+            assert!(
+                allowed_children.contains(&"ActionListGroup".to_string()),
+                "Allowed set should include ActionListGroup"
+            );
+            assert!(
+                allowed_children.contains(&"ActionListItem".to_string()),
+                "Allowed set should include ActionListItem"
             );
         }
     }
