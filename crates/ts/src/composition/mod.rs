@@ -48,13 +48,20 @@ pub struct DelegateContext<'a> {
 /// 7. DOM nesting (A wraps children in `<ul>`, B renders `<li>`)
 /// 8. cloneElement threading (A injects props into children that B declares)
 /// 8.5. BEM element orphan fallback (orphan BEM elements → root→member)
+/// 8.6. Secondary BEM block sub-root fallback
+/// 8.7. Prop-passed detection (ReactNode/ReactElement props → PropPassed edges)
 /// 9. Suppress root edges when intermediate exists
-/// 10. Drop unconnected members
+/// 10. Drop unconnected members (exported orphans are retained)
 pub fn build_composition_tree_v2(
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
-    css_profile: Option<&CssBlockProfile>,
+    css_profiles: Option<&HashMap<String, CssBlockProfile>>,
+    primary_css_block: Option<&str>,
     delegate_contexts: &[DelegateContext<'_>],
+    // Barrel-file exports — components exported in `index.ts`. Members in
+    // this set are retained even with zero edges (as orphans). If `None`,
+    // Step 10 drops all zero-edge members (legacy behavior).
+    exported_members: Option<&[String]>,
 ) -> Option<CompositionTree> {
     if family_exports.is_empty() {
         return None;
@@ -71,6 +78,9 @@ pub fn build_composition_tree_v2(
 
     // Track existing edges for O(1) dedup lookups instead of linear scan
     let mut edge_set: HashSet<(String, String)> = HashSet::new();
+
+    // Resolve the primary CSS profile from the profiles map.
+    let css_profile = primary_css_block.and_then(|key| css_profiles?.get(key));
 
     // Build CSS element → component mapping for CSS-based steps.
     // Maps a CSS BEM element name (e.g., "content-section") to the component
@@ -97,6 +107,7 @@ pub fn build_composition_tree_v2(
                         required: true,
                         bem_evidence: Some("internally rendered".to_string()),
                         strength: EdgeStrength::Required,
+                        prop_name: None,
                     });
                 }
             }
@@ -162,6 +173,7 @@ pub fn build_composition_tree_v2(
                         edge.child,
                     )),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 });
             }
         }
@@ -170,33 +182,40 @@ pub fn build_composition_tree_v2(
     if let Some(css_prof) = css_profile {
         // ── Step 2: CSS direct-child selectors ──────────────────────
         for (css_parent, css_child) in &css_prof.direct_child_nesting {
-            if let (Some(parent_comp), Some(child_comp)) = (
-                css_to_component.get(css_parent.as_str()),
-                css_to_component.get(css_child.as_str()),
-            ) {
-                let key = (parent_comp.clone(), child_comp.clone());
-                if parent_comp != child_comp && edge_set.insert(key) {
-                    // Recursive nesting (child == root) is Allowed, not
-                    // Required. E.g., DataList inside DataListContent or
-                    // Menu inside MenuItem are valid CSS-supported patterns
-                    // but not structurally required — most instances don't
-                    // recurse.
-                    let strength = if *child_comp == root {
-                        EdgeStrength::Allowed
-                    } else {
-                        EdgeStrength::Required
-                    };
-                    tree.edges.push(CompositionEdge {
-                        parent: parent_comp.clone(),
-                        child: child_comp.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "CSS direct child: .{} > .{}",
-                            css_parent, css_child
-                        )),
-                        strength,
-                    });
+            let Some(parent_comps) = css_to_component.get(css_parent.as_str()) else {
+                continue;
+            };
+            let Some(child_comps) = css_to_component.get(css_child.as_str()) else {
+                continue;
+            };
+            // When an element maps to multiple components, all edges from
+            // that element are Allowed — the CSS class is ambiguous across
+            // components and could be either one.
+            let parent_ambiguous = parent_comps.len() > 1;
+            let child_ambiguous = child_comps.len() > 1;
+            for parent_comp in parent_comps {
+                for child_comp in child_comps {
+                    let key = (parent_comp.clone(), child_comp.clone());
+                    if parent_comp != child_comp && edge_set.insert(key) {
+                        let strength = if *child_comp == root || parent_ambiguous || child_ambiguous
+                        {
+                            EdgeStrength::Allowed
+                        } else {
+                            EdgeStrength::Required
+                        };
+                        tree.edges.push(CompositionEdge {
+                            parent: parent_comp.clone(),
+                            child: child_comp.clone(),
+                            relationship: ChildRelationship::DirectChild,
+                            required: false,
+                            bem_evidence: Some(format!(
+                                "CSS direct child: .{} > .{}",
+                                css_parent, css_child
+                            )),
+                            strength,
+                            prop_name: None,
+                        });
+                    }
                 }
             }
         }
@@ -204,14 +223,19 @@ pub fn build_composition_tree_v2(
         // ── Step 3: CSS grid parent-child ───────────────────────────
         // Find grid containers (has_grid_template) and grid children
         // (has_grid_column/grid_row). Map to components.
-        let grid_containers: Vec<(&str, &str)> = css_prof
+        // With multi-component mapping, an element may map to multiple
+        // components — expand each to (element, component) pairs.
+        let grid_containers: Vec<(&str, String)> = css_prof
             .elements
             .iter()
             .filter(|(_, info)| info.has_grid_template && info.display_values.contains("grid"))
-            .filter_map(|(el, _)| {
+            .flat_map(|(el, _)| {
                 css_to_component
                     .get(el.as_str())
-                    .map(|comp| (el.as_str(), comp.as_str()))
+                    .into_iter()
+                    .flat_map(move |comps| {
+                        comps.iter().map(move |comp| (el.as_str(), comp.clone()))
+                    })
             })
             .collect();
 
@@ -219,72 +243,71 @@ pub fn build_composition_tree_v2(
             if !child_info.has_grid_column && !child_info.has_grid_row {
                 continue;
             }
-            let Some(child_comp) = css_to_component.get(child_el.as_str()) else {
+            let Some(child_comps) = css_to_component.get(child_el.as_str()) else {
                 continue;
             };
+            let child_ambiguous = child_comps.len() > 1;
 
-            // Find the best grid container for this child.
-            // Prefer CSS selector evidence, then fall back to the most
-            // specific (longest name) grid container.
-            let mut best_parent: Option<&str> = None;
+            for child_comp in child_comps {
+                // Find the best grid container for this child.
+                let mut best_parent: Option<&str> = None;
 
-            // Check direct-child selectors first
-            for (container_el, container_comp) in &grid_containers {
-                if *container_comp == child_comp.as_str() {
-                    continue;
-                }
-                if css_prof
-                    .direct_child_nesting
-                    .contains(&(container_el.to_string(), child_el.clone()))
-                {
-                    best_parent = Some(container_comp);
-                    break;
-                }
-            }
-
-            // Then check descendant selectors
-            if best_parent.is_none() {
                 for (container_el, container_comp) in &grid_containers {
-                    if *container_comp == child_comp.as_str() {
+                    if *container_comp == *child_comp {
                         continue;
                     }
                     if css_prof
-                        .descendant_nesting
+                        .direct_child_nesting
                         .contains(&(container_el.to_string(), child_el.clone()))
                     {
                         best_parent = Some(container_comp);
                         break;
                     }
                 }
-            }
 
-            // Fall back to most specific grid container
-            if best_parent.is_none() && grid_containers.len() == 1 {
-                let (_, container_comp) = grid_containers[0];
-                if container_comp != child_comp.as_str() {
-                    best_parent = Some(container_comp);
+                if best_parent.is_none() {
+                    for (container_el, container_comp) in &grid_containers {
+                        if *container_comp == *child_comp {
+                            continue;
+                        }
+                        if css_prof
+                            .descendant_nesting
+                            .contains(&(container_el.to_string(), child_el.clone()))
+                        {
+                            best_parent = Some(container_comp);
+                            break;
+                        }
+                    }
                 }
-            }
 
-            if let Some(parent_comp) = best_parent {
-                let key = (parent_comp.to_string(), child_comp.clone());
-                if edge_set.insert(key) {
-                    let strength = if *child_comp == root {
-                        EdgeStrength::Allowed
-                    } else {
-                        EdgeStrength::Required
-                    };
-                    tree.edges.push(CompositionEdge {
-                        parent: parent_comp.to_string(),
-                        child: child_comp.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "CSS grid: {} has grid-template, {} has grid-column/row",
-                            parent_comp, child_comp
-                        )),
-                        strength,
-                    });
+                if best_parent.is_none() && grid_containers.len() == 1 {
+                    let (_, ref container_comp) = grid_containers[0];
+                    if *container_comp != *child_comp {
+                        best_parent = Some(container_comp);
+                    }
+                }
+
+                if let Some(parent_comp) = best_parent {
+                    let key = (parent_comp.to_string(), child_comp.clone());
+                    if edge_set.insert(key) {
+                        let strength = if *child_comp == root || child_ambiguous {
+                            EdgeStrength::Allowed
+                        } else {
+                            EdgeStrength::Required
+                        };
+                        tree.edges.push(CompositionEdge {
+                            parent: parent_comp.to_string(),
+                            child: child_comp.clone(),
+                            relationship: ChildRelationship::DirectChild,
+                            required: false,
+                            bem_evidence: Some(format!(
+                                "CSS grid: {} has grid-template, {} has grid-column/row",
+                                parent_comp, child_comp
+                            )),
+                            strength,
+                            prop_name: None,
+                        });
+                    }
                 }
             }
         }
@@ -297,7 +320,7 @@ pub fn build_composition_tree_v2(
         //
         // Only applies to non-root grid containers (containers that are
         // themselves grid children of the root grid).
-        let non_root_grid_containers: Vec<(&str, &str)> = grid_containers
+        let non_root_grid_containers: Vec<(&str, String)> = grid_containers
             .iter()
             .filter(|(el, _)| {
                 // Must not be root and must itself be a grid child
@@ -307,7 +330,7 @@ pub fn build_composition_tree_v2(
                         .get(*el)
                         .is_some_and(|info| info.has_grid_column || info.has_grid_row)
             })
-            .copied()
+            .cloned()
             .collect();
 
         if !non_root_grid_containers.is_empty() {
@@ -324,65 +347,67 @@ pub fn build_composition_tree_v2(
                 if child_info.has_grid_template {
                     continue;
                 }
-                let Some(child_comp) = css_to_component.get(child_el.as_str()) else {
+                let Some(child_comps) = css_to_component.get(child_el.as_str()) else {
                     continue;
                 };
-                // Skip if already has a non-root parent
-                if tree
-                    .edges
-                    .iter()
-                    .any(|e| e.child == *child_comp && e.parent != root)
-                {
-                    continue;
-                }
+                let child_ambiguous = child_comps.len() > 1;
 
-                // Find the best non-root grid container for this element.
-                // Use CSS selector evidence, then fall back.
-                let mut best_parent: Option<&str> = None;
-
-                for (container_el, container_comp) in &non_root_grid_containers {
-                    if *container_comp == child_comp.as_str() {
+                for child_comp in child_comps {
+                    // Skip if already has a non-root parent
+                    if tree
+                        .edges
+                        .iter()
+                        .any(|e| e.child == *child_comp && e.parent != root)
+                    {
                         continue;
                     }
-                    if css_prof
-                        .direct_child_nesting
-                        .contains(&(container_el.to_string(), child_el.clone()))
-                        || css_prof
-                            .descendant_nesting
+
+                    let mut best_parent: Option<&str> = None;
+
+                    for (container_el, container_comp) in &non_root_grid_containers {
+                        if *container_comp == *child_comp {
+                            continue;
+                        }
+                        if css_prof
+                            .direct_child_nesting
                             .contains(&(container_el.to_string(), child_el.clone()))
-                    {
-                        best_parent = Some(container_comp);
-                        break;
+                            || css_prof
+                                .descendant_nesting
+                                .contains(&(container_el.to_string(), child_el.clone()))
+                        {
+                            best_parent = Some(container_comp);
+                            break;
+                        }
                     }
-                }
 
-                // Fall back: if only one non-root grid container, use it
-                if best_parent.is_none() && non_root_grid_containers.len() == 1 {
-                    let (_, comp) = non_root_grid_containers[0];
-                    if comp != child_comp.as_str() {
-                        best_parent = Some(comp);
+                    if best_parent.is_none() && non_root_grid_containers.len() == 1 {
+                        let (_, ref comp) = non_root_grid_containers[0];
+                        if *comp != *child_comp {
+                            best_parent = Some(comp);
+                        }
                     }
-                }
 
-                if let Some(parent_comp) = best_parent {
-                    let key = (parent_comp.to_string(), child_comp.clone());
-                    if edge_set.insert(key) {
-                        let strength = if *child_comp == root {
-                            EdgeStrength::Allowed
-                        } else {
-                            EdgeStrength::Required
-                        };
-                        tree.edges.push(CompositionEdge {
-                            parent: parent_comp.to_string(),
-                            child: child_comp.clone(),
-                            relationship: ChildRelationship::DirectChild,
-                            required: false,
-                            bem_evidence: Some(format!(
-                                "CSS grid: {} is grid container, {} is implicit grid child",
-                                parent_comp, child_comp
-                            )),
-                            strength,
-                        });
+                    if let Some(parent_comp) = best_parent {
+                        let key = (parent_comp.to_string(), child_comp.clone());
+                        if edge_set.insert(key) {
+                            let strength = if *child_comp == root || child_ambiguous {
+                                EdgeStrength::Allowed
+                            } else {
+                                EdgeStrength::Required
+                            };
+                            tree.edges.push(CompositionEdge {
+                                parent: parent_comp.to_string(),
+                                child: child_comp.clone(),
+                                relationship: ChildRelationship::DirectChild,
+                                required: false,
+                                bem_evidence: Some(format!(
+                                    "CSS grid: {} is grid container, {} is implicit grid child",
+                                    parent_comp, child_comp
+                                )),
+                                strength,
+                                prop_name: None,
+                            });
+                        }
                     }
                 }
             }
@@ -521,6 +546,7 @@ pub fn build_composition_tree_v2(
                                     best_parent
                                 )),
                                 strength: EdgeStrength::Allowed,
+                                prop_name: None,
                             });
                         }
                     }
@@ -530,23 +556,29 @@ pub fn build_composition_tree_v2(
 
         // ── Step 5: CSS descendant selectors ────────────────────────
         for (css_parent, css_child) in &css_prof.descendant_nesting {
-            if let (Some(parent_comp), Some(child_comp)) = (
-                css_to_component.get(css_parent.as_str()),
-                css_to_component.get(css_child.as_str()),
-            ) {
-                let key = (parent_comp.clone(), child_comp.clone());
-                if parent_comp != child_comp && edge_set.insert(key) {
-                    tree.edges.push(CompositionEdge {
-                        parent: parent_comp.clone(),
-                        child: child_comp.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "CSS descendant: .{} .{}",
-                            css_parent, css_child
-                        )),
-                        strength: EdgeStrength::Allowed,
-                    });
+            let Some(parent_comps) = css_to_component.get(css_parent.as_str()) else {
+                continue;
+            };
+            let Some(child_comps) = css_to_component.get(css_child.as_str()) else {
+                continue;
+            };
+            for parent_comp in parent_comps {
+                for child_comp in child_comps {
+                    let key = (parent_comp.clone(), child_comp.clone());
+                    if parent_comp != child_comp && edge_set.insert(key) {
+                        tree.edges.push(CompositionEdge {
+                            parent: parent_comp.clone(),
+                            child: child_comp.clone(),
+                            relationship: ChildRelationship::DirectChild,
+                            required: false,
+                            bem_evidence: Some(format!(
+                                "CSS descendant: .{} .{}",
+                                css_parent, css_child
+                            )),
+                            strength: EdgeStrength::Allowed,
+                            prop_name: None,
+                        });
+                    }
                 }
             }
         }
@@ -561,23 +593,28 @@ pub fn build_composition_tree_v2(
         // intermediate nesting within families (e.g., EmptyStateFooter →
         // EmptyStateActions from a shared CSS rule with flex-wrap).
         for (css_container, css_child) in &css_prof.layout_children {
-            if let (Some(container_comp), Some(child_comp)) = (
-                css_to_component.get(css_container.as_str()),
-                css_to_component.get(css_child.as_str()),
-            ) {
-                let key = (container_comp.clone(), child_comp.clone());
-                if container_comp != child_comp && edge_set.insert(key) {
-                    tree.edges.push(CompositionEdge {
-                        parent: container_comp.clone(),
-                        child: child_comp.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "CSS layout container: .{} wraps .{} (shared CSS rule with flex-wrap/gap)",
-                            css_container, css_child
-                        )),
-                        strength: EdgeStrength::Allowed,
-                    });
+            let Some(container_comps) = css_to_component.get(css_container.as_str()) else {
+                continue;
+            };
+            let Some(child_comps) = css_to_component.get(css_child.as_str()) else {
+                continue;
+            };
+            for container_comp in container_comps {
+                for child_comp in child_comps {
+                    let key = (container_comp.clone(), child_comp.clone());
+                    if container_comp != child_comp && edge_set.insert(key) {
+                        tree.edges.push(CompositionEdge {
+                            parent: container_comp.clone(),
+                            child: child_comp.clone(),
+                            relationship: ChildRelationship::DirectChild,
+                            required: false,
+                            bem_evidence: Some(format!(
+                                "CSS layout container: .{} wraps .{} (shared CSS rule with flex-wrap/gap)",
+                                css_container, css_child
+                            )),
+                            strength: EdgeStrength::Allowed, prop_name: None,
+                        });
+                    }
                 }
             }
         }
@@ -620,8 +657,10 @@ pub fn build_composition_tree_v2(
             let parented: HashSet<String> = tree.edges.iter().map(|e| e.child.clone()).collect();
 
             // Collect the set of components that are BEM elements (values in the map)
-            let bem_element_components: HashSet<&str> =
-                css_to_component.values().map(|s| s.as_str()).collect();
+            let bem_element_components: HashSet<&str> = css_to_component
+                .values()
+                .flat_map(|comps| comps.iter().map(|s| s.as_str()))
+                .collect();
 
             let mut fallback_edges = Vec::new();
 
@@ -672,7 +711,7 @@ pub fn build_composition_tree_v2(
                             "BEM element fallback: {} is a BEM element of {}'s block with no other parent",
                             member, root
                         )),
-                        strength: EdgeStrength::Allowed,
+                        strength: EdgeStrength::Allowed, prop_name: None,
                     });
                 }
             }
@@ -681,29 +720,293 @@ pub fn build_composition_tree_v2(
         }
     }
 
+    // ── Step 8.6: Secondary BEM block sub-root fallback ───────────
+    // Some families have components that use a different BEM block than the
+    // root (e.g., Modal root uses "backdrop" while ModalBody uses "modalBox",
+    // Tabs root uses "tabs" while TabContentBody uses "tabContent").
+    //
+    // For each secondary block:
+    // 1. Build a secondary css_to_component map for that block
+    // 2. Find the sub-root: the component that maps to element "" (root)
+    //    of the secondary block
+    // 3. Run Step 8.5 logic using the sub-root: orphan members whose
+    //    bem_block matches the secondary block get an Allowed edge to the
+    //    sub-root
+    //
+    // After collapse_internal_nodes, if the sub-root is internal (non-exported),
+    // edges propagate to the family root automatically.
+    if let Some(css_profs) = css_profiles {
+        // Collect all distinct BEM blocks used by family members that
+        // differ from the root's BEM block. These need sub-root fallback
+        // because the root's Step 8.5 only connects orphans whose
+        // bem_block matches the root's block.
+        //
+        // NOTE: we compare against the root's block, NOT the primary
+        // CSS profile key. The primary CSS key may differ from the root's
+        // block (e.g., Modal: root block = "backdrop", primary CSS key =
+        // "modalBox" via dominant vote). The sub-root fallback is about
+        // which components can't be reached from the root — that's
+        // determined by the root's block, not the CSS file selection.
+        let root_block = profiles
+            .get(&root)
+            .and_then(|p| p.bem_block.as_deref())
+            .unwrap_or("");
+        let mut secondary_blocks: HashSet<&str> = HashSet::new();
+        for name in family_exports {
+            if let Some(prof) = profiles.get(name) {
+                if let Some(ref block) = prof.bem_block {
+                    if block != root_block {
+                        secondary_blocks.insert(block.as_str());
+                    }
+                }
+            }
+        }
+
+        for sec_block in &secondary_blocks {
+            // Only process if we have a CSS profile for this block
+            if !css_profs.contains_key(*sec_block) {
+                continue;
+            }
+
+            // Build secondary CSS element → component map
+            let sec_css_to_component =
+                build_css_element_to_component_map(profiles, family_exports, sec_block);
+
+            // Find the sub-root: component(s) that map to element "" (the
+            // block root) in the secondary map
+            let sub_roots: Vec<&str> = sec_css_to_component
+                .get("")
+                .into_iter()
+                .flat_map(|comps| comps.iter().map(|s| s.as_str()))
+                .collect();
+
+            // Find the best sub-root: prefer one with has_children_prop
+            let sub_root = sub_roots
+                .iter()
+                .find(|name| profiles.get(**name).is_some_and(|p| p.has_children_prop))
+                .or(sub_roots.first())
+                .copied();
+
+            let Some(sub_root) = sub_root else {
+                continue;
+            };
+
+            let sub_root_has_children = profiles.get(sub_root).is_some_and(|p| p.has_children_prop);
+            if !sub_root_has_children {
+                continue;
+            }
+
+            // Collect BEM element components from the secondary map
+            let sec_bem_components: HashSet<&str> = sec_css_to_component
+                .values()
+                .flat_map(|comps| comps.iter().map(|s| s.as_str()))
+                .collect();
+
+            // Refresh parented set (may have changed from primary Step 8.5)
+            let parented: HashSet<String> = tree.edges.iter().map(|e| e.child.clone()).collect();
+
+            let mut sec_fallback_edges = Vec::new();
+
+            for member in family_exports {
+                if member == sub_root || member == &root {
+                    continue;
+                }
+                // Guard 1: only orphans
+                if parented.contains(member) {
+                    continue;
+                }
+                // Guard 2: must be in the secondary CSS element map
+                if !sec_bem_components.contains(member.as_str()) {
+                    continue;
+                }
+                // Guard 3: member's BEM block must match this secondary block
+                if let Some(member_bem) = profiles.get(member).and_then(|p| p.bem_block.as_deref())
+                {
+                    if member_bem != *sec_block {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                let key = (sub_root.to_string(), member.clone());
+                if edge_set.insert(key) {
+                    debug!(
+                        sub_root = %sub_root,
+                        member = %member,
+                        secondary_block = %sec_block,
+                        "Secondary block fallback: connecting orphan to sub-root"
+                    );
+                    sec_fallback_edges.push(CompositionEdge {
+                        parent: sub_root.to_string(),
+                        child: member.clone(),
+                        relationship: ChildRelationship::DirectChild,
+                        required: false,
+                        bem_evidence: Some(format!(
+                            "Secondary block fallback: {} is a BEM element of {}'s block ({})",
+                            member, sub_root, sec_block
+                        )),
+                        strength: EdgeStrength::Allowed,
+                        prop_name: None,
+                    });
+                }
+            }
+
+            tree.edges.extend(sec_fallback_edges);
+        }
+    }
+
+    // ── Step 8.7: Prop-passed detection ───────────────────────────
+    // Detect components passed via named ReactNode/ReactElement props
+    // rather than as JSX children. For each family member, check if any
+    // other family member has a ReactNode prop whose name correlates
+    // with the component name (e.g., Alert.actionLinks ↔ AlertActionLink).
+    //
+    // This step both:
+    // - Creates new PropPassed edges for orphan components
+    // - Reclassifies existing DirectChild edges to PropPassed when a
+    //   prop name match is found
+    {
+        let parented: HashSet<String> = tree.edges.iter().map(|e| e.child.clone()).collect();
+
+        let mut new_prop_edges = Vec::new();
+        let mut reclassify: Vec<(String, String, String)> = Vec::new(); // (parent, child, prop_name)
+
+        for child_name in family_exports {
+            if child_name == &root {
+                continue;
+            }
+            let child_lower = child_name.to_lowercase();
+
+            for parent_name in family_exports {
+                if parent_name == child_name {
+                    continue;
+                }
+                let Some(parent_prof) = profiles.get(parent_name) else {
+                    continue;
+                };
+
+                let parent_lower = parent_name.to_lowercase();
+
+                // Strip parent name prefix from child to get suffix
+                let suffix = if child_lower.starts_with(&parent_lower) {
+                    &child_lower[parent_lower.len()..]
+                } else {
+                    continue; // child name doesn't start with parent name
+                };
+
+                if suffix.is_empty() {
+                    continue;
+                }
+
+                // Check parent's prop_types for ReactNode/ReactElement props
+                for (prop_name, prop_type) in &parent_prof.prop_types {
+                    if prop_name == "children" {
+                        continue;
+                    }
+                    if !prop_type.contains("ReactNode")
+                        && !prop_type.contains("ReactElement")
+                        && !prop_type.contains("ComponentType")
+                    {
+                        continue;
+                    }
+
+                    let prop_lower = prop_name.to_lowercase();
+
+                    // Match: suffix starts with prop name or prop name
+                    // starts with suffix (case-insensitive)
+                    if suffix.starts_with(&prop_lower) || prop_lower.starts_with(suffix) {
+                        // Check if edge already exists
+                        let edge_exists = tree
+                            .edges
+                            .iter()
+                            .any(|e| e.parent == *parent_name && e.child == *child_name);
+
+                        if edge_exists {
+                            // Reclassify existing edge to PropPassed
+                            reclassify.push((
+                                parent_name.clone(),
+                                child_name.clone(),
+                                prop_name.clone(),
+                            ));
+                        } else if !parented.contains(child_name) {
+                            // Create new PropPassed edge for orphan
+                            let key = (parent_name.clone(), child_name.clone());
+                            if edge_set.insert(key) {
+                                debug!(
+                                    parent = %parent_name,
+                                    child = %child_name,
+                                    prop = %prop_name,
+                                    "Prop-passed detection: {} accepts {} via prop '{}'",
+                                    parent_name, child_name, prop_name
+                                );
+                                new_prop_edges.push(CompositionEdge {
+                                    parent: parent_name.clone(),
+                                    child: child_name.clone(),
+                                    relationship: ChildRelationship::PropPassed,
+                                    required: false,
+                                    bem_evidence: Some(format!(
+                                        "Prop-passed: {} accepts {} via `{}` prop ({})",
+                                        parent_name, child_name, prop_name, prop_type
+                                    )),
+                                    strength: EdgeStrength::Allowed,
+                                    prop_name: Some(prop_name.clone()),
+                                });
+                            }
+                        }
+                        break; // Found a match for this parent, no need to check more props
+                    }
+                }
+            }
+        }
+
+        tree.edges.extend(new_prop_edges);
+
+        // Reclassify existing edges
+        for (parent, child, prop) in reclassify {
+            if let Some(edge) = tree
+                .edges
+                .iter_mut()
+                .find(|e| e.parent == parent && e.child == child)
+            {
+                edge.relationship = ChildRelationship::PropPassed;
+                edge.prop_name = Some(prop.clone());
+                edge.bem_evidence = Some(format!(
+                    "Prop-passed (reclassified): {} accepts {} via `{}` prop",
+                    parent, child, prop
+                ));
+            }
+        }
+    }
+
     // ── Step 9: Suppress + dedup ───────────────────────────────────
     deduplicate_edges(&mut tree);
     suppress_root_edges_with_intermediate(&mut tree);
 
     // ── Step 10: Drop unconnected members ───────────────────────────
-    // Members with no edges at all are dropped from the tree entirely.
-    // No "default to root" guessing — every edge must have structural
-    // evidence. Unconnected members may be standalone components,
-    // context objects, type exports, or members that need stronger
-    // signals to connect.
+    // Members with no edges at all are dropped from the tree, UNLESS
+    // they are barrel-file exports (exported_members). Exported orphans
+    // are retained — they're part of the family's public API even if
+    // no structural signal links them (e.g., convenience composites
+    // like LoginForm, orchestrators like MenuContainer).
+    //
+    // Non-exported members with zero edges are internal noise (context
+    // objects, type exports, helper components) and are dropped.
     //
     // Members with outgoing edges but no incoming edges are secondary
-    // roots — top-level containers within the family (e.g.,
-    // JumpLinksList wraps <ul> containing JumpLinksItem <li> children,
-    // but nothing is "above" JumpLinksList). These are retained so that
-    // collapse_internal_nodes can properly handle them: exported
-    // secondary roots stay as roots; non-exported ones get collapsed
-    // (and since they have no incoming edges, collapsing removes their
-    // outgoing edges cleanly with zero transitive edges created).
+    // roots — top-level containers within the family. These are retained
+    // so that collapse_internal_nodes can properly handle them.
     let parented: HashSet<&str> = tree.edges.iter().map(|e| e.child.as_str()).collect();
     let parenting: HashSet<&str> = tree.edges.iter().map(|e| e.parent.as_str()).collect();
-    tree.family_members
-        .retain(|m| m == &root || parented.contains(m.as_str()) || parenting.contains(m.as_str()));
+    let exported_set: HashSet<&str> = exported_members
+        .map(|e| e.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    tree.family_members.retain(|m| {
+        m == &root
+            || parented.contains(m.as_str())
+            || parenting.contains(m.as_str())
+            || exported_set.contains(m.as_str())
+    });
 
     Some(tree)
 }
@@ -802,6 +1105,7 @@ fn infer_clone_element_nesting(
                         child_name
                     )),
                     strength: EdgeStrength::Required,
+                    prop_name: None,
                 });
             }
         }
@@ -832,8 +1136,9 @@ fn build_css_element_to_component_map(
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
     block_name: &str,
-) -> HashMap<String, String> {
-    let mut map: HashMap<String, String> = HashMap::new();
+) -> HashMap<String, HashSet<String>> {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    let root_name = family_exports.first().map(|s| s.as_str());
 
     for comp_name in family_exports {
         let Some(profile) = profiles.get(comp_name) else {
@@ -867,33 +1172,26 @@ fn build_css_element_to_component_map(
                     camel_to_kebab(&camel)
                 };
 
-                // Prefer non-root components for non-root elements.
+                // For non-root elements, skip the root component claiming
+                // child tokens when a dedicated component already exists.
+                // The root often uses child CSS tokens (e.g., JumpLinks uses
+                // `styles.jumpLinksList`) because it renders those elements
+                // internally, but JumpLinksList is the dedicated component.
                 //
-                // The root component often uses child CSS tokens (e.g.,
-                // JumpLinks uses `styles.jumpLinksList`) because it renders
-                // those elements internally. But JumpLinksList is the
-                // dedicated component for that element. If we let the root
-                // claim "list", JumpLinksList becomes invisible in the map
-                // and Signal B / CSS nesting steps can't create edges to it.
-                //
-                // For the root element (""), first wins (both root and
-                // sub-components may use the block token).
-                let root_name = family_exports.first().map(|s| s.as_str());
-                let existing = map.get(&element_name);
-                let should_insert = match existing {
-                    None => true,
-                    Some(current) => {
-                        // Allow non-root to overwrite root for non-root elements.
-                        // Root keeps the root element ("") and anything no one
-                        // else claims.
-                        !element_name.is_empty()
-                            && root_name == Some(current.as_str())
-                            && root_name != Some(comp_name.as_str())
-                    }
-                };
-                if should_insert {
-                    map.insert(element_name, comp_name.clone());
+                // For the root element (""), all components are allowed
+                // (both root and sub-components may use the block token).
+                if !element_name.is_empty()
+                    && root_name == Some(comp_name.as_str())
+                    && map.contains_key(&element_name)
+                {
+                    // Root trying to claim a non-root element that already
+                    // has a dedicated component — skip.
+                    continue;
                 }
+
+                map.entry(element_name)
+                    .or_default()
+                    .insert(comp_name.clone());
             }
         }
     }
@@ -1005,6 +1303,7 @@ fn infer_dom_nesting(
                             parent_name, slot_el, child_name, root_el
                         )),
                         strength: EdgeStrength::Required,
+                        prop_name: None,
                     });
                 }
             }
@@ -1131,7 +1430,7 @@ fn infer_dom_nesting(
                 "Flow container nesting: {} renders <ul>/<ol>, {} wraps {{children}} in flow container",
                 child, parent
             )),
-            strength: EdgeStrength::Allowed,
+            strength: EdgeStrength::Allowed, prop_name: None,
         });
     }
 }
@@ -1232,6 +1531,7 @@ fn infer_context_nesting(
                             provider_name, consumed_ctx, child_name
                         )),
                         strength: EdgeStrength::Required,
+                        prop_name: None,
                     });
                 }
             }
@@ -1400,7 +1700,7 @@ mod tests {
 
         let family = vec!["Menu".into(), "MenuList".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         let menu_to_list = tree
             .edges
@@ -1441,7 +1741,7 @@ mod tests {
 
         let family = vec!["MenuList".into(), "MenuItem".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         let list_to_item = tree
             .edges
@@ -1482,6 +1782,7 @@ mod tests {
                     required: true,
                     bem_evidence: Some("BEM element of accordion block".into()),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "Accordion".into(),
@@ -1490,6 +1791,7 @@ mod tests {
                     required: true,
                     bem_evidence: Some("BEM element of accordion block".into()),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 // Correct root edge (no intermediate for AccordionItem)
                 CompositionEdge {
@@ -1499,6 +1801,7 @@ mod tests {
                     required: true,
                     bem_evidence: Some("BEM element of accordion block".into()),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 // Context-derived intermediate edges (should be kept)
                 CompositionEdge {
@@ -1508,6 +1811,7 @@ mod tests {
                     required: false,
                     bem_evidence: Some("Context nesting".into()),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "AccordionItem".into(),
@@ -1516,6 +1820,7 @@ mod tests {
                     required: false,
                     bem_evidence: Some("Context nesting".into()),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
             ],
         };
@@ -1585,6 +1890,7 @@ mod tests {
                     required: true,
                     bem_evidence: None,
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "Masthead".into(),
@@ -1593,6 +1899,7 @@ mod tests {
                     required: true,
                     bem_evidence: None,
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "Masthead".into(),
@@ -1601,6 +1908,7 @@ mod tests {
                     required: true,
                     bem_evidence: None,
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
             ],
         };
@@ -1644,7 +1952,7 @@ mod tests {
             "DropdownGroup".into(),
         ];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // All BEM-derived edges should be required=false
         for edge in &tree.edges {
@@ -1694,7 +2002,7 @@ mod tests {
 
         let family = vec!["Label".into(), "LabelGroup".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // There should be NO edge from Label -> LabelGroup
         let bad_edge = tree
@@ -1736,7 +2044,7 @@ mod tests {
 
         let family = vec!["Alert".into(), "AlertGroup".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         let bad_edge = tree
             .edges
@@ -1789,7 +2097,7 @@ mod tests {
 
         let family = vec!["Modal".into(), "ModalBox".into(), "ModalBoxBody".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // Name-prefix inference should NOT create Modal → ModalBox because
         // "modalBox" != "modal" (different block). ModalBox → ModalBoxBody
@@ -1844,7 +2152,7 @@ mod tests {
             "JumpLinksItem".into(),
         ];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // JumpLinksList should be retained as a member (secondary root)
         assert!(
@@ -1895,7 +2203,7 @@ mod tests {
 
         let family = vec!["Root".into(), "Child".into(), "Orphan".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // Orphan has no edges, should be dropped
         assert!(
@@ -1933,7 +2241,7 @@ mod tests {
 
         let family = vec!["Menu".into(), "MenuToggle".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         let bad_edge = tree
             .edges
@@ -1985,7 +2293,7 @@ mod tests {
 
         let family = vec!["Root".into(), "SubA".into(), "SubB".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // Step 1 edges Root→SubA and Root→SubB should exist
         assert!(
@@ -2048,7 +2356,7 @@ mod tests {
 
         let family = vec!["Root".into(), "Sub".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // Root→Sub should exist from Step 1
         assert!(
@@ -2109,7 +2417,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // Signal A: EmptyStateFooter → EmptyStateActions (from layout_children)
         let footer_to_actions = tree
@@ -2197,7 +2517,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // All 3 sub-components should be connected to root
         for child in &["PanelHeader", "PanelMain", "PanelFooter"] {
@@ -2259,7 +2591,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // Label → LabelGroup should NOT exist (independent BEM block)
         let bad_edge = tree
@@ -2300,7 +2644,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // MenuList should have a parent from context nesting (Step 6)
         let context_edge = tree
@@ -2350,7 +2706,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // WidgetBody should NOT be connected (root has no children prop)
         let edge = tree
@@ -2403,7 +2771,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // JumpLinksList → JumpLinksItem from DOM nesting (Step 7)
         let list_to_item = tree
@@ -2486,7 +2866,19 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
+        let tree = {
+            let css_map = HashMap::from([(css_prof.block.clone(), css_prof)]);
+            let block_key = css_map.keys().next().unwrap().clone();
+            build_composition_tree_v2(
+                &profiles,
+                &family,
+                Some(&css_map),
+                Some(&block_key),
+                &[],
+                None,
+            )
+        }
+        .unwrap();
 
         // Expected tree:
         // EmptyState
@@ -2546,7 +2938,7 @@ mod tests {
         let family = vec!["Panel".into(), "PanelHeader".into()];
 
         // No CSS profile — Signal B should not fire
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
 
         // PanelHeader should be dropped (no edges, no CSS profile)
         assert!(
@@ -2580,6 +2972,7 @@ mod tests {
                     required: false,
                     bem_evidence: Some("context nesting".into()),
                     strength: EdgeStrength::Required,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "MenuList".into(),
@@ -2588,6 +2981,7 @@ mod tests {
                     required: false,
                     bem_evidence: Some("DOM nesting: ul → li".into()),
                     strength: EdgeStrength::Required,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "Menu".into(),
@@ -2596,6 +2990,7 @@ mod tests {
                     required: false,
                     bem_evidence: Some("CSS descendant".into()),
                     strength: EdgeStrength::Allowed,
+                    prop_name: None,
                 },
             ],
         };
@@ -2638,7 +3033,7 @@ mod tests {
             wrapper_to_delegate: wrapper_map,
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[ctx]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[ctx], None).unwrap();
 
         // Dropdown → DropdownList (from Menu → MenuList)
         assert!(
@@ -2717,6 +3112,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: EdgeStrength::Required,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "MenuList".into(),
@@ -2725,6 +3121,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -2751,7 +3148,7 @@ mod tests {
 
         let family = vec!["Wrapper".into(), "WrapperList".into(), "WrapperItem".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[ctx]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[ctx], None).unwrap();
 
         // Wrapper → WrapperList should exist (both mapped)
         assert!(tree
@@ -2800,10 +3197,110 @@ mod tests {
 
         let family = vec!["MyButton".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None, &[ctx]).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[ctx], None).unwrap();
 
         // No edges projected (Button has no edges)
         assert!(tree.edges.is_empty());
         assert_eq!(tree.family_members.len(), 1);
+    }
+
+    /// Test Step 8.6: Secondary BEM block sub-root fallback.
+    ///
+    /// Simulates the Modal family pattern where the root (Modal) uses BEM
+    /// block "backdrop" while sub-components (ModalBody, ModalFooter) use
+    /// BEM block "modalBox". An internal component (ModalBox) acts as the
+    /// sub-root for the "modalBox" block.
+    ///
+    /// Step 8.6 should connect ModalBody and ModalFooter to ModalBox as
+    /// orphan BEM elements of the secondary block.
+    #[test]
+    fn test_secondary_block_subroot_fallback() {
+        let mut profiles = HashMap::new();
+
+        // Modal: root, uses "backdrop" block, renders ModalContent internally
+        let mut modal = make_profile("Modal");
+        modal.bem_block = Some("backdrop".into());
+        modal.rendered_components = vec!["ModalContent".into()];
+        profiles.insert("Modal".into(), modal);
+
+        // ModalContent: internal, renders ModalBox
+        let mut modal_content = make_profile("ModalContent");
+        modal_content.rendered_components = vec!["ModalBox".into()];
+        profiles.insert("ModalContent".into(), modal_content);
+
+        // ModalBox: internal, sub-root for "modalBox" block, has children
+        let mut modal_box = make_profile("ModalBox");
+        modal_box.bem_block = Some("modalBox".into());
+        modal_box.css_tokens_used = ["styles.modalBox".to_string()].into_iter().collect();
+        modal_box.has_children_prop = true;
+        profiles.insert("ModalBox".into(), modal_box);
+
+        // ModalBody: uses "modalBox" block, orphan (renders only HTML)
+        let mut modal_body = make_profile("ModalBody");
+        modal_body.bem_block = Some("modalBox".into());
+        modal_body.css_tokens_used = ["styles.modalBoxBody".to_string()].into_iter().collect();
+        profiles.insert("ModalBody".into(), modal_body);
+
+        // ModalFooter: uses "modalBox" block, orphan (renders only HTML)
+        let mut modal_footer = make_profile("ModalFooter");
+        modal_footer.bem_block = Some("modalBox".into());
+        modal_footer.css_tokens_used = ["styles.modalBoxFooter".to_string()].into_iter().collect();
+        profiles.insert("ModalFooter".into(), modal_footer);
+
+        let family = vec![
+            "Modal".into(),
+            "ModalContent".into(),
+            "ModalBox".into(),
+            "ModalBody".into(),
+            "ModalFooter".into(),
+        ];
+
+        // CSS profiles: we need "modalBox" block to exist so Step 8.6 fires
+        let modal_box_css = CssBlockProfile {
+            block: "modalBox".into(),
+            ..Default::default()
+        };
+        let css_map = HashMap::from([("modalBox".to_string(), modal_box_css)]);
+
+        // Primary block is "backdrop" (from root) but no CSS profile for it
+        let tree = build_composition_tree_v2(
+            &profiles,
+            &family,
+            Some(&css_map),
+            None, // no primary CSS profile for "backdrop"
+            &[],
+            None,
+        )
+        .unwrap();
+
+        // Step 1 should create: Modal → ModalContent, ModalContent → ModalBox
+        // Step 8.6 should create: ModalBox → ModalBody, ModalBox → ModalFooter
+        let box_to_body = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "ModalBox" && e.child == "ModalBody");
+        let box_to_footer = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "ModalBox" && e.child == "ModalFooter");
+
+        assert!(
+            box_to_body,
+            "Expected ModalBox → ModalBody edge from secondary block fallback. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            box_to_footer,
+            "Expected ModalBox → ModalFooter edge from secondary block fallback. Edges: {:?}",
+            tree.edges
+        );
+
+        // All 5 members should be retained
+        assert_eq!(
+            tree.family_members.len(),
+            5,
+            "All members should be retained. Members: {:?}",
+            tree.family_members
+        );
     }
 }

@@ -3216,6 +3216,7 @@ mod tests {
                     required: true,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "DropdownList".into(),
@@ -3224,6 +3225,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -3271,6 +3273,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 // Recursive nesting: nested tabs inside a tab (Allowed, not Required)
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -3280,6 +3283,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
                 },
             ],
         };
@@ -3334,6 +3338,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Table".into(),
@@ -3342,6 +3347,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Thead".into(),
@@ -3350,6 +3356,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tbody".into(),
@@ -3358,6 +3365,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tr".into(),
@@ -3366,6 +3374,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tr".into(),
@@ -3374,6 +3383,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -3457,6 +3467,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Table".into(),
@@ -3465,6 +3476,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Thead".into(),
@@ -3473,6 +3485,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tbody".into(),
@@ -3481,6 +3494,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -3531,6 +3545,7 @@ mod tests {
                     required: true,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "DropdownList".into(),
@@ -3539,6 +3554,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -3865,6 +3881,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Table".into(),
@@ -3873,6 +3890,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 // Tbody→Tr is Required (e.g., CSS direct-child selector)
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -3882,6 +3900,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 // Thead→Tr is Allowed (e.g., CSS descendant selector)
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -3891,6 +3910,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
                 },
             ],
         };
@@ -3954,6 +3974,7 @@ mod tests {
                 required: false,
                 bem_evidence: None,
                 strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                prop_name: None,
             }],
         };
 
@@ -3996,6 +4017,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "AlertGroup".into(),
@@ -4004,6 +4026,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -4064,6 +4087,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tbody".into(),
@@ -4072,6 +4096,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tr".into(),
@@ -4080,6 +4105,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -4146,6 +4172,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 // Internal rendering: AccordionItem renders AccordionContent
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -4155,6 +4182,7 @@ mod tests {
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };

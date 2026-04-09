@@ -402,6 +402,11 @@ pub struct CompositionEdge {
     /// `Allowed` = valid placement but not the only option (no conformance rules).
     #[serde(default)]
     pub strength: EdgeStrength,
+
+    /// For `PropPassed` edges, the name of the prop on the parent that
+    /// accepts this child (e.g., "actionLinks", "labelHelp", "sidebar").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prop_name: Option<String>,
 }
 
 /// How strongly a composition edge is enforced.
@@ -432,6 +437,10 @@ pub enum ChildRelationship {
     Internal,
     /// Child is expected in the consumer's JSX children.
     DirectChild,
+    /// Child is passed to the parent via a named `ReactNode`/`ReactElement`
+    /// prop rather than placed as a JSX child. The prop name is stored in
+    /// the edge's `prop_name` field.
+    PropPassed,
     /// Relationship could not be determined from BEM.
     Unknown,
 }

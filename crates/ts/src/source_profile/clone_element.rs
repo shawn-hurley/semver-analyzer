@@ -87,12 +87,20 @@ fn find_clone_element_in_statement<'a>(
         }
         Statement::ClassDeclaration(class) => {
             for element in &class.body.body {
-                if let ClassElement::MethodDefinition(method) = element {
-                    if let Some(body) = &method.value.body {
-                        for stmt in &body.statements {
-                            find_clone_element_in_statement(stmt, injections);
+                match element {
+                    ClassElement::MethodDefinition(method) => {
+                        if let Some(body) = &method.value.body {
+                            for stmt in &body.statements {
+                                find_clone_element_in_statement(stmt, injections);
+                            }
                         }
                     }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            find_clone_element_in_expression(init, injections);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -121,12 +129,20 @@ fn find_clone_element_in_declaration<'a>(
         }
         Declaration::ClassDeclaration(class) => {
             for element in &class.body.body {
-                if let ClassElement::MethodDefinition(method) = element {
-                    if let Some(body) = &method.value.body {
-                        for stmt in &body.statements {
-                            find_clone_element_in_statement(stmt, injections);
+                match element {
+                    ClassElement::MethodDefinition(method) => {
+                        if let Some(body) = &method.value.body {
+                            for stmt in &body.statements {
+                                find_clone_element_in_statement(stmt, injections);
+                            }
                         }
                     }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            find_clone_element_in_expression(init, injections);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

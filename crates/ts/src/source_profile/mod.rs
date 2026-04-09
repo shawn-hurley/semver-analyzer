@@ -314,10 +314,18 @@ fn extract_from_decl<'a>(
         }
         Declaration::ClassDeclaration(cls) => {
             for item in &cls.body.body {
-                if let ClassElement::MethodDefinition(method) = item {
-                    if let Some(body) = &method.value.body {
-                        walk_stmts_for_jsx(&body.statements, source, info);
+                match item {
+                    ClassElement::MethodDefinition(method) => {
+                        if let Some(body) = &method.value.body {
+                            walk_stmts_for_jsx(&body.statements, source, info);
+                        }
                     }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            walk_expr_for_jsx(init, source, info);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -431,11 +439,19 @@ fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullS
     match stmt {
         Statement::ClassDeclaration(cls) => {
             for item in &cls.body.body {
-                if let ClassElement::MethodDefinition(method) = item {
-                    walk_params_for_jsx(&method.value.params, source, info);
-                    if let Some(body) = &method.value.body {
-                        walk_stmts_for_jsx(&body.statements, source, info);
+                match item {
+                    ClassElement::MethodDefinition(method) => {
+                        walk_params_for_jsx(&method.value.params, source, info);
+                        if let Some(body) = &method.value.body {
+                            walk_stmts_for_jsx(&body.statements, source, info);
+                        }
                     }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            walk_expr_for_jsx(init, source, info);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -502,11 +518,19 @@ fn walk_decl_for_jsx<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut Ful
         }
         Declaration::ClassDeclaration(cls) => {
             for item in &cls.body.body {
-                if let ClassElement::MethodDefinition(method) = item {
-                    walk_params_for_jsx(&method.value.params, source, info);
-                    if let Some(body) = &method.value.body {
-                        walk_stmts_for_jsx(&body.statements, source, info);
+                match item {
+                    ClassElement::MethodDefinition(method) => {
+                        walk_params_for_jsx(&method.value.params, source, info);
+                        if let Some(body) = &method.value.body {
+                            walk_stmts_for_jsx(&body.statements, source, info);
+                        }
                     }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            walk_expr_for_jsx(init, source, info);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -585,6 +609,23 @@ fn walk_expr_for_jsx<'a>(expr: &'a Expression<'a>, source: &str, info: &mut Full
                     walk_expr_for_jsx(expr, source, info);
                 }
             }
+        }
+        // TypeScript expression wrappers — transparent to JSX walking.
+        // e.g., `ReactDOM.createPortal(<Foo/>, el) as React.ReactElement`
+        Expression::TSAsExpression(ts_as) => {
+            walk_expr_for_jsx(&ts_as.expression, source, info);
+        }
+        Expression::TSSatisfiesExpression(ts_sat) => {
+            walk_expr_for_jsx(&ts_sat.expression, source, info);
+        }
+        Expression::TSNonNullExpression(ts_nn) => {
+            walk_expr_for_jsx(&ts_nn.expression, source, info);
+        }
+        Expression::TSTypeAssertion(ts_assert) => {
+            walk_expr_for_jsx(&ts_assert.expression, source, info);
+        }
+        Expression::TSInstantiationExpression(ts_inst) => {
+            walk_expr_for_jsx(&ts_inst.expression, source, info);
         }
         Expression::ArrowFunctionExpression(arrow) => {
             walk_params_for_jsx(&arrow.params, source, info);
@@ -1179,5 +1220,56 @@ mod tests {
         eprintln!("Td has_children_prop: {}", profile.has_children_prop);
         eprintln!("Td rendered_elements: {:?}", profile.rendered_elements);
         assert_eq!(profile.children_slot_path, vec!["td"]);
+    }
+
+    /// Class components that define `render` as an arrow property assignment
+    /// (`render = () => { ... }`) use `ClassElement::PropertyDefinition` in
+    /// the OXC AST, not `ClassElement::MethodDefinition`. The JSX walker must
+    /// handle both forms to detect internally rendered components.
+    ///
+    /// Real-world example: PatternFly's ClipboardCopy component.
+    #[test]
+    fn test_extract_profile_class_property_definition_render() {
+        let source = r#"
+            import { Component } from 'react';
+            import { ClipboardCopyButton } from './ClipboardCopyButton';
+            import { ClipboardCopyToggle } from './ClipboardCopyToggle';
+
+            class ClipboardCopy extends Component<ClipboardCopyProps, ClipboardCopyState> {
+                timer = null as any;
+
+                render = () => {
+                    const { children } = this.props;
+                    return (
+                        <div>
+                            <ClipboardCopyToggle />
+                            <input value={this.state.text} />
+                            <ClipboardCopyButton onClick={this.handleCopy}>
+                                Copy
+                            </ClipboardCopyButton>
+                            {children}
+                        </div>
+                    );
+                };
+            }
+
+            export { ClipboardCopy };
+        "#;
+
+        let profile = extract_profile("ClipboardCopy", "ClipboardCopy.tsx", source);
+        assert!(
+            profile
+                .rendered_components
+                .contains(&"ClipboardCopyButton".to_string()),
+            "Expected ClipboardCopyButton in rendered_components, got: {:?}",
+            profile.rendered_components
+        );
+        assert!(
+            profile
+                .rendered_components
+                .contains(&"ClipboardCopyToggle".to_string()),
+            "Expected ClipboardCopyToggle in rendered_components, got: {:?}",
+            profile.rendered_components
+        );
     }
 }

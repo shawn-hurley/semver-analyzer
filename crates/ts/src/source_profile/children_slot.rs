@@ -458,13 +458,11 @@ fn find_children_in_class_body<'a>(
     aliases: &HashMap<String, String>,
 ) -> bool {
     for element in &body.body {
-        if let ClassElement::MethodDefinition(method) = element {
-            // Match render() method by name
-            let is_render = match &method.key {
-                PropertyKey::StaticIdentifier(id) => id.name == "render",
-                _ => false,
-            };
-            if is_render {
+        let is_render_named = |key: &PropertyKey| -> bool {
+            matches!(key, PropertyKey::StaticIdentifier(id) if id.name == "render")
+        };
+        match element {
+            ClassElement::MethodDefinition(method) if is_render_named(&method.key) => {
                 if let Some(body) = &method.value.body {
                     for stmt in &body.statements {
                         if find_children_in_statement(stmt, source, path, aliases) {
@@ -473,6 +471,18 @@ fn find_children_in_class_body<'a>(
                     }
                 }
             }
+            ClassElement::PropertyDefinition(prop) if is_render_named(&prop.key) => {
+                if let Some(init) = &prop.value {
+                    if let Expression::ArrowFunctionExpression(arrow) = init {
+                        for stmt in &arrow.body.statements {
+                            if find_children_in_statement(stmt, source, path, aliases) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     false
@@ -843,12 +853,11 @@ fn find_children_in_class_body_detail<'a>(
     aliases: &HashMap<String, String>,
 ) -> bool {
     for element in &body.body {
-        if let ClassElement::MethodDefinition(method) = element {
-            let is_render = match &method.key {
-                PropertyKey::StaticIdentifier(id) => id.name == "render",
-                _ => false,
-            };
-            if is_render {
+        let is_render_named = |key: &PropertyKey| -> bool {
+            matches!(key, PropertyKey::StaticIdentifier(id) if id.name == "render")
+        };
+        match element {
+            ClassElement::MethodDefinition(method) if is_render_named(&method.key) => {
                 if let Some(body) = &method.value.body {
                     for stmt in &body.statements {
                         if find_children_in_statement_detail(stmt, source, path, aliases) {
@@ -857,6 +866,18 @@ fn find_children_in_class_body_detail<'a>(
                     }
                 }
             }
+            ClassElement::PropertyDefinition(prop) if is_render_named(&prop.key) => {
+                if let Some(init) = &prop.value {
+                    if let Expression::ArrowFunctionExpression(arrow) = init {
+                        for stmt in &arrow.body.statements {
+                            if find_children_in_statement_detail(stmt, source, path, aliases) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     false

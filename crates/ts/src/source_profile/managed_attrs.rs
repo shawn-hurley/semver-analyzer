@@ -346,11 +346,26 @@ fn collect_from_stmt<'a>(
         }
         Statement::ClassDeclaration(cls) => {
             for item in &cls.body.body {
-                if let ClassElement::MethodDefinition(method) = item {
-                    if let Some(body) = &method.value.body {
-                        for s in &body.statements {
-                            collect_from_stmt(
-                                s,
+                match item {
+                    ClassElement::MethodDefinition(method) => {
+                        if let Some(body) = &method.value.body {
+                            for s in &body.statements {
+                                collect_from_stmt(
+                                    s,
+                                    source,
+                                    known_props,
+                                    destructurings,
+                                    flows,
+                                    jsx_spreads,
+                                    rest_prop,
+                                );
+                            }
+                        }
+                    }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            collect_from_expr(
+                                init,
                                 source,
                                 known_props,
                                 destructurings,
@@ -360,6 +375,7 @@ fn collect_from_stmt<'a>(
                             );
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -420,17 +436,32 @@ fn collect_from_decl<'a>(
         }
         Declaration::ClassDeclaration(cls) => {
             for item in &cls.body.body {
-                if let ClassElement::MethodDefinition(method) = item {
-                    check_function_params(
-                        &method.value.params,
-                        source,
-                        known_props,
-                        destructurings,
-                    );
-                    if let Some(body) = &method.value.body {
-                        for s in &body.statements {
-                            collect_from_stmt(
-                                s,
+                match item {
+                    ClassElement::MethodDefinition(method) => {
+                        check_function_params(
+                            &method.value.params,
+                            source,
+                            known_props,
+                            destructurings,
+                        );
+                        if let Some(body) = &method.value.body {
+                            for s in &body.statements {
+                                collect_from_stmt(
+                                    s,
+                                    source,
+                                    known_props,
+                                    destructurings,
+                                    flows,
+                                    jsx_spreads,
+                                    rest_prop,
+                                );
+                            }
+                        }
+                    }
+                    ClassElement::PropertyDefinition(prop) => {
+                        if let Some(init) = &prop.value {
+                            collect_from_expr(
+                                init,
                                 source,
                                 known_props,
                                 destructurings,
@@ -440,6 +471,7 @@ fn collect_from_decl<'a>(
                             );
                         }
                     }
+                    _ => {}
                 }
             }
         }
