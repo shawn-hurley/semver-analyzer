@@ -197,7 +197,17 @@ pub fn build_composition_tree_v2(
                 for child_comp in child_comps {
                     let key = (parent_comp.clone(), child_comp.clone());
                     if parent_comp != child_comp && edge_set.insert(key) {
-                        let strength = if *child_comp == root || parent_ambiguous || child_ambiguous
+                        // If the reverse edge already exists (child→parent from
+                        // a prior step), this creates a bidirectional pair.
+                        // Bidirectional CSS relationships represent optional
+                        // recursive nesting (e.g., WizardNavItem > WizardNav
+                        // for sub-navigation), not mandatory containment.
+                        let reverse_key = (child_comp.clone(), parent_comp.clone());
+                        let has_reverse = edge_set.contains(&reverse_key);
+                        let strength = if *child_comp == root
+                            || parent_ambiguous
+                            || child_ambiguous
+                            || has_reverse
                         {
                             EdgeStrength::Allowed
                         } else {
@@ -1521,6 +1531,13 @@ fn infer_context_nesting(
                         "context nesting inferred"
                     );
 
+                    // Context availability does NOT mean mandatory children.
+                    // A parent providing context means "these children CAN use
+                    // this context if present", not "these children MUST be
+                    // present". For example, ToolbarContent provides
+                    // ToolbarContentContext for ToolbarFilter, but
+                    // <ToolbarContent> with just <ToolbarGroup> children is
+                    // perfectly valid.
                     new_edges.push(CompositionEdge {
                         parent: provider_name.clone(),
                         child: child_name.clone(),
@@ -1530,7 +1547,7 @@ fn infer_context_nesting(
                             "Context nesting: {} provides {}, {} consumes it via useContext",
                             provider_name, consumed_ctx, child_name
                         )),
-                        strength: EdgeStrength::Required,
+                        strength: EdgeStrength::Allowed,
                         prop_name: None,
                     });
                 }
