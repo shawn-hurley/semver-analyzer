@@ -147,6 +147,8 @@ from structural evidence.**
 | 7 | DOM nesting | Required | Invalid HTML without correct parent |
 | 8 | cloneElement | Required | Missing injected props breaks functionality |
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
+| 8.6 | Secondary BEM block sub-root | Allowed | Cross-block orphans connected to sub-root (e.g., ModalBox→ModalBody) |
+| 8.7 | Prop-passed detection | Allowed | ReactNode/ReactElement prop name matches child component name |
 
 *Steps 2, 3, 3b use `Allowed` instead of `Required` when the child component
 equals the family root — this indicates recursive/self-nesting (e.g., DataList
@@ -157,6 +159,21 @@ Step 1 detects JSX elements in **parameter destructuring defaults**
 (`const { icon = <Icon /> } = this.props`), not just the function body.
 This is critical for components like ChartBullet that receive sub-components
 as props with JSX defaults.
+
+Step 1 handles both `ClassElement::MethodDefinition` (standard `render()`)
+AND `ClassElement::PropertyDefinition` (arrow property `render = () => {}`)
+in class components. Both forms are walked for JSX elements, children slot
+tracing, cloneElement detection, and managed attribute flow. The
+`PropertyDefinition` support is applied in `mod.rs`, `children_slot.rs`,
+`clone_element.rs`, and `managed_attrs.rs`.
+
+Step 1 also handles **TypeScript expression wrappers** transparently.
+`TSAsExpression` (`expr as Type`), `TSSatisfiesExpression`,
+`TSNonNullExpression` (`expr!`), `TSTypeAssertion` (`<Type>expr`), and
+`TSInstantiationExpression` (`expr<Type>`) are all unwrapped before JSX
+walking. This is critical for class components like Modal whose render
+returns `ReactDOM.createPortal(<ModalContent/>, el) as React.ReactElement`
+— without this, the `as` cast hides the JSX from the walker.
 
 Step 1.5 projects edges from a delegate family's composition tree onto
 wrapper families. When a family like Dropdown wraps Menu (each Dropdown
@@ -200,12 +217,43 @@ edges:
    Menu/MenuToggle, Alert/AlertGroup where camelCase naming creates false
    prefix matches in the CSS element map).
 
+Step 8.6 handles families where components use a **different BEM block**
+than the root (cross-block sub-families). For example, Modal's root uses
+block `"backdrop"` while ModalBody/ModalFooter/ModalHeader use block
+`"modalBox"`. Similarly, TabContentBody uses block `"tabContent"` while the
+Tabs root uses `"tabs"`. For each BEM block used by family members that
+differs from the **root's** block (not the primary CSS profile key — those
+may differ when the dominant block wins by vote), Step 8.6:
+1. Builds a secondary `css_to_component` map for that block.
+2. Finds the **sub-root**: the component mapping to element `""` (root) of
+   that block with `has_children_prop` (e.g., ModalBox, TabContent).
+3. Connects orphan members whose `bem_block` matches the secondary block
+   to the sub-root via `Allowed` edges.
+After `collapse_internal_nodes`, if the sub-root is internal (non-exported),
+edges propagate to the family root (e.g., `ModalBox → ModalBody` becomes
+`Modal → ModalBody`).
+
+Step 8.7 detects **prop-passed** components — those passed via named
+`ReactNode`/`ReactElement` props rather than as JSX `{children}`. For each
+family member, it checks all other family members' `prop_types` for
+ReactNode/ReactElement props (excluding `children`). When a member's name
+(with the parent's name prefix stripped) matches a prop name
+(case-insensitive, `starts_with` in both directions), it creates a
+`PropPassed` edge with `Allowed` strength. The matched prop name is stored
+in the edge's `prop_name` field. Step 8.7 also **reclassifies** existing
+`DirectChild` edges to `PropPassed` when a prop name match is found (e.g.,
+`CodeBlock → CodeBlockAction` reclassified via `actions` prop).
+
 After all steps, members with zero edges (no incoming AND no outgoing) are
-dropped from the tree (no "default to root" guessing). Members with outgoing
-edges but no incoming edges are retained as **secondary roots** — top-level
-containers within the family (e.g., JumpLinksList wraps `<ul>` containing
-JumpLinksItem `<li>` children). Non-exported secondary roots are then properly
-collapsed by `collapse_internal_nodes`.
+dropped from the tree **unless** they are barrel-file exports. Exported
+orphans are retained as family members — they're part of the family's
+public API even if no structural signal links them (e.g., convenience
+composites like LoginForm, orchestrators like MenuContainer). Non-exported
+members with zero edges are dropped (internal noise: context objects, type
+exports, helper components). Members with outgoing edges but no incoming
+edges are retained as **secondary roots** — top-level containers within
+the family. Non-exported secondary roots are then properly collapsed by
+`collapse_internal_nodes`.
 
 #### EdgeStrength: Required vs Allowed
 
@@ -303,10 +351,22 @@ stripping, `sanitize()` handles lowercasing and special character replacement.
 #### CSS Element → Component Mapping (CRITICAL)
 
 `build_css_element_to_component_map` maps CSS BEM element names to React
-components via `css_tokens_used`. **Tokens are stored with the `"styles."`
-prefix** (e.g., `"styles.drawerBody"`). The mapping function must strip
-`"styles."` before matching against the BEM block name. Skip `"styles.modifiers."`
-tokens — they don't map to BEM elements.
+components via `css_tokens_used`. The map type is
+`HashMap<String, HashSet<String>>` — multiple components can map to the
+same BEM element (e.g., `DrawerContentBody` and `DrawerPanelBody` both
+render `__body`). When an element maps to multiple components, all
+CSS-based signal steps (2, 3, 3b, 5, 5.5) create edges to all candidates,
+but with `Allowed` strength (the CSS class is ambiguous across components).
+Single-component elements use the step's normal strength logic.
+
+**Tokens are stored with the `"styles."` prefix** (e.g.,
+`"styles.drawerBody"`). The mapping function must strip `"styles."` before
+matching against the BEM block name. Skip `"styles.modifiers."` tokens —
+they don't map to BEM elements.
+
+The root component is prevented from claiming child CSS tokens when a
+dedicated component already exists for that element. This prevents the
+root from shadowing dedicated components in the map.
 
 #### CSS Profile Loading
 
@@ -336,15 +396,18 @@ parses for path and detail).
 
 #### Known Issues
 
-- **Shared CSS token**: Multiple components render the same CSS class (e.g.,
-  `DrawerContentBody` and `DrawerPanelBody` both render `__body`). First
-  component registered wins in the mapping. Needs multi-component token map
-  with parent-context disambiguation.
-- **Non-component exports**: Context objects, type exports may appear as family
-  members if they have any structural signal. Need filtering.
-- **Prop-based composition**: Components passed via props (e.g., `panelContent`
-  on DrawerContent) create collapsed edges that look like children composition.
-  The TD pipeline handles these separately.
+- **Non-component exports**: Context objects (AlertContext, FormContext,
+  TabsContext, WizardContext, etc.) appear as orphan family members when
+  they are barrel-file exports. They have zero edges and don't affect
+  rule generation, but they add noise to the tree's member list. Future
+  work: filter members whose source file only exports context/type
+  declarations (no JSX rendering).
+- **Primary vs secondary CSS block mismatch**: When the root's BEM block
+  differs from the dominant BEM block (e.g., Modal root uses `"backdrop"`
+  but most members use `"modalBox"`), the primary CSS profile covers the
+  children's block. Step 8.6 handles this by treating the dominant block as
+  a secondary block for sub-root fallback. A future refactor should unify
+  primary/secondary processing into a single multi-block loop.
 
 #### Single-Component Families (Skip for Composition)
 
@@ -374,25 +437,25 @@ internally-rendered-only (Popover, Tooltip, AboutModal, SearchInput, Slider,
 TimePicker, ChartBullet, ChartCursorTooltip, ChartLegendTooltip — all
 sub-components are internally rendered, not consumer-placed).
 
-| Family | Expected Exports | Currently Missing |
-|--------|-----------------|-------------------|
+| Family | Expected Exports | Notes |
+|--------|-----------------|-------|
 | Accordion | Accordion, AccordionContent, AccordionExpandableContentBody, AccordionItem, AccordionToggle | — |
-| ActionList | ActionList, ActionListGroup, ActionListItem | ActionListItem |
-| Alert | Alert, AlertActionCloseButton, AlertActionLink, AlertGroup | AlertActionLink |
+| ActionList | ActionList, ActionListGroup, ActionListItem | — |
+| Alert | Alert, AlertActionCloseButton, AlertActionLink, AlertGroup | AlertActionLink: prop-passed via `actionLinks` |
 | Breadcrumb | Breadcrumb, BreadcrumbHeading, BreadcrumbItem | — |
 | Card | Card, CardBody, CardExpandableContent, CardFooter, CardHeader, CardTitle | — |
-| ClipboardCopy | ClipboardCopy, ClipboardCopyAction, ClipboardCopyButton | ClipboardCopyButton |
-| CodeBlock | CodeBlock, CodeBlockAction, CodeBlockCode | — |
+| ClipboardCopy | ClipboardCopy, ClipboardCopyAction, ClipboardCopyButton | — |
+| CodeBlock | CodeBlock, CodeBlockAction, CodeBlockCode | CodeBlockAction: prop-passed via `actions` |
 | CodeEditor | CodeEditor, CodeEditorControl | — |
-| DataList | DataList, DataListAction, DataListCell, DataListCheck, DataListContent, DataListControl, DataListDragButton, DataListItem, DataListItemCells, DataListItemRow, DataListText, DataListToggle | DataListControl |
-| DescriptionList | DescriptionList, DescriptionListDescription, DescriptionListGroup, DescriptionListTerm, DescriptionListTermHelpText, DescriptionListTermHelpTextButton | DescriptionListTermHelpTextButton |
-| Drawer | Drawer, DrawerActions, DrawerCloseButton, DrawerContent, DrawerContentBody, DrawerHead, DrawerPanelBody, DrawerPanelContent, DrawerPanelDescription, DrawerSection | DrawerPanelBody |
+| DataList | DataList, DataListAction, DataListCell, DataListCheck, DataListContent, DataListControl, DataListDragButton, DataListItem, DataListItemCells, DataListItemRow, DataListText, DataListToggle | — |
+| DescriptionList | DescriptionList, DescriptionListDescription, DescriptionListGroup, DescriptionListTerm, DescriptionListTermHelpText, DescriptionListTermHelpTextButton | — |
+| Drawer | Drawer, DrawerActions, DrawerCloseButton, DrawerContent, DrawerContentBody, DrawerHead, DrawerPanelBody, DrawerPanelContent, DrawerPanelDescription, DrawerSection | DrawerPanelBody: multi-component CSS map |
 | Dropdown | Dropdown, DropdownGroup, DropdownItem, DropdownList | — |
 | DualListSelector | DualListSelector, DualListSelectorControl, DualListSelectorControlsWrapper, DualListSelectorList, DualListSelectorListItem, DualListSelectorPane, DualListSelectorTree | — |
 | EmptyState | EmptyState, EmptyStateActions, EmptyStateBody, EmptyStateFooter | — |
-| ExpandableSection | ExpandableSection, ExpandableSectionToggle | — |
-| FileUpload | FileUpload, FileUploadField, FileUploadHelperText | FileUploadHelperText |
-| Form | ActionGroup, Form, FormAlert, FormFieldGroup, FormFieldGroupExpandable, FormFieldGroupHeader, FormGroup, FormGroupLabelHelp, FormHelperText, FormSection | FormAlert, FormGroupLabelHelp |
+| ExpandableSection | ExpandableSection, ExpandableSectionToggle | ExpandableSectionToggle: prop-passed via `toggleContent` |
+| FileUpload | FileUpload, FileUploadField, FileUploadHelperText | — |
+| Form | ActionGroup, Form, FormAlert, FormFieldGroup, FormFieldGroupExpandable, FormFieldGroupHeader, FormGroup, FormGroupLabelHelp, FormHelperText, FormSection | FormGroupLabelHelp: prop-passed via `label` |
 | FormSelect | FormSelect, FormSelectOption, FormSelectOptionGroup | — |
 | HelperText | HelperText, HelperTextItem | — |
 | Hint | Hint, HintBody, HintFooter, HintTitle | — |
@@ -400,16 +463,16 @@ sub-components are internally rendered, not consumer-placed).
 | JumpLinks | JumpLinks, JumpLinksItem, JumpLinksList | — |
 | Label | Label, LabelGroup | — |
 | List | List, ListItem | — |
-| LoginPage | Login, LoginFooter, LoginFooterItem, LoginForm, LoginHeader, LoginMainBody, LoginMainFooter, LoginMainFooterBandItem, LoginMainFooterLinksItem, LoginMainHeader, LoginPage | LoginFooterItem, LoginForm, LoginMainFooterBandItem |
+| LoginPage | Login, LoginFooter, LoginFooterItem, LoginForm, LoginHeader, LoginMainBody, LoginMainFooter, LoginMainFooterBandItem, LoginMainFooterLinksItem, LoginMainHeader, LoginPage | LoginFooterItem: prop-passed via `footer`; LoginForm: exported orphan (convenience composite) |
 | Masthead | Masthead, MastheadBrand, MastheadContent, MastheadLogo, MastheadMain, MastheadToggle | — |
-| Menu | DrilldownMenu, Menu, MenuBreadcrumb, MenuContainer, MenuContent, MenuFooter, MenuGroup, MenuItem, MenuItemAction, MenuList, MenuSearch, MenuSearchInput | MenuContainer, MenuSearchInput |
-| MenuToggle | MenuToggle, MenuToggleAction, MenuToggleCheckbox | MenuToggleCheckbox |
-| Modal | Modal, ModalBody, ModalFooter, ModalHeader | ModalBody, ModalFooter |
+| Menu | DrilldownMenu, Menu, MenuBreadcrumb, MenuContainer, MenuContent, MenuFooter, MenuGroup, MenuItem, MenuItemAction, MenuList, MenuSearch, MenuSearchInput | MenuContainer: exported orphan (standalone orchestrator) |
+| MenuToggle | MenuToggle, MenuToggleAction, MenuToggleCheckbox | MenuToggleCheckbox: exported orphan (opaque slot via `splitButtonItems`) |
+| Modal | Modal, ModalBody, ModalFooter, ModalHeader | Cross-block: ModalBody/ModalFooter via Step 8.6 (modalBox sub-block) |
 | MultipleFileUpload | MultipleFileUpload, MultipleFileUploadMain, MultipleFileUploadStatus, MultipleFileUploadStatusItem | — |
 | Nav | Nav, NavExpandable, NavGroup, NavItem, NavItemSeparator, NavList | — |
 | NotificationDrawer | NotificationDrawer, NotificationDrawerBody, NotificationDrawerGroup, NotificationDrawerGroupList, NotificationDrawerHeader, NotificationDrawerList, NotificationDrawerListItem, NotificationDrawerListItemBody, NotificationDrawerListItemHeader | — |
 | OverflowMenu | OverflowMenu, OverflowMenuContent, OverflowMenuControl, OverflowMenuDropdownItem, OverflowMenuGroup, OverflowMenuItem | — |
-| Page | Page, PageBody, PageBreadcrumb, PageGroup, PageSection, PageSidebar, PageSidebarBody, PageToggleButton | — |
+| Page | Page, PageBody, PageBreadcrumb, PageGroup, PageSection, PageSidebar, PageSidebarBody, PageToggleButton | PageSidebar: prop-passed via `sidebar`; PageBreadcrumb: prop-passed via `breadcrumb` |
 | Pagination | Pagination, ToggleTemplate | — |
 | Panel | Panel, PanelFooter, PanelHeader, PanelMain, PanelMainBody | — |
 | Progress | Progress, ProgressBar, ProgressContainer | — |
@@ -418,26 +481,32 @@ sub-components are internally rendered, not consumer-placed).
 | Sidebar | Sidebar, SidebarContent, SidebarPanel | — |
 | SimpleList | SimpleList, SimpleListGroup, SimpleListItem | — |
 | Table | (see note) | (see note) |
-| Tabs | Tab, TabAction, TabContent, TabContentBody, TabTitleIcon, TabTitleText, Tabs | TabContentBody, TabTitleIcon |
+| Tabs | Tab, TabAction, TabContent, TabContentBody, TabTitleIcon, TabTitleText, Tabs | TabContentBody: cross-block via Step 8.6 (tabContent sub-block) |
 | TextInputGroup | TextInputGroup, TextInputGroupMain, TextInputGroupUtilities | — |
 | ToggleGroup | ToggleGroup, ToggleGroupItem | — |
 | Toolbar | Toolbar, ToolbarContent, ToolbarExpandableContent, ToolbarExpandIconWrapper, ToolbarFilter, ToolbarGroup, ToolbarItem, ToolbarToggleGroup | — |
-| TreeView | TreeView, TreeViewSearch | TreeViewSearch |
-| Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardStep, WizardToggle | — |
+| TreeView | TreeView, TreeViewSearch | — |
+| Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardStep, WizardToggle | WizardHeader: prop-passed via `header` |
 | deprecated/Chip | Chip, ChipGroup | — |
 | deprecated/DualListSelector | DualListSelector, DualListSelectorControl, DualListSelectorControlsWrapper, DualListSelectorList, DualListSelectorListItem, DualListSelectorPane, DualListSelectorTree | — |
-| deprecated/Modal | Modal, ModalBox, ModalBoxBody, ModalBoxCloseButton, ModalBoxFooter, ModalBoxHeader, ModalContent | ModalBoxBody, ModalBoxFooter, ModalBoxHeader |
-| deprecated/Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardToggle | — |
+| deprecated/Modal | Modal, ModalBox, ModalBoxBody, ModalBoxCloseButton, ModalBoxFooter, ModalBoxHeader, ModalContent | — |
+| deprecated/Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardToggle | WizardFooter: prop-passed via `footer` |
 
 **Note on Table:** The Table family exports many components (Caption, Tbody,
 Thead, Tr, Td, Th, etc.) plus utility wrappers (ActionsColumn, RowWrapper,
 TreeRowWrapper, InnerScrollContainer, OuterScrollContainer, SelectColumn,
-etc.). The current tree has 16 members and 18 edges. Missing exports need
-individual verification as many are utility wrappers not composition components.
+etc.). The current tree has 16 members and 18 edges. Some utility wrappers
+appear as exported orphans (EditableSelectInputCell, EditableTextCell,
+SelectColumn, FavoritesCell, OuterScrollContainer, InnerScrollContainer,
+TableTypes).
 
-**Summary:** 23 exported consumer-facing components are missing across 18
-families. 3 context providers (PageContext, WizardContext,
-DualListSelectorContext) incorrectly appear in trees and should be filtered.
+**Summary:** All expected consumer-facing components are present in
+composition trees. 3 components are retained as exported orphans with no
+edges (LoginForm, MenuContainer, MenuToggleCheckbox) — these are
+convenience composites or orchestrators with no structural composition
+signal. Context providers (AlertContext, FormContext, TabsContext,
+WizardContext, etc.) appear as orphan members when exported from barrel
+files; they don't affect rule generation.
 
 #### Family Grouping and Deprecated Separation
 
@@ -457,6 +526,59 @@ distinguishable from main families in the output.
 
 Files from the `code-connect` package (Figma integration) are excluded from
 SD file discovery via `should_exclude_from_sd`.
+
+#### Deprecated Profile Key Collision (CRITICAL)
+
+When a component name exists in both main and deprecated paths (e.g.,
+`ModalContent` in `src/components/Modal/` and
+`src/deprecated/components/Modal/`), the main version wins in the global
+`new_profiles` map. The deprecated version is preserved in a separate
+`deprecated_profiles` map. `collect_family_profiles()` uses the deprecated
+profile when building a deprecated family's tree, ensuring each family
+sees its own version of shared component names.
+
+**Never** allow a global profile map lookup to silently return the wrong
+version's profile for a deprecated family. The deprecated version of a
+component may render different sub-components (e.g., deprecated
+`ModalContent` renders `ModalBoxBody/Footer/Header` while v6
+`ModalContent` renders `{children}` passthrough).
+
+#### `collapse_internal_nodes` Algorithm (CRITICAL)
+
+`collapse_internal_nodes` in `sd_pipeline.rs` removes non-exported
+components from the tree, creating transitive edges that bypass them.
+It processes **one internal node at a time**, preferring leaf nodes
+(those whose children are all resolved). This is critical for multi-level
+internal chains like:
+
+```
+Modal → ModalContent(int) → ModalBox(int) → ModalBody
+```
+
+Processing one node at a time ensures:
+1. Collapse ModalBox first → creates `ModalContent → ModalBody`
+2. Collapse ModalContent → creates `Modal → ModalBody`
+
+**Never** process all internal nodes in a single pass and remove all
+their edges at once. This breaks multi-level chains because intermediate
+transitive edges reference nodes that haven't been collapsed yet, and
+removing all internal edges destroys the chain.
+
+Collapsed edges inherit:
+- The **stronger** `EdgeStrength` of the two edges in the chain
+- The child edge's `relationship` type
+- The child edge's `prop_name` (propagated through transitive edges)
+
+Regression test:
+`sd_pipeline::tests::test_collapse_three_level_internal_chain` — uses
+the real Modal family structure with 9 members and verifies that the
+3-level chain collapses to `Modal → ModalBody/ModalFooter/ModalHeader`.
+
+Integration test:
+`sd_pipeline::tests::test_modal_family_integration_real_files` — uses
+real PatternFly source files and CSS to verify the full pipeline
+end-to-end for the Modal family. Requires files at
+`/tmp/semver-pipeline-v2/repos/` (marked `#[ignore]`).
 
 ### BEM Block Independence (CRITICAL)
 
