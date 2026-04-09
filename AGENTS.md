@@ -322,6 +322,83 @@ NumberInput, Radio, Sankey, Skeleton, SkipToContent, Spinner, Switch,
 TextArea, TextInput, Timestamp, Title, Truncate, deprecated/DragDrop,
 deprecated/Tile.
 
+#### Composition Tree Ground Truth (PatternFly v6.4.1)
+
+The expected consumer-facing API for each multi-component family is derived
+from the barrel file (index.ts) exports at the v6.4.1 tag. Context providers
+and type exports are excluded. This is the definitive reference for
+composition tree validation.
+
+Families not listed here are either single-component (see above) or
+internally-rendered-only (Popover, Tooltip, AboutModal, SearchInput, Slider,
+TimePicker, ChartBullet, ChartCursorTooltip, ChartLegendTooltip — all
+sub-components are internally rendered, not consumer-placed).
+
+| Family | Expected Exports | Currently Missing |
+|--------|-----------------|-------------------|
+| Accordion | Accordion, AccordionContent, AccordionExpandableContentBody, AccordionItem, AccordionToggle | — |
+| ActionList | ActionList, ActionListGroup, ActionListItem | ActionListItem |
+| Alert | Alert, AlertActionCloseButton, AlertActionLink, AlertGroup | AlertActionLink |
+| Breadcrumb | Breadcrumb, BreadcrumbHeading, BreadcrumbItem | — |
+| Card | Card, CardBody, CardExpandableContent, CardFooter, CardHeader, CardTitle | — |
+| ClipboardCopy | ClipboardCopy, ClipboardCopyAction, ClipboardCopyButton | ClipboardCopyButton |
+| CodeBlock | CodeBlock, CodeBlockAction, CodeBlockCode | — |
+| CodeEditor | CodeEditor, CodeEditorControl | — |
+| DataList | DataList, DataListAction, DataListCell, DataListCheck, DataListContent, DataListControl, DataListDragButton, DataListItem, DataListItemCells, DataListItemRow, DataListText, DataListToggle | DataListControl |
+| DescriptionList | DescriptionList, DescriptionListDescription, DescriptionListGroup, DescriptionListTerm, DescriptionListTermHelpText, DescriptionListTermHelpTextButton | DescriptionListTermHelpTextButton |
+| Drawer | Drawer, DrawerActions, DrawerCloseButton, DrawerContent, DrawerContentBody, DrawerHead, DrawerPanelBody, DrawerPanelContent, DrawerPanelDescription, DrawerSection | DrawerPanelBody |
+| Dropdown | Dropdown, DropdownGroup, DropdownItem, DropdownList | — |
+| DualListSelector | DualListSelector, DualListSelectorControl, DualListSelectorControlsWrapper, DualListSelectorList, DualListSelectorListItem, DualListSelectorPane, DualListSelectorTree | — |
+| EmptyState | EmptyState, EmptyStateActions, EmptyStateBody, EmptyStateFooter | — |
+| ExpandableSection | ExpandableSection, ExpandableSectionToggle | — |
+| FileUpload | FileUpload, FileUploadField, FileUploadHelperText | FileUploadHelperText |
+| Form | ActionGroup, Form, FormAlert, FormFieldGroup, FormFieldGroupExpandable, FormFieldGroupHeader, FormGroup, FormGroupLabelHelp, FormHelperText, FormSection | FormAlert, FormGroupLabelHelp |
+| FormSelect | FormSelect, FormSelectOption, FormSelectOptionGroup | — |
+| HelperText | HelperText, HelperTextItem | — |
+| Hint | Hint, HintBody, HintFooter, HintTitle | — |
+| InputGroup | InputGroup, InputGroupItem, InputGroupText | — |
+| JumpLinks | JumpLinks, JumpLinksItem, JumpLinksList | — |
+| Label | Label, LabelGroup | — |
+| List | List, ListItem | — |
+| LoginPage | Login, LoginFooter, LoginFooterItem, LoginForm, LoginHeader, LoginMainBody, LoginMainFooter, LoginMainFooterBandItem, LoginMainFooterLinksItem, LoginMainHeader, LoginPage | LoginFooterItem, LoginForm, LoginMainFooterBandItem |
+| Masthead | Masthead, MastheadBrand, MastheadContent, MastheadLogo, MastheadMain, MastheadToggle | — |
+| Menu | DrilldownMenu, Menu, MenuBreadcrumb, MenuContainer, MenuContent, MenuFooter, MenuGroup, MenuItem, MenuItemAction, MenuList, MenuSearch, MenuSearchInput | MenuContainer, MenuSearchInput |
+| MenuToggle | MenuToggle, MenuToggleAction, MenuToggleCheckbox | MenuToggleCheckbox |
+| Modal | Modal, ModalBody, ModalFooter, ModalHeader | ModalBody, ModalFooter |
+| MultipleFileUpload | MultipleFileUpload, MultipleFileUploadMain, MultipleFileUploadStatus, MultipleFileUploadStatusItem | — |
+| Nav | Nav, NavExpandable, NavGroup, NavItem, NavItemSeparator, NavList | — |
+| NotificationDrawer | NotificationDrawer, NotificationDrawerBody, NotificationDrawerGroup, NotificationDrawerGroupList, NotificationDrawerHeader, NotificationDrawerList, NotificationDrawerListItem, NotificationDrawerListItemBody, NotificationDrawerListItemHeader | — |
+| OverflowMenu | OverflowMenu, OverflowMenuContent, OverflowMenuControl, OverflowMenuDropdownItem, OverflowMenuGroup, OverflowMenuItem | — |
+| Page | Page, PageBody, PageBreadcrumb, PageGroup, PageSection, PageSidebar, PageSidebarBody, PageToggleButton | — |
+| Pagination | Pagination, ToggleTemplate | — |
+| Panel | Panel, PanelFooter, PanelHeader, PanelMain, PanelMainBody | — |
+| Progress | Progress, ProgressBar, ProgressContainer | — |
+| ProgressStepper | ProgressStepper, ProgressStep | — |
+| Select | Select, SelectGroup, SelectList, SelectOption | — |
+| Sidebar | Sidebar, SidebarContent, SidebarPanel | — |
+| SimpleList | SimpleList, SimpleListGroup, SimpleListItem | — |
+| Table | (see note) | (see note) |
+| Tabs | Tab, TabAction, TabContent, TabContentBody, TabTitleIcon, TabTitleText, Tabs | TabContentBody, TabTitleIcon |
+| TextInputGroup | TextInputGroup, TextInputGroupMain, TextInputGroupUtilities | — |
+| ToggleGroup | ToggleGroup, ToggleGroupItem | — |
+| Toolbar | Toolbar, ToolbarContent, ToolbarExpandableContent, ToolbarExpandIconWrapper, ToolbarFilter, ToolbarGroup, ToolbarItem, ToolbarToggleGroup | — |
+| TreeView | TreeView, TreeViewSearch | TreeViewSearch |
+| Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardStep, WizardToggle | — |
+| deprecated/Chip | Chip, ChipGroup | — |
+| deprecated/DualListSelector | DualListSelector, DualListSelectorControl, DualListSelectorControlsWrapper, DualListSelectorList, DualListSelectorListItem, DualListSelectorPane, DualListSelectorTree | — |
+| deprecated/Modal | Modal, ModalBox, ModalBoxBody, ModalBoxCloseButton, ModalBoxFooter, ModalBoxHeader, ModalContent | ModalBoxBody, ModalBoxFooter, ModalBoxHeader |
+| deprecated/Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardToggle | — |
+
+**Note on Table:** The Table family exports many components (Caption, Tbody,
+Thead, Tr, Td, Th, etc.) plus utility wrappers (ActionsColumn, RowWrapper,
+TreeRowWrapper, InnerScrollContainer, OuterScrollContainer, SelectColumn,
+etc.). The current tree has 16 members and 18 edges. Missing exports need
+individual verification as many are utility wrappers not composition components.
+
+**Summary:** 23 exported consumer-facing components are missing across 18
+families. 3 context providers (PageContext, WizardContext,
+DualListSelectorContext) incorrectly appear in trees and should be filtered.
+
 #### Family Grouping and Deprecated Separation
 
 `extract_family_from_path` in `sd_pipeline.rs` determines which component
