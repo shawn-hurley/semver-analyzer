@@ -260,6 +260,44 @@ for (parent, children) in parent_to_req_children:
   should not be Required — the recursive direction should be `Allowed`.
   The rule generator does not handle cycles; fix the tree instead.
 
+#### Conformance Rule ID Format
+
+Conformance rule IDs use abbreviated segments and stripped component names
+to keep IDs short. Each rule ID includes the family name to prevent
+duplicates when regular and deprecated families share component names
+(e.g., `DualListSelector` and `deprecated/DualListSelector`).
+
+**Abbreviation scheme:**
+
+| Full segment | Abbreviation |
+|---|---|
+| `conformance` | `cf` |
+| `must-be-in` | `in` |
+| `requires` | `req` |
+| `requires-wrapper` | `req-wrap` |
+
+**Component name shortening:** The family root name is stripped from
+component names when the component starts with it. For example, in the
+`DualListSelector` family, `DualListSelectorControl` becomes `control`.
+When stripping would produce an empty string (component equals the family
+root), the full name is kept. Components that don't start with the family
+name are kept as-is (e.g., `Tr` in the `Table` family stays `tr`).
+
+For deprecated families like `deprecated/DualListSelector`, only the base
+name (`DualListSelector`) is used for prefix stripping.
+
+**Rule ID formats:**
+
+| Rule type | Format | Example |
+|---|---|---|
+| notParent | `sd-cf-{family}-{child}-in-{parent1-or-parent2}` | `sd-cf-duallistselector-control-in-list-or-tree` |
+| invalidDirectChild | `sd-cf-{family}-{child}-not-in-{grandparent}-use-{parent1-or-parent2}` | `sd-cf-table-td-not-in-table-use-tr` |
+| requiresChild | `sd-cf-{family}-{parent}-req-{child1-and-child2}` | `sd-cf-tabs-tabs-req-tab` |
+| exclusiveWrapper | `sd-cf-{family}-{parent}-req-wrap` | `sd-cf-inputgroup-inputgroup-req-wrap` |
+
+Implementation: `short_component_id()` in `konveyor_v2.rs` handles the
+stripping, `sanitize()` handles lowercasing and special character replacement.
+
 #### CSS Element → Component Mapping (CRITICAL)
 
 `build_css_element_to_component_map` maps CSS BEM element names to React

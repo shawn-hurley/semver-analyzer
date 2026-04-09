@@ -740,7 +740,7 @@ pub fn generate_rules(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                     value: None,
                     // Don't filter on the matched component's import source —
                     // we want to catch app-level icons too (e.g., ContextIcon).
@@ -1037,7 +1037,7 @@ pub fn generate_rules(
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                     fix_strategy: Some(strategy),
@@ -1493,7 +1493,7 @@ pub fn generate_rules(
                                             not_parent: None,
                                             child: None,
                                             not_child: None,
-                requires_child: None,
+                                            requires_child: None,
                                         },
                                     },
                                     KonveyorCondition::FrontendReferenced {
@@ -1509,7 +1509,7 @@ pub fn generate_rules(
                                             not_parent: None,
                                             child: None,
                                             not_child: None,
-                requires_child: None,
+                                            requires_child: None,
                                         },
                                     },
                                 ],
@@ -1528,7 +1528,7 @@ pub fn generate_rules(
                                     not_parent: None,
                                     child: None,
                                     not_child: None,
-                requires_child: None,
+                                    requires_child: None,
                                 },
                             }
                         }
@@ -1560,7 +1560,7 @@ pub fn generate_rules(
                                     not_parent: None,
                                     child: None,
                                     not_child: None,
-                requires_child: None,
+                                    requires_child: None,
                                 },
                             })
                             .collect();
@@ -1601,7 +1601,7 @@ pub fn generate_rules(
                                         not_parent: None,
                                         child: Some(child_pattern),
                                         not_child: None,
-                requires_child: None,
+                                        requires_child: None,
                                     },
                                 });
                             }
@@ -1629,7 +1629,7 @@ pub fn generate_rules(
                                 not_parent: None,
                                 child: None,
                                 not_child: None,
-                requires_child: None,
+                                requires_child: None,
                             },
                         }
                     };
@@ -1944,7 +1944,7 @@ pub fn generate_rules(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -1990,7 +1990,7 @@ pub fn generate_rules(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::rename(&entry.old_prop, &entry.new_prop)),
@@ -2031,7 +2031,7 @@ pub fn generate_rules(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("Manual")),
@@ -2068,7 +2068,7 @@ pub fn generate_rules(
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("Manual")),
@@ -2264,7 +2264,7 @@ pub fn generate_rules(
                                     not_parent: None,
                                     child: None,
                                     not_child: None,
-                requires_child: None,
+                                    requires_child: None,
                                 },
                             },
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2417,7 +2417,7 @@ pub fn generate_rules(
                                     not_parent: None,
                                     child: None,
                                     not_child: None,
-                requires_child: None,
+                                    requires_child: None,
                                 },
                             },
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2756,7 +2756,7 @@ pub fn apply_suffix_renames(
 }
 
 // NOTE: v1 generate_conformance_rules was removed — superseded by
-// sd-conformance rules in konveyor_v2.rs (generate_conformance_rules).
+// sd-cf-* conformance rules in konveyor_v2.rs (generate_conformance_rules).
 
 pub fn build_package_name_cache(report: &AnalysisReport<TypeScript>) -> HashMap<String, String> {
     let full_cache = build_package_info_cache(report);
@@ -3428,7 +3428,7 @@ fn api_change_to_rules(
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                     fix_strategy: Some(fix_strategy),
@@ -5198,7 +5198,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -5228,7 +5228,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -5262,7 +5262,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -5296,7 +5296,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -5939,7 +5939,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -5972,7 +5972,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -6026,7 +6026,7 @@ mod tests {
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("Manual")),
@@ -6290,7 +6290,7 @@ mod tests {
                         not_parent: None,
                         child: None,
                         not_child: None,
-                requires_child: None,
+                        requires_child: None,
                     },
                 };
                 r.fix_strategy = Some(FixStrategyEntry::new("LlmAssisted"));
@@ -8027,7 +8027,7 @@ mod tests {
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                     KonveyorCondition::FrontendReferenced {
@@ -8043,7 +8043,7 @@ mod tests {
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                 ],
@@ -8077,7 +8077,7 @@ mod tests {
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                     KonveyorCondition::FrontendReferenced {
@@ -8093,7 +8093,7 @@ mod tests {
                             not_parent: None,
                             child: None,
                             not_child: None,
-                requires_child: None,
+                            requires_child: None,
                         },
                     },
                 ],
@@ -8126,7 +8126,7 @@ mod tests {
                     not_parent: None,
                     child: None,
                     not_child: None,
-                requires_child: None,
+                    requires_child: None,
                 },
             },
             fix_strategy: None,

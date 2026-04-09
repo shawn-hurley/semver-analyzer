@@ -308,6 +308,30 @@ fn generate_composition_change_rules(
 }
 
 // ── Conformance rules ───────────────────────────────────────────────────
+//
+// Conformance rule IDs use abbreviated segments to keep IDs short.
+// Component names are shortened by stripping the family root prefix
+// (e.g., `DualListSelectorControl` → `control` in the `DualListSelector` family).
+// When stripping would produce an empty string (component == family root),
+// the full name is kept.
+//
+// Abbreviation scheme:
+//   conformance → cf
+//   must-be-in  → in
+//   requires    → req
+//   requires-wrapper → req-wrap
+//
+// Rule ID formats:
+//   notParent:         sd-cf-{family}-{child}-in-{parent1-or-parent2}
+//   invalidDirectChild: sd-cf-{family}-{child}-not-in-{grandparent}-use-{parent1-or-parent2}
+//   requiresChild:     sd-cf-{family}-{parent}-req-{child1-and-child2}
+//   exclusiveWrapper:  sd-cf-{family}-{parent}-req-wrap
+//
+// Examples:
+//   sd-cf-duallistselector-control-in-list-or-tree
+//   sd-cf-table-td-not-in-table-use-tr
+//   sd-cf-tabs-tabs-req-tab
+//   sd-cf-deprecated-duallistselector-control-in-list-or-tree
 
 fn generate_conformance_rules(
     trees: &[CompositionTree],
@@ -317,100 +341,187 @@ fn generate_conformance_rules(
     let mut rules = Vec::new();
 
     for tree in trees {
-        // Build parent lookup for InvalidDirectChild detection
-        let mut child_to_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        // ── Step 1: Build the `has_required_incoming` set.
+        //
+        // Members with at least one incoming Required non-internal edge have
+        // a mandatory parent — the constraint is on where they must be PLACED
+        // (notParent rule on the child).
+        //
+        // Members with zero Required incoming edges are "entry points" (the
+        // family root or secondary roots like AlertGroup, JumpLinksList).
+        // These can exist standalone — the constraint is on what they must
+        // CONTAIN (requiresChild rule on the parent).
+        //
+        // Only Required edges count. An Allowed incoming edge (e.g., Tab→Tabs
+        // for recursive nesting) doesn't make the child mandatory — it's a
+        // valid-but-optional placement.
+        let mut has_required_incoming: HashSet<&str> = HashSet::new();
         for edge in &tree.edges {
-            child_to_parents
-                .entry(edge.child.as_str())
-                .or_default()
-                .push(edge.parent.as_str());
-        }
-
-        // Compute depth from root via BFS over non-internal edges.
-        // Used to detect back-edges: an edge A → B is a back-edge if B
-        // has a smaller depth than A (i.e., points upward toward root).
-        let mut depth: HashMap<&str, usize> = HashMap::new();
-        depth.insert(tree.root.as_str(), 0);
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(tree.root.as_str());
-        while let Some(node) = queue.pop_front() {
-            let node_depth = depth[node];
-            for edge in &tree.edges {
-                if edge.parent == node
-                    && edge.relationship != ChildRelationship::Internal
-                    && !depth.contains_key(edge.child.as_str())
-                {
-                    depth.insert(edge.child.as_str(), node_depth + 1);
-                    queue.push_back(edge.child.as_str());
-                }
+            if edge.relationship != ChildRelationship::Internal
+                && edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
+            {
+                has_required_incoming.insert(edge.child.as_str());
             }
         }
 
-        // ── Phase 1: collect valid (non-internal, non-back-edge) edges,
-        //    grouped by child → [parents].
+        // ── Step 2: Build parent → required children map.
         //
-        // Two maps are built in a single pass:
-        //  - `required_child_to_parents`: only Required edges — determines
-        //    which children get conformance rules generated.
-        //  - `all_valid_child_to_parents`: both Required and Allowed edges —
-        //    used for the notParent regex so valid-but-not-required placements
-        //    don't trigger false positives.
-        //
-        // When a child has multiple valid parents (e.g., Tr can be in Thead
-        // OR Tbody), we generate ONE merged rule with a combined notParent
-        // regex (e.g., ^(Thead|Tbody)$) instead of separate per-parent rules
-        // that false-positive against each other.
-        let mut required_child_to_parents: HashMap<&str, Vec<&str>> = HashMap::new();
-        let mut all_valid_child_to_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        // Only Required, non-internal edges. Determines WHICH parents need
+        // conformance rules and what type:
+        //   - Parent in no_incoming → requiresChild rule on the parent
+        //   - Parent NOT in no_incoming → notParent rule on each child
+        let mut parent_to_req_children: HashMap<&str, Vec<&str>> = HashMap::new();
         for edge in &tree.edges {
-            // Skip internal rendering edges — not consumer-facing
-            if edge.relationship == ChildRelationship::Internal {
-                continue;
+            if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
+                && edge.relationship != ChildRelationship::Internal
+            {
+                parent_to_req_children
+                    .entry(edge.parent.as_str())
+                    .or_default()
+                    .push(edge.child.as_str());
             }
-            // Skip back-edges (child depth ≤ parent depth)
-            let parent_depth = depth.get(edge.parent.as_str()).copied();
-            let child_depth = depth.get(edge.child.as_str()).copied();
-            if let (Some(pd), Some(cd)) = (parent_depth, child_depth) {
-                if cd <= pd {
-                    continue;
-                }
-            }
-            // All non-internal, non-back-edge parents are valid placements
-            all_valid_child_to_parents
-                .entry(edge.child.as_str())
-                .or_default()
-                .push(edge.parent.as_str());
-            // Only Required edges determine which children get conformance rules
-            if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required {
-                required_child_to_parents
+        }
+
+        // ── Step 3: Build child → all parents map.
+        //
+        // ALL non-internal edges (Required + Allowed). Used for the notParent
+        // regex so valid-but-not-required placements don't trigger false
+        // positives, and for InvalidDirectChild grandparent lookup.
+        let mut child_to_all_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &tree.edges {
+            if edge.relationship != ChildRelationship::Internal {
+                child_to_all_parents
                     .entry(edge.child.as_str())
                     .or_default()
                     .push(edge.parent.as_str());
             }
         }
 
-        // ── Phase 2: generate rules from the grouped edges.
+        // ── Step 4: Generate rules.
         //
-        // Iterate children that have at least one Required edge (conformance
-        // rules are only generated for required nesting). But use the full
-        // set of valid parents (Required + Allowed) for the notParent regex
-        // and InvalidDirectChild suggestions so that valid-but-not-required
-        // placements don't trigger false positives.
+        // For each parent with Required children, the rule type depends on
+        // whether the parent has incoming edges:
+        //
+        //   no_incoming parent → requiresChild rule
+        //     "If you use <AlertGroup>, it must contain <Alert> children"
+        //     Scanner: pattern=AlertGroup, requiresChild=^(Alert)$
+        //
+        //   has_incoming parent → notParent rule on each child
+        //     "Td must be inside Tr"
+        //     Scanner: pattern=Td, notParent=^(Tr)$
 
-        for child in required_child_to_parents.keys() {
+        // 4a: Collect children that need notParent rules (parents with incoming edges).
+        //     Group by child to merge parents into one regex.
+        let mut children_needing_not_parent: HashSet<&str> = HashSet::new();
+        for (parent, children) in &parent_to_req_children {
+            if has_required_incoming.contains(parent) {
+                for child in children {
+                    children_needing_not_parent.insert(child);
+                }
+            }
+        }
+
+        // 4b: Generate notParent rules (child must be inside parent).
+        for child in &children_needing_not_parent {
             let pkg = pkg_for(child, component_packages);
-            let all_parents = all_valid_child_to_parents
+
+            // Use ALL parents (Required + Allowed) for the notParent regex
+            // so valid-but-not-required placements don't trigger false positives.
+            let all_parents = child_to_all_parents
                 .get(child)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
 
+            let mut sorted_parents: Vec<&str> = all_parents.to_vec();
+            sorted_parents.sort();
+            sorted_parents.dedup();
+
+            let not_parent_pattern = if sorted_parents.len() == 1 {
+                format!("^{}$", sorted_parents[0])
+            } else {
+                format!("^({})$", sorted_parents.join("|"))
+            };
+
+            let rule_id_suffix = sorted_parents
+                .iter()
+                .map(|p| short_component_id(p, &tree.root))
+                .collect::<Vec<_>>()
+                .join("-or-");
+            let rule_id = format!(
+                "sd-cf-{}-{}-in-{}",
+                sanitize(&tree.root),
+                short_component_id(child, &tree.root),
+                rule_id_suffix,
+            );
+
+            let parent_list = sorted_parents.join(" or ");
+
+            let message = if sorted_parents.len() == 1 {
+                format!(
+                    "<{}> must be used inside <{}>.\n\n\
+                     Correct usage:\n  <{}>\n    <{} />\n  </{}>",
+                    child, sorted_parents[0], sorted_parents[0], child, sorted_parents[0],
+                )
+            } else {
+                let examples: Vec<String> = sorted_parents
+                    .iter()
+                    .map(|p| format!("  <{}>\n    <{} />\n  </{}>", p, child, p))
+                    .collect();
+                format!(
+                    "<{}> must be used inside {}.\n\n\
+                     Correct usage (either):\n{}",
+                    child,
+                    parent_list,
+                    examples.join("\n  or\n"),
+                )
+            };
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=conformance".into(),
+                    format!("package={}", pkg),
+                    format!("family={}", tree.root),
+                ],
+                effort: 1,
+                category: "mandatory".into(),
+                description: format!("<{}> must be a child of {}", child, parent_list),
+                message,
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", child),
+                        location: "JSX_COMPONENT".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: Some(not_parent_pattern),
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: None,
+                        from: Some(pkg.to_string()),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "LlmAssisted".into(),
+                    component: Some(child.to_string()),
+                    replacement: Some(sorted_parents[0].to_string()),
+                    ..Default::default()
+                }),
+            });
+
             // ── InvalidDirectChild: child inside grandparent, skipping parent.
-            // Group by (grandparent, child) to merge when multiple parents
-            // share the same grandparent (e.g., Tr in Table needs either
-            // Thead or Tbody, not separate rules for each).
+            //
+            // For each valid parent of this child, look up that parent's own
+            // parents (grandparents of the child). Group by grandparent to
+            // merge when multiple parents share the same grandparent (e.g.,
+            // Tr in Table needs either Thead or Tbody).
             let mut grandparent_to_expected: HashMap<&str, Vec<&str>> = HashMap::new();
-            for parent in all_parents {
-                if let Some(grandparents) = child_to_parents.get(parent) {
+            for parent in &sorted_parents {
+                if let Some(grandparents) = child_to_all_parents.get(parent) {
                     for grandparent in grandparents {
                         grandparent_to_expected
                             .entry(grandparent)
@@ -421,7 +532,6 @@ fn generate_conformance_rules(
             }
 
             for (grandparent, expected_parents) in &grandparent_to_expected {
-                // Deduplicate parents (in case of repeated edges)
                 let mut unique_parents: Vec<&str> = expected_parents.clone();
                 unique_parents.sort();
                 unique_parents.dedup();
@@ -429,13 +539,14 @@ fn generate_conformance_rules(
                 let parent_list = unique_parents.join(" or ");
                 let rule_id_suffix = unique_parents
                     .iter()
-                    .map(|p| sanitize(p))
+                    .map(|p| short_component_id(p, &tree.root))
                     .collect::<Vec<_>>()
                     .join("-or-");
                 let rule_id = format!(
-                    "sd-conformance-{}-not-in-{}-use-{}",
-                    sanitize(child),
-                    sanitize(grandparent),
+                    "sd-cf-{}-{}-not-in-{}-use-{}",
+                    sanitize(&tree.root),
+                    short_component_id(child, &tree.root),
+                    short_component_id(grandparent, &tree.root),
                     rule_id_suffix,
                 );
 
@@ -520,72 +631,42 @@ fn generate_conformance_rules(
                     }),
                 });
             }
+        }
 
-            // ── Must-be-inside: child must have at least one valid parent
-            //    as ancestor. Uses `notParent` regex to fire only when the
-            //    child is NOT inside ANY of its valid parents.
-            //
-            //    The parent list includes both Required and Allowed edges so
-            //    valid-but-not-required placements don't trigger false positives.
-            //
-            //    Single parent:   notParent: ^Tbody$
-            //    Multi-parent:    notParent: ^(Thead|Tbody)$
-            let not_parent_pattern = if all_parents.len() == 1 {
-                format!("^{}$", all_parents[0])
-            } else {
-                let mut sorted = all_parents.to_vec();
-                sorted.sort();
-                sorted.dedup();
-                format!("^({})$", sorted.join("|"))
-            };
+        // 4c: Generate requiresChild rules (parent must contain children).
+        //
+        // For parents in no_incoming (roots / secondary roots), the constraint
+        // is "if you use this component, it must contain these children."
+        for (parent, children) in &parent_to_req_children {
+            if has_required_incoming.contains(parent) {
+                continue; // handled above as notParent
+            }
 
-            let rule_id_suffix = {
-                let mut sorted = all_parents.to_vec();
-                sorted.sort();
-                sorted.dedup();
-                sorted
-                    .iter()
-                    .map(|p| sanitize(p))
-                    .collect::<Vec<_>>()
-                    .join("-or-")
-            };
+            let pkg = pkg_for(parent, component_packages);
+            let mut sorted_children: Vec<&str> = children.clone();
+            sorted_children.sort();
+            sorted_children.dedup();
+
+            let children_pattern = format!("^({})$", sorted_children.join("|"));
+            let children_list = sorted_children.join(" or ");
+
+            let rule_id_suffix = sorted_children
+                .iter()
+                .map(|c| short_component_id(c, &tree.root))
+                .collect::<Vec<_>>()
+                .join("-and-");
             let rule_id = format!(
-                "sd-conformance-{}-must-be-in-{}",
-                sanitize(child),
+                "sd-cf-{}-{}-req-{}",
+                sanitize(&tree.root),
+                short_component_id(parent, &tree.root),
                 rule_id_suffix,
             );
 
-            let parent_list = {
-                let mut sorted = all_parents.to_vec();
-                sorted.sort();
-                sorted.dedup();
-                sorted.join(" or ")
-            };
-
-            let message = if all_parents.len() == 1 {
-                format!(
-                    "<{}> must be used inside <{}>.\n\n\
-                     Correct usage:\n  <{}>\n    <{} />\n  </{}>",
-                    child, all_parents[0], all_parents[0], child, all_parents[0],
-                )
-            } else {
-                let examples: Vec<String> = {
-                    let mut sorted = all_parents.to_vec();
-                    sorted.sort();
-                    sorted.dedup();
-                    sorted
-                        .iter()
-                        .map(|p| format!("  <{}>\n    <{} />\n  </{}>", p, child, p))
-                        .collect()
-                };
-                format!(
-                    "<{}> must be used inside {}.\n\n\
-                     Correct usage (either):\n{}",
-                    child,
-                    parent_list,
-                    examples.join("\n  or\n"),
-                )
-            };
+            let message = format!(
+                "<{}> must contain at least one {} child component.\n\n\
+                 Correct usage:\n  <{}>\n    <{} />\n  </{}>",
+                parent, children_list, parent, sorted_children[0], parent,
+            );
 
             rules.push(KonveyorRule {
                 rule_id,
@@ -597,19 +678,19 @@ fn generate_conformance_rules(
                 ],
                 effort: 1,
                 category: "mandatory".into(),
-                description: format!("<{}> must be a child of {}", child, parent_list),
+                description: format!("<{}> must contain {} children", parent, children_list),
                 message,
                 links: vec![],
                 when: KonveyorCondition::FrontendReferenced {
                     referenced: FrontendReferencedFields {
-                        pattern: format!("^{}$", child),
+                        pattern: format!("^{}$", parent),
                         location: "JSX_COMPONENT".into(),
                         component: None,
                         parent: None,
-                        not_parent: Some(not_parent_pattern),
+                        not_parent: None,
                         child: None,
                         not_child: None,
-                        requires_child: None,
+                        requires_child: Some(children_pattern),
                         parent_from: None,
                         value: None,
                         from: Some(pkg.to_string()),
@@ -618,8 +699,8 @@ fn generate_conformance_rules(
                 },
                 fix_strategy: Some(FixStrategyEntry {
                     strategy: "LlmAssisted".into(),
-                    component: Some(child.to_string()),
-                    replacement: Some(all_parents[0].to_string()),
+                    component: Some(parent.to_string()),
+                    replacement: Some(sorted_children[0].to_string()),
                     ..Default::default()
                 }),
             });
@@ -637,7 +718,11 @@ fn generate_conformance_rules(
             let allowed_pattern = format!("^({})$", allowed_children.join("|"));
             let allowed_list = allowed_children.join(" or ");
 
-            let rule_id = format!("sd-conformance-{}-requires-wrapper", sanitize(parent),);
+            let rule_id = format!(
+                "sd-cf-{}-{}-req-wrap",
+                sanitize(&check.family),
+                short_component_id(parent, &check.family),
+            );
 
             rules.push(KonveyorRule {
                 rule_id,
@@ -2987,6 +3072,27 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Shorten a component name for use in conformance rule IDs by stripping the
+/// family root prefix. For example, in the `DualListSelector` family,
+/// `DualListSelectorControl` becomes `control`.
+///
+/// If `family` contains a modifier prefix (e.g., `deprecated/DualListSelector`),
+/// only the base name (`DualListSelector`) is used for prefix matching.
+///
+/// Returns the full sanitized name when:
+/// - The component name doesn't start with the family base name
+/// - Stripping would produce an empty string (component == family root)
+fn short_component_id(component: &str, family: &str) -> String {
+    // Extract the base family name: "deprecated/DualListSelector" → "DualListSelector"
+    let base_family = family.rsplit('/').next().unwrap_or(family);
+
+    if component.len() > base_family.len() && component.starts_with(base_family) {
+        sanitize(&component[base_family.len()..])
+    } else {
+        sanitize(component)
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3028,6 +3134,44 @@ mod tests {
     fn test_sanitize() {
         assert_eq!(sanitize("ModalHeader"), "modalheader");
         assert_eq!(sanitize("Dropdown.Item"), "dropdown-item");
+    }
+
+    #[test]
+    fn test_short_component_id() {
+        // Strips family prefix when component starts with it
+        assert_eq!(
+            short_component_id("DualListSelectorControl", "DualListSelector"),
+            "control"
+        );
+        assert_eq!(
+            short_component_id("DualListSelectorList", "DualListSelector"),
+            "list"
+        );
+        assert_eq!(short_component_id("CardBody", "Card"), "body");
+        assert_eq!(short_component_id("AlertGroup", "Alert"), "group");
+
+        // Keeps full name when component == family root (stripping would be empty)
+        assert_eq!(
+            short_component_id("DualListSelector", "DualListSelector"),
+            "duallistselector"
+        );
+        assert_eq!(short_component_id("Card", "Card"), "card");
+
+        // Keeps full name when component doesn't start with family
+        assert_eq!(short_component_id("Tr", "Table"), "tr");
+        assert_eq!(short_component_id("Thead", "Table"), "thead");
+        assert_eq!(short_component_id("Tab", "Tabs"), "tab");
+        assert_eq!(short_component_id("ActionGroup", "Form"), "actiongroup");
+
+        // Handles deprecated/ prefix — strips the base family name
+        assert_eq!(
+            short_component_id("DualListSelectorControl", "deprecated/DualListSelector"),
+            "control"
+        );
+        assert_eq!(
+            short_component_id("DualListSelector", "deprecated/DualListSelector"),
+            "duallistselector"
+        );
     }
 
     #[test]
@@ -3089,7 +3233,7 @@ mod tests {
         // Should have an InvalidDirectChild rule: DropdownItem in Dropdown
         let invalid_rule = rules
             .iter()
-            .find(|r| r.rule_id.contains("dropdownitem-not-in-dropdown"));
+            .find(|r| r.rule_id.contains("item-not-in-dropdown"));
         assert!(
             invalid_rule.is_some(),
             "Expected InvalidDirectChild rule for DropdownItem in Dropdown, got rules: {:?}",
@@ -3105,11 +3249,13 @@ mod tests {
         }
     }
 
-    /// Back-edges (cycles like Tab → Tabs) should NOT generate conformance
-    /// rules. The "Tabs must be in Tab" rule would fire on ALL top-level
-    /// <Tabs> usage, which is incorrect — only nested tabs need Tab as parent.
+    /// Recursive nesting edges (e.g., Tab → Tabs for nested tabs) should
+    /// use Allowed strength, not Required. When both directions are Required
+    /// (a tree accuracy bug), the rule generator produces contradictory
+    /// notParent rules for both directions. This test verifies the correct
+    /// behavior when the back-edge is properly marked as Allowed.
     #[test]
-    fn test_conformance_rules_skip_back_edges_to_root() {
+    fn test_conformance_rules_skip_allowed_back_edges() {
         let mut pkgs = test_pkg_map();
         pkgs.insert("Tabs".into(), "@patternfly/react-core".into());
         pkgs.insert("Tab".into(), "@patternfly/react-core".into());
@@ -3126,44 +3272,32 @@ mod tests {
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
                 },
-                // Back-edge: nested tabs pattern
+                // Recursive nesting: nested tabs inside a tab (Allowed, not Required)
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "Tab".into(),
                     child: "Tabs".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
                 },
             ],
         };
 
         let rules = generate_conformance_rules(&[tree], &[], &pkgs);
 
-        // "Tab must be in Tabs" should exist (correct forward edge)
+        // Tabs is no_incoming (root), so it should get a requiresChild rule
         assert!(
-            rules
-                .iter()
-                .any(|r| r.rule_id == "sd-conformance-tab-must-be-in-tabs"),
-            "Expected 'tab-must-be-in-tabs' rule. Got rules: {:?}",
+            rules.iter().any(|r| r.rule_id.contains("tabs-req-tab")),
+            "Expected requiresChild rule for Tabs. Got rules: {:?}",
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
 
-        // "Tabs must be in Tab" should NOT exist (back-edge cycle)
+        // "Tabs must be in Tab" should NOT exist — the Allowed back-edge
+        // doesn't trigger Required conformance, and Tabs is no_incoming
         assert!(
-            !rules
-                .iter()
-                .any(|r| r.rule_id == "sd-conformance-tabs-must-be-in-tab"),
-            "Back-edge 'tabs-must-be-in-tab' should be suppressed. Got rules: {:?}",
-            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
-        );
-
-        // "Tabs not in Tabs use Tab" should NOT exist either
-        assert!(
-            !rules
-                .iter()
-                .any(|r| r.rule_id.contains("tabs-not-in-tabs-use-tab")),
-            "Back-edge InvalidDirectChild should be suppressed. Got rules: {:?}",
+            !rules.iter().any(|r| r.rule_id == "sd-cf-tabs-tabs-in-tab"),
+            "Back-edge 'tabs-in-tab' should not exist. Got rules: {:?}",
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
     }
@@ -3246,15 +3380,15 @@ mod tests {
 
         let rules = generate_conformance_rules(&[tree], &[], &pkgs);
 
-        // Tr should have ONE must-be-in rule with combined notParent
+        // Tr should have ONE in- rule with combined notParent
         let tr_must_be_in: Vec<&KonveyorRule> = rules
             .iter()
-            .filter(|r| r.rule_id.contains("tr-must-be-in"))
+            .filter(|r| r.rule_id.contains("tr-in-"))
             .collect();
         assert_eq!(
             tr_must_be_in.len(),
             1,
-            "Expected exactly 1 merged must-be-in rule for Tr, got {}: {:?}",
+            "Expected exactly 1 merged in- rule for Tr, got {}: {:?}",
             tr_must_be_in.len(),
             tr_must_be_in.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
@@ -3291,18 +3425,14 @@ mod tests {
             rule.description
         );
 
-        // There should be NO separate tr-must-be-in-thead or tr-must-be-in-tbody
+        // There should be NO separate tr-in-thead or tr-in-tbody
         assert!(
-            !rules
-                .iter()
-                .any(|r| r.rule_id == "sd-conformance-tr-must-be-in-thead"),
-            "Should not have separate tr-must-be-in-thead rule"
+            !rules.iter().any(|r| r.rule_id == "sd-cf-table-tr-in-thead"),
+            "Should not have separate tr-in-thead rule"
         );
         assert!(
-            !rules
-                .iter()
-                .any(|r| r.rule_id == "sd-conformance-tr-must-be-in-tbody"),
-            "Should not have separate tr-must-be-in-tbody rule"
+            !rules.iter().any(|r| r.rule_id == "sd-cf-table-tr-in-tbody"),
+            "Should not have separate tr-in-tbody rule"
         );
     }
 
@@ -3382,9 +3512,10 @@ mod tests {
         );
     }
 
-    /// Single-parent children should still produce simple (non-merged) rules.
+    /// Root components (no incoming edges) get requiresChild rules, not
+    /// notParent rules. Children of non-root parents get notParent rules.
     #[test]
-    fn test_single_parent_conformance_unchanged() {
+    fn test_root_gets_requires_child_children_get_not_parent() {
         let tree = CompositionTree {
             root: "Dropdown".into(),
             family_members: vec![
@@ -3414,23 +3545,45 @@ mod tests {
 
         let rules = generate_conformance_rules(&[tree], &[], &test_pkg_map());
 
-        // DropdownList should have a single must-be-in rule
-        let dl_rule = rules
+        // Dropdown is root (no incoming) → requiresChild rule
+        let dropdown_rule = rules
             .iter()
-            .find(|r| r.rule_id.contains("dropdownlist-must-be-in-dropdown"));
+            .find(|r| r.rule_id.contains("dropdown-req-list"));
         assert!(
-            dl_rule.is_some(),
-            "Expected single-parent must-be-in rule for DropdownList"
+            dropdown_rule.is_some(),
+            "Expected requiresChild rule for Dropdown. Got rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
-
-        // notParent should be simple (not alternation)
-        if let KonveyorCondition::FrontendReferenced { referenced } = &dl_rule.unwrap().when {
+        if let KonveyorCondition::FrontendReferenced { referenced } = &dropdown_rule.unwrap().when {
+            assert_eq!(referenced.pattern, "^Dropdown$");
             assert_eq!(
-                referenced.not_parent.as_deref(),
-                Some("^Dropdown$"),
-                "Single-parent notParent should be simple regex"
+                referenced.requires_child.as_deref(),
+                Some("^(DropdownList)$"),
             );
+            assert!(referenced.not_parent.is_none());
+        } else {
+            panic!("Expected FrontendReferenced condition");
         }
+
+        // DropdownItem has incoming edge (from DropdownList) → notParent rule
+        let di_rule = rules.iter().find(|r| r.rule_id.contains("item-in-list"));
+        assert!(
+            di_rule.is_some(),
+            "Expected notParent rule for DropdownItem. Got rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        if let KonveyorCondition::FrontendReferenced { referenced } = &di_rule.unwrap().when {
+            assert_eq!(referenced.pattern, "^DropdownItem$");
+            assert_eq!(referenced.not_parent.as_deref(), Some("^DropdownList$"),);
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+
+        // NO notParent rule for DropdownList (its parent Dropdown is no_incoming)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("list-in")),
+            "DropdownList should not have a notParent rule (parent is root/no_incoming)"
+        );
     }
 
     #[test]
@@ -3745,8 +3898,8 @@ mod tests {
         let rules = generate_conformance_rules(&[tree], &[], &pkgs);
 
         // A conformance rule SHOULD be generated (because Tbody→Tr is Required)
-        let tr_must_be_in = rules.iter().find(|r| r.rule_id.contains("tr-must-be-in"));
-        assert!(tr_must_be_in.is_some(), "Expected a must-be-in rule for Tr");
+        let tr_must_be_in = rules.iter().find(|r| r.rule_id.contains("tr-in-"));
+        assert!(tr_must_be_in.is_some(), "Expected an in- rule for Tr");
 
         let rule = tr_must_be_in.unwrap();
 
@@ -3806,13 +3959,214 @@ mod tests {
 
         let rules = generate_conformance_rules(&[tree], &[], &test_pkg_map());
 
-        // No must-be-in rule should be generated for MenuContent
-        let mc_rule = rules
-            .iter()
-            .find(|r| r.rule_id.contains("menucontent-must-be-in"));
+        // No in- rule should be generated for MenuContent
+        let mc_rule = rules.iter().find(|r| r.rule_id.contains("content-in"));
         assert!(
             mc_rule.is_none(),
             "No conformance rule should be generated when child only has Allowed parents"
+        );
+    }
+
+    /// Secondary roots (no incoming Required edges, not the tree root) should
+    /// get requiresChild rules for their Required children. The tree root
+    /// itself is also no_incoming and gets requiresChild.
+    #[test]
+    fn test_secondary_root_gets_requires_child() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Alert".into(), "@patternfly/react-core".into());
+        pkgs.insert("AlertGroup".into(), "@patternfly/react-core".into());
+        pkgs.insert(
+            "AlertActionCloseButton".into(),
+            "@patternfly/react-core".into(),
+        );
+
+        let tree = CompositionTree {
+            root: "Alert".into(),
+            family_members: vec![
+                "Alert".into(),
+                "AlertGroup".into(),
+                "AlertActionCloseButton".into(),
+            ],
+            edges: vec![
+                // AlertGroup is a secondary root — no incoming edges
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "AlertGroup".into(),
+                    child: "Alert".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "AlertGroup".into(),
+                    child: "AlertActionCloseButton".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // AlertGroup should get a requiresChild rule
+        let ag_rule = rules.iter().find(|r| r.rule_id.contains("group-req-"));
+        assert!(
+            ag_rule.is_some(),
+            "Expected requiresChild rule for AlertGroup. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        if let KonveyorCondition::FrontendReferenced { referenced } = &ag_rule.unwrap().when {
+            assert_eq!(referenced.pattern, "^AlertGroup$");
+            assert!(
+                referenced.requires_child.is_some(),
+                "Should use requiresChild field"
+            );
+            let req = referenced.requires_child.as_deref().unwrap();
+            assert!(req.contains("Alert"), "requiresChild should include Alert");
+            assert!(
+                req.contains("AlertActionCloseButton"),
+                "requiresChild should include AlertActionCloseButton"
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+
+        // Alert should NOT get a notParent rule — its only Required parent
+        // is AlertGroup which is no_incoming (secondary root)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("alert-in")),
+            "Alert should NOT have a notParent rule. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Table-like deep trees: root gets requiresChild, intermediate nodes
+    /// get notParent, and invalidDirectChild rules fire for skip-level.
+    #[test]
+    fn test_deep_tree_requires_child_and_not_parent() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Table".into(), "@patternfly/react-table".into());
+        pkgs.insert("Tbody".into(), "@patternfly/react-table".into());
+        pkgs.insert("Tr".into(), "@patternfly/react-table".into());
+        pkgs.insert("Td".into(), "@patternfly/react-table".into());
+
+        let tree = CompositionTree {
+            root: "Table".into(),
+            family_members: vec!["Table".into(), "Tbody".into(), "Tr".into(), "Td".into()],
+            edges: vec![
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Table".into(),
+                    child: "Tbody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Tbody".into(),
+                    child: "Tr".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Tr".into(),
+                    child: "Td".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // Table (root, no_incoming) → requiresChild
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("table-req-tbody")),
+            "Expected requiresChild on Table. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Tr (has incoming from Tbody) → notParent
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("tr-in-tbody")),
+            "Expected notParent on Tr. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Td (has incoming from Tr) → notParent
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("td-in-tr")),
+            "Expected notParent on Td. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // InvalidDirectChild: Tr in Table should use Tbody
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("tr-not-in-table")),
+            "Expected InvalidDirectChild for Tr in Table. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // InvalidDirectChild: Td in Tbody should use Tr
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("td-not-in-tbody")),
+            "Expected InvalidDirectChild for Td in Tbody. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Tbody should NOT have a notParent rule (parent is Table = no_incoming)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("tbody-in")),
+            "Tbody should NOT have notParent (parent Table is no_incoming)"
+        );
+    }
+
+    /// Internal edges should not affect conformance rules at all.
+    #[test]
+    fn test_internal_edges_ignored() {
+        let tree = CompositionTree {
+            root: "Accordion".into(),
+            family_members: vec![
+                "Accordion".into(),
+                "AccordionItem".into(),
+                "AccordionContent".into(),
+            ],
+            edges: vec![
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Accordion".into(),
+                    child: "AccordionItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+                // Internal rendering: AccordionItem renders AccordionContent
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "AccordionItem".into(),
+                    child: "AccordionContent".into(),
+                    relationship: ChildRelationship::Internal,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &test_pkg_map());
+
+        // AccordionContent should NOT get any rule — the internal edge
+        // doesn't count for no_incoming or parent_to_req_children
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("content")),
+            "Internal edges should not generate conformance rules. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
     }
 }
