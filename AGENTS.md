@@ -146,6 +146,7 @@ from structural evidence.**
 | 6 | React context | Required | Null context = crash/broken behavior |
 | 7 | DOM nesting | Required | Invalid HTML without correct parent |
 | 8 | cloneElement | Structural | Child relies on injected props from parent (CHP=YES), but parent doesn't demand specific child (PMC=NO) |
+| 8 | cloneElement (ReactElement children) | Wrapper | Parent types `children` as `ReactElement` (purpose-built wrapper). PMC=YES, CHP=NO. |
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
 | 8.6 | Secondary BEM block sub-root | Structural | BEM element CSS classes are designed to be styled inside their block's container (CHP=YES, PMC=NO) |
 | 8.7 | Prop-passed detection | Allowed | ReactNode/ReactElement prop name matches child component name |
@@ -865,7 +866,7 @@ Alert is the family root).
 | Family | Edge | Strength | Status |
 |--------|------|----------|--------|
 | Alert | AlertGroup→Alert | structural | ✓ Correct — AlertGroup contains Alerts |
-| ChartDonutUtilization | ChartDonutThreshold→ChartDonutUtilization | structural | ⚠ Should be Wrapper (Cat C: PMC=YES, CHP=NO) |
+| ChartDonutUtilization | ChartDonutThreshold→ChartDonutUtilization | wrapper | ✓ FIXED — Step 8 uses Wrapper for ReactElement children type (Cat C: PMC=YES, CHP=NO) |
 | ExpandableSection | ExpandableSectionToggle→ExpandableSection | allowed | ✓ Noise — CSS match, no rule generated |
 | JumpLinks | JumpLinksList→JumpLinks | allowed | ✓ Noise — CSS `.list .list` recursive match |
 | Menu | MenuItem→Menu | allowed | ✓ Noise — recursive sub-menu nesting |

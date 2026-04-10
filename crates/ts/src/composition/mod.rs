@@ -1208,8 +1208,8 @@ fn infer_clone_element_nesting(
     // Collect existing edges from prior steps to detect reverse conflicts
     let prior_edges: HashSet<(String, String)> = edge_map.keys().cloned().collect();
 
-    // Collect candidate signals: (parent, child, evidence)
-    let mut candidates: Vec<(String, String, String)> = Vec::new();
+    // Collect candidate signals: (parent, child, evidence, children_is_react_element)
+    let mut candidates: Vec<(String, String, String, bool)> = Vec::new();
 
     for parent_name in family_exports {
         let Some(parent_profile) = profiles.get(parent_name) else {
@@ -1260,6 +1260,20 @@ fn infer_clone_element_nesting(
                 .collect();
 
             if !matching_props.is_empty() {
+                // Check if the parent's `children` prop is typed as ReactElement
+                // (singular, specific) vs ReactNode (plural, generic). Parents
+                // that accept ReactElement are purpose-built wrappers for a
+                // specific child type (PMC=YES, CHP=NO → Wrapper). Parents
+                // that accept ReactNode are generic containers (CHP=YES,
+                // PMC=NO → Structural).
+                let children_type = parent_profile
+                    .prop_types
+                    .get("children")
+                    .map(|t| t.as_str())
+                    .unwrap_or("");
+                let is_react_element =
+                    children_type.contains("ReactElement") && !children_type.contains("ReactNode");
+
                 candidates.push((
                     parent_name.clone(),
                     child_name.clone(),
@@ -1269,6 +1283,7 @@ fn infer_clone_element_nesting(
                         matching_props.join(", "),
                         child_name
                     ),
+                    is_react_element,
                 ));
             }
         }
@@ -1277,20 +1292,33 @@ fn infer_clone_element_nesting(
     // Filter 2: remove bidirectional cloneElement pairs.
     let clone_pairs: HashSet<(String, String)> = candidates
         .iter()
-        .map(|(p, c, _)| (p.clone(), c.clone()))
+        .map(|(p, c, _, _)| (p.clone(), c.clone()))
         .collect();
 
-    candidates.retain(|(p, c, _)| !clone_pairs.contains(&(c.clone(), p.clone())));
+    candidates.retain(|(p, c, _, _)| !clone_pairs.contains(&(c.clone(), p.clone())));
 
-    for (parent, child, evidence) in candidates {
+    for (parent, child, evidence, is_react_element) in candidates {
+        // Determine edge strength based on the parent's children prop type:
+        // - ReactElement (singular): parent is a purpose-built wrapper for a
+        //   specific child type. PMC=YES (parent needs child), CHP=NO (child
+        //   works standalone). Example: ChartDonutThreshold wraps
+        //   ChartDonutUtilization.
+        // - ReactNode (generic): parent is a generic container that processes
+        //   whatever children it receives. CHP=YES (child relies on injected
+        //   props), PMC=NO (parent doesn't demand specific child).
+        //   Example: AlertGroup, DataListItem, Breadcrumb.
+        let strength = if is_react_element {
+            EdgeStrength::Wrapper
+        } else {
+            EdgeStrength::Structural
+        };
+
         record_signal(
             tree,
             edge_map,
             parent,
             child,
-            // CHP=YES: child relies on injected props from parent (missing props breaks functionality).
-            // PMC=NO: parent processes whatever children it has, doesn't demand a specific child type.
-            EdgeStrength::Structural,
+            strength,
             ChildRelationship::DirectChild,
             evidence,
             None,
@@ -3368,6 +3396,98 @@ mod tests {
             edge.unwrap().strength,
             EdgeStrength::Structural,
             "cloneElement edge should be Structural (CHP=YES: child needs injected props)"
+        );
+    }
+
+    /// ChartDonutThreshold scenario: parent types `children` as
+    /// `React.ReactElement<any>` (singular, specific). This indicates a
+    /// purpose-built wrapper — the parent exists to wrap a specific child.
+    /// The cloneElement edge should use Wrapper strength (PMC=YES, CHP=NO)
+    /// instead of Structural (CHP=YES, PMC=NO).
+    #[test]
+    fn test_clone_element_react_element_children_uses_wrapper_strength() {
+        use semver_analyzer_core::types::sd::CloneElementInjection;
+
+        let mut parent = make_profile("ChartDonutThreshold");
+        parent.has_children_prop = true;
+        parent
+            .prop_types
+            .insert("children".into(), "React.ReactElement<any>".into());
+        parent.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["isStatic".into(), "theme".into()],
+        }];
+
+        let mut child = make_profile("ChartDonutUtilization");
+        child.all_props = vec!["isStatic".into(), "theme".into(), "data".into()]
+            .into_iter()
+            .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("ChartDonutThreshold".into(), parent);
+        profiles.insert("ChartDonutUtilization".into(), child);
+
+        let family = vec!["ChartDonutUtilization".into(), "ChartDonutThreshold".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
+
+        let edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "ChartDonutThreshold" && e.child == "ChartDonutUtilization");
+        assert!(
+            edge.is_some(),
+            "ChartDonutThreshold → ChartDonutUtilization should exist. Edges: {:?}",
+            tree.edges
+        );
+        assert_eq!(
+            edge.unwrap().strength,
+            EdgeStrength::Wrapper,
+            "ReactElement<any> children type should produce Wrapper strength (PMC=YES, CHP=NO)"
+        );
+    }
+
+    /// ReactNode children type should still produce Structural strength.
+    /// This is the common case (AlertGroup, DataListItem, Breadcrumb, etc.).
+    #[test]
+    fn test_clone_element_react_node_children_uses_structural_strength() {
+        use semver_analyzer_core::types::sd::CloneElementInjection;
+
+        let mut parent = make_profile("ToggleGroup");
+        parent.has_children_prop = true;
+        parent
+            .prop_types
+            .insert("children".into(), "React.ReactNode".into());
+        parent.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["isDisabled".into()],
+        }];
+
+        let mut child = make_profile("ToggleGroupItem");
+        child.has_children_prop = true;
+        child.all_props = vec!["isDisabled".into(), "onChange".into()]
+            .into_iter()
+            .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("ToggleGroup".into(), parent);
+        profiles.insert("ToggleGroupItem".into(), child);
+
+        let family = vec!["ToggleGroup".into(), "ToggleGroupItem".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
+
+        let edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "ToggleGroup" && e.child == "ToggleGroupItem");
+        assert!(
+            edge.is_some(),
+            "ToggleGroup → ToggleGroupItem should exist. Edges: {:?}",
+            tree.edges
+        );
+        assert_eq!(
+            edge.unwrap().strength,
+            EdgeStrength::Structural,
+            "ReactNode children type should produce Structural strength (CHP=YES, PMC=NO)"
         );
     }
 
