@@ -3302,17 +3302,37 @@ fn api_change_to_rules(
         }
     }
 
-    let mut rules = vec![KonveyorRule {
-        rule_id,
-        labels: labels.clone(),
-        effort,
-        category: "mandatory".to_string(),
-        description: change.description.clone(),
-        message,
-        links: Vec::new(),
-        when: condition,
-        fix_strategy,
-    }];
+    // Skip the main type-changed rule when per-value sub-rules will cover
+    // all removed values. The sub-rules (emitted below in P4-B) have precise
+    // `value` discriminators and include fix guidance. The main rule fires on
+    // EVERY usage of the prop regardless of the value passed, causing false
+    // positives on correctly-migrated code (e.g., `<Nav variant="horizontal">`
+    // fires even though only `"tertiary"` was removed).
+    //
+    // The check: if this is a TypeChanged Property/Field AND
+    // extract_removed_union_values() returns non-empty, the per-value sub-rules
+    // will cover it. Skip the main rule. If no union values can be parsed
+    // (structural type change, nullability, etc.), the main rule is emitted
+    // as a catch-all since no per-value discrimination is possible.
+    let per_value_covered = matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field)
+        && change.change == ApiChangeType::TypeChanged
+        && !extract_removed_union_values(change).is_empty();
+
+    let mut rules = if per_value_covered {
+        Vec::new()
+    } else {
+        vec![KonveyorRule {
+            rule_id,
+            labels: labels.clone(),
+            effort,
+            category: "mandatory".to_string(),
+            description: change.description.clone(),
+            message,
+            links: Vec::new(),
+            when: condition,
+            fix_strategy,
+        }]
+    };
 
     // P4-B: For type_changed Property/Field changes, check for removed union
     // member values and emit per-value rules so the `value` constraint fires.
@@ -8671,8 +8691,9 @@ mod tests {
 
     #[test]
     fn test_type_changed_rule_tier1_message_has_direct_mapping() {
-        // A type-changed rule with 1 removed + 1 added value should have
-        // the explicit mapping in its message (not just before/after types).
+        // For enum narrowing with 1 removed + 1 added value, the main
+        // type-changed rule is suppressed (per-value sub-rules cover it).
+        // The per-value sub-rule should have the replacement mapping.
         let changes = vec![FileChanges {
             file: PathBuf::from("packages/react-core/src/components/Tabs/Tabs.d.ts"),
             status: FileStatus::Modified,
@@ -8702,22 +8723,33 @@ mod tests {
             &HashMap::new(),
         );
 
-        // Find the type-changed rule (not the prop-value-change one)
+        // Main type-changed rule should NOT exist (suppressed for enum narrowing)
         let tc_rules: Vec<&KonveyorRule> = rules
             .iter()
             .filter(|r| r.labels.iter().any(|l| l == "change-type=type-changed"))
             .collect();
-        assert!(!tc_rules.is_empty(), "Should have a type-changed rule");
-
-        let rule = tc_rules[0];
         assert!(
-            rule.message.contains("'light300' → 'secondary'"),
-            "Type-changed message should contain Tier 1 mapping. Message:\n{}",
-            rule.message,
+            tc_rules.is_empty(),
+            "Main type-changed rule should be suppressed for enum narrowing. Got: {:?}",
+            tc_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
+
+        // Per-value sub-rule should exist with replacement mapping
+        let pv_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=prop-value-change")
+            })
+            .collect();
+        assert!(!pv_rules.is_empty(), "Should have per-value sub-rules");
+
+        let rule = pv_rules[0];
         assert!(
-            rule.message.contains("direct replacement"),
-            "Tier 1 should indicate direct replacement",
+            rule.message.contains("Replace with 'secondary'"),
+            "Per-value rule should contain replacement guidance. Message:\n{}",
+            rule.message,
         );
 
         // Fix strategy should have the mapping
@@ -8734,9 +8766,10 @@ mod tests {
     }
 
     #[test]
-    fn test_type_changed_rule_tier3_message_lists_values() {
-        // A type-changed rule with different removed/added counts should
-        // list removed and new values separately.
+    fn test_type_changed_rule_tier3_per_value_rules_list_replacements() {
+        // For enum changes with multiple removed/added values, per-value
+        // sub-rules should list available replacements. The main type-changed
+        // rule is suppressed (per-value sub-rules cover it).
         let changes = vec![FileChanges {
             file: PathBuf::from("packages/react-core/src/components/Toolbar/ToolbarGroup.d.ts"),
             status: FileStatus::Modified,
@@ -8766,27 +8799,42 @@ mod tests {
             &HashMap::new(),
         );
 
+        // Main type-changed rule should NOT exist (suppressed for enum narrowing)
         let tc_rules: Vec<&KonveyorRule> = rules
             .iter()
             .filter(|r| r.labels.iter().any(|l| l == "change-type=type-changed"))
             .collect();
-        assert!(!tc_rules.is_empty());
+        assert!(
+            tc_rules.is_empty(),
+            "Main type-changed rule should be suppressed for enum changes. Got: {:?}",
+            tc_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
 
-        let rule = tc_rules[0];
-        assert!(
-            rule.message.contains("Removed values:")
-                && rule.message.contains("'button-group'")
-                && rule.message.contains("'icon-button-group'"),
-            "Should list removed values. Message:\n{}",
-            rule.message,
+        // Per-value sub-rules should exist for each removed value
+        let pv_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=prop-value-change")
+            })
+            .collect();
+        assert_eq!(
+            pv_rules.len(),
+            2,
+            "Should have 2 per-value sub-rules (button-group, icon-button-group). Got: {:?}",
+            pv_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
-        assert!(
-            rule.message.contains("New values available:")
-                && rule.message.contains("'action-group'")
-                && rule.message.contains("'action-group-plain'"),
-            "Should list new values. Message:\n{}",
-            rule.message,
-        );
+
+        // Each per-value rule should list replacement options
+        for rule in &pv_rules {
+            assert!(
+                rule.message.contains("'action-group'")
+                    || rule.message.contains("'action-group-plain'"),
+                "Per-value rule should list replacement values. Message:\n{}",
+                rule.message,
+            );
+        }
     }
 
     // ── Hierarchy delta rule generation tests ────────────────────────
@@ -9485,5 +9533,139 @@ mod tests {
                 "Expected individual rule for {name} with import path info (V2 path)"
             );
         }
+    }
+
+    /// When a TypeChanged property has removed union values, the main
+    /// type-changed rule should NOT be emitted — only per-value sub-rules
+    /// with `value` discriminators should be generated. This prevents false
+    /// positives where `<Nav variant="horizontal">` fires the type-changed
+    /// rule even though only `"tertiary"` was removed.
+    #[test]
+    fn test_type_changed_enum_narrowing_skips_main_rule() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/components/Nav.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Nav.variant".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'default' | 'horizontal' | 'tertiary'".to_string()),
+                after: Some("'default' | 'horizontal'".to_string()),
+                description: "Removed 'tertiary' from Nav.variant union".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should NOT have a main type-changed rule (fires on all variant usage)
+        let main_rule = rules
+            .iter()
+            .find(|r| r.labels.iter().any(|l| l == "change-type=type-changed"));
+        assert!(
+            main_rule.is_none(),
+            "Main type-changed rule should be suppressed when per-value sub-rules \
+             cover removed values. Got: {:?}",
+            main_rule.map(|r| &r.rule_id)
+        );
+
+        // SHOULD have a per-value sub-rule for "tertiary" with value discriminator
+        let val_rule = rules.iter().find(|r| {
+            r.labels
+                .iter()
+                .any(|l| l == "change-type=prop-value-change")
+        });
+        assert!(
+            val_rule.is_some(),
+            "Expected per-value sub-rule for removed 'tertiary' value. Rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // The per-value rule should have a value field matching "tertiary"
+        let val_rule = val_rule.unwrap();
+        if let KonveyorCondition::FrontendReferenced { ref referenced } = val_rule.when {
+            assert_eq!(
+                referenced.value.as_deref(),
+                Some("^tertiary$"),
+                "Per-value rule should match only 'tertiary', got: {:?}",
+                referenced.value
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition on per-value rule");
+        }
+    }
+
+    /// When a TypeChanged property has NO removed union values (structural
+    /// type change like `ReactNode → string`), the main type-changed rule
+    /// should still be emitted as a catch-all since no per-value
+    /// discrimination is possible.
+    #[test]
+    fn test_type_changed_structural_keeps_main_rule() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/components/ClipboardCopy.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ClipboardCopy.children".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("React.ReactNode".to_string()),
+                after: Some("string | string[]".to_string()),
+                description: "children type changed from ReactNode to string".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // SHOULD have the main type-changed rule (no union values to parse)
+        let main_rule = rules
+            .iter()
+            .find(|r| r.labels.iter().any(|l| l == "change-type=type-changed"));
+        assert!(
+            main_rule.is_some(),
+            "Main type-changed rule should be emitted for structural type changes. Rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Should NOT have per-value sub-rules (no union values)
+        let val_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=prop-value-change")
+            })
+            .collect();
+        assert!(
+            val_rules.is_empty(),
+            "No per-value sub-rules should exist for structural type changes. Got: {:?}",
+            val_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
     }
 }

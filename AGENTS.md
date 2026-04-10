@@ -1120,6 +1120,24 @@ Tests: `deprecated_replacement_tests` module in `src/orchestrator.rs` (15 tests)
   prop-attribute-override)
 - `crates/konveyor-core/src/lib.rs` — Shared rule types, fix strategies
 
+#### Type-Changed Rule Suppression (IMPORTANT)
+
+When a `TypeChanged` property has parseable removed union values (e.g.,
+`'default' | 'tertiary'` → `'default'`), the main `type-changed` rule is
+suppressed. Per-value sub-rules (Path B in `konveyor.rs`, labeled
+`change-type=prop-value-change`) are emitted instead with precise `value`
+discriminators that fire only on the specific removed value.
+
+Without this, the main rule fires on EVERY usage of the prop regardless of
+the value passed — `<Nav variant="horizontal">` would trigger even though
+only `"tertiary"` was removed. The per-value sub-rules fire only on
+`<Nav variant="tertiary">` and include replacement guidance.
+
+The suppression uses `extract_removed_union_values()` from
+`konveyor-core/src/lib.rs`. If no union values can be parsed (structural
+type change like `ReactNode → string`), the main rule is emitted as a
+catch-all since no per-value discrimination is possible.
+
 ### Testing
 
 ```sh
