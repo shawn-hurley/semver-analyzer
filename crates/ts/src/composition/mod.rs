@@ -481,6 +481,162 @@ pub fn build_composition_tree_v2(
             }
         }
 
+        // ── Step 3c: Re-parent through display:contents intermediaries ──
+        //
+        // When a family member's CSS element is a "mode-switcher" (switches
+        // between `display: contents` and `display: flex`), it acts as an
+        // invisible grid-passthrough in one mode and a visible flex container
+        // in the other. Grid children that have `grid_column_reverts`
+        // (their grid-column is `initial`/`unset`/`revert` in some mode)
+        // are actually DOM children of the mode-switcher, not direct grid
+        // children of the root.
+        //
+        // Example: Masthead (grid root) → MastheadMain (mode-switcher:
+        // display:contents in stack, display:flex in inline). MastheadBrand
+        // has grid-column that reverts to `initial` in inline mode — it's
+        // actually inside MastheadMain, not a direct child of Masthead.
+        //
+        // We also use `variable_child_refs` (from CSS custom property naming
+        // like `--masthead__main--toggle--GridColumn`) and `has_containment`
+        // (from `:has()` selectors) to assign non-grid children to the
+        // mode-switcher.
+        {
+            // Find mode-switcher CSS elements and map them to components
+            let mode_switcher_components: Vec<(String, String)> = css_prof
+                .elements
+                .iter()
+                .filter(|(_, info)| info.is_mode_switcher)
+                .filter_map(|(element, _)| {
+                    let comps = css_to_component.get(element.as_str())?;
+                    // Only take family members
+                    comps
+                        .iter()
+                        .find(|c| family_set.contains(c.as_str()) && **c != root)
+                        .map(|c| (c.clone(), element.clone()))
+                })
+                .collect();
+
+            for (switcher_comp, switcher_element) in &mode_switcher_components {
+                // 1. Re-parent grid children with grid_column_reverts from
+                //    root → switcher
+                for (element_name, info) in &css_prof.elements {
+                    if !info.grid_column_reverts || !info.has_grid_column {
+                        continue;
+                    }
+                    // Don't re-parent the mode-switcher to itself
+                    if element_name == switcher_element {
+                        continue;
+                    }
+                    // Find the component for this CSS element
+                    let Some(child_comps) = css_to_component.get(element_name.as_str()) else {
+                        continue;
+                    };
+                    for child_comp in child_comps {
+                        if !family_set.contains(child_comp.as_str()) || child_comp == &root {
+                            continue;
+                        }
+                        // Check if this child currently has a root→child edge
+                        let has_root_edge = tree
+                            .edges
+                            .iter()
+                            .any(|e| e.parent == root && e.child == *child_comp);
+                        if !has_root_edge {
+                            continue;
+                        }
+                        // Re-parent: remove root→child edge, add switcher→child
+                        if let Some(idx) = tree
+                            .edges
+                            .iter()
+                            .position(|e| e.parent == root && e.child == *child_comp)
+                        {
+                            tree.edges.remove(idx);
+                            // Remove from edge_map too
+                            edge_map.remove(&(root.clone(), child_comp.clone()));
+                        }
+                        record_signal(
+                            &mut tree,
+                            &mut edge_map,
+                            switcher_comp.clone(),
+                            child_comp.clone(),
+                            EdgeStrength::Structural,
+                            ChildRelationship::DirectChild,
+                            format!(
+                                "CSS display:contents re-parent: {} has grid_column_reverts, \
+                                 {} is mode-switcher (display:contents ↔ flex)",
+                                child_comp, switcher_comp
+                            ),
+                            None,
+                        );
+                    }
+                }
+
+                // 2. Assign non-grid children via variable_child_refs
+                //    e.g., main.variable_child_refs = {"toggle", "content"}
+                //    → MastheadToggle goes under MastheadMain
+                //
+                //    Guard: skip children whose CSS element has grid-column
+                //    WITHOUT grid_column_reverts — those are genuine grid
+                //    children of the root, not nested inside the mode-switcher.
+                //    (e.g., MastheadContent has grid-column that never reverts,
+                //    so it stays as a direct child of Masthead even though the
+                //    variable --masthead__main--toggle--content-- references it.)
+                if let Some(switcher_info) = css_prof.elements.get(switcher_element.as_str()) {
+                    for child_ref in &switcher_info.variable_child_refs {
+                        // Skip if the child CSS element is a genuine grid child
+                        if let Some(child_css) = css_prof.elements.get(child_ref.as_str()) {
+                            if child_css.has_grid_column && !child_css.grid_column_reverts {
+                                continue;
+                            }
+                        }
+                        // Map the child_ref CSS element to a component
+                        let Some(child_comps) = css_to_component.get(child_ref.as_str()) else {
+                            continue;
+                        };
+                        for child_comp in child_comps {
+                            if !family_set.contains(child_comp.as_str())
+                                || child_comp == &root
+                                || child_comp == switcher_comp
+                            {
+                                continue;
+                            }
+                            // Skip children that already have a non-root parent
+                            // (don't override Step 1 internal rendering or
+                            // earlier re-parenting)
+                            let has_non_root_parent = tree
+                                .edges
+                                .iter()
+                                .any(|e| e.child == *child_comp && e.parent != root);
+                            if has_non_root_parent {
+                                continue;
+                            }
+                            record_signal(
+                                &mut tree,
+                                &mut edge_map,
+                                switcher_comp.clone(),
+                                child_comp.clone(),
+                                EdgeStrength::Allowed,
+                                ChildRelationship::DirectChild,
+                                format!(
+                                    "CSS variable nesting: --{}__{}--{}-- references {} inside {}",
+                                    css_prof.block,
+                                    switcher_element,
+                                    child_ref,
+                                    child_comp,
+                                    switcher_comp
+                                ),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Note: has_containment from :has() selectors is NOT consumed here.
+            // The :has() signal requires more careful handling (bidirectional
+            // false positives, incorrect element-to-component mapping) and
+            // should be added as a separate, guarded step in the future.
+        }
+
         // ── Step 4: CSS flex context ────────────────────────────────
         // Only fires when the ROOT component's CSS slot is a grid container.
         // In that case, family members WITHOUT grid positioning can't be

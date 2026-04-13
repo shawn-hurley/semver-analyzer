@@ -419,6 +419,12 @@ fn extract_css_block_profile(source: &str, _component_dir: &str) -> Result<CssBl
         extract_from_rule(rule, &block_class, &mut profile, &mut selector_groups);
     }
 
+    // Step 2b: Resolve display values from CSS variable definitions.
+    // When elements use `display: var(...)`, the actual values (contents,
+    // flex, etc.) are defined in modifier-scoped variables. Resolve them
+    // before the mode-switcher check so it sees the real display values.
+    resolve_display_var_values(source, &block_class, &mut profile);
+
     // Step 3: Detect mode-switchers (display: contents ↔ flex/grid)
     for info in profile.elements.values_mut() {
         let has_contents = info.display_values.contains("contents");
@@ -864,6 +870,60 @@ fn extract_variable_nesting(source: &str, class_prefix: &str, profile: &mut CssB
                         }
                         info.variable_child_refs.insert(child_ref.to_string());
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve display values from CSS custom property definitions.
+///
+/// When an element uses `display: var(--block__element--Display)`, the
+/// actual display values (`contents`, `flex`, etc.) are set via CSS
+/// variable definitions in modifier contexts:
+///
+///   `--{block}--m-display-stack__{element}--Display: contents;`
+///   `--{block}--m-display-inline__{element}--Display: flex;`
+///
+/// This function scans for these definitions and adds the resolved values
+/// to the element's `display_values` set, enabling accurate
+/// `is_mode_switcher` detection.
+fn resolve_display_var_values(source: &str, block_class: &str, profile: &mut CssBlockProfile) {
+    let var_prefix = format!("--{}", block_class);
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(&var_prefix) {
+            continue;
+        }
+
+        // Must contain --Display
+        if !trimmed.contains("--Display") {
+            continue;
+        }
+
+        // Extract the value after the colon
+        let Some(colon_idx) = trimmed.find(':') else {
+            continue;
+        };
+        let value = trimmed[colon_idx + 1..].trim().trim_end_matches(';').trim();
+
+        // Only interested in concrete display values, not var() references
+        if value.starts_with("var(") {
+            continue;
+        }
+
+        // Extract the element name from the variable
+        // Pattern: --block--m-*__{element}--Display or --block__{element}--Display
+        let var_name = trimmed[..colon_idx].trim();
+        if let Some(dunder_idx) = var_name.rfind("__") {
+            let after_dunder = &var_name[dunder_idx + 2..];
+            // Element name is before the --Display part
+            if let Some(prop_idx) = after_dunder.find("--Display") {
+                let element = &after_dunder[..prop_idx];
+                if !element.is_empty() {
+                    let info = profile.elements.entry(element.to_string()).or_default();
+                    info.display_values.insert(value.to_string());
                 }
             }
         }
