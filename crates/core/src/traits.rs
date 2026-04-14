@@ -19,7 +19,7 @@ use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ── BU Traits (language-agnostic, LLM-based) ───────────────────────────
@@ -464,6 +464,52 @@ pub trait MessageFormatter {
     fn describe(&self, change: &StructuralChange) -> String;
 }
 
+// ── Extended analysis parameters ─────────────────────────────────────────
+
+/// Parameters for `Language::run_extended_analysis`.
+///
+/// Bundles the repo/ref context with data computed by the orchestrator
+/// (removed CSS blocks, dep-repo packages) so that language implementations
+/// can attach them to their extensions without the orchestrator needing to
+/// know the concrete extension type.
+#[derive(Debug, Clone)]
+pub struct ExtendedAnalysisParams {
+    /// Path to the primary repository being analyzed.
+    pub repo: PathBuf,
+    /// Git ref for the old (from) version.
+    pub from_ref: String,
+    /// Git ref for the new (to) version.
+    pub to_ref: String,
+    /// Optional path to the dependency CSS repo (already checked out/built).
+    pub dep_css_dir: Option<PathBuf>,
+    /// CSS component blocks removed between old and new dep-repo versions
+    /// (e.g., `["select", "chip"]`). Computed by the orchestrator from
+    /// `detect_removed_css_blocks()`.
+    pub removed_css_blocks: Vec<String>,
+    /// Dependency repo packages (name → version at new ref).
+    /// Used to generate dep-update rules for packages outside the main
+    /// analyzed monorepo (e.g., `@patternfly/patternfly` CSS package).
+    pub dep_repo_packages: HashMap<String, String>,
+}
+
+// ── LLM category definitions ────────────────────────────────────────────
+
+/// A behavioral change category definition for LLM prompts.
+///
+/// Each language provides a list of these to guide the LLM's output.
+/// The `id` must match the serde name of the corresponding `Language::Category`
+/// enum variant (e.g., `"dom_structure"` for `TsCategory::DomStructure`).
+#[derive(Debug, Clone)]
+pub struct LlmCategoryDefinition {
+    /// Machine-readable identifier (e.g., `"dom_structure"`, `"annotation_change"`).
+    /// Must match the serde serialization of `Language::Category` variants.
+    pub id: String,
+    /// Short human label (e.g., `"DOM/render changes"`, `"Annotation changes"`).
+    pub label: String,
+    /// Detailed description for the LLM prompt explaining what this category covers.
+    pub description: String,
+}
+
 /// The core language abstraction.
 ///
 /// Composes `LanguageSemantics + MessageFormatter` and adds four associated
@@ -657,6 +703,18 @@ pub trait Language:
         qualified_name.to_string()
     }
 
+    /// Return the behavioral change categories for LLM prompts.
+    ///
+    /// Each category has an `id` that must match the serde serialization of
+    /// the corresponding `Language::Category` variant. The LLM prompt is
+    /// built dynamically from these definitions, so adding a new language
+    /// automatically gets language-appropriate behavioral categories.
+    ///
+    /// Default: empty (no behavioral categories — LLM skips category assignment).
+    fn llm_categories(&self) -> Vec<LlmCategoryDefinition> {
+        vec![]
+    }
+
     // ── v2 Extended Analysis pipeline ───────────────────────────────
 
     /// Run language-specific extended analysis.
@@ -665,13 +723,14 @@ pub trait Language:
     /// reads component source files at both refs, extracts structured
     /// profiles, diffs them, and builds composition trees.
     ///
+    /// The `params` struct carries both common fields (repo, refs, CSS dir)
+    /// and data computed by the orchestrator (removed CSS blocks, dep-repo
+    /// packages) that the language impl can attach to its extensions.
+    ///
     /// Default implementation returns empty extensions (no extended analysis).
     fn run_extended_analysis(
         &self,
-        _repo: &Path,
-        _from_ref: &str,
-        _to_ref: &str,
-        _dep_css_dir: Option<&Path>,
+        _params: &ExtendedAnalysisParams,
     ) -> Result<Self::AnalysisExtensions> {
         Ok(Self::AnalysisExtensions::default())
     }
@@ -732,246 +791,6 @@ pub fn diff_surfaces<M: Default + Clone + PartialEq>(
     crate::diff::diff_surfaces(old, new)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{ChangeSubject, StructuralChangeType, SymbolKind, Visibility};
-    use std::path::PathBuf;
-
-    /// Minimal HierarchySemantics impl for testing.
-    struct TestHierarchy;
-
-    impl<M: Default + Clone + PartialEq> HierarchySemantics<M> for TestHierarchy {
-        fn family_source_paths(
-            &self,
-            _repo: &Path,
-            _git_ref: &str,
-            _family_name: &str,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn family_name_from_symbols(&self, symbols: &[&Symbol<M>]) -> Option<String> {
-            symbols.first().and_then(|s| {
-                s.file
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-            })
-        }
-
-        fn cross_family_relationships(
-            &self,
-            _repo: &Path,
-            _git_ref: &str,
-        ) -> Vec<(String, String, String)> {
-            Vec::new()
-        }
-
-        fn related_family_content(
-            &self,
-            _repo: &Path,
-            _git_ref: &str,
-            _family_name: &str,
-            _relationship_names: &[String],
-        ) -> Option<String> {
-            None
-        }
-
-        fn is_hierarchy_candidate(&self, sym: &Symbol<M>) -> bool {
-            matches!(
-                sym.kind,
-                SymbolKind::Variable | SymbolKind::Function | SymbolKind::Constant
-            ) && sym.name.starts_with(|c: char| c.is_ascii_uppercase())
-        }
-    }
-
-    // ─── Test helpers ────────────────────────────────────────────────
-
-    fn make_component(name: &str, family: &str, rendered: Vec<&str>) -> Symbol {
-        let sym = Symbol::new(
-            name,
-            format!("src/components/{}/{}.{}", family, name, name),
-            SymbolKind::Variable,
-            Visibility::Exported,
-            PathBuf::from(format!("src/components/{}/{}.d.ts", family, name)),
-            1,
-        );
-        let _ = rendered; // rendered_components moved to language_data in genericization
-        sym
-    }
-
-    fn make_interface(
-        name: &str,
-        family: &str,
-        extends: Option<&str>,
-        members: Vec<&str>,
-    ) -> Symbol {
-        let mut sym = Symbol::new(
-            name,
-            format!("src/components/{}/{}.{}", family, name, name),
-            SymbolKind::Interface,
-            Visibility::Exported,
-            PathBuf::from(format!("src/components/{}/{}.d.ts", family, name)),
-            1,
-        );
-        sym.extends = extends.map(|e| e.to_string());
-        sym.members = members
-            .into_iter()
-            .map(|m| {
-                Symbol::new(
-                    m,
-                    format!("{}.{}", name, m),
-                    SymbolKind::Variable,
-                    Visibility::Exported,
-                    PathBuf::from(format!("src/components/{}/{}.d.ts", family, name)),
-                    1,
-                )
-            })
-            .collect();
-        sym
-    }
-
-    /// Create a structural change for a removed member.
-    fn removed_member(parent: &str, member: &str) -> StructuralChange {
-        StructuralChange {
-            symbol: format!("{}.{}", parent, member),
-            qualified_name: format!("src/components/X/{}.{}", parent, member),
-            kind: SymbolKind::Interface,
-            package: None,
-            change_type: StructuralChangeType::Removed(ChangeSubject::Member {
-                name: member.to_string(),
-                kind: SymbolKind::Variable,
-            }),
-            before: None,
-            after: None,
-            description: format!("property `{}` was removed", member),
-            is_breaking: true,
-            impact: None,
-            migration_target: None,
-        }
-    }
-
-    fn child_names(
-        result: &HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
-        family: &str,
-        component: &str,
-    ) -> Vec<String> {
-        result
-            .get(family)
-            .and_then(|f| f.get(component))
-            .map(|children| children.iter().map(|c| c.name.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    fn child_mechanism(
-        result: &HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
-        family: &str,
-        parent: &str,
-        child: &str,
-    ) -> Option<String> {
-        result
-            .get(family)
-            .and_then(|f| f.get(parent))
-            .and_then(|children| children.iter().find(|c| c.name == child))
-            .map(|c| c.mechanism.clone())
-    }
-
-    fn has_entry(
-        result: &HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
-        family: &str,
-        component: &str,
-    ) -> bool {
-        result
-            .get(family)
-            .map(|f| f.contains_key(component))
-            .unwrap_or(false)
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Signal 1–3 tests moved to crates/ts/src/language.rs
-    // ═══════════════════════════════════════════════════════════════════
-    //
-    // The full hierarchy algorithm (prop absorption, cross-family extends,
-    // internal rendering) was moved to TypeScript's HierarchySemantics
-    // implementation during genericization. The tests live in the TS
-    // crate where they can access TsSymbolData.rendered_components.
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Masthead: all leaves, no hierarchy
-    // ═══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn masthead_all_leaves() {
-        let h = TestHierarchy;
-
-        let surface = ApiSurface {
-            symbols: vec![
-                make_component("Masthead", "Masthead", vec![]),
-                make_component("MastheadBrand", "Masthead", vec![]),
-                make_component("MastheadContent", "Masthead", vec![]),
-                make_component("MastheadLogo", "Masthead", vec![]),
-                make_component("MastheadMain", "Masthead", vec![]),
-                make_component("MastheadToggle", "Masthead", vec![]),
-            ],
-        };
-
-        let result = h.compute_deterministic_hierarchy(&surface, &[]);
-
-        assert!(
-            !result.contains_key("Masthead"),
-            "Masthead: all components are leaves (div wrappers)"
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // No data → empty hierarchy
-    // ═══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn no_signals_empty_hierarchy() {
-        let h = TestHierarchy;
-
-        let surface = ApiSurface {
-            symbols: vec![
-                make_component("Modal", "Modal", vec![]),
-                make_component("ModalHeader", "Modal", vec![]),
-            ],
-        };
-
-        let result = h.compute_deterministic_hierarchy(&surface, &[]);
-        assert!(result.is_empty(), "no signals → no hierarchy");
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Interfaces/types excluded from hierarchy candidates
-    // ═══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn interfaces_not_hierarchy_candidates() {
-        let h = TestHierarchy;
-
-        let surface = ApiSurface {
-            symbols: vec![
-                make_component("Modal", "Modal", vec![]),
-                make_component("ModalBody", "Modal", vec![]),
-                make_interface("ModalProps", "Modal", None, vec!["children"]),
-            ],
-        };
-
-        let changes = vec![removed_member("ModalProps", "title")];
-        let result = h.compute_deterministic_hierarchy(&surface, &changes);
-
-        // ModalProps should not appear as a child anywhere
-        for family in result.values() {
-            for children in family.values() {
-                for child in children {
-                    assert_ne!(
-                        child.name, "ModalProps",
-                        "Interfaces should not be hierarchy candidates"
-                    );
-                }
-            }
-        }
-    }
-}
+// Hierarchy algorithm tests live in crates/ts/src/language.rs where
+// they can use TsSymbolData.rendered_components. The core default
+// implementation returns an empty map.

@@ -16,6 +16,69 @@ migration rules with fix strategies.
 - `src/orchestrator.rs` — Pipeline orchestrator (TD+BU or TD+SD)
 - `src/main.rs` — CLI entry point
 
+### Code Placement Rules (CRITICAL)
+
+The codebase enforces strict separation between language-agnostic core logic
+and language-specific implementations. **Every new piece of code must go in
+the correct crate.** Misplacement creates the coupling that the genericization
+effort removed.
+
+#### Decision table: where does new code go?
+
+| Code type | Correct crate | Examples |
+|-----------|--------------|----------|
+| Traits, associated types, parameter structs for cross-crate contracts | `crates/core/` | `Language`, `LanguageSemantics`, `ExtendedAnalysisParams`, `LlmCategoryDefinition` |
+| Diff algorithm, rename detection, relocation detection | `crates/core/src/diff/` | `diff_surfaces_with_semantics`, `detect_renames`, `detect_relocations` |
+| Report types, result types, envelope types | `crates/core/src/types/` | `AnalysisResult<L>`, `TypeSummary<L>`, `StructuralChange` |
+| TypeScript/React/PatternFly extraction, JSX analysis, CSS profiles | `crates/ts/` | `TsSymbolData`, `ComponentSourceProfile`, `extract_css_profiles` |
+| TypeScript `Language` trait impl, `LanguageSemantics` impl | `crates/ts/src/language.rs` | `is_member_addition_breaking`, `llm_categories`, hierarchy algorithm |
+| TypeScript Konveyor rule generation | `crates/ts/src/konveyor.rs`, `konveyor_v2.rs` | `generate_rules`, `generate_sd_rules` |
+| Java extraction, semantics, manifest parsing | `crates/java/` | `JavaExtractor`, `Java` Language impl |
+| Konveyor rule types, conditions, fix strategies (shared) | `crates/konveyor-core/` | `KonveyorRule`, `KonveyorCondition`, `FixStrategy` |
+| LLM prompt building, response parsing, spec comparison | `crates/llm/` | `build_file_behavioral_prompt`, `parse_file_behavioral_response` |
+| Pipeline orchestration, CLI, progress reporting | `src/` | `Analyzer::run`, `Analyzer::run_v2`, `cmd_analyze` |
+
+#### Rules
+
+1. **`crates/core/` must never import from `crates/ts/`, `crates/java/`, or
+   `crates/llm/`.** Core defines the contracts; language crates implement them.
+   If you need language-specific behavior in core, add a trait method with a
+   default impl and override it in the language crate.
+
+2. **`crates/llm/` must never import from language crates.** The LLM crate is
+   language-agnostic. Language-specific data (like behavioral categories) flows
+   in via parameters, not imports. The `LlmCategoryDefinition` type is defined
+   in core and passed through by the orchestrator.
+
+3. **Per-symbol metadata goes in `Language::SymbolData`.** TypeScript has
+   `TsSymbolData` (rendered_components, css_tokens). Java has `JavaSymbolData`
+   (annotations, modifiers). Core uses `Symbol<M>` where `M` is the metadata
+   type. Never add language-specific fields to `Symbol` directly.
+
+4. **Pipeline extension data goes in `Language::AnalysisExtensions`.** TypeScript
+   has `TsAnalysisExtensions` (SD pipeline results). Java uses `()`. The
+   orchestrator interacts with extensions only through `run_extended_analysis`,
+   `finalize_extensions`, and `extensions_log_summary` — it never downcasts.
+
+5. **Data computed by the orchestrator that language impls need** must flow
+   through parameter structs (like `ExtendedAnalysisParams`), not through
+   the `Language` trait's associated types. The orchestrator is generic over
+   `L: Language` and cannot access concrete extension fields.
+
+6. **LLM behavioral categories** are defined by each `Language` impl via
+   `fn llm_categories() -> Vec<LlmCategoryDefinition>`. The orchestrator
+   passes them to the LLM crate. Never hardcode language-specific categories
+   in the LLM prompt templates.
+
+7. **Hierarchy algorithms** belong in the language crate, not core. The
+   `HierarchySemantics` trait defines the contract; TypeScript overrides
+   `compute_deterministic_hierarchy` with the full prop-absorption /
+   cross-family-extends / internal-rendering algorithm. Core's default
+   returns an empty map.
+
+8. **Clippy must be clean.** Run `cargo clippy --workspace --all-targets`
+   before committing. Zero warnings, zero errors.
+
 ### Three Pipelines
 
 The analyzer has three pipelines. The `--behavioral` flag controls which

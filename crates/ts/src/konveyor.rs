@@ -7281,13 +7281,13 @@ mod tests {
             KonveyorCondition::FrontendReferenced { referenced } => referenced
                 .from
                 .as_ref()
-                .map_or(false, |f| f.contains("deprecated")),
+                .is_some_and(|f| f.contains("deprecated")),
             KonveyorCondition::Or { or } => or.iter().any(|c| {
                 if let KonveyorCondition::FrontendReferenced { referenced } = c {
                     referenced
                         .from
                         .as_ref()
-                        .map_or(false, |f| f.contains("deprecated"))
+                        .is_some_and(|f| f.contains("deprecated"))
                 } else {
                     false
                 }
@@ -9615,11 +9615,8 @@ mod tests {
             is_enum_value,
             "Should detect enum value removal from quoted before"
         );
-        // has_codemod should be false for enum value removals
-        assert!(
-            !is_enum_value || true, // The logic sets has_codemod=false for these
-            "Enum value removals should not be codemod"
-        );
+        // The rule generation logic sets has_codemod=false when is_enum_value
+        // is true, verified by the snapshot tests for enum value removal rules.
     }
 
     #[test]

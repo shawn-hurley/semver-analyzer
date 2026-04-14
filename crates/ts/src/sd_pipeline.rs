@@ -1978,52 +1978,6 @@ export { DropdownList } from './DropdownList';
         assert_eq!(files[0].family, Some("Modal".to_string()));
     }
 
-    // ── CSS enrichment guard tests ──────────────────────────────────
-
-    use crate::css_profile::{CssBlockProfile, CssElementInfo};
-    use crate::sd_types::{CompositionEdge, CompositionTree};
-    use std::collections::BTreeMap;
-
-    #[allow(dead_code)]
-    fn make_css_element(display: &str, is_flex: bool) -> CssElementInfo {
-        let mut info = CssElementInfo::default();
-        info.display_values.insert(display.to_string());
-        if is_flex {
-            info.display_values.insert("flex".to_string());
-        }
-        info
-    }
-
-    fn make_source_profile(name: &str) -> ComponentSourceProfile {
-        ComponentSourceProfile {
-            name: name.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn make_source_profile_with_block(name: &str, block: &str) -> ComponentSourceProfile {
-        ComponentSourceProfile {
-            name: name.to_string(),
-            bem_block: Some(block.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Real PatternFly case: PageSidebar has a self-referential edge
-    /// (PageSidebar → PageSidebar) from the CSS enrichment because
-    /// the sidebar element is a flex container and also appears as a
-    /// non-grid element. The self-referential guard must block this.
-
-    /// Real PatternFly case: TextInputGroupMain and TextInputGroupUtilities
-    /// are siblings under TextInputGroup. CSS has
-    /// `.pf-v6-c-text-input-group:has(> .pf-v6-c-text-input-group__utilities)`
-    /// proving utilities is a root-level direct child, NOT inside main.
-
-    /// Real PatternFly case: Card header contains title (proven by CSS
-    /// `.pf-v6-c-card__header .pf-v6-c-card__title`). Valid nesting.
-
-    /// CSS sibling selectors prevent nesting.
-
     // ── Deprecated migration diffing tests ──────────────────────────
 
     /// When a deprecated component (e.g., deprecated/Select) is removed and
@@ -2034,23 +1988,20 @@ export { DropdownList } from './DropdownList';
         use crate::sd_types::SourceLevelCategory;
 
         // Deprecated Select rendered TextInput internally
-        let mut deprecated_profile = ComponentSourceProfile::default();
-        deprecated_profile.name = "Select".to_string();
-        deprecated_profile.file =
-            "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string();
-        deprecated_profile
-            .rendered_components
-            .push("TextInput".into());
-        deprecated_profile
-            .rendered_components
-            .push("ChipGroup".into());
+        let deprecated_profile = ComponentSourceProfile {
+            name: "Select".to_string(),
+            file: "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string(),
+            rendered_components: vec!["TextInput".into(), "ChipGroup".into()],
+            ..Default::default()
+        };
 
         // New Select does NOT render TextInput or ChipGroup
-        let mut replacement_profile = ComponentSourceProfile::default();
-        replacement_profile.name = "Select".to_string();
-        replacement_profile.file =
-            "packages/react-core/src/components/Select/Select.tsx".to_string();
-        replacement_profile.rendered_components.push("Menu".into());
+        let replacement_profile = ComponentSourceProfile {
+            name: "Select".to_string(),
+            file: "packages/react-core/src/components/Select/Select.tsx".to_string(),
+            rendered_components: vec!["Menu".into()],
+            ..Default::default()
+        };
 
         // Diff them
         let changes = diff_profiles(&deprecated_profile, &replacement_profile);
@@ -2111,18 +2062,19 @@ export { DropdownList } from './DropdownList';
     #[test]
     fn test_deprecated_without_replacement_skipped() {
         // deprecated/Tile removed, no components/Tile exists
-        let mut deprecated_profile = ComponentSourceProfile::default();
-        deprecated_profile.name = "Tile".to_string();
-        deprecated_profile.file =
-            "packages/react-core/src/deprecated/components/Tile/Tile.tsx".to_string();
-        deprecated_profile.rendered_components.push("Button".into());
+        let _deprecated_profile = ComponentSourceProfile {
+            name: "Tile".to_string(),
+            file: "packages/react-core/src/deprecated/components/Tile/Tile.tsx".to_string(),
+            rendered_components: vec!["Button".into()],
+            ..Default::default()
+        };
 
         // Simulate: new_profiles does NOT contain "Tile"
         let new_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
 
         // The lookup should return None
         assert!(
-            new_profiles.get("Tile").is_none(),
+            !new_profiles.contains_key("Tile"),
             "No replacement should exist for Tile"
         );
         // No diff is produced (the Phase A.5 code simply skips this case)
@@ -2135,27 +2087,29 @@ export { DropdownList } from './DropdownList';
         use crate::sd_types::SourceLevelCategory;
 
         // Same-component evolution: Select v5 → Select v6 (minor changes)
-        let mut select_v5 = ComponentSourceProfile::default();
-        select_v5.name = "Select".to_string();
-        select_v5.file = "packages/react-core/src/components/Select/Select.tsx".to_string();
-        select_v5.rendered_components.push("Menu".into());
+        let select_v5 = ComponentSourceProfile {
+            name: "Select".to_string(),
+            file: "packages/react-core/src/components/Select/Select.tsx".to_string(),
+            rendered_components: vec!["Menu".into()],
+            ..Default::default()
+        };
 
-        let mut select_v6 = ComponentSourceProfile::default();
-        select_v6.name = "Select".to_string();
-        select_v6.file = "packages/react-core/src/components/Select/Select.tsx".to_string();
-        select_v6.rendered_components.push("Menu".into());
-        select_v6.rendered_components.push("Popper".into()); // new in v6
+        let select_v6 = ComponentSourceProfile {
+            name: "Select".to_string(),
+            file: "packages/react-core/src/components/Select/Select.tsx".to_string(),
+            rendered_components: vec!["Menu".into(), "Popper".into()], // Popper new in v6
+            ..Default::default()
+        };
 
         let evolution_changes = diff_profiles(&select_v5, &select_v6);
 
         // Deprecated migration: deprecated/Select → Select
-        let mut deprecated_select = ComponentSourceProfile::default();
-        deprecated_select.name = "Select".to_string();
-        deprecated_select.file =
-            "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string();
-        deprecated_select
-            .rendered_components
-            .push("TextInput".into());
+        let deprecated_select = ComponentSourceProfile {
+            name: "Select".to_string(),
+            file: "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string(),
+            rendered_components: vec!["TextInput".into()],
+            ..Default::default()
+        };
 
         let migration_changes = diff_profiles(&deprecated_select, &select_v6);
 

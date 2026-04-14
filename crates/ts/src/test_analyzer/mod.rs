@@ -758,8 +758,10 @@ index abc..def 100644
         let found =
             find_test_files(dir.path(), Path::new("src/Popover/PopoverHeader.tsx")).unwrap();
         assert!(
-            found.iter().any(|f| f.path
-                == PathBuf::from("src/Popover/__tests__/Generated/PopoverHeader.test.tsx")),
+            found
+                .iter()
+                .any(|f| f.path
+                    == Path::new("src/Popover/__tests__/Generated/PopoverHeader.test.tsx")),
             "Should find test in __tests__/Generated/ subdir, got: {:?}",
             found.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
@@ -780,7 +782,7 @@ index abc..def 100644
         assert!(
             found
                 .iter()
-                .any(|f| f.path == PathBuf::from("src/Slider/__tests__/Slider.test.tsx")),
+                .any(|f| f.path == Path::new("src/Slider/__tests__/Slider.test.tsx")),
             "Should find parent component test, got: {:?}",
             found.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
@@ -798,7 +800,7 @@ index abc..def 100644
         assert!(
             found
                 .iter()
-                .any(|f| f.path == PathBuf::from("src/Card/Card.test.tsx")),
+                .any(|f| f.path == Path::new("src/Card/Card.test.tsx")),
             "Should find parent component sibling test, got: {:?}",
             found.iter().map(|f| &f.path).collect::<Vec<_>>()
         );

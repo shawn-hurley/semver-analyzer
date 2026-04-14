@@ -102,9 +102,12 @@ impl<L: Language> Analyzer<L> {
         let progress_bu_phase2 = progress.clone();
         let llm_api_entries_bu = llm_api_entries.clone();
 
-        // Additional clones for rename/hierarchy inference (run inside TD branch)
-        let lang_rename = self.lang.clone();
-        let lang_hierarchy = self.lang.clone();
+    // LLM behavioral categories from the Language impl
+    let llm_categories = self.lang.llm_categories();
+
+    // Additional clones for rename/hierarchy inference (run inside TD branch)
+    let lang_rename = self.lang.clone();
+    let lang_hierarchy = self.lang.clone();
         let repo_hierarchy = repo.to_path_buf();
         let from_hierarchy = from_ref.to_string();
         let to_hierarchy = to_ref.to_string();
@@ -236,6 +239,7 @@ impl<L: Language> Analyzer<L> {
                         &llm_api_entries_bu,
                         llm_timeout,
                         &progress_bu_phase2,
+                        &llm_categories,
                     )
                     .await;
                     llm_stats = stats;
@@ -525,23 +529,33 @@ impl<L: Language> Analyzer<L> {
                         Vec::new()
                     };
 
+                    // Detect dep-repo packages (name → version) for dep-update
+                    // rule generation. Reads the dep repo's package.json at to_ref.
+                    // Must run before dep_css_dir_sd is consumed below.
+                    let dep_repo_packages = if let (Some(dep_dir), Some(to_ref)) =
+                        (&dep_css_dir_sd, &dep_to_sd)
+                    {
+                        detect_dep_repo_packages(dep_dir, to_ref)
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+
                     // Use worktree path if available, otherwise fall back to raw dir
                     let css_dir = dep_worktree_guard
                         .as_ref()
                         .map(|g| g.path().to_path_buf())
                         .or(dep_css_dir_sd);
 
-                    // TODO(phase2): removed_css_blocks is computed above but no longer
-                    // attached here — Language::run_extended_analysis handles it internally
-                    // or it moves to main.rs where the concrete type is known.
-                    let _ = removed_css_blocks;
+                    let params = semver_analyzer_core::ExtendedAnalysisParams {
+                        repo: repo_sd.clone(),
+                        from_ref: from_sd.clone(),
+                        to_ref: to_sd.clone(),
+                        dep_css_dir: css_dir,
+                        removed_css_blocks,
+                        dep_repo_packages,
+                    };
 
-                    lang_sd.run_extended_analysis(
-                        &repo_sd,
-                        &from_sd,
-                        &to_sd,
-                        css_dir.as_deref(),
-                    )
+                    lang_sd.run_extended_analysis(&params)
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("SD task panicked: {}", e))?;
@@ -580,11 +594,6 @@ impl<L: Language> Analyzer<L> {
                 L::AnalysisExtensions::default()
             }
         };
-
-        // TODO(phase2): Move dep-repo package detection to Language impl or main.rs.
-        // The dep_repo_packages were previously set on the SdPipelineResult directly,
-        // but extensions are now opaque to the orchestrator. The dep-update rules
-        // won't be generated until this is wired up where the concrete type is known.
 
         // ── Finalize extensions + summary logging ────────────────────
         // Delegate cross-pipeline processing (e.g., deprecated replacement
@@ -1434,6 +1443,7 @@ impl<L: Language> Analyzer<L> {
         llm_api_entries: &Arc<Mutex<Vec<LlmApiChange>>>,
         llm_timeout: u64,
         progress: &ProgressReporter,
+        categories: &[semver_analyzer_core::LlmCategoryDefinition],
     ) -> (LlmPhaseStats, Vec<(String, Vec<ContainerChange>)>) {
         let _span = info_span!("bu_pipeline_phase2", file_count = files.len()).entered();
         let cmd = match llm_command {
@@ -1469,6 +1479,7 @@ impl<L: Language> Analyzer<L> {
             let functions = task.functions.clone();
             let test_diff = task.test_diff.clone();
 
+            let cats = categories.to_vec();
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
 
@@ -1487,6 +1498,7 @@ impl<L: Language> Analyzer<L> {
                             &diff_content,
                             &functions,
                             test_diff.as_deref(),
+                            &cats,
                         );
                         match first {
                             Ok(result) => Ok((file_path, result)),
@@ -1503,6 +1515,7 @@ impl<L: Language> Analyzer<L> {
                                         &diff_content,
                                         &functions,
                                         test_diff.as_deref(),
+                                        &cats,
                                     )
                                     .map(|result| (file_path, result))
                             }
@@ -2269,4 +2282,45 @@ fn pascal_to_kebab(s: &str) -> String {
         }
     }
     result
+}
+
+/// Detect dependency repo packages (name → version) at a given git ref.
+///
+/// Reads `package.json` from the dep repo at `to_ref` using `git show`.
+/// Returns the package name and version as a single-entry map, or empty
+/// if the file doesn't exist or can't be parsed.
+fn detect_dep_repo_packages(
+    dep_dir: &Path,
+    to_ref: &str,
+) -> std::collections::HashMap<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{}:package.json", to_ref)])
+        .current_dir(dep_dir)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let content = String::from_utf8_lossy(&out.stdout);
+            // Parse name and version from package.json
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                let name = json["name"].as_str().unwrap_or_default();
+                let version = json["version"].as_str().unwrap_or_default();
+                if !name.is_empty() && !version.is_empty() {
+                    tracing::info!(
+                        package = %name,
+                        version = %version,
+                        "Detected dep-repo package"
+                    );
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(name.to_string(), version.to_string());
+                    return map;
+                }
+            }
+            std::collections::HashMap::new()
+        }
+        _ => {
+            tracing::trace!("No package.json found in dep repo at {}", to_ref);
+            std::collections::HashMap::new()
+        }
+    }
 }

@@ -58,10 +58,10 @@ fn surface(symbols: Vec<Symbol>) -> ApiSurface {
     ApiSurface { symbols }
 }
 
-fn find_change<'a>(
-    changes: &'a [StructuralChange],
+fn find_change(
+    changes: &[StructuralChange],
     predicate: impl Fn(&StructuralChangeType) -> bool,
-) -> &'a StructuralChange {
+) -> &StructuralChange {
     changes
         .iter()
         .find(|c| predicate(&c.change_type))

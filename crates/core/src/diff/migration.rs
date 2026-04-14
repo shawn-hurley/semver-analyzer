@@ -408,7 +408,7 @@ mod tests {
     fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
         let mut sym = Symbol::new(
             name,
-            &format!("{}.{}", file, name),
+            format!("{}.{}", file, name),
             SymbolKind::Interface,
             Visibility::Exported,
             file,
@@ -417,7 +417,7 @@ mod tests {
         for member_name in members {
             sym.members.push(Symbol::new(
                 *member_name,
-                &format!("{}.{}.{}", file, name, member_name),
+                format!("{}.{}.{}", file, name, member_name),
                 SymbolKind::Property,
                 Visibility::Public,
                 file,

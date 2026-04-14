@@ -27,7 +27,8 @@ pub use invoke::{
     LlmInterfaceRenameMapping, LlmSuffixRename,
 };
 use semver_analyzer_core::{
-    BehaviorAnalyzer, BreakingVerdict, ChangedFunction, FunctionSpec, TestDiff,
+    BehaviorAnalyzer, BreakingVerdict, ChangedFunction, FunctionSpec, LlmCategoryDefinition,
+    TestDiff,
 };
 
 /// LLM-based implementation of `BehaviorAnalyzer`.
@@ -87,13 +88,18 @@ impl LlmBehaviorAnalyzer {
     /// 2+ calls per function. The prompt includes the git diff and the
     /// list of changed function signatures.
     ///
-    /// Returns (behavioral_changes, api_changes).
+    /// The `categories` parameter provides language-specific behavioral change
+    /// categories for the LLM prompt. Pass `&lang.llm_categories()` from the
+    /// `Language` trait implementation.
+    ///
+    /// Returns (behavioral_changes, api_changes, composition_changes).
     pub fn analyze_file_diff(
         &self,
         file_path: &str,
         diff_content: &str,
         changed_functions: &[ChangedFunction],
         test_diff: Option<&str>,
+        categories: &[LlmCategoryDefinition],
     ) -> Result<(
         Vec<FileBehavioralChange>,
         Vec<FileApiChange>,
@@ -104,6 +110,7 @@ impl LlmBehaviorAnalyzer {
             diff_content,
             changed_functions,
             test_diff,
+            categories,
         );
         let response = self.run_llm(&prompt)?;
         let (beh, api) = invoke::parse_file_behavioral_response(&response)?;

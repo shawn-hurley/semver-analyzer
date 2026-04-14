@@ -589,6 +589,64 @@ impl Language for Java {
         }
         qualified_name.to_string()
     }
+
+    fn llm_categories(&self) -> Vec<semver_analyzer_core::LlmCategoryDefinition> {
+        use semver_analyzer_core::LlmCategoryDefinition;
+        vec![
+            LlmCategoryDefinition {
+                id: "annotation_change".into(),
+                label: "Annotation changes".into(),
+                description: "Changed annotations (@Deprecated, @Override, @Nullable, \
+                    custom annotations), added/removed annotation elements, changed \
+                    retention or target"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "exception_handling".into(),
+                label: "Exception changes".into(),
+                description: "Changed throws clauses, different exception types thrown, \
+                    removed or added checked exceptions, changed error handling behavior"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "method_signature".into(),
+                label: "Method signature changes".into(),
+                description: "Return type changes, parameter type/count changes, \
+                    generic type parameter changes, varargs changes"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "access_control".into(),
+                label: "Access control changes".into(),
+                description: "Visibility modifier changes (public → protected, \
+                    protected → package-private), added/removed final on methods"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "type_hierarchy".into(),
+                label: "Type hierarchy changes".into(),
+                description: "Changed extends/implements, sealed/permits changes, \
+                    added/removed final on classes, interface to abstract class or \
+                    vice versa"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "default_impl".into(),
+                label: "Default implementation changes".into(),
+                description: "Added/removed default methods on interfaces, changed \
+                    default method behavior, abstract method additions"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "behavioral".into(),
+                label: "Behavioral changes".into(),
+                description: "Changed method body logic, different return values for \
+                    same inputs, changed side effects, altered state transitions, \
+                    threading/synchronization changes"
+                    .into(),
+            },
+        ]
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

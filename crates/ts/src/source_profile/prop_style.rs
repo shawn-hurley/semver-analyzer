@@ -462,7 +462,7 @@ mod tests {
 
         let bindings = extract(source, &["isScrollable"]);
         assert!(
-            bindings.get("localVar").is_none(),
+            !bindings.contains_key("localVar"),
             "localVar is not a known prop"
         );
         assert!(bindings.contains_key("isScrollable"));

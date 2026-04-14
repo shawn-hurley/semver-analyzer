@@ -142,7 +142,7 @@ pub fn enum_member(name: &str, value: &str) -> Symbol {
 pub fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
     let mut s = Symbol::new(
         name,
-        &format!("{}.{}", file, name),
+        format!("{}.{}", file, name),
         SymbolKind::Interface,
         Visibility::Exported,
         file,
@@ -151,7 +151,7 @@ pub fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
     for &member_name in members {
         s.members.push(Symbol::new(
             member_name,
-            &format!("{}.{}.{}", file, name, member_name),
+            format!("{}.{}.{}", file, name, member_name),
             SymbolKind::Property,
             Visibility::Public,
             file,

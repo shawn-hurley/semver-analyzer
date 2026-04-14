@@ -788,6 +788,53 @@ fn tokenize_name(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Compute name similarity between two identifiers.
+///
+/// Uses longest common subsequence ratio, which handles:
+/// - Prefix matches: `isActive` / `isClicked` → share "is"
+/// - Suffix matches: `chipGroupContentRef` / `labelGroupContentRef` → share "GroupContentRef"
+/// - Substring matches: `hasSelectableInput` / `hasClickableInput` → share "has" + "Input"
+///
+/// Returns a value in [0.0, 1.0] where 1.0 = identical.
+pub(super) fn name_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+
+    let lcs_len = longest_common_subsequence_len(a, b);
+    let max_len = a.len().max(b.len());
+    lcs_len as f64 / max_len as f64
+}
+
+/// Length of the longest common subsequence of two strings.
+pub(super) fn longest_common_subsequence_len(a: &str, b: &str) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let m = a_bytes.len();
+    let n = b_bytes.len();
+
+    // Space-optimized: only keep two rows
+    let mut prev = vec![0usize; n + 1];
+    let mut curr = vec![0usize; n + 1];
+
+    for i in 1..=m {
+        for j in 1..=n {
+            if a_bytes[i - 1] == b_bytes[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+            } else {
+                curr[j] = prev[j].max(curr[j - 1]);
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.iter_mut().for_each(|v| *v = 0);
+    }
+
+    prev[n]
+}
+
 #[cfg(test)]
 mod token_tests {
     use super::*;
@@ -1449,12 +1496,12 @@ mod token_tests {
     #[test]
     fn test_pass4_name_similarity_same_interface() {
         // Pass 4: different types on same interface, matched by name similarity
-        let removed = vec![make_prop(
+        let removed = [make_prop(
             "splitButtonOptions",
             "MenuToggle.MenuToggleProps",
             "SplitButtonOptions",
         )];
-        let added = vec![make_prop(
+        let added = [make_prop(
             "splitButtonItems",
             "MenuToggle.MenuToggleProps",
             "ReactNode[]",
@@ -1472,8 +1519,8 @@ mod token_tests {
     #[test]
     fn test_pass4_rejects_low_similarity() {
         // Names are too different — should NOT match
-        let removed = vec![make_prop("isOpen", "Dropdown.DropdownProps", "boolean")];
-        let added = vec![make_prop("isDisabled", "Dropdown.DropdownProps", "string")];
+        let removed = [make_prop("isOpen", "Dropdown.DropdownProps", "boolean")];
+        let added = [make_prop("isDisabled", "Dropdown.DropdownProps", "string")];
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
@@ -1489,12 +1536,12 @@ mod token_tests {
     #[test]
     fn test_pass4_different_interfaces_no_match() {
         // Same name pattern but different parent interfaces — should NOT match
-        let removed = vec![make_prop(
+        let removed = [make_prop(
             "splitButtonOptions",
             "MenuToggle.MenuToggleProps",
             "SplitButtonOptions",
         )];
-        let added = vec![make_prop(
+        let added = [make_prop(
             "splitButtonItems",
             "Button.ButtonProps",
             "ReactNode[]",
@@ -1515,12 +1562,12 @@ mod token_tests {
         // DropdownSeparator → DrawerPanelDescription (similarity 0.36)
         // Different families (Dropdown/ vs Drawer/) — should be rejected
         // by the 0.50 cross-family threshold.
-        let removed = vec![make_sym(
+        let removed = [make_sym(
             "DropdownSeparator",
             SymbolKind::Constant,
             "FunctionComponent<SeparatorProps>",
         )];
-        let added = vec![make_sym(
+        let added = [make_sym(
             "DrawerPanelDescription",
             SymbolKind::Constant,
             "FunctionComponent<DrawerPanelDescriptionProps>",
@@ -1550,8 +1597,8 @@ mod token_tests {
         // TextVariants → ContentVariants (similarity 0.667)
         // Different families (Text/ vs Content/) — should PASS the 0.50
         // cross-family threshold.
-        let removed = vec![make_sym("TextVariants", SymbolKind::TypeAlias, "")];
-        let added = vec![make_sym("ContentVariants", SymbolKind::TypeAlias, "")];
+        let removed = [make_sym("TextVariants", SymbolKind::TypeAlias, "")];
+        let added = [make_sym("ContentVariants", SymbolKind::TypeAlias, "")];
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
@@ -1572,16 +1619,12 @@ mod token_tests {
         // isDisabled → hasAnimations (sim 0.231) should be rejected because
         // the boolean fingerprint group has >2 members on the removed side,
         // triggering the primitive-ambiguous guard (threshold 0.45).
-        let removed = vec![
-            make_prop("isDisabled", "DLS.DLSProps", "boolean"),
+        let removed = [make_prop("isDisabled", "DLS.DLSProps", "boolean"),
             make_prop("isSearchable", "DLS.DLSProps", "boolean"),
-            make_prop("isCompact", "DLS.DLSProps", "boolean"),
-        ];
-        let added = vec![
-            make_prop("hasAnimations", "DLS.DLSProps", "boolean"),
+            make_prop("isCompact", "DLS.DLSProps", "boolean")];
+        let added = [make_prop("hasAnimations", "DLS.DLSProps", "boolean"),
             make_prop("hasCheckbox", "DLS.DLSProps", "boolean"),
-            make_prop("hasTooltip", "DLS.DLSProps", "boolean"),
-        ];
+            make_prop("hasTooltip", "DLS.DLSProps", "boolean")];
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
@@ -1603,8 +1646,8 @@ mod token_tests {
     fn test_primitive_guard_allows_1to1_boolean_rename() {
         // When there's only 1 boolean removed and 1 boolean added (no
         // ambiguity), the primitive guard should NOT apply.
-        let removed = vec![make_prop("isActive", "Button.ButtonProps", "boolean")];
-        let added = vec![make_prop("isClicked", "Button.ButtonProps", "boolean")];
+        let removed = [make_prop("isActive", "Button.ButtonProps", "boolean")];
+        let added = [make_prop("isClicked", "Button.ButtonProps", "boolean")];
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
@@ -1734,51 +1777,4 @@ mod token_tests {
         assert_eq!(matches[0].old.name, "labelIcon");
         assert_eq!(matches[0].new.name, "labelHelp");
     }
-}
-
-/// Compute name similarity between two identifiers.
-///
-/// Uses longest common subsequence ratio, which handles:
-/// - Prefix matches: `isActive` / `isClicked` → share "is"
-/// - Suffix matches: `chipGroupContentRef` / `labelGroupContentRef` → share "GroupContentRef"
-/// - Substring matches: `hasSelectableInput` / `hasClickableInput` → share "has" + "Input"
-///
-/// Returns a value in [0.0, 1.0] where 1.0 = identical.
-pub(super) fn name_similarity(a: &str, b: &str) -> f64 {
-    if a == b {
-        return 1.0;
-    }
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-
-    let lcs_len = longest_common_subsequence_len(a, b);
-    let max_len = a.len().max(b.len());
-    lcs_len as f64 / max_len as f64
-}
-
-/// Length of the longest common subsequence of two strings.
-pub(super) fn longest_common_subsequence_len(a: &str, b: &str) -> usize {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let m = a_bytes.len();
-    let n = b_bytes.len();
-
-    // Space-optimized: only keep two rows
-    let mut prev = vec![0usize; n + 1];
-    let mut curr = vec![0usize; n + 1];
-
-    for i in 1..=m {
-        for j in 1..=n {
-            if a_bytes[i - 1] == b_bytes[j - 1] {
-                curr[j] = prev[j - 1] + 1;
-            } else {
-                curr[j] = prev[j].max(curr[j - 1]);
-            }
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.iter_mut().for_each(|v| *v = 0);
-    }
-
-    prev[n]
 }

@@ -4,7 +4,7 @@
 //! the `FunctionSpec` or `BreakingVerdict` schemas. Template-guided
 //! generation reduces hallucination (Preguss finding: ~30% → ~11-19%).
 
-use semver_analyzer_core::{ChangedFunction, FunctionSpec, TestDiff};
+use semver_analyzer_core::{ChangedFunction, FunctionSpec, LlmCategoryDefinition, TestDiff};
 
 /// JSON schema template for `FunctionSpec`.
 ///
@@ -262,6 +262,7 @@ pub fn build_file_behavioral_prompt(
     diff_content: &str,
     changed_functions: &[ChangedFunction],
     test_diff: Option<&str>,
+    categories: &[LlmCategoryDefinition],
 ) -> String {
     let mut func_list = String::new();
     for f in changed_functions {
@@ -308,6 +309,10 @@ pub fn build_file_behavioral_prompt(
         String::new()
     };
 
+    // Build the category section dynamically from language definitions
+    let category_section = build_category_section(categories);
+    let category_enum = build_category_enum(categories);
+
     format!(
         r#"Analyze this file diff for breaking changes.
 
@@ -326,47 +331,21 @@ Identify breaking changes in these categories:
 
 ### A. Behavioral breaking changes
 Changes that alter the OBSERVABLE BEHAVIOR of exported functions/components.
-For each, assign a `category` from: `dom_structure`, `css_class`, `css_variable`,
-`accessibility`, `default_value`, `logic_change`, `data_attribute`, `render_output`.
-
-1. **DOM/render changes** (category: `dom_structure`): Changed element types
-   (e.g., `<header>` → `<div>`), added/removed wrapper elements, altered
-   component nesting structure, children wrapping changes
-2. **CSS changes** (category: `css_class`): Class name renames
-   (e.g., pf-v5-* → pf-v6-*), removed CSS classes, changed class
-   application logic, modifier classes no longer applied
-3. **CSS variable changes** (category: `css_variable`): Renamed or removed
-   CSS custom properties (e.g., --pf-v5-* → --pf-v6-*)
-4. **Accessibility changes** (category: `accessibility`): Added/removed/changed
-   ARIA attributes (aria-label, aria-labelledby, aria-describedby, aria-hidden),
-   changed `role` attributes, keyboard navigation changes, focus management
-   changes, tab order changes (tabIndex additions/removals)
-5. **Default value changes** (category: `default_value`): Changed default
-   prop values that alter behavior
-6. **Logic changes** (category: `logic_change`): Changed conditional logic,
-   removed code paths, altered return values for same inputs, changed event
-   handler types, removed or changed event emissions
-7. **Data attribute changes** (category: `data_attribute`): Changed
-   data-ouia-component-type, data-testid, or other data-* attributes
-8. **Other render output** (category: `render_output`): Any other change
-   to what is visually rendered that doesn't fit above
-
+{category_section}
 ### B. API type-level breaking changes
-Changes to type signatures that static .d.ts analysis may miss:
-1. **Interface `extends` changed**: e.g., props now extends `CheckboxProps`
-   instead of `React.HTMLProps<HTMLInputElement>` — changes available props
-2. **Prop optionality changed**: prop went from optional to required or
+Changes to type signatures that static analysis may miss:
+1. **Interface/class `extends` changed**: changes available members
+2. **Member optionality changed**: member went from optional to required or
    vice versa
 3. **Enum/union members removed or renamed**: e.g., variant value
-   'light300' replaced with 'secondary'
+   removed or replaced
 4. **Type narrowed or widened**: e.g., `string | null` → `string`
-5. **Default value changed**: e.g., closeBtnAriaLabel default changed
-   from 'close' to dynamic value
-6. **Prop migration**: When a prop is removed and its functionality moved
-   to a child/sibling component, include `removal_disposition`
+5. **Default value changed**: default changed in a way that alters behavior
+6. **Member migration**: When a member is removed and its functionality moved
+   to a child/sibling type, include `removal_disposition`
 
 ## What to EXCLUDE:
-- New additions (new props, new functions, new enum members)
+- New additions (new members, new functions, new enum variants)
 - Internal refactoring that doesn't change observable behavior
 - Comment-only changes
 - Import reorganization
@@ -376,70 +355,63 @@ Changes to type signatures that static .d.ts analysis may miss:
 Return ONLY a JSON object:
 
 ```json
-{{
+{{{{
   "breaking_behavioral_changes": [
-    {{
-      "symbol": "<ComponentName or functionName>",
+    {{{{
+      "symbol": "<TypeName or functionName>",
       "kind": "class",
-      "category": "<dom_structure|css_class|css_variable|accessibility|default_value|logic_change|data_attribute|render_output>",
+      "category": "{category_enum}",
       "description": "<what changed and why it breaks consumers>",
       "is_internal_only": false
-    }}
+    }}}}
   ],
   "breaking_api_changes": [
-    {{
-      "symbol": "<InterfaceName.propName or TypeName>",
+    {{{{
+      "symbol": "<TypeName.memberName or TypeName>",
       "change": "<signature_changed|type_changed|default_changed|removed>",
       "description": "<what changed in the type signature>",
       "removal_disposition": null,
       "renders_element": null
-    }}
+    }}}}
   ],
   "composition_pattern_changes": [
-    {{
+    {{{{
       "component": "<symbol whose container changed>",
       "old_parent": "<previous container/parent or null>",
       "new_parent": "<new container/parent or null>",
       "description": "<what nesting changed>"
-    }}
+    }}}}
   ]
-}}
+}}}}
 ```
 
 Rules:
-- For behavioral: use "class" for React components, "function" for others
+- For behavioral: use "class" for components/types, "function" for others
 - For behavioral: ALWAYS include a "category" from the list above
 - For behavioral: set `is_internal_only` to true when the change only
-  affects internal rendering and does NOT require consumer code changes
-  (e.g., internal component now passes a prop differently). Set false
-  when consumers must update their code.
-- For API: use "InterfaceName.propName" format for property changes
+  affects internal rendering and does NOT require consumer code changes.
+  Set false when consumers must update their code.
+- For API: use "TypeName.memberName" format for member changes
 - For API removals: include `removal_disposition` when you can determine
-  where the prop's functionality went:
-  - `{{"type": "moved_to_related_type", "target_type": "ChildName", "mechanism": "prop"}}` —
-    member moved to a named prop on a child/related type (e.g., title → ModalHeader.title)
-  - `{{"type": "moved_to_related_type", "target_type": "ChildName", "mechanism": "children"}}` —
+  where the member's functionality went:
+  - `{{{{"type": "moved_to_related_type", "target_type": "ChildName", "mechanism": "prop"}}}}` —
+    member moved to a named member on a child/related type
+  - `{{{{"type": "moved_to_related_type", "target_type": "ChildName", "mechanism": "children"}}}}` —
     member value should now be passed as children of the child type
-    (e.g., actions → <ModalFooter>{{actions}}</ModalFooter>)
-   - `{{"type": "replaced_by_member", "new_member": "newMemberName"}}` —
+   - `{{{{"type": "replaced_by_member", "new_member": "newMemberName"}}}}` —
      replaced by a different member on the SAME type. Rules:
-     * `new_member` MUST be an exact member name that was ADDED to the same interface in the diff
-     * The new member must serve the same purpose (e.g., `chips` → `labels`, NOT `chips` → `deleteLabel`)
-     * If the types are fundamentally different (e.g., boolean → element, callback → array), use `truly_removed` instead
-     * If the new member name contains "or" or you're unsure which member replaced it, use `null` instead
-     * Do NOT guess — if you cannot find a clear 1:1 replacement in the added members, use `null`
-   - `{{"type": "made_automatic"}}` — functionality is now inferred automatically
-   - `{{"type": "truly_removed"}}` — removed with no replacement
+     * `new_member` MUST be an exact member name that was ADDED to the same type in the diff
+     * The new member must serve the same purpose
+     * If the types are fundamentally different, use `truly_removed` instead
+     * If unsure which member replaced it, use `null` instead
+     * Do NOT guess — if you cannot find a clear 1:1 replacement, use `null`
+   - `{{{{"type": "made_automatic"}}}}` — functionality is now inferred automatically
+   - `{{{{"type": "truly_removed"}}}}` — removed with no replacement
    - `null` if you cannot determine the disposition
 - For API removals of components: include `renders_element` with the HTML
-  element the component renders (e.g., "ol", "ul", "div", "footer") when
-  the component is being replaced by a generic component that needs an
-  explicit element type. Set null if not applicable.
-- For composition: include when the test/example diff shows JSX components
-  whose parent-child nesting changed (e.g., component moved from being a
-  child of A to being a child of B). Also include when children passed
-  inline become a prop value (e.g., `<Button><Icon /></Button>` →
-  `<Button icon={{<Icon />}} />`). Use empty array if no nesting changes.
+  element the component renders when applicable. Set null if not applicable.
+- For composition: include when nesting structure changed. Use empty array
+  if no nesting changes.
 - Keep descriptions specific and actionable
 - Only include changes that would break existing consumers
 - Use empty arrays for categories with no changes
@@ -448,6 +420,8 @@ Rules:
         func_section = func_section,
         diff = diff_truncated,
         test_diff_section = test_diff_section,
+        category_section = category_section,
+        category_enum = category_enum,
     )
 }
 
@@ -479,6 +453,50 @@ fn format_test_context(test_diff: &TestDiff) -> String {
     }
 
     parts.join("\n")
+}
+
+/// Build the numbered category list for the behavioral section of the prompt.
+///
+/// Produces text like:
+/// ```text
+/// For each, assign a `category` from: `dom_structure`, `css_class`, ...
+///
+/// 1. **DOM/render changes** (category: `dom_structure`): Changed element types...
+/// 2. **CSS changes** (category: `css_class`): Class name renames...
+/// ```
+fn build_category_section(categories: &[LlmCategoryDefinition]) -> String {
+    if categories.is_empty() {
+        return String::new();
+    }
+
+    let id_list: Vec<String> = categories.iter().map(|c| format!("`{}`", c.id)).collect();
+    let mut section = format!(
+        "For each, assign a `category` from: {}.\n\n",
+        id_list.join(", ")
+    );
+
+    for (i, cat) in categories.iter().enumerate() {
+        section.push_str(&format!(
+            "{}. **{}** (category: `{}`): {}\n",
+            i + 1,
+            cat.label,
+            cat.id,
+            cat.description
+        ));
+    }
+
+    section
+}
+
+/// Build the category enum string for the JSON schema in the prompt.
+///
+/// Produces: `<dom_structure|css_class|css_variable|...>`
+fn build_category_enum(categories: &[LlmCategoryDefinition]) -> String {
+    if categories.is_empty() {
+        return "<category>".to_string();
+    }
+    let ids: Vec<&str> = categories.iter().map(|c| c.id.as_str()).collect();
+    format!("<{}>", ids.join("|"))
 }
 
 #[cfg(test)]
@@ -570,17 +588,35 @@ mod tests {
             new_signature: Some("function Modal(props: ModalProps): JSX.Element".into()),
         }];
 
+        let categories = vec![
+            LlmCategoryDefinition {
+                id: "dom_structure".into(),
+                label: "DOM/render changes".into(),
+                description: "Changed element types".into(),
+            },
+            LlmCategoryDefinition {
+                id: "css_class".into(),
+                label: "CSS changes".into(),
+                description: "Class name renames".into(),
+            },
+        ];
         let prompt = build_file_behavioral_prompt(
             "src/Modal.tsx",
             "- <div>old</div>\n+ <section>new</section>",
             &funcs,
             None,
+            &categories,
         );
         assert!(prompt.contains("Modal"));
         assert!(prompt.contains("src/Modal.tsx"));
         assert!(prompt.contains("<div>old</div>"));
         assert!(prompt.contains("breaking_behavioral_changes"));
         assert!(prompt.contains("exported"));
+        // Categories appear in the prompt
+        assert!(prompt.contains("`dom_structure`"));
+        assert!(prompt.contains("`css_class`"));
+        assert!(prompt.contains("DOM/render changes"));
+        assert!(prompt.contains("<dom_structure|css_class>"));
     }
 
     #[test]

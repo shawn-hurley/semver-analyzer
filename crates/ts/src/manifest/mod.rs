@@ -434,10 +434,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn find_manifest_change<'a>(
-        changes: &'a [ManifestChange<TypeScript>],
+    fn find_manifest_change(
+        changes: &[ManifestChange<TypeScript>],
         ct: TsManifestChangeType,
-    ) -> &'a ManifestChange<TypeScript> {
+    ) -> &ManifestChange<TypeScript> {
         changes
             .iter()
             .find(|c| c.change_type == ct)

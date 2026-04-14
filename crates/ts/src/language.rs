@@ -12,9 +12,9 @@ use anyhow::Result;
 use semver_analyzer_core::{
     AnalysisReport, AnalysisResult, ApiSurface, BehavioralChangeKind, BodyAnalysisResult,
     BodyAnalysisSemantics, Caller, ChangedFunction, EvidenceType, ExpectedChild,
-    HierarchySemantics, Language, LanguageSemantics, ManifestChange, MessageFormatter, Reference,
-    RenameSemantics, StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff,
-    TestFile, Visibility,
+    ExtendedAnalysisParams, HierarchySemantics, Language, LanguageSemantics, ManifestChange,
+    MessageFormatter, Reference, RenameSemantics, StructuralChange, StructuralChangeType, Symbol,
+    SymbolKind, TestDiff, TestFile, Visibility,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
@@ -466,6 +466,71 @@ impl Language for TypeScript {
         }
     }
 
+    fn llm_categories(&self) -> Vec<semver_analyzer_core::LlmCategoryDefinition> {
+        use semver_analyzer_core::LlmCategoryDefinition;
+        vec![
+            LlmCategoryDefinition {
+                id: "dom_structure".into(),
+                label: "DOM/render changes".into(),
+                description: "Changed element types (e.g., `<header>` → `<div>`), \
+                    added/removed wrapper elements, altered component nesting structure, \
+                    children wrapping changes"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "css_class".into(),
+                label: "CSS changes".into(),
+                description: "Class name renames (e.g., pf-v5-* → pf-v6-*), removed \
+                    CSS classes, changed class application logic, modifier classes \
+                    no longer applied"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "css_variable".into(),
+                label: "CSS variable changes".into(),
+                description: "Renamed or removed CSS custom properties \
+                    (e.g., --pf-v5-* → --pf-v6-*)"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "accessibility".into(),
+                label: "Accessibility changes".into(),
+                description: "Added/removed/changed ARIA attributes (aria-label, \
+                    aria-labelledby, aria-describedby, aria-hidden), changed `role` \
+                    attributes, keyboard navigation changes, focus management changes, \
+                    tab order changes (tabIndex additions/removals)"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "default_value".into(),
+                label: "Default value changes".into(),
+                description: "Changed default prop values that alter behavior".into(),
+            },
+            LlmCategoryDefinition {
+                id: "logic_change".into(),
+                label: "Logic changes".into(),
+                description: "Changed conditional logic, removed code paths, altered \
+                    return values for same inputs, changed event handler types, removed \
+                    or changed event emissions"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "data_attribute".into(),
+                label: "Data attribute changes".into(),
+                description: "Changed data-ouia-component-type, data-testid, or other \
+                    data-* attributes"
+                    .into(),
+            },
+            LlmCategoryDefinition {
+                id: "render_output".into(),
+                label: "Other render output".into(),
+                description: "Any other change to what is visually rendered that \
+                    doesn't fit above"
+                    .into(),
+            },
+        ]
+    }
+
     fn diff_manifest_content(old: &str, new: &str) -> Vec<ManifestChange<Self>> {
         let old_json: serde_json::Value = match serde_json::from_str(old) {
             Ok(v) => v,
@@ -499,12 +564,9 @@ impl Language for TypeScript {
 
     fn run_extended_analysis(
         &self,
-        repo: &Path,
-        from_ref: &str,
-        to_ref: &str,
-        dep_css_dir: Option<&Path>,
+        params: &ExtendedAnalysisParams,
     ) -> Result<TsAnalysisExtensions> {
-        let css_profiles = dep_css_dir.and_then(|dir| {
+        let css_profiles = params.dep_css_dir.as_deref().and_then(|dir| {
             crate::css_profile::extract_css_profiles_from_dir(dir)
                 .map_err(|e| {
                     tracing::warn!(%e, "failed to extract CSS profiles from dependency");
@@ -513,7 +575,17 @@ impl Language for TypeScript {
                 .ok()
         });
 
-        let sd_result = crate::sd_pipeline::run_sd(repo, from_ref, to_ref, css_profiles.as_ref())?;
+        let mut sd_result = crate::sd_pipeline::run_sd(
+            &params.repo,
+            &params.from_ref,
+            &params.to_ref,
+            css_profiles.as_ref(),
+        )?;
+
+        // Wire orchestrator-computed data into the SD result
+        sd_result.removed_css_blocks = params.removed_css_blocks.clone();
+        sd_result.dep_repo_packages = params.dep_repo_packages.clone();
+
         Ok(TsAnalysisExtensions {
             sd_result: Some(sd_result),
             hierarchy_deltas: Vec::new(),
@@ -717,6 +789,319 @@ impl HierarchySemantics<TsSymbolData> for TypeScript {
         }
 
         relationships
+    }
+
+    fn compute_deterministic_hierarchy(
+        &self,
+        new_surface: &ApiSurface<TsSymbolData>,
+        structural_changes: &[StructuralChange],
+    ) -> std::collections::HashMap<String, std::collections::HashMap<String, Vec<ExpectedChild>>>
+    {
+        use semver_analyzer_core::ChangeSubject;
+        use std::collections::{BTreeMap, HashMap};
+
+        // ── Index: group hierarchy candidates by family ──────────────
+        let mut families: HashMap<String, Vec<&Symbol<TsSymbolData>>> = HashMap::new();
+        for sym in &new_surface.symbols {
+            if !self.is_hierarchy_candidate(sym) {
+                continue;
+            }
+            if let Some(family) = self.family_name_from_symbols(&[sym]) {
+                families.entry(family).or_default().push(sym);
+            }
+        }
+
+        // ── Index: interface extends map ─────────────────────────────
+        //
+        // Maps interface name → what it extends.
+        // e.g., "DropdownProps" → "MenuProps"
+        let mut iface_extends: HashMap<&str, &str> = HashMap::new();
+        for sym in &new_surface.symbols {
+            if sym.kind == SymbolKind::Interface {
+                if let Some(ext) = &sym.extends {
+                    iface_extends.insert(&sym.name, ext.as_str());
+                }
+            }
+        }
+
+        // ── Index: component → props interface name ──────────────────
+        //
+        // Convention: component "Dropdown" → props interface "DropdownProps".
+        // We verify the interface actually exists in the surface.
+        let iface_names: HashSet<&str> = new_surface
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .map(|s| s.name.as_str())
+            .collect();
+
+        // ── Index: props interface → component name ──────────────────
+        //
+        // Reverse mapping: "MenuProps" → "Menu", "MenuListProps" → "MenuList"
+        // Used for cross-family extends resolution.
+        let mut props_to_component: HashMap<String, &str> = HashMap::new();
+        for sym in &new_surface.symbols {
+            if !self.is_hierarchy_candidate(sym) {
+                continue;
+            }
+            let props_name = format!("{}Props", sym.name);
+            if iface_names.contains(props_name.as_str()) {
+                props_to_component.insert(props_name, &sym.name);
+            }
+        }
+
+        // ── Signal 1: Prop absorption ────────────────────────────────
+        //
+        // For each parent interface with removed members, find new family
+        // members whose props interface has matching member names.
+        let mut removed_props_by_parent: HashMap<String, HashSet<String>> = HashMap::new();
+        for change in structural_changes {
+            if let StructuralChangeType::Removed(ChangeSubject::Member { name, .. }) =
+                &change.change_type
+            {
+                let parent = if let Some((p, _)) = change.symbol.rsplit_once('.') {
+                    p.strip_suffix("Props").unwrap_or(p).to_string()
+                } else {
+                    change
+                        .symbol
+                        .strip_suffix("Props")
+                        .unwrap_or(&change.symbol)
+                        .to_string()
+                };
+                removed_props_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .insert(name.clone());
+            }
+        }
+
+        // For each family, check which new members absorbed removed props.
+        let mut absorption_children: HashMap<String, BTreeMap<String, Vec<String>>> =
+            HashMap::new();
+
+        for members in families.values() {
+            for parent in members.iter() {
+                let removed = match removed_props_by_parent.get(&parent.name) {
+                    Some(r) if !r.is_empty() => r,
+                    _ => continue,
+                };
+
+                for candidate in members.iter() {
+                    if candidate.name == parent.name {
+                        continue;
+                    }
+
+                    let candidate_props: HashSet<&str> =
+                        candidate.members.iter().map(|m| m.name.as_str()).collect();
+
+                    let props_iface_name = format!("{}Props", candidate.name);
+                    let iface_props: HashSet<&str> = new_surface
+                        .symbols
+                        .iter()
+                        .find(|s| s.name == props_iface_name && s.kind == SymbolKind::Interface)
+                        .map(|s| s.members.iter().map(|m| m.name.as_str()).collect())
+                        .unwrap_or_default();
+
+                    let all_candidate_props: HashSet<&str> =
+                        candidate_props.union(&iface_props).copied().collect();
+
+                    let absorbed: Vec<String> = removed
+                        .iter()
+                        .filter(|prop| all_candidate_props.contains(prop.as_str()))
+                        .cloned()
+                        .collect();
+
+                    if !absorbed.is_empty() {
+                        absorption_children
+                            .entry(parent.name.clone())
+                            .or_default()
+                            .insert(candidate.name.clone(), absorbed);
+                    }
+                }
+            }
+        }
+
+        // ── Signal 2: Cross-family extends mapping ───────────────────
+        //
+        // If Dropdown renders Menu (from Menu family), and DropdownList's
+        // props extend MenuListProps → DropdownList maps to MenuList.
+        let mut extends_map: HashMap<&str, &str> = HashMap::new();
+        for members in families.values() {
+            for sym in members {
+                let props_name = format!("{}Props", sym.name);
+                if let Some(ext_iface) = iface_extends.get(props_name.as_str()) {
+                    // Strip Omit<...> wrapper if present
+                    let ext_clean = ext_iface
+                        .strip_prefix("Omit<")
+                        .and_then(|s| s.split(',').next())
+                        .unwrap_or(ext_iface);
+                    if let Some(ext_component) = props_to_component.get(ext_clean) {
+                        // Only cross-family: the extended component should NOT be
+                        // in the same family.
+                        let ext_family = self.family_name_from_symbols(&[new_surface
+                            .symbols
+                            .iter()
+                            .find(|s| s.name.as_str() == *ext_component)
+                            .unwrap_or(sym)]);
+                        let own_family = self.family_name_from_symbols(&[sym]);
+                        if ext_family != own_family {
+                            extends_map.insert(&sym.name, ext_component);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Combine signals into hierarchy ───────────────────────────
+        let mut result: HashMap<String, HashMap<String, Vec<ExpectedChild>>> = HashMap::new();
+
+        for (family_name, members) in &families {
+            let member_names: HashSet<&str> = members.iter().map(|s| s.name.as_str()).collect();
+            let mut family_hierarchy: HashMap<String, Vec<ExpectedChild>> = HashMap::new();
+
+            // Signal 3: internal rendering (from TsSymbolData.rendered_components)
+            let mut renders_family: HashMap<&str, HashSet<&str>> = HashMap::new();
+            for sym in members {
+                let family_renders: HashSet<&str> = sym
+                    .language_data
+                    .rendered_components
+                    .iter()
+                    .filter(|r| {
+                        member_names.contains(r.as_str()) && r.as_str() != sym.name.as_str()
+                    })
+                    .map(|r| r.as_str())
+                    .collect();
+                if !family_renders.is_empty() {
+                    renders_family.insert(&sym.name, family_renders);
+                }
+            }
+
+            for parent in members.iter() {
+                let mut children: BTreeMap<&str, ExpectedChild> = BTreeMap::new();
+
+                // ── Signal 1: absorption ─────────────────────────────
+                if let Some(absorbed) = absorption_children.get(&parent.name) {
+                    for child_name in absorbed.keys() {
+                        if !member_names.contains(child_name.as_str()) {
+                            continue;
+                        }
+                        let parent_renders = renders_family.get(parent.name.as_str());
+                        let is_rendered = parent_renders
+                            .map(|r| r.contains(child_name.as_str()))
+                            .unwrap_or(false);
+
+                        let child = if is_rendered {
+                            ExpectedChild {
+                                name: child_name.clone(),
+                                required: false,
+                                mechanism: "prop".to_string(),
+                                prop_name: None,
+                            }
+                        } else {
+                            ExpectedChild::new(child_name, false)
+                        };
+                        children.insert(child_name.as_str(), child);
+                    }
+                }
+
+                // ── Signal 2: cross-family extends mapping ───────────
+                if let Some(ext_parent) = extends_map.get(parent.name.as_str()) {
+                    let renders_ext_parent = parent
+                        .language_data
+                        .rendered_components
+                        .iter()
+                        .any(|r| r.as_str() == *ext_parent);
+
+                    let ext_parent_sym = new_surface
+                        .symbols
+                        .iter()
+                        .find(|s| s.name.as_str() == *ext_parent);
+                    let ext_parent_is_container = ext_parent_sym
+                        .map(|ep| {
+                            let ep_family = self.family_name_from_symbols(&[ep]);
+                            ep.language_data.rendered_components.iter().any(|rc| {
+                                new_surface
+                                    .symbols
+                                    .iter()
+                                    .filter(|s| self.is_hierarchy_candidate(s))
+                                    .any(|s| {
+                                        s.name.as_str() == rc.as_str()
+                                            && self.family_name_from_symbols(&[s]) == ep_family
+                                    })
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    if renders_ext_parent && ext_parent_is_container {
+                        if let Some(ext_sym) = ext_parent_sym {
+                            for candidate in members.iter() {
+                                if candidate.name == parent.name {
+                                    continue;
+                                }
+                                if children.contains_key(candidate.name.as_str()) {
+                                    continue;
+                                }
+
+                                if let Some(ext_child) = extends_map.get(candidate.name.as_str()) {
+                                    let ext_renders_child = ext_sym
+                                        .language_data
+                                        .rendered_components
+                                        .contains(&ext_child.to_string());
+
+                                    if !ext_renders_child {
+                                        let ext_child_sym = new_surface
+                                            .symbols
+                                            .iter()
+                                            .find(|s| s.name.as_str() == *ext_child);
+                                        let ext_child_is_container = ext_child_sym
+                                            .map(|ec| {
+                                                let ec_family =
+                                                    self.family_name_from_symbols(&[ec]);
+                                                ec.language_data.rendered_components.iter().any(
+                                                    |rc| {
+                                                        new_surface
+                                                            .symbols
+                                                            .iter()
+                                                            .filter(|s| {
+                                                                self.is_hierarchy_candidate(s)
+                                                            })
+                                                            .any(|s| {
+                                                                s.name.as_str() == rc.as_str()
+                                                                    && self
+                                                                        .family_name_from_symbols(
+                                                                            &[s],
+                                                                        )
+                                                                        == ec_family
+                                                            })
+                                                    },
+                                                )
+                                            })
+                                            .unwrap_or(false);
+
+                                        if !ext_child_is_container {
+                                            children.insert(
+                                                &candidate.name,
+                                                ExpectedChild::new(&candidate.name, false),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !children.is_empty() {
+                    family_hierarchy.insert(parent.name.clone(), children.into_values().collect());
+                }
+            }
+
+            if !family_hierarchy.is_empty() {
+                result.insert(family_name.clone(), family_hierarchy);
+            }
+        }
+
+        result
     }
 
     fn related_family_content(
@@ -1044,7 +1429,7 @@ mod tests {
     fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
         let mut s = Symbol::new(
             name,
-            &format!("{}.{}", file, name),
+            format!("{}.{}", file, name),
             SymbolKind::Interface,
             Visibility::Exported,
             file,
@@ -1053,7 +1438,7 @@ mod tests {
         for &member_name in members {
             s.members.push(Symbol::new(
                 member_name,
-                &format!("{}.{}.{}", file, name, member_name),
+                format!("{}.{}.{}", file, name, member_name),
                 SymbolKind::Property,
                 Visibility::Public,
                 file,
@@ -1492,6 +1877,340 @@ mod tests {
                 "pkg/dist/esm/next/components/Foo/Foo.Foo"
             ),
             Some("moved to next")
+        );
+    }
+
+    // ── Deterministic hierarchy tests ───────────────────────────────
+
+    fn make_component(name: &str, family: &str, rendered: Vec<&str>) -> Symbol {
+        let mut sym = Symbol::new(
+            name,
+            format!("src/components/{}/{}.{}", family, name, name),
+            SymbolKind::Variable,
+            Visibility::Exported,
+            format!("src/components/{}/{}.d.ts", family, name),
+            1,
+        );
+        sym.language_data.rendered_components = rendered.into_iter().map(String::from).collect();
+        sym
+    }
+
+    fn make_props_interface(
+        name: &str,
+        family: &str,
+        extends: Option<&str>,
+        members: &[&str],
+    ) -> Symbol {
+        let mut s = Symbol::new(
+            name,
+            format!("src/components/{}/{}.{}", family, name, name),
+            SymbolKind::Interface,
+            Visibility::Exported,
+            format!("src/components/{}/{}.d.ts", family, name),
+            1,
+        );
+        s.extends = extends.map(|e| e.to_string());
+        for &member_name in members {
+            s.members.push(Symbol::new(
+                member_name,
+                format!("{}.{}", name, member_name),
+                SymbolKind::Variable,
+                Visibility::Exported,
+                format!("src/components/{}/{}.d.ts", family, name),
+                1,
+            ));
+        }
+        s
+    }
+
+    fn removed_member(parent: &str, member: &str) -> StructuralChange {
+        use semver_analyzer_core::ChangeSubject;
+        StructuralChange {
+            symbol: format!("{}.{}", parent, member),
+            qualified_name: format!("src/components/X/{}.{}", parent, member),
+            kind: SymbolKind::Interface,
+            package: None,
+            change_type: StructuralChangeType::Removed(ChangeSubject::Member {
+                name: member.to_string(),
+                kind: SymbolKind::Variable,
+            }),
+            before: None,
+            after: None,
+            description: format!("property `{}` was removed", member),
+            is_breaking: true,
+            impact: None,
+            migration_target: None,
+        }
+    }
+
+    fn child_names(
+        result: &std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<ExpectedChild>>,
+        >,
+        family: &str,
+        component: &str,
+    ) -> Vec<String> {
+        result
+            .get(family)
+            .and_then(|f| f.get(component))
+            .map(|children| children.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn child_mechanism(
+        result: &std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<ExpectedChild>>,
+        >,
+        family: &str,
+        parent: &str,
+        child: &str,
+    ) -> Option<String> {
+        result
+            .get(family)
+            .and_then(|f| f.get(parent))
+            .and_then(|children| children.iter().find(|c| c.name == child))
+            .map(|c| c.mechanism.clone())
+    }
+
+    #[test]
+    fn hierarchy_all_leaves_empty() {
+        let ts = TypeScript::default();
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Masthead", "Masthead", vec![]),
+                make_component("MastheadBrand", "Masthead", vec![]),
+                make_component("MastheadContent", "Masthead", vec![]),
+                make_component("MastheadLogo", "Masthead", vec![]),
+                make_component("MastheadMain", "Masthead", vec![]),
+                make_component("MastheadToggle", "Masthead", vec![]),
+            ],
+        };
+        let result = ts.compute_deterministic_hierarchy(&surface, &[]);
+        assert!(
+            !result.contains_key("Masthead"),
+            "All leaves → no hierarchy entry"
+        );
+    }
+
+    #[test]
+    fn hierarchy_no_signals_empty() {
+        let ts = TypeScript::default();
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Modal", "Modal", vec![]),
+                make_component("ModalHeader", "Modal", vec![]),
+            ],
+        };
+        let result = ts.compute_deterministic_hierarchy(&surface, &[]);
+        assert!(result.is_empty(), "No signals → empty hierarchy");
+    }
+
+    #[test]
+    fn hierarchy_interfaces_excluded() {
+        let ts = TypeScript::default();
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Modal", "Modal", vec![]),
+                make_component("ModalBody", "Modal", vec![]),
+                make_props_interface("ModalProps", "Modal", None, &["children"]),
+            ],
+        };
+        let changes = vec![removed_member("ModalProps", "title")];
+        let result = ts.compute_deterministic_hierarchy(&surface, &changes);
+
+        for family in result.values() {
+            for children in family.values() {
+                for child in children {
+                    assert_ne!(
+                        child.name, "ModalProps",
+                        "Interfaces should not be hierarchy candidates"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Signal 1: Prop absorption ────────────────────────────────
+
+    #[test]
+    fn hierarchy_signal1_prop_absorption() {
+        let ts = TypeScript::default();
+        // Parent had "header" prop removed, child ModalHeader has "header" member
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Modal", "Modal", vec![]),
+                make_component("ModalHeader", "Modal", vec![]),
+                make_props_interface("ModalProps", "Modal", None, &["children"]),
+                make_props_interface("ModalHeaderProps", "Modal", None, &["header", "title"]),
+            ],
+        };
+        let changes = vec![
+            removed_member("ModalProps", "header"),
+            removed_member("ModalProps", "title"),
+        ];
+        let result = ts.compute_deterministic_hierarchy(&surface, &changes);
+        let children = child_names(&result, "Modal", "Modal");
+        assert!(
+            children.contains(&"ModalHeader".to_string()),
+            "ModalHeader absorbed removed props from Modal"
+        );
+    }
+
+    #[test]
+    fn hierarchy_signal1_internally_rendered_is_prop_passed() {
+        let ts = TypeScript::default();
+        // Modal renders ModalHeader internally → mechanism should be "prop"
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Modal", "Modal", vec!["ModalHeader"]),
+                make_component("ModalHeader", "Modal", vec![]),
+                make_props_interface("ModalProps", "Modal", None, &["children"]),
+                make_props_interface("ModalHeaderProps", "Modal", None, &["header"]),
+            ],
+        };
+        let changes = vec![removed_member("ModalProps", "header")];
+        let result = ts.compute_deterministic_hierarchy(&surface, &changes);
+        assert_eq!(
+            child_mechanism(&result, "Modal", "Modal", "ModalHeader"),
+            Some("prop".to_string()),
+            "Internally rendered child uses prop mechanism"
+        );
+    }
+
+    #[test]
+    fn hierarchy_signal1_not_rendered_is_child() {
+        let ts = TypeScript::default();
+        // Modal does NOT render ModalBody → mechanism should be "child"
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Modal", "Modal", vec![]),
+                make_component("ModalBody", "Modal", vec![]),
+                make_props_interface("ModalProps", "Modal", None, &["children"]),
+                make_props_interface("ModalBodyProps", "Modal", None, &["bodyContent"]),
+            ],
+        };
+        let changes = vec![removed_member("ModalProps", "bodyContent")];
+        let result = ts.compute_deterministic_hierarchy(&surface, &changes);
+        assert_eq!(
+            child_mechanism(&result, "Modal", "Modal", "ModalBody"),
+            Some("child".to_string()),
+            "Non-rendered child uses child mechanism"
+        );
+    }
+
+    // ── Signal 2: Cross-family extends ──────────────────────────
+
+    #[test]
+    fn hierarchy_signal2_cross_family_extends() {
+        let ts = TypeScript::default();
+        // Dropdown renders Menu (cross-family). DropdownList extends MenuListProps.
+        // Menu is a container (renders MenuItem) but does NOT render MenuList
+        // internally — MenuList is a consumer-placed child. So DropdownList
+        // should also be a consumer-placed child of Dropdown.
+        let surface = ApiSurface {
+            symbols: vec![
+                // Menu family: Menu renders MenuItem (making it a container),
+                // but NOT MenuList (consumer places MenuList)
+                make_component("Menu", "Menu", vec!["MenuItem"]),
+                make_component("MenuList", "Menu", vec![]),
+                make_component("MenuItem", "Menu", vec![]),
+                make_props_interface("MenuProps", "Menu", None, &["children"]),
+                make_props_interface("MenuListProps", "Menu", None, &["items"]),
+                make_props_interface("MenuItemProps", "Menu", None, &["label"]),
+                // Dropdown family
+                make_component("Dropdown", "Dropdown", vec!["Menu"]),
+                make_component("DropdownList", "Dropdown", vec![]),
+                make_props_interface(
+                    "DropdownProps",
+                    "Dropdown",
+                    Some("MenuProps"),
+                    &["children"],
+                ),
+                make_props_interface(
+                    "DropdownListProps",
+                    "Dropdown",
+                    Some("MenuListProps"),
+                    &["items"],
+                ),
+            ],
+        };
+        let result = ts.compute_deterministic_hierarchy(&surface, &[]);
+        let children = child_names(&result, "Dropdown", "Dropdown");
+        assert!(
+            children.contains(&"DropdownList".to_string()),
+            "Cross-family extends: DropdownList should be child of Dropdown"
+        );
+    }
+
+    #[test]
+    fn hierarchy_signal2_leaf_wrapper_no_false_children() {
+        let ts = TypeScript::default();
+        // DropdownList extends MenuListProps but does NOT render Menu.
+        // DropdownItem extends MenuItemProps.
+        // DropdownList should NOT claim DropdownItem as its child
+        // (only the root Dropdown that renders Menu should map children).
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Menu", "Menu", vec!["MenuList", "MenuItem"]),
+                make_component("MenuList", "Menu", vec![]),
+                make_component("MenuItem", "Menu", vec![]),
+                make_props_interface("MenuProps", "Menu", None, &["children"]),
+                make_props_interface("MenuListProps", "Menu", None, &["items"]),
+                make_props_interface("MenuItemProps", "Menu", None, &["label"]),
+                make_component("Dropdown", "Dropdown", vec!["Menu"]),
+                make_component("DropdownList", "Dropdown", vec!["MenuList"]),
+                make_component("DropdownItem", "Dropdown", vec![]),
+                make_props_interface(
+                    "DropdownProps",
+                    "Dropdown",
+                    Some("MenuProps"),
+                    &["children"],
+                ),
+                make_props_interface(
+                    "DropdownListProps",
+                    "Dropdown",
+                    Some("MenuListProps"),
+                    &["items"],
+                ),
+                make_props_interface(
+                    "DropdownItemProps",
+                    "Dropdown",
+                    Some("MenuItemProps"),
+                    &["label"],
+                ),
+            ],
+        };
+        let result = ts.compute_deterministic_hierarchy(&surface, &[]);
+        // DropdownList is a leaf wrapper — it should NOT have children
+        let dl_children = child_names(&result, "Dropdown", "DropdownList");
+        assert!(
+            dl_children.is_empty(),
+            "Leaf wrapper DropdownList should not have children"
+        );
+    }
+
+    // ── Signal 3: Internal rendering ────────────────────────────
+
+    #[test]
+    fn hierarchy_signal3_internal_render_with_absorption() {
+        let ts = TypeScript::default();
+        // Alert renders AlertIcon internally. AlertIcon absorbed "icon" prop.
+        let surface = ApiSurface {
+            symbols: vec![
+                make_component("Alert", "Alert", vec!["AlertIcon"]),
+                make_component("AlertIcon", "Alert", vec![]),
+                make_props_interface("AlertProps", "Alert", None, &["children"]),
+                make_props_interface("AlertIconProps", "Alert", None, &["icon"]),
+            ],
+        };
+        let changes = vec![removed_member("AlertProps", "icon")];
+        let result = ts.compute_deterministic_hierarchy(&surface, &changes);
+        assert_eq!(
+            child_mechanism(&result, "Alert", "Alert", "AlertIcon"),
+            Some("prop".to_string()),
+            "Internally rendered child with absorption → prop mechanism"
         );
     }
 }
