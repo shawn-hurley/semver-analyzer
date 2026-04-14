@@ -196,8 +196,8 @@ pub struct FileBehavioralChange {
     pub symbol: String,
     #[serde(default = "default_kind")]
     pub kind: String,
-    /// Sub-category: dom_structure, css_class, css_variable, accessibility,
-    /// default_value, logic_change, data_attribute, render_output.
+    /// Sub-category of the behavioral change (language-specific, injected
+    /// via `LlmCategoryDefinition` in the prompt).
     #[serde(default)]
     pub category: Option<String>,
     pub description: String,
@@ -221,9 +221,6 @@ pub struct FileApiChange {
     /// Why a removed prop was removed and where its functionality went.
     #[serde(default)]
     pub removal_disposition: Option<RemovalDisposition>,
-    /// HTML element the component renders (e.g., "ol", "div").
-    #[serde(default)]
-    pub renders_element: Option<String>,
 }
 
 fn default_change() -> String {
@@ -343,60 +340,6 @@ fn truncate(s: &str, max_len: usize) -> &str {
     } else {
         &s[..max_len]
     }
-}
-
-// ── Composition pattern response parsing ──────────────────────────────
-
-/// Response from composition pattern analysis of test/example diffs.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CompositionPatternResponse {
-    #[serde(default)]
-    pub composition_changes: Vec<LlmCompositionChange>,
-}
-
-/// A single composition pattern change from the LLM.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LlmCompositionChange {
-    pub component: String,
-    pub old_parent: Option<String>,
-    pub new_parent: Option<String>,
-    #[serde(default)]
-    pub description: String,
-}
-
-/// Parse the LLM response for composition pattern analysis (standalone call).
-pub fn parse_composition_pattern_response(response: &str) -> Result<Vec<LlmCompositionChange>> {
-    let json_str =
-        extract_json(response).with_context(|| "No JSON found in composition pattern response")?;
-    let parsed: CompositionPatternResponse =
-        serde_json::from_str(&json_str).with_context(|| {
-            format!(
-                "Failed to parse composition pattern response: {}",
-                truncate(&json_str, 200)
-            )
-        })?;
-    Ok(parsed.composition_changes)
-}
-
-/// Extract composition_pattern_changes from a file behavioral response.
-///
-/// This is a best-effort extraction -- the field may not be present if the
-/// LLM didn't include it (backward compat with older models).
-pub fn parse_composition_from_file_response(response: &str) -> Result<Vec<LlmCompositionChange>> {
-    let json_str = match extract_json(response) {
-        Some(s) => s,
-        None => return Ok(vec![]),
-    };
-    // Try parsing the full response structure with composition field
-    #[derive(Deserialize)]
-    struct WithComposition {
-        #[serde(default)]
-        composition_pattern_changes: Vec<LlmCompositionChange>,
-    }
-    let parsed: WithComposition = serde_json::from_str(&json_str).unwrap_or(WithComposition {
-        composition_pattern_changes: vec![],
-    });
-    Ok(parsed.composition_pattern_changes)
 }
 
 // ── Rename inference response parsing ─────────────────────────────────
@@ -927,44 +870,6 @@ The function validates email addresses."#;
 ```"#;
         let (beh, _api) = parse_file_behavioral_response(response).unwrap();
         assert!(beh[0].is_internal_only.is_none());
-    }
-
-    #[test]
-    fn parse_renders_element() {
-        let response = r#"```json
-{
-  "breaking_behavioral_changes": [],
-  "breaking_api_changes": [
-    {
-      "symbol": "TextList",
-      "change": "removed",
-      "description": "TextList removed, use Content instead",
-      "renders_element": "ol"
-    }
-  ]
-}
-```"#;
-        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
-        assert_eq!(api[0].renders_element.as_deref(), Some("ol"));
-    }
-
-    #[test]
-    fn parse_renders_element_null_is_none() {
-        let response = r#"```json
-{
-  "breaking_behavioral_changes": [],
-  "breaking_api_changes": [
-    {
-      "symbol": "ModalProps.title",
-      "change": "removed",
-      "description": "title removed",
-      "renders_element": null
-    }
-  ]
-}
-```"#;
-        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
-        assert!(api[0].renders_element.is_none());
     }
 
     #[test]

@@ -236,6 +236,20 @@ impl LanguageSemantics<TsSymbolData> for TypeScript {
         Some(self)
     }
 
+    fn primitive_type_names(&self) -> &[&str] {
+        &[
+            "string",
+            "number",
+            "boolean",
+            "void",
+            "null",
+            "undefined",
+            "never",
+            "any",
+            "unknown",
+        ]
+    }
+
     fn is_async_wrapper(&self, type_str: &str) -> bool {
         type_str.starts_with("Promise<")
     }
@@ -396,6 +410,7 @@ impl Language for TypeScript {
     }
 
     fn build_report(
+        &self,
         results: &AnalysisResult<Self>,
         repo: &Path,
         from_ref: &str,
@@ -566,7 +581,7 @@ impl Language for TypeScript {
         &self,
         params: &ExtendedAnalysisParams,
     ) -> Result<TsAnalysisExtensions> {
-        let css_profiles = params.dep_css_dir.as_deref().and_then(|dir| {
+        let css_profiles = params.dep_dir.as_deref().and_then(|dir| {
             crate::css_profile::extract_css_profiles_from_dir(dir)
                 .map_err(|e| {
                     tracing::warn!(%e, "failed to extract CSS profiles from dependency");
@@ -583,7 +598,7 @@ impl Language for TypeScript {
         )?;
 
         // Wire orchestrator-computed data into the SD result
-        sd_result.removed_css_blocks = params.removed_css_blocks.clone();
+        sd_result.removed_css_blocks = params.removed_dep_components.clone();
         sd_result.dep_repo_packages = params.dep_repo_packages.clone();
 
         Ok(TsAnalysisExtensions {

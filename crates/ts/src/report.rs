@@ -14,11 +14,11 @@ use semver_analyzer_core::ApiSurface as CoreApiSurface;
 use semver_analyzer_core::Symbol as CoreSymbol;
 use semver_analyzer_core::{
     AddedExport, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
-    ApiChangeType, BehavioralChange, ChangeSubject, Comparison, ComponentStatus, ConstantGroup,
-    ExpectedChild, FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange,
-    ManifestChange, MemberSummary, MigratedMember, MigrationTarget, PackageChanges,
-    RemovalDisposition, RemovedMember, StructuralChange, StructuralChangeType, SuffixRename,
-    Summary, SymbolKind, TypeChange, TypeSummary,
+    ApiChangeType, BehavioralChange, ChangeSubject, Comparison, ConstantGroup, ExpectedChild,
+    FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange, ManifestChange,
+    MemberSummary, MigratedMember, MigrationTarget, PackageChanges, RemovalDisposition,
+    RemovedMember, StructuralChange, StructuralChangeType, SuffixRename, Summary, SymbolKind,
+    TypeChange, TypeStatus, TypeSummary,
 };
 
 use crate::language::{ChildComponent, ChildComponentStatus, TsReportData};
@@ -181,18 +181,14 @@ fn build_report_inner(
             description: entry.description.clone(),
             migration_target: None,
             removal_disposition,
-            renders_element: entry.renders_element.clone(),
         };
         // Only add if not already present (avoid duplicating TD findings).
         // If the symbol already exists from TD, enrich it with LLM data
-        // (removal_disposition, renders_element) that TD doesn't produce.
+        // (removal_disposition) that TD doesn't produce.
         let existing = file_api_map.entry(file).or_default();
         if let Some(td_entry) = existing.iter_mut().find(|c| c.symbol == api_change.symbol) {
             if td_entry.removal_disposition.is_none() && api_change.removal_disposition.is_some() {
                 td_entry.removal_disposition = api_change.removal_disposition;
-            }
-            if td_entry.renders_element.is_none() && api_change.renders_element.is_some() {
-                td_entry.renders_element = api_change.renders_element;
             }
         } else {
             existing.push(api_change);
@@ -430,7 +426,6 @@ fn build_report_inner(
                                         ),
                                         migration_target: None,
                                         removal_disposition: None,
-                                        renders_element: None,
                                     },
                                 ));
                             }
@@ -765,14 +760,14 @@ fn build_package_summaries(
                     )
             });
             if component_still_exists {
-                ComponentStatus::Modified
+                TypeStatus::Modified
             } else {
-                ComponentStatus::Removed
+                TypeStatus::Removed
             }
         } else if removal_ratio > 0.5 && removed >= 3 {
-            ComponentStatus::Removed
+            TypeStatus::Removed
         } else {
-            ComponentStatus::Modified
+            TypeStatus::Modified
         };
 
         let migration_target = self_change
@@ -1434,7 +1429,7 @@ fn enrich_hierarchy_deltas(
                     report.packages[idx].type_summaries.push(TypeSummary {
                         name: comp_name.clone(),
                         definition_name: format!("{}Props", comp_name),
-                        status: ComponentStatus::Modified,
+                        status: TypeStatus::Modified,
                         member_summary: MemberSummary::default(),
                         removed_members: vec![],
                         type_changes: vec![],
@@ -2171,7 +2166,6 @@ fn structural_to_api_change(sc: &StructuralChange) -> ApiChange {
         description: sc.description.clone(),
         migration_target: sc.migration_target.clone(),
         removal_disposition: None,
-        renders_element: None,
     }
 }
 
@@ -2481,7 +2475,7 @@ mod tests {
         assert!(foo_comp.is_some(), "Foo should appear in the report");
         assert_eq!(
             foo_comp.unwrap().status,
-            ComponentStatus::Removed,
+            TypeStatus::Removed,
             "Foo should be marked Removed when component doesn't exist in new surface"
         );
     }
@@ -2593,7 +2587,7 @@ mod tests {
         if let Some(comp) = icon_comp {
             assert_ne!(
                 comp.status,
-                ComponentStatus::Removed,
+                TypeStatus::Removed,
                 "Icon should NOT be marked Removed when the component still exists in new surface. Status: {:?}",
                 comp.status
             );
@@ -3139,7 +3133,7 @@ mod tests {
             vec![TypeSummary {
                 name: "Dropdown".to_string(),
                 definition_name: "DropdownProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 18,
                     removed: 0,
@@ -3201,7 +3195,6 @@ mod tests {
                         description: "removed".to_string(),
                         migration_target: None,
                         removal_disposition: None,
-                        renders_element: None,
                     },
                     ApiChange {
                         symbol: "KebabToggle".to_string(),
@@ -3213,7 +3206,6 @@ mod tests {
                         description: "removed".to_string(),
                         migration_target: None,
                         removal_disposition: None,
-                        renders_element: None,
                     },
                 ],
                 breaking_behavioral_changes: vec![],
@@ -3271,7 +3263,7 @@ mod tests {
             vec![TypeSummary {
                 name: "ApplicationLauncher".to_string(),
                 definition_name: "ApplicationLauncherProps".to_string(),
-                status: ComponentStatus::Removed,
+                status: TypeStatus::Removed,
                 member_summary: MemberSummary::default(),
                 removed_members: vec![],
                 type_changes: vec![],
@@ -3310,7 +3302,7 @@ mod tests {
             vec![TypeSummary {
                 name: "Dropdown".to_string(),
                 definition_name: "DropdownProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary::default(),
                 removed_members: vec![],
                 type_changes: vec![],
@@ -3445,7 +3437,7 @@ mod tests {
             vec![TypeSummary {
                 name: "FormGroup".to_string(),
                 definition_name: "FormGroupProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary::default(),
                 removed_members: vec![],
                 type_changes: vec![],
@@ -3591,7 +3583,7 @@ mod tests {
             vec![TypeSummary {
                 name: "FormGroup".to_string(),
                 definition_name: "FormGroupProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary::default(),
                 removed_members: vec![],
                 type_changes: vec![],
@@ -3775,7 +3767,7 @@ mod tests {
             vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary::default(),
                 removed_members: vec![],
                 type_changes: vec![],
@@ -3871,7 +3863,7 @@ mod tests {
             vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 28,
                     removed: 11,

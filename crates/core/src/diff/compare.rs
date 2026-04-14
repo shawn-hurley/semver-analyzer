@@ -687,7 +687,12 @@ pub(super) fn diff_members<M, S>(
     // Member-level renames are within the same parent interface, so
     // cross-family distinction is not meaningful — always same-family.
     let renames = if old.kind != SymbolKind::Enum {
-        detect_renames(&removed, &added, |_, _| true)
+        detect_renames(
+            &removed,
+            &added,
+            |_, _| true,
+            semantics.primitive_type_names(),
+        )
     } else {
         Vec::new()
     };
@@ -712,7 +717,9 @@ pub(super) fn diff_members<M, S>(
             .as_ref()
             .and_then(|s| s.return_type.as_deref());
         let types_match = match (old_rt, new_rt) {
-            (Some(o), Some(n)) => types_structurally_similar(o, n),
+            (Some(o), Some(n)) => {
+                types_structurally_similar(o, n, semantics.primitive_type_names())
+            }
             _ => true,
         };
         if types_match {
@@ -1013,14 +1020,19 @@ fn diff_enum_member_value<M: Default + Clone + PartialEq>(
 /// (object vs array, type-reference vs primitive) while treating types with
 /// the same shape but different values/members as similar.
 ///
+/// Check if two type strings have the same structural shape, using the
+/// provided list of primitive type names for classification.
+///
+/// The `primitives` slice comes from `LanguageSemantics::primitive_type_names()`.
+///
 /// Examples:
-///   - `SplitButtonOptions` vs `ReactNode[]` → false (reference vs array)
-///   - `{ default?: 'spacerNone' | ... }` vs `{ default?: 'gapNone' | ... }` → true (both objects)
-///   - `boolean` vs `string` → true (both primitives — rename is valid)
-///   - `(e: Event) => void` vs `string` → false (function vs primitive)
-pub(crate) fn types_structurally_similar(old: &str, new: &str) -> bool {
-    let old_cat = type_category(old);
-    let new_cat = type_category(new);
+/// - `SplitButtonOptions` vs `ReactNode[]` → false (reference vs array)
+/// - `{ default?: 'spacerNone' | ... }` vs `{ default?: 'gapNone' | ... }` → true (both objects)
+/// - `boolean` vs `string` → true (both primitives — rename is valid)
+/// - `(e: Event) => void` vs `string` → false (function vs primitive)
+pub(crate) fn types_structurally_similar(old: &str, new: &str, primitives: &[&str]) -> bool {
+    let old_cat = type_category(old, primitives);
+    let new_cat = type_category(new, primitives);
     old_cat == new_cat
 }
 
@@ -1034,7 +1046,7 @@ enum TypeCategory {
     Reference,
 }
 
-fn type_category(t: &str) -> TypeCategory {
+fn type_category(t: &str, primitives: &[&str]) -> TypeCategory {
     let trimmed = t.trim();
 
     // Array: ends with [] or is Array<...>
@@ -1057,20 +1069,9 @@ fn type_category(t: &str) -> TypeCategory {
         return TypeCategory::Tuple;
     }
 
-    // Primitive: known primitive types
+    // Primitive: check against the language-provided list
     let lower = trimmed.to_lowercase();
-    if matches!(
-        lower.as_str(),
-        "string"
-            | "number"
-            | "boolean"
-            | "void"
-            | "null"
-            | "undefined"
-            | "never"
-            | "any"
-            | "unknown"
-    ) {
+    if primitives.iter().any(|p| p.to_lowercase() == lower) {
         return TypeCategory::Primitive;
     }
 

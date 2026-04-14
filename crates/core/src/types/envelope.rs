@@ -260,6 +260,7 @@ mod tests {
             false
         }
         fn build_report(
+            &self,
             _results: &crate::types::AnalysisResult<Self>,
             _repo: &Path,
             _from_ref: &str,

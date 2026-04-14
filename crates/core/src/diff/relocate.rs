@@ -14,6 +14,7 @@ use crate::types::{Symbol, SymbolKind};
 use std::collections::HashMap;
 
 /// A detected symbol relocation: same name+kind but different file path.
+#[derive(Debug)]
 pub(super) struct RelocationMatch<'a, M: Default + Clone + PartialEq = ()> {
     pub old: &'a Symbol<M>,
     pub new: &'a Symbol<M>,

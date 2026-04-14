@@ -23,8 +23,8 @@ mod spec_compare;
 
 use anyhow::Result;
 pub use invoke::{
-    FileApiChange, FileBehavioralChange, LlmCompositionChange, LlmConstantRenamePattern,
-    LlmInterfaceRenameMapping, LlmSuffixRename,
+    FileApiChange, FileBehavioralChange, LlmConstantRenamePattern, LlmInterfaceRenameMapping,
+    LlmSuffixRename,
 };
 use semver_analyzer_core::{
     BehaviorAnalyzer, BreakingVerdict, ChangedFunction, FunctionSpec, LlmCategoryDefinition,
@@ -92,7 +92,7 @@ impl LlmBehaviorAnalyzer {
     /// categories for the LLM prompt. Pass `&lang.llm_categories()` from the
     /// `Language` trait implementation.
     ///
-    /// Returns (behavioral_changes, api_changes, composition_changes).
+    /// Returns (behavioral_changes, api_changes).
     pub fn analyze_file_diff(
         &self,
         file_path: &str,
@@ -100,11 +100,7 @@ impl LlmBehaviorAnalyzer {
         changed_functions: &[ChangedFunction],
         test_diff: Option<&str>,
         categories: &[LlmCategoryDefinition],
-    ) -> Result<(
-        Vec<FileBehavioralChange>,
-        Vec<FileApiChange>,
-        Vec<invoke::LlmCompositionChange>,
-    )> {
+    ) -> Result<(Vec<FileBehavioralChange>, Vec<FileApiChange>)> {
         let prompt = prompts::build_file_behavioral_prompt(
             file_path,
             diff_content,
@@ -113,20 +109,7 @@ impl LlmBehaviorAnalyzer {
             categories,
         );
         let response = self.run_llm(&prompt)?;
-        let (beh, api) = invoke::parse_file_behavioral_response(&response)?;
-        let comp = invoke::parse_composition_from_file_response(&response).unwrap_or_default();
-        Ok((beh, api, comp))
-    }
-
-    /// Analyze a test/example file diff for composition pattern changes.
-    pub fn analyze_composition_patterns(
-        &self,
-        file_path: &str,
-        diff_content: &str,
-    ) -> Result<Vec<LlmCompositionChange>> {
-        let prompt = prompts::build_composition_pattern_prompt(file_path, diff_content);
-        let response = self.run_llm(&prompt)?;
-        invoke::parse_composition_pattern_response(&response)
+        invoke::parse_file_behavioral_response(&response)
     }
 
     /// Infer constant rename patterns from sampled removed/added constant names.
@@ -149,37 +132,29 @@ impl LlmBehaviorAnalyzer {
         invoke::parse_constant_rename_response(&response)
     }
 
-    /// Infer the component hierarchy for a single component family.
+    /// Run a pre-built prompt and parse the response as a component hierarchy.
     ///
-    /// Takes the concatenated source files of a component directory and returns
-    /// the expected parent-child composition structure.
-    pub fn infer_component_hierarchy(
+    /// The prompt text is language-specific and should be provided by the
+    /// `Language` implementation. The LLM crate only handles execution and
+    /// JSON parsing of the response.
+    pub fn infer_hierarchy_from_prompt(
         &self,
-        family_name: &str,
-        files_content: &str,
-        related_components: Option<&str>,
+        prompt: &str,
     ) -> Result<std::collections::HashMap<String, Vec<semver_analyzer_core::ExpectedChild>>> {
-        let prompt = prompts::build_hierarchy_inference_prompt(
-            family_name,
-            files_content,
-            related_components,
-        );
-        let response = self.run_llm(&prompt)?;
+        let response = self.run_llm(prompt)?;
         invoke::parse_hierarchy_response(&response)
     }
 
-    /// Infer CSS property suffix renames from removed/added suffix inventories.
+    /// Run a pre-built prompt and parse the response as suffix rename pairs.
     ///
-    /// Given two sets of suffixes extracted from compound token member key
-    /// diffs, asks the LLM to identify CSS physical→logical property renames
-    /// (e.g., PaddingTop → PaddingBlockStart).
-    pub fn infer_suffix_renames(
+    /// The prompt text is language-specific (e.g., CSS logical property
+    /// renames for TypeScript). The LLM crate only handles execution and
+    /// JSON parsing of the response.
+    pub fn infer_suffix_renames_from_prompt(
         &self,
-        removed_suffixes: &[&str],
-        added_suffixes: &[&str],
+        prompt: &str,
     ) -> Result<Vec<invoke::LlmSuffixRename>> {
-        let prompt = prompts::build_suffix_rename_prompt(removed_suffixes, added_suffixes);
-        let response = self.run_llm(&prompt)?;
+        let response = self.run_llm(prompt)?;
         invoke::parse_suffix_rename_response(&response)
     }
 

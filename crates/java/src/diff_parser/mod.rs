@@ -5,6 +5,7 @@
 //! to parse method/constructor declarations from both versions.
 
 use anyhow::{Context, Result};
+use semver_analyzer_core::git::read_git_file;
 use semver_analyzer_core::{ChangedFunction, SymbolKind, Visibility};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,14 +39,14 @@ impl JavaDiffParser {
         for (status, old_path, new_path) in &changed_files {
             match status.as_str() {
                 "M" => {
-                    let old_content = git_show(repo, from_ref, old_path)?;
-                    let new_content = git_show(repo, to_ref, new_path)?;
+                    let old_content = read_git_file(repo, from_ref, old_path).unwrap_or_default();
+                    let new_content = read_git_file(repo, to_ref, new_path).unwrap_or_default();
                     let mut file_changes =
                         diff_functions_in_file(&mut parser, &old_content, &new_content, new_path)?;
                     changed_functions.append(&mut file_changes);
                 }
                 "A" => {
-                    let new_content = git_show(repo, to_ref, new_path)?;
+                    let new_content = read_git_file(repo, to_ref, new_path).unwrap_or_default();
                     let funcs = extract_functions(&mut parser, &new_content, new_path)?;
                     for func in funcs {
                         changed_functions.push(ChangedFunction {
@@ -63,7 +64,7 @@ impl JavaDiffParser {
                     }
                 }
                 "D" => {
-                    let old_content = git_show(repo, from_ref, old_path)?;
+                    let old_content = read_git_file(repo, from_ref, old_path).unwrap_or_default();
                     let funcs = extract_functions(&mut parser, &old_content, old_path)?;
                     for func in funcs {
                         changed_functions.push(ChangedFunction {
@@ -81,8 +82,8 @@ impl JavaDiffParser {
                     }
                 }
                 _ if status.starts_with('R') => {
-                    let old_content = git_show(repo, from_ref, old_path)?;
-                    let new_content = git_show(repo, to_ref, new_path)?;
+                    let old_content = read_git_file(repo, from_ref, old_path).unwrap_or_default();
+                    let new_content = read_git_file(repo, to_ref, new_path).unwrap_or_default();
                     let mut file_changes =
                         diff_functions_in_file(&mut parser, &old_content, &new_content, new_path)?;
                     changed_functions.append(&mut file_changes);
@@ -155,20 +156,6 @@ fn is_java_source(path: &str) -> bool {
         && !path.ends_with("IT.java")
         && !path.contains("module-info.java")
         && !path.contains("package-info.java")
-}
-
-fn git_show(repo: &Path, git_ref: &str, file_path: &str) -> Result<String> {
-    let output = Command::new("git")
-        .args(["show", &format!("{}:{}", git_ref, file_path)])
-        .current_dir(repo)
-        .output()
-        .context("Failed to run git show")?;
-
-    if !output.status.success() {
-        return Ok(String::new());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 // ── Function extraction ─────────────────────────────────────────────────

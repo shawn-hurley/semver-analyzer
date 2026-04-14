@@ -19,6 +19,17 @@
 use crate::types::{MemberMapping, MigrationTarget, Symbol, SymbolKind};
 use std::collections::{HashMap, HashSet};
 
+/// Best candidate match during migration detection.
+///
+/// Used internally to track the highest-overlap candidate while iterating
+/// through potential migration targets.
+struct MigrationCandidate<'a, M: Default + Clone + PartialEq> {
+    target: &'a Symbol<M>,
+    overlap_ratio: f64,
+    matching_members: Vec<MemberMapping>,
+    removed_only: Vec<String>,
+}
+
 /// Minimum overlap ratio to consider a migration suggestion.
 /// Set at 0.25 (25%) to catch cases like Select where only 11/86 old props
 /// match, but 11/28 (39%) of the new interface matches.
@@ -44,6 +55,7 @@ fn min_overlap_count(member_count: usize) -> usize {
 
 /// A detected migration relationship between a removed symbol and a candidate
 /// replacement in the same component directory.
+#[derive(Debug)]
 pub(super) struct MigrationMatch<'a, M: Default + Clone + PartialEq = ()> {
     /// The removed symbol (interface/class).
     pub removed: &'a Symbol<M>,
@@ -157,8 +169,7 @@ where
             }
         }
 
-        #[allow(clippy::type_complexity)]
-        let mut best_match: Option<(&Symbol<M>, f64, Vec<MemberMapping>, Vec<String>)> = None;
+        let mut best_match: Option<MigrationCandidate<M>> = None;
 
         for candidate in candidates {
             // Skip if it's the exact same symbol instance (same qualified_name).
@@ -281,6 +292,7 @@ where
                         &unmatched_removed,
                         &unmatched_added,
                         |_, _| true,
+                        semantics.primitive_type_names(),
                     );
 
                     for prm in &prop_renames {
@@ -303,7 +315,11 @@ where
                             .as_ref()
                             .and_then(|s| s.return_type.as_deref());
                         let types_ok = match (old_rt, new_rt) {
-                            (Some(o), Some(n)) => super::compare::types_structurally_similar(o, n),
+                            (Some(o), Some(n)) => super::compare::types_structurally_similar(
+                                o,
+                                n,
+                                semantics.primitive_type_names(),
+                            ),
                             _ => true, // No type info → assume compatible
                         };
                         if !types_ok {
@@ -347,13 +363,24 @@ where
             // Keep the best match (highest overlap ratio).
             if best_match
                 .as_ref()
-                .is_none_or(|(_, r, _, _)| best_ratio > *r)
+                .is_none_or(|m| best_ratio > m.overlap_ratio)
             {
-                best_match = Some((*candidate, best_ratio, all_matching, removed_only));
+                best_match = Some(MigrationCandidate {
+                    target: candidate,
+                    overlap_ratio: best_ratio,
+                    matching_members: all_matching,
+                    removed_only,
+                });
             }
         }
 
-        if let Some((replacement, ratio, matching_members, removed_only_members)) = best_match {
+        if let Some(MigrationCandidate {
+            target: replacement,
+            overlap_ratio: ratio,
+            matching_members,
+            removed_only: removed_only_members,
+        }) = best_match
+        {
             if !matched_removed.contains(removed_sym.qualified_name.as_str()) {
                 matched_removed.insert(&removed_sym.qualified_name);
                 // Capture base type changes (extends clause) when they differ.

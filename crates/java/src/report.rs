@@ -39,7 +39,6 @@ pub fn build_report(
             description: change.description.clone(),
             migration_target: change.migration_target.clone(),
             removal_disposition: None,
-            renders_element: None,
         };
 
         file_map.entry(file).or_default().push(api_change);

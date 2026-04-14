@@ -370,16 +370,7 @@ Return ONLY a JSON object:
       "symbol": "<TypeName.memberName or TypeName>",
       "change": "<signature_changed|type_changed|default_changed|removed>",
       "description": "<what changed in the type signature>",
-      "removal_disposition": null,
-      "renders_element": null
-    }}}}
-  ],
-  "composition_pattern_changes": [
-    {{{{
-      "component": "<symbol whose container changed>",
-      "old_parent": "<previous container/parent or null>",
-      "new_parent": "<new container/parent or null>",
-      "description": "<what nesting changed>"
+      "removal_disposition": null
     }}}}
   ]
 }}}}
@@ -408,10 +399,6 @@ Rules:
    - `{{{{"type": "made_automatic"}}}}` — functionality is now inferred automatically
    - `{{{{"type": "truly_removed"}}}}` — removed with no replacement
    - `null` if you cannot determine the disposition
-- For API removals of components: include `renders_element` with the HTML
-  element the component renders when applicable. Set null if not applicable.
-- For composition: include when nesting structure changed. Use empty array
-  if no nesting changes.
 - Keep descriptions specific and actionable
 - Only include changes that would break existing consumers
 - Use empty arrays for categories with no changes
@@ -498,6 +485,134 @@ fn build_category_enum(categories: &[LlmCategoryDefinition]) -> String {
     let ids: Vec<&str> = categories.iter().map(|c| c.id.as_str()).collect();
     format!("<{}>", ids.join("|"))
 }
+
+// ── Rename inference prompts ──────────────────────────────────────────
+
+/// Build the prompt for constant rename pattern inference (Call 1).
+///
+/// Given samples of removed and added constant names from a package,
+/// asks the LLM to identify systematic regex-based rename patterns.
+pub fn build_constant_rename_prompt(
+    removed_sample: &[&str],
+    added_sample: &[&str],
+    package_name: &str,
+    from_ref: &str,
+    to_ref: &str,
+) -> String {
+    let removed_list = removed_sample
+        .iter()
+        .map(|s| format!("  {}", s))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let added_list = added_sample
+        .iter()
+        .map(|s| format!("  {}", s))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"These exported constants were removed from {package_name} between {from_ref} and {to_ref}:
+{removed_list}
+
+These exported constants were added:
+{added_list}
+
+Identify ALL systematic naming patterns that map removed constant names to added constant names.
+
+Return ONLY a JSON array of regex substitution rules inside a ```json fenced block:
+```json
+[
+  {{"match": "regex pattern matching removed names", "replace": "replacement using capture groups"}}
+]
+```
+
+Rules:
+- Use capture groups to generalize patterns (e.g., "(.*)Top$" not just "c_alert_PaddingTop")
+- Each pattern should match multiple constants, not just one
+- Order from most specific to least specific
+- Only include patterns where applying the substitution to a removed name produces a name in the added list
+- Do not include identity patterns where match and replace produce the same string"#,
+        package_name = package_name,
+        from_ref = from_ref,
+        to_ref = to_ref,
+        removed_list = removed_list,
+        added_list = added_list,
+    )
+}
+
+/// Build the prompt for interface/component rename mapping inference (Call 2).
+///
+/// Given removed and added interfaces with their member lists,
+/// asks the LLM to identify which removed interfaces map to which added ones.
+pub fn build_interface_rename_prompt(
+    removed: &[(&str, &[String])], // (name, member_names)
+    added: &[(&str, &[String])],   // (name, member_names)
+    package_name: &str,
+    from_ref: &str,
+    to_ref: &str,
+) -> String {
+    let removed_list = removed
+        .iter()
+        .map(|(name, members)| {
+            if members.is_empty() {
+                format!("  {} (no members)", name)
+            } else {
+                format!("  {} (members: {})", name, members.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let added_list = added
+        .iter()
+        .map(|(name, members)| {
+            if members.is_empty() {
+                format!("  {} (no members)", name)
+            } else {
+                format!("  {} (members: {})", name, members.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"These interfaces/components were removed from {package_name} between {from_ref} and {to_ref}:
+{removed_list}
+
+These interfaces/components were added:
+{added_list}
+
+Identify which removed interfaces map to which added interfaces (renames/replacements).
+Consider:
+- Name similarity (e.g., TextProps → ContentProps)
+- Member overlap (same prop names appearing in both)
+- Typo corrections (e.g., FormFiledGroup → FormFieldGroup)
+- Functional equivalence (component that does the same thing under a new name)
+
+Return ONLY a JSON array of mappings inside a ```json fenced block:
+```json
+[
+  {{"old_name": "removed name", "new_name": "added name", "confidence": "high|medium|low", "reason": "brief explanation"}}
+]
+```
+
+Rules:
+- Only include mappings where the added interface is a clear replacement for the removed one
+- Set confidence to "high" for clear renames/typo fixes, "medium" for functional replacements with different names, "low" for uncertain matches
+- If a removed interface has no replacement in the added list, omit it
+- Return an empty array if no mappings can be determined"#,
+        package_name = package_name,
+        from_ref = from_ref,
+        to_ref = to_ref,
+        removed_list = removed_list,
+        added_list = added_list,
+    )
+}
+
+// Note: build_hierarchy_inference_prompt, build_suffix_rename_prompt, and
+// build_composition_pattern_prompt have been moved to crates/ts/src/llm_prompts.rs.
+// These prompts contain React/JSX/CSS-specific terminology and belong in the
+// language crate, not the generic LLM infrastructure crate.
 
 #[cfg(test)]
 mod tests {
@@ -633,334 +748,5 @@ mod tests {
         assert!(prompt.contains("helper"));
         assert!(prompt.contains("return helper() + 1"));
         assert!(prompt.contains("propagates"));
-    }
-}
-
-// ── Composition pattern analysis prompt ───────────────────────────────
-
-/// Build the prompt for analyzing test/example diffs to detect composition
-/// pattern changes (JSX nesting restructuring).
-///
-/// Given the diff of a test or example file, asks the LLM to identify
-/// components whose parent-child nesting relationship changed.
-pub fn build_composition_pattern_prompt(file_path: &str, diff_content: &str) -> String {
-    // Truncate large diffs
-    let diff_truncated = if diff_content.len() > 15_000 {
-        &diff_content[..15_000]
-    } else {
-        diff_content
-    };
-
-    format!(
-        r#"Analyze this diff of a component library's test/example file to identify changes in JSX component nesting structure.
-
-## File: {file_path}
-
-```diff
-{diff_content}
-```
-
-Identify components whose **parent component changed** between the old and new code. This includes:
-- A component that was a direct child of component A but is now a child of component B
-- A component that gained a new wrapper component
-- A component that was removed from a wrapper and is now a direct child of a higher-level component
-- JSX props that changed from children pattern to named prop pattern (e.g., `<Button><Icon /></Button>` → `<Button icon={{<Icon />}} />`)
-
-Return ONLY a JSON object inside a ```json fenced block:
-```json
-{{
-  "composition_changes": [
-    {{
-      "component": "the symbol whose container changed",
-      "old_parent": "the previous container/parent (null if newly added)",
-      "new_parent": "the new container/parent (null if removed from nesting)",
-      "description": "brief description of the nesting change"
-    }}
-  ]
-}}
-```
-
-Rules:
-- Only include changes where the JSX nesting structure actually changed
-- Ignore CSS class changes, prop value changes, or text content changes
-- Focus on structural parent-child relationships between React components
-- If no composition changes are found, return {{"composition_changes": []}}
-- Return the component names without angle brackets (e.g., "MastheadToggle" not "<MastheadToggle>")"#,
-        file_path = file_path,
-        diff_content = diff_truncated,
-    )
-}
-
-// ── Rename inference prompts ──────────────────────────────────────────
-
-/// Build the prompt for constant rename pattern inference (Call 1).
-///
-/// Given samples of removed and added constant names from a package,
-/// asks the LLM to identify systematic regex-based rename patterns.
-pub fn build_constant_rename_prompt(
-    removed_sample: &[&str],
-    added_sample: &[&str],
-    package_name: &str,
-    from_ref: &str,
-    to_ref: &str,
-) -> String {
-    let removed_list = removed_sample
-        .iter()
-        .map(|s| format!("  {}", s))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let added_list = added_sample
-        .iter()
-        .map(|s| format!("  {}", s))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        r#"These exported constants were removed from {package_name} between {from_ref} and {to_ref}:
-{removed_list}
-
-These exported constants were added:
-{added_list}
-
-Identify ALL systematic naming patterns that map removed constant names to added constant names.
-
-Return ONLY a JSON array of regex substitution rules inside a ```json fenced block:
-```json
-[
-  {{"match": "regex pattern matching removed names", "replace": "replacement using capture groups"}}
-]
-```
-
-Rules:
-- Use capture groups to generalize patterns (e.g., "(.*)Top$" not just "c_alert_PaddingTop")
-- Each pattern should match multiple constants, not just one
-- Order from most specific to least specific
-- Only include patterns where applying the substitution to a removed name produces a name in the added list
-- Do not include identity patterns where match and replace produce the same string"#,
-        package_name = package_name,
-        from_ref = from_ref,
-        to_ref = to_ref,
-        removed_list = removed_list,
-        added_list = added_list,
-    )
-}
-
-/// Build the prompt for interface/component rename mapping inference (Call 2).
-///
-/// Given removed and added interfaces with their member lists,
-/// asks the LLM to identify which removed interfaces map to which added ones.
-pub fn build_interface_rename_prompt(
-    removed: &[(&str, &[String])], // (name, member_names)
-    added: &[(&str, &[String])],   // (name, member_names)
-    package_name: &str,
-    from_ref: &str,
-    to_ref: &str,
-) -> String {
-    let removed_list = removed
-        .iter()
-        .map(|(name, members)| {
-            if members.is_empty() {
-                format!("  {} (no members)", name)
-            } else {
-                format!("  {} (members: {})", name, members.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let added_list = added
-        .iter()
-        .map(|(name, members)| {
-            if members.is_empty() {
-                format!("  {} (no members)", name)
-            } else {
-                format!("  {} (members: {})", name, members.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        r#"These interfaces/components were removed from {package_name} between {from_ref} and {to_ref}:
-{removed_list}
-
-These interfaces/components were added:
-{added_list}
-
-Identify which removed interfaces map to which added interfaces (renames/replacements).
-Consider:
-- Name similarity (e.g., TextProps → ContentProps)
-- Member overlap (same prop names appearing in both)
-- Typo corrections (e.g., FormFiledGroup → FormFieldGroup)
-- Functional equivalence (component that does the same thing under a new name)
-
-Return ONLY a JSON array of mappings inside a ```json fenced block:
-```json
-[
-  {{"old_name": "removed name", "new_name": "added name", "confidence": "high|medium|low", "reason": "brief explanation"}}
-]
-```
-
-Rules:
-- Only include mappings where the added interface is a clear replacement for the removed one
-- Set confidence to "high" for clear renames/typo fixes, "medium" for functional replacements with different names, "low" for uncertain matches
-- If a removed interface has no replacement in the added list, omit it
-- Return an empty array if no mappings can be determined"#,
-        package_name = package_name,
-        from_ref = from_ref,
-        to_ref = to_ref,
-        removed_list = removed_list,
-        added_list = added_list,
-    )
-}
-
-/// Build a prompt to infer the component hierarchy for a component family.
-///
-/// The LLM receives the full source code of all files in a component family
-/// directory and determines the expected parent-child composition structure
-/// for consumers of the library.
-///
-/// Props are NOT included in the prompt — they come from the AST surface.
-/// The LLM only needs to determine the hierarchy (what goes inside what).
-pub fn build_hierarchy_inference_prompt(
-    family_name: &str,
-    files_content: &str,
-    related_components: Option<&str>,
-) -> String {
-    let related_section = related_components
-        .map(|rc| {
-            format!(
-                r#"
-
-## Related components from other families
-
-These components share React context with this family. If a related
-component is designed to be placed INSIDE a family component, include
-it as an expected child of that family component. Match by naming
-(e.g., a "ToggleButton" goes inside a "Toggle" container).
-
-Do NOT include a related component if the family component goes inside
-IT (reversed direction).
-
-{rc}"#
-            )
-        })
-        .unwrap_or_default();
-
-    format!(
-        r#"You are a JSON-only API. Do NOT output any explanation, reasoning, or markdown headers.
-Output ONLY a single ```json fenced code block.
-
-Analyze the `{family_name}` component family and determine the expected parent-child composition hierarchy.
-
-## Source files:
-{files_content}{related_section}
-
-## Rules:
-- For each **exported** component, list what other components from this family (or related components listed above) that CONSUMERS provide as direct JSX children
-- A child is "required" if the parent needs it to function, "optional" otherwise
-- CRITICAL: If a parent component WRAPS children in another component internally (e.g., `return <div><SomeWrapper>{{children}}</SomeWrapper></div>` or `{{hasWrapper ? <SomeWrapper>{{children}}</SomeWrapper> : children}}`), that wrapper is an INTERNAL implementation detail. Do NOT list it as an expected child. The consumer passes `children` to the parent and the parent handles the wrapping automatically.
-- This rule applies even if the wrapper component is exported from index.ts.
-- CRITICAL: If a component is received via a NAMED PROP (e.g., `header`, `icon`, `toggle`, `footer`) and rendered internally, it is NOT a direct JSX child. Set mechanism to "prop" and specify the prop name. Only set mechanism to "child" for components that consumers place directly between opening and closing JSX tags: `<Parent><Child /></Parent>`.
-  Example prop-passed: `<FormFieldGroup header={{<FormFieldGroupHeader />}} />` → mechanism: "prop", propName: "header"
-  Example child-passed: `<Modal><ModalBody>...</ModalBody></Modal>` → mechanism: "child"
-- Only include components that consumers must explicitly add in their JSX (as children or prop values)
-- Exclude: internally-rendered components, base components from other families, HTML elements, the component itself
-
-## Output format — respond with ONLY this JSON, no other text:
-```json
-{{
-  "components": {{
-    "<ComponentName>": {{
-      "expected_children": [
-        {{ "name": "<ChildComponentName>", "required": true, "mechanism": "child" }},
-        {{ "name": "<PropPassedComponent>", "required": false, "mechanism": "prop", "propName": "header" }}
-      ]
-    }}
-  }}
-}}
-```"#,
-        family_name = family_name,
-        files_content = files_content,
-    )
-}
-
-// ── CSS Suffix Rename Inference Prompt ───────────────────────────────────
-
-/// Build a prompt for LLM inference of CSS property suffix renames.
-///
-/// Given two sets of suffixes (removed from old version, added in new version),
-/// the LLM identifies which removed suffixes are CSS physical property names
-/// that were renamed to their logical equivalents in the new version.
-pub fn build_suffix_rename_prompt(removed_suffixes: &[&str], added_suffixes: &[&str]) -> String {
-    let removed_list = removed_suffixes.join(", ");
-    let added_list = added_suffixes.join(", ");
-
-    format!(
-        r#"A CSS design system library changed its CSS custom property naming between versions. The library encodes CSS property names as PascalCase suffixes in variable names (e.g., `--pf-c-button--PaddingTop` uses suffix `PaddingTop` for the CSS property `padding-top`).
-
-Between versions, some suffixes were removed and new ones were added. Your task is to identify which removed suffixes were **renamed** to new suffixes — specifically, CSS physical property names that were replaced with their CSS Logical Properties equivalents.
-
-## CSS Logical Properties background
-
-CSS Logical Properties replace physical direction words with flow-relative ones:
-- `top` → `block-start`, `bottom` → `block-end`
-- `left` → `inline-start`, `right` → `inline-end`
-- Position properties like `top`/`left` → `inset-block-start`/`inset-inline-start`
-
-## Removed suffixes (from old version):
-{removed}
-
-## Added suffixes (in new version):
-{added}
-
-## Task:
-Identify pairs where a removed suffix is the PascalCase form of a CSS physical property and the corresponding added suffix is its CSS logical property equivalent.
-
-Only include pairs where you are confident the rename is a CSS physical→logical property change. Do NOT include pairs that are unrelated property changes (e.g., Color→FontWeight is NOT a logical property rename).
-
-## Output format:
-Return ONLY a JSON object inside a ```json fenced block:
-```json
-{{
-  "renames": [
-    {{ "from": "PaddingTop", "to": "PaddingBlockStart" }}
-  ]
-}}
-```
-
-Rules:
-- Only include CSS physical→logical property renames
-- The "from" must be a removed suffix, the "to" must be an added suffix
-- If no valid renames are found, return `{{"renames": []}}`"#,
-        removed = removed_list,
-        added = added_list,
-    )
-}
-
-#[cfg(test)]
-mod hierarchy_tests {
-    use super::*;
-
-    #[test]
-    fn hierarchy_prompt_without_related() {
-        let prompt = build_hierarchy_inference_prompt("Dropdown", "source code here", None);
-        assert!(prompt.contains("Dropdown"));
-        assert!(prompt.contains("source code here"));
-        // Should NOT have the related components section header
-        assert!(
-            !prompt.contains("Related components from other families"),
-            "Prompt should not include related section when None",
-        );
-    }
-
-    #[test]
-    fn hierarchy_prompt_with_related() {
-        let related =
-            "--- Related: Page/PageToggleButton.tsx ---\nexport interface PageToggleButtonProps {}";
-        let prompt = build_hierarchy_inference_prompt("Masthead", "masthead source", Some(related));
-        assert!(prompt.contains("Masthead"));
-        assert!(prompt.contains("Related components from other families"));
-        assert!(prompt.contains("PageToggleButtonProps"));
     }
 }

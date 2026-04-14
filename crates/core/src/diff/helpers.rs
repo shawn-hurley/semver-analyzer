@@ -92,11 +92,12 @@ pub(super) fn type_param_summary(tp: &TypeParameter) -> String {
     s
 }
 
-/// Numeric rank for visibility levels (higher = more visible).
+/// Default numeric rank for visibility levels (higher = more visible).
 ///
-/// NOTE: This hardcoded ranking will move to `LanguageSemantics::visibility_rank`
-/// in Phase 3, since the ordering differs by language (e.g., Java's `protected`
-/// is more visible than package-private).
+/// Provides the fallback ranking used by `MinimalSemantics`. Language
+/// implementations should override `LanguageSemantics::visibility_rank()`
+/// when the ordering differs (e.g., Java's `protected` is more visible
+/// than package-private/`Internal`).
 pub(super) fn visibility_rank(v: Visibility) -> u8 {
     match v {
         Visibility::Private => 0,

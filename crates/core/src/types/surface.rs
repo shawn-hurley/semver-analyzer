@@ -183,9 +183,7 @@ impl<M: Default + Clone + PartialEq> Symbol<M> {
             language_data: M::default(),
         }
     }
-}
 
-impl<M: Default + Clone + PartialEq> Symbol<M> {
     /// Convert this symbol's metadata type to a different type.
     ///
     /// Useful for converting between `Symbol<()>` (core/test) and
@@ -247,9 +245,13 @@ pub enum SymbolKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
-    /// Directly exported (`export function ...` or `export { ... }`).
+    /// Module-level export: the symbol is visible to external consumers.
+    /// Relevant for languages with an explicit export mechanism
+    /// (JS/TS: `export`, Python: `__all__`, Rust: `pub` at crate root).
+    /// Languages without a distinction between public and exported (Java,
+    /// C#, Go) should use `Public` for all externally-visible symbols.
     Exported,
-    /// Public class member (not `private` or `protected`).
+    /// Public member: visible to all code within the same package/module.
     #[default]
     Public,
     /// Accessible to subclasses. Java: `protected`. C#: `protected`. Python: `_prefix`.

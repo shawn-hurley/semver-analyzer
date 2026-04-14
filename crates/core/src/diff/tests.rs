@@ -1,10 +1,88 @@
 //! Tests for the diff engine.
 //!
-//! All tests exercise the public `diff_surfaces` API, which in turn
-//! exercises the internal comparison, rename detection, and helper functions.
+//! Most tests exercise the public `diff_surfaces` API (language-agnostic).
+//! Tests that need TS-like behavior (star re-export filtering, deprecated/next
+//! path handling) use `diff_surfaces_with_semantics` + `TsLikeTestSemantics`.
 
 use super::*;
 use crate::types::*;
+
+/// Test semantics that includes TypeScript-like behaviors:
+/// - Star re-export (`*`) filtering
+/// - `/deprecated/` and `/next/` path-based relocation detection
+/// - Import subpath derivation from deprecated/next paths
+///
+/// Used only by tests that exercise these language-specific features.
+struct TsLikeTestSemantics;
+
+impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for TsLikeTestSemantics {
+    fn is_member_addition_breaking(&self, _container: &Symbol<M>, _member: &Symbol<M>) -> bool {
+        false
+    }
+
+    fn same_family(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool {
+        let a_dir = a
+            .file
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let b_dir = b
+            .file
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        a_dir == b_dir
+    }
+
+    fn same_identity(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool {
+        a.name == b.name
+    }
+
+    fn visibility_rank(&self, v: Visibility) -> u8 {
+        super::helpers::visibility_rank(v)
+    }
+
+    fn should_skip_symbol(&self, sym: &Symbol<M>) -> bool {
+        sym.name == "*"
+    }
+
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        qualified_name
+            .replace("/deprecated/", "/")
+            .replace("/next/", "/")
+    }
+
+    fn classify_relocation(&self, old_qname: &str, new_qname: &str) -> Option<&'static str> {
+        let old_deprecated = old_qname.contains("/deprecated/");
+        let new_deprecated = new_qname.contains("/deprecated/");
+        let old_next = old_qname.contains("/next/");
+        let new_next = new_qname.contains("/next/");
+
+        match (old_deprecated, new_deprecated, old_next, new_next) {
+            (false, true, _, _) => Some("moved to deprecated"),
+            (true, false, _, _) => Some("promoted from deprecated"),
+            (_, _, true, false) => Some("promoted from next"),
+            (_, _, false, true) => Some("moved to next"),
+            _ => None,
+        }
+    }
+
+    fn derive_import_subpath(&self, package: Option<&str>, qualified_name: &str) -> String {
+        let base = package.unwrap_or("unknown");
+        if qualified_name.contains("/deprecated/") {
+            format!("{base}/deprecated")
+        } else if qualified_name.contains("/next/") {
+            format!("{base}/next")
+        } else {
+            base.to_string()
+        }
+    }
+}
+
+/// Shortcut for tests that need TS-like relocation/skip behavior.
+fn diff_surfaces_ts(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
+    diff_surfaces_with_semantics(old, new, &TsLikeTestSemantics)
+}
 
 fn sym(name: &str, kind: SymbolKind) -> Symbol {
     Symbol::new(name, name, kind, Visibility::Exported, "test.d.ts", 1)
@@ -1150,7 +1228,7 @@ fn star_reexport_removed_is_filtered() {
         func("greet", vec![param("name", "string")], "void"),
     ]);
     let new = surface(vec![func("greet", vec![param("name", "string")], "void")]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     assert!(
         !changes.iter().any(|c| c.symbol == "*"),
@@ -1170,7 +1248,7 @@ fn star_reexport_added_is_filtered() {
         star,
         func("greet", vec![param("name", "string")], "void"),
     ]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     assert!(
         !changes.iter().any(|c| c.symbol == "*"),
@@ -1190,7 +1268,7 @@ fn multiple_star_reexports_same_file_filtered() {
 
     let old = surface(vec![mk_star(), mk_star(), mk_star()]);
     let new = surface(vec![mk_star()]); // Two removed, one kept
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     assert!(
         !changes.iter().any(|c| c.symbol == "*"),
@@ -1206,7 +1284,7 @@ fn star_reexport_filtered_but_real_symbols_still_diff() {
 
     let old = surface(vec![star.clone(), func("oldFunc", vec![], "void")]);
     let new = surface(vec![func("newFunc", vec![], "void")]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     // Star should NOT appear
     assert!(!changes.iter().any(|c| c.symbol == "*"));
@@ -1265,7 +1343,7 @@ fn detect_moved_to_deprecated() {
 
     let old = surface(vec![old_sym]);
     let new = surface(vec![new_sym]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     let moved = changes
         .iter()
@@ -1316,7 +1394,7 @@ fn detect_moved_to_deprecated_with_member_changes() {
 
     let old = surface(vec![old_iface]);
     let new = surface(vec![new_iface]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     // Should detect the deprecation move
     assert!(
@@ -1358,7 +1436,7 @@ fn detect_moved_from_next_to_deprecated() {
 
     let old = surface(vec![old_sym]);
     let new = surface(vec![new_sym]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     assert!(
         has_change(&changes, |ct| matches!(
@@ -1380,7 +1458,7 @@ fn promoted_from_deprecated_not_breaking() {
 
     let old = surface(vec![old_sym]);
     let new = surface(vec![new_sym]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     // Promotion is non-breaking
     assert!(
@@ -1409,7 +1487,7 @@ fn relocation_does_not_interfere_with_rename_detection() {
 
     let old = surface(vec![old_chip, old_widget]);
     let new = surface(vec![new_chip, new_widget]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     // Chip should be moved to deprecated
     assert!(has_change(&changes, |ct| matches!(
@@ -1460,7 +1538,7 @@ fn multiple_symbols_moved_to_deprecated() {
         mk("ChipGroup", "deprecated/components"),
         mk("ChipProps", "deprecated/components"),
     ]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     let moved_count = changes
         .iter()
@@ -1647,7 +1725,7 @@ fn no_op_rename_with_different_import_path_emits_relocated() {
 
     let old = surface(vec![old_sym]);
     let new = surface(vec![new_sym]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     // Should NOT have a SymbolRenamed change
     let renames: Vec<_> = changes
@@ -1820,7 +1898,7 @@ fn deprecated_removal_not_falsely_renamed_when_same_name_exists_in_main() {
 
     let old = surface(vec![old_select, old_select_main]);
     let new = surface(vec![new_select, new_tooltip]);
-    let changes = diff_surfaces(&old, &new);
+    let changes = diff_surfaces_ts(&old, &new);
 
     // SelectOptionProps should NOT be renamed to TooltipOptionProps
     let renames: Vec<_> = changes

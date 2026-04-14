@@ -87,7 +87,6 @@ fn test_every_token_rename_produces_rename_strategy() {
             description: format!("Exported constant `{}` was renamed", entry.symbol),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
 
         let strat = api_change_to_strategy(&change, &patterns, &member_renames, &entry.file);
@@ -218,7 +217,6 @@ fn test_consolidated_token_strategies_have_clean_mappings() {
                 description: format!("Exported constant `{}` was renamed", entry.symbol),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             };
 
             let fix_strategy =
@@ -372,7 +370,6 @@ fn test_every_token_findable_in_consolidated_mappings() {
                 description: format!("Exported constant `{}` was renamed", entry.symbol),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             };
 
             let fix_strategy =

@@ -10,6 +10,7 @@ pub mod cli;
 pub mod diagnostics;
 pub mod diff;
 pub mod error;
+pub mod git;
 pub mod shared;
 pub mod traits;
 pub mod types;
@@ -123,6 +124,7 @@ pub(crate) mod test_support {
             false
         }
         fn build_report(
+            &self,
             _results: &AnalysisResult<Self>,
             _repo: &Path,
             _from_ref: &str,

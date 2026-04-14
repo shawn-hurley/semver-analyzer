@@ -7,6 +7,20 @@
 //! Key design: changes are grouped **per-file**, with only files containing
 //! breaking changes included in the output. Each file entry has separate
 //! arrays for API and behavioral breaking changes.
+//!
+//! ## `#[serde(bound = "")]` pattern
+//!
+//! Types generic over `L: Language` use `#[serde(bound = "")]` to disable
+//! serde's automatic trait bound inference. Without this, serde would add
+//! `L: Serialize` / `L: Deserialize` bounds, which is wrong — `L` itself
+//! is never serialized. Instead, its *associated types* (`L::Category`,
+//! `L::ManifestChangeType`, etc.) carry `Serialize + DeserializeOwned`
+//! bounds via the `Language` trait definition. This means:
+//!
+//! - Adding a new associated type to `Language` requires ensuring it has
+//!   `Serialize + DeserializeOwned` in its trait bounds.
+//! - The compiler enforces these bounds at the `Language` impl level, not
+//!   at the struct derive level.
 
 use super::bu::EvidenceType;
 use super::change_subject::ChangeSubject;
@@ -95,7 +109,7 @@ pub struct AnalysisReport<L: Language> {
 }
 
 /// Git comparison metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comparison {
     pub from_ref: String,
     pub to_ref: String,
@@ -106,7 +120,7 @@ pub struct Comparison {
 }
 
 /// Summary counts for the report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub total_breaking_changes: usize,
     pub breaking_api_changes: usize,
@@ -131,7 +145,7 @@ pub struct FileChanges<L: Language> {
     /// Breaking changes to public/exported symbols.
     pub breaking_api_changes: Vec<ApiChange>,
 
-    /// Breaking behavioral changes (DOM structure, CSS, defaults, rendering).
+    /// Breaking behavioral changes detected by the BU pipeline.
     pub breaking_behavioral_changes: Vec<BehavioralChange<L>>,
 
     /// Container/nesting changes detected from test/example diffs.
@@ -153,13 +167,13 @@ pub enum FileStatus {
 
 /// A breaking API change detected by structural analysis (TD pipeline).
 ///
-/// Follows the v2 harness schema: symbol uses `Component.propName` format,
+/// Follows the v2 harness schema: symbol uses `TypeName.memberName` format,
 /// kind maps to a fixed set of categories, and change classifies the type
 /// of breaking change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiChange {
-    /// Symbol name: `ComponentName` for component-level, `ComponentName.propName`
-    /// for prop-level changes.
+    /// Symbol name: `TypeName` for type-level changes, `TypeName.memberName`
+    /// for member-level changes.
     pub symbol: String,
 
     /// Fully qualified name including module path.
@@ -188,16 +202,10 @@ pub struct ApiChange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration_target: Option<MigrationTarget>,
 
-    /// Why a removed prop was removed and where its functionality went.
+    /// Why a removed member was removed and where its functionality went.
     /// Populated from LLM behavioral analysis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_disposition: Option<RemovalDisposition>,
-
-    /// The HTML element this component renders (e.g., "ol", "div", "footer").
-    /// Used when a component is replaced by a generic component that needs
-    /// an explicit element type prop (e.g., TextList→Content component="ol").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub renders_element: Option<String>,
 }
 
 /// Kind of symbol affected by an API change.
@@ -264,7 +272,7 @@ pub struct BehavioralChange<L: Language> {
     /// The kind of symbol.
     pub kind: BehavioralChangeKind,
 
-    /// Sub-category of the behavioral change (DOM, CSS, a11y, etc.).
+    /// Sub-category of the behavioral change (language-specific).
     /// When present, enables more precise Konveyor rule generation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<L::Category>,
@@ -375,7 +383,7 @@ pub struct TypeSummary<L: Language> {
     pub definition_name: String,
 
     /// Overall status of this type.
-    pub status: ComponentStatus,
+    pub status: TypeStatus,
 
     /// Aggregated member change counts.
     pub member_summary: MemberSummary,
@@ -410,10 +418,10 @@ pub struct TypeSummary<L: Language> {
     pub source_files: Vec<PathBuf>,
 }
 
-/// Overall status of a type across the version change.
+/// Overall status of a type definition across the version change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComponentStatus {
+pub enum TypeStatus {
     /// Type exists in both versions but has changes.
     Modified,
     /// Type was removed (interface/class gone or mostly removed).
@@ -423,7 +431,7 @@ pub enum ComponentStatus {
 }
 
 /// Aggregated member-level change counts for a type.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemberSummary {
     /// Total number of members in the old version.
     pub total: usize,
@@ -496,24 +504,24 @@ pub struct TypeChange {
 // `crates/ts/src/language.rs::TsReportData` during Phase 4 genericization.
 // They are React/JSX-specific (component hierarchy analysis).
 
-/// An expected direct child component, derived from LLM hierarchy inference.
+/// An expected direct child type, derived from LLM hierarchy inference.
 ///
-/// Each entry names a component that should be used as a direct child of the
-/// parent component. The `name` resolves to another `TypeSummary` in the
+/// Each entry names a type that should be used as a direct child of the
+/// parent type. The `name` resolves to another `TypeSummary` in the
 /// same package.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpectedChild {
-    /// Component name (e.g., "DropdownList").
+    /// Child type name (e.g., "DropdownList").
     pub name: String,
     /// Whether this child is required or optional.
     #[serde(default)]
     pub required: bool,
-    /// How this component is passed to the parent:
-    /// - "child": direct JSX child (`<Parent><Child /></Parent>`)
-    /// - "prop": via a named prop (`<Parent header={<Child />} />`)
+    /// How this child is passed to the parent:
+    /// - `"child"`: direct nesting (React: JSX children, Vue: slots)
+    /// - `"prop"`: via a named attribute (React: props, Angular: inputs)
     #[serde(default = "default_mechanism")]
     pub mechanism: String,
-    /// When mechanism is "prop", the name of the prop (e.g., "header").
+    /// When mechanism is "prop", the attribute name (e.g., "header").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prop_name: Option<String>,
 }
@@ -546,7 +554,7 @@ impl ExpectedChild {
 
 /// A change in the component hierarchy between versions, computed by diffing
 /// the old and new hierarchy inference results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HierarchyDelta {
     /// The parent component whose children changed.
     pub component: String,
@@ -574,7 +582,7 @@ pub struct HierarchyDelta {
 }
 
 /// A member that migrated from a parent type to a child type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigratedMember {
     /// The member name on the old parent type.
     pub member_name: String,
@@ -650,7 +658,7 @@ pub struct AddedExport {
 ///
 /// This is the internal representation. The `build_report` function in
 /// the binary crate converts these to `ApiChange` entries for the output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuralChange {
     /// The affected symbol name.
     pub symbol: String,
@@ -735,7 +743,7 @@ impl StructuralChangeType {
 ///
 /// When a removed interface/class has members that overlap with a surviving
 /// interface in the same component directory, this records the mapping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberMapping {
     /// Name of the member in the removed interface.
     pub old_name: String,
@@ -748,7 +756,7 @@ pub struct MemberMapping {
 /// Produced by the migration detection phase in the diff engine. Records
 /// that a removed symbol has a plausible replacement, including the specific
 /// member-level overlap that signals the relationship.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MigrationTarget {
     /// The removed symbol name (e.g., "EmptyStateHeaderProps").
     pub removed_symbol: String,
@@ -770,7 +778,7 @@ pub struct MigrationTarget {
     pub removed_only_members: Vec<String>,
     /// The ratio of overlap: |matching| / |removed.members|.
     pub overlap_ratio: f64,
-    /// Base type of the removed interface (e.g., "Omit<React.HTMLProps<HTMLElement>, 'type' | 'ref'>").
+    /// Base type of the removed interface (e.g., "BaseService", "AbstractHandler").
     /// Present when the old interface had an `extends` clause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_extends: Option<String>,
@@ -781,7 +789,7 @@ pub struct MigrationTarget {
 }
 
 /// Impact analysis: what code depends on a broken symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactAnalysis {
     /// Direct dependents within the repository.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -793,7 +801,7 @@ pub struct ImpactAnalysis {
 }
 
 /// A code location that depends on a broken symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dependent {
     pub file: PathBuf,
     pub line: usize,
@@ -909,8 +917,6 @@ pub struct LlmApiChange {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removal_disposition: Option<RemovalDisposition>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub renders_element: Option<String>,
 }
 
 /// Statistics about the LLM rename inference run.

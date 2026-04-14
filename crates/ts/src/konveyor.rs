@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 
 use crate::{TsCategory, TsManifestChangeType, TypeScript};
 use semver_analyzer_core::{
-    AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange, ComponentStatus,
-    FileChanges, ManifestChange, RemovalDisposition, RemovedMember, TypeSummary,
+    AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange, FileChanges,
+    ManifestChange, RemovalDisposition, RemovedMember, TypeStatus, TypeSummary,
 };
 
 use crate::language::{ChildComponent, ChildComponentStatus};
@@ -509,7 +509,7 @@ fn build_migration_message_v2(comp: &TypeSummary<TypeScript>) -> String {
                 target.removed_only_members.join(", ")
             ));
         }
-    } else if comp.status == ComponentStatus::Removed || (removal_count == total && total <= 2) {
+    } else if comp.status == TypeStatus::Removed || (removal_count == total && total <= 2) {
         // Fully removed component
         msg.push_str(&format!(
             "MIGRATION: <{}> was removed.\n\n\
@@ -702,7 +702,7 @@ fn build_migration_message_v2(comp: &TypeSummary<TypeScript>) -> String {
              Also remove {} from the import statement.",
             component_name, replacement, component_name
         ));
-    } else if comp.status == ComponentStatus::Removed || (removal_count == total && total <= 2) {
+    } else if comp.status == TypeStatus::Removed || (removal_count == total && total <= 2) {
         // Fully removed — tell LLM to remove the import
         msg.push_str(&format!(
             "Remove {} from the import statement.",
@@ -994,7 +994,7 @@ pub fn generate_rules(
 
     for pkg in &report.packages {
         for comp in &pkg.type_summaries {
-            let qualifies = comp.status == ComponentStatus::Removed
+            let qualifies = comp.status == TypeStatus::Removed
                 || (comp.member_summary.removed >= 3 && comp.member_summary.removal_ratio > 0.5)
                 || comp.member_summary.removed >= 5;
             if !qualifies {
@@ -1564,7 +1564,7 @@ pub fn generate_rules(
                     // - it has a high absolute count of removals (>=5), indicating
                     //   significant restructuring even if total prop count is large
                     //   (e.g., Modal: 11 of 28 props removed = composition change)
-                    let qualifies = comp.status == ComponentStatus::Removed
+                    let qualifies = comp.status == TypeStatus::Removed
                         || (comp.member_summary.removed >= 3
                             && comp.member_summary.removal_ratio > 0.5)
                         || comp.member_summary.removed >= 5;
@@ -1599,8 +1599,7 @@ pub fn generate_rules(
                     // TextContent was renamed to Content, then Text should also
                     // suggest Content as a replacement.
                     if comp.migration_target.is_none()
-                        && (comp.status == ComponentStatus::Removed
-                            || comp.member_summary.total <= 2)
+                        && (comp.status == TypeStatus::Removed || comp.member_summary.total <= 2)
                     {
                         let sibling_replacement = find_sibling_replacement_in_report(comp, report);
                         if let Some(ref replacement) = sibling_replacement {
@@ -1625,8 +1624,7 @@ pub fn generate_rules(
                     // migration target, enrich the message with the new API
                     // structure from the composition tree.
                     if comp.migration_target.is_none()
-                        && (comp.status == ComponentStatus::Removed
-                            || comp.member_summary.total <= 2)
+                        && (comp.status == TypeStatus::Removed || comp.member_summary.total <= 2)
                     {
                         if let Some(ref sd) = report.extensions.sd_result {
                             let source_family = comp.source_files.iter().find_map(|f| {
@@ -1704,7 +1702,7 @@ pub fn generate_rules(
 
                     let pattern = format!("^{}$", regex_escape(component_name));
 
-                    let when = if comp.status == ComponentStatus::Removed {
+                    let when = if comp.status == TypeStatus::Removed {
                         // Fully removed — trigger on import (from either path)
                         if is_from_deprecated {
                             KonveyorCondition::Or {
@@ -1808,7 +1806,7 @@ pub fn generate_rules(
                                 .type_summaries
                                 .iter()
                                 .filter(|sibling| {
-                                    sibling.status == ComponentStatus::Removed
+                                    sibling.status == TypeStatus::Removed
                                         && sibling.name != *component_name
                                         && sibling.name.starts_with(component_name)
                                 })
@@ -4666,7 +4664,6 @@ mod tests {
                 description: "Exported function 'createUser' was removed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -4821,7 +4818,6 @@ mod tests {
                     description: "Removed foo".to_string(),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 },
                 ApiChange {
                     symbol: "foo".to_string(),
@@ -4833,7 +4829,6 @@ mod tests {
                     description: "Removed foo overload".to_string(),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 },
             ],
             breaking_behavioral_changes: vec![],
@@ -4911,7 +4906,6 @@ mod tests {
                 description: "Removed 'secondary' variant, added 'danger'".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -4952,7 +4946,6 @@ mod tests {
                 description: "Chip renamed to Label".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -4996,7 +4989,6 @@ mod tests {
                 description: "Function createUser was removed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -5038,7 +5030,6 @@ mod tests {
                 description: "Added required 'locale' parameter".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -5157,7 +5148,6 @@ mod tests {
                     description: "Renamed".to_string(),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 },
                 ApiChange {
                     symbol: "oldFn".to_string(),
@@ -5169,7 +5159,6 @@ mod tests {
                     description: "Removed".to_string(),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 },
             ],
             breaking_behavioral_changes: vec![BehavioralChange {
@@ -5221,7 +5210,6 @@ mod tests {
                     description: "Renamed Foo to Bar".to_string(),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 },
                 ApiChange {
                     symbol: "baz".to_string(),
@@ -5233,7 +5221,6 @@ mod tests {
                     description: "Added required param".to_string(),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 },
             ],
             breaking_behavioral_changes: vec![],
@@ -5292,7 +5279,6 @@ mod tests {
                 description: "Chip renamed to Label".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -5334,7 +5320,6 @@ mod tests {
                 description: "Card.isFlat prop removed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -5381,7 +5366,6 @@ mod tests {
                 description: "createUser removed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -5419,7 +5403,6 @@ mod tests {
                 description: "UserRole type removed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -5460,7 +5443,6 @@ mod tests {
             description: description.to_string(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         }
     }
 
@@ -5849,7 +5831,6 @@ mod tests {
                 description: format!("Token {} removed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -5912,7 +5893,6 @@ mod tests {
                 description: format!("Token {} removed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -5960,7 +5940,6 @@ mod tests {
                 description: format!("Exported constant `global_token_{}` was renamed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -6068,7 +6047,6 @@ mod tests {
                 description: format!("Exported constant `global_token_{}` was renamed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -6466,8 +6444,8 @@ mod tests {
             ],
         );
 
-        let key1 = consolidation_key(&css_prefix_rule);
-        let key2 = consolidation_key(&css_logical_rule);
+        let key1 = consolidation_key(&css_prefix_rule, &extract_package_from_path);
+        let key2 = consolidation_key(&css_logical_rule, &extract_package_from_path);
 
         assert_ne!(
             key1, key2,
@@ -6493,8 +6471,8 @@ mod tests {
             ],
         );
 
-        let key_a = consolidation_key(&sibling_a);
-        let key_b = consolidation_key(&sibling_b);
+        let key_a = consolidation_key(&sibling_a, &extract_package_from_path);
+        let key_b = consolidation_key(&sibling_b, &extract_package_from_path);
 
         assert_ne!(
             key_a, key_b,
@@ -6514,8 +6492,8 @@ mod tests {
             vec!["source=semver-analyzer", "change-type=component-removal"],
         );
 
-        let key_modal = consolidation_key(&modal_rule);
-        let key_empty = consolidation_key(&emptystate_rule);
+        let key_modal = consolidation_key(&modal_rule, &extract_package_from_path);
+        let key_empty = consolidation_key(&emptystate_rule, &extract_package_from_path);
 
         assert_ne!(
             key_modal, key_empty,
@@ -6535,8 +6513,8 @@ mod tests {
             vec!["source=semver-analyzer", "change-type=dependency-update"],
         );
 
-        let key_a = consolidation_key(&dep_a);
-        let key_b = consolidation_key(&dep_b);
+        let key_a = consolidation_key(&dep_a, &extract_package_from_path);
+        let key_b = consolidation_key(&dep_b, &extract_package_from_path);
 
         assert_ne!(
             key_a, key_b,
@@ -6571,8 +6549,8 @@ mod tests {
             "actions was removed\nFile: packages/react-core/src/components/Modal/Modal.d.ts"
                 .to_string();
 
-        let key_a = consolidation_key(&rule_a);
-        let key_b = consolidation_key(&rule_b);
+        let key_a = consolidation_key(&rule_a, &extract_package_from_path);
+        let key_b = consolidation_key(&rule_b, &extract_package_from_path);
 
         assert_eq!(
             key_a, key_b,
@@ -6826,7 +6804,6 @@ mod tests {
             description: format!("{} type changed", symbol),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         }
     }
 
@@ -7080,7 +7057,6 @@ mod tests {
                 description: format!("Token {} removed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -7316,7 +7292,6 @@ mod tests {
                 description: "DEFAULT_TIMEOUT removed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -7380,7 +7355,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 14,
                     removed: 10,
@@ -7513,7 +7488,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Button".to_string(),
                 definition_name: "ButtonProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 10,
                     removed: 1,
@@ -7592,7 +7567,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "MastheadBrand".to_string(),
                 definition_name: "MastheadBrandProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 5,
                     removed: 1,
@@ -7667,7 +7642,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 20,
                     removed: 1,
@@ -7744,7 +7719,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary::default(),
                 removed_members: vec![],
                 type_changes: vec![],
@@ -7806,7 +7781,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "EmptyStateHeader".to_string(),
                 definition_name: "EmptyStateHeaderProps".to_string(),
-                status: ComponentStatus::Removed,
+                status: TypeStatus::Removed,
                 member_summary: MemberSummary {
                     total: 5,
                     removed: 5,
@@ -7861,7 +7836,7 @@ mod tests {
         let comp = TypeSummary {
             name: "EmptyStateHeader".to_string(),
             definition_name: "EmptyStateHeaderProps".to_string(),
-            status: ComponentStatus::Removed,
+            status: TypeStatus::Removed,
             member_summary: MemberSummary {
                 total: 5,
                 removed: 5,
@@ -7937,7 +7912,7 @@ mod tests {
         let comp = TypeSummary {
             name: "Modal".to_string(),
             definition_name: "ModalProps".to_string(),
-            status: ComponentStatus::Modified,
+            status: TypeStatus::Modified,
             member_summary: MemberSummary {
                 total: 14,
                 removed: 10,
@@ -8033,7 +8008,7 @@ mod tests {
         let comp = TypeSummary {
             name: "Modal".to_string(),
             definition_name: "ModalProps".to_string(),
-            status: ComponentStatus::Modified,
+            status: TypeStatus::Modified,
             member_summary: MemberSummary {
                 total: 20,
                 removed: 8,
@@ -8163,7 +8138,6 @@ mod tests {
                     description: format!("{} removed", name),
                     migration_target: None,
                     removal_disposition: None,
-                    renders_element: None,
                 })
                 .collect(),
             breaking_behavioral_changes: vec![],
@@ -8178,7 +8152,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 20,
                     removed: 6,
@@ -8388,7 +8362,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Menu".to_string(),
                 definition_name: "MenuProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 5,
                     removed: 0,
@@ -8628,7 +8602,7 @@ mod tests {
             type_summaries: vec![TypeSummary {
                 name: "Menu".to_string(),
                 definition_name: "MenuProps".to_string(),
-                status: ComponentStatus::Modified,
+                status: TypeStatus::Modified,
                 member_summary: MemberSummary {
                     total: 5,
                     removed: 0,
@@ -8926,7 +8900,6 @@ mod tests {
                 description: "light300 renamed to secondary".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -8990,7 +8963,6 @@ mod tests {
                 description: "variant values changed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9050,7 +9022,6 @@ mod tests {
                 description: "variant simplified".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9098,7 +9069,6 @@ mod tests {
             description: "values changed".to_string(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
 
         let removed = extract_removed_union_values(&change);
@@ -9129,7 +9099,6 @@ mod tests {
                 description: "variant values changed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9205,7 +9174,6 @@ mod tests {
                 description: "variant values changed".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9285,7 +9253,6 @@ mod tests {
             removal_disposition: Some(RemovalDisposition::ReplacedByMember {
                 new_member: "labels".to_string(),
             }),
-            renders_element: None,
         };
 
         let rename_patterns = empty_rename_patterns();
@@ -9317,7 +9284,6 @@ mod tests {
             removal_disposition: Some(RemovalDisposition::ReplacedByMember {
                 new_member: "deleteLabel".to_string(),
             }),
-            renders_element: None,
         };
 
         let rename_patterns = empty_rename_patterns();
@@ -9344,7 +9310,6 @@ mod tests {
             description: "expandableChipContainerRef removed".to_string(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
 
         let rename_patterns = empty_rename_patterns();
@@ -9372,7 +9337,6 @@ mod tests {
             description: "showClose removed".to_string(),
             migration_target: None,
             removal_disposition: Some(RemovalDisposition::TrulyRemoved),
-            renders_element: None,
         };
 
         let rename_patterns = empty_rename_patterns();
@@ -9403,7 +9367,6 @@ mod tests {
                 target_type: "ModalHeader".to_string(),
                 mechanism: "prop".to_string(),
             }),
-            renders_element: None,
         };
 
         let rename_patterns = empty_rename_patterns();
@@ -9488,7 +9451,6 @@ mod tests {
                 description: String::new(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9515,7 +9477,6 @@ mod tests {
                 description: String::new(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9542,7 +9503,6 @@ mod tests {
                 description: String::new(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -9602,7 +9562,6 @@ mod tests {
             removal_disposition: Some(RemovalDisposition::ReplacedByMember {
                 new_member: "secondary".to_string(),
             }),
-            renders_element: None,
         };
 
         // Enum value removal: change=Removed, before starts with quote
@@ -9635,7 +9594,6 @@ mod tests {
             removal_disposition: Some(RemovalDisposition::ReplacedByMember {
                 new_member: "gap".to_string(),
             }),
-            renders_element: None,
         };
 
         let is_enum_value = change.change == ApiChangeType::Removed
@@ -9702,7 +9660,6 @@ mod tests {
                 ),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -9719,7 +9676,6 @@ mod tests {
                 description: format!("Exported constant `chart_token_{}` was renamed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -9741,7 +9697,6 @@ mod tests {
                 ),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -9865,7 +9820,6 @@ mod tests {
                 ),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -9881,7 +9835,6 @@ mod tests {
                 description: format!("Exported constant `chart_token_{}` was renamed", i),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             });
         }
 
@@ -9974,7 +9927,6 @@ mod tests {
                 description: "Removed 'tertiary' from Nav.variant union".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -10046,7 +9998,6 @@ mod tests {
                 description: "children type changed from ReactNode to string".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -10155,7 +10106,6 @@ mod tests {
                 description: "Class 'Chip' was renamed to 'Label'".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -10187,7 +10137,6 @@ mod tests {
                 description: "Removed 'tertiary' from variant union".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -10219,7 +10168,6 @@ mod tests {
                 description: "Property 'title' was renamed to 'header'".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],
@@ -10278,7 +10226,6 @@ mod tests {
                 description: "CSS token 'global_success_color_100' renamed to 't_global_color_status_success_100'".to_string(),
                 migration_target: None,
                 removal_disposition: None,
-                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
             container_changes: vec![],

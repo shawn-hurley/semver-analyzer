@@ -292,6 +292,22 @@ pub trait LanguageSemantics<M: Default + Clone + PartialEq = ()> {
     fn body_analyzer(&self) -> Option<&dyn BodyAnalysisSemantics> {
         None
     }
+
+    /// Primitive type names for this language, used by the diff engine's
+    /// structural similarity comparison.
+    ///
+    /// When two types are compared for structural similarity (e.g., during
+    /// rename detection), types matching these names are classified as
+    /// primitives. Two primitives of different names are structurally similar
+    /// (both are scalars), whereas a primitive vs a reference type is not.
+    ///
+    /// Default: common cross-language primitives (string, number, boolean,
+    /// void, null). Languages should override to add their own (e.g.,
+    /// TypeScript adds `undefined`, `never`, `any`, `unknown`; Java adds
+    /// `int`, `long`, `double`, `float`, `char`, `byte`, `short`).
+    fn primitive_type_names(&self) -> &[&str] {
+        &["string", "number", "boolean", "void", "null"]
+    }
 }
 
 // ── Optional capability traits ──────────────────────────────────────────
@@ -469,9 +485,13 @@ pub trait MessageFormatter {
 /// Parameters for `Language::run_extended_analysis`.
 ///
 /// Bundles the repo/ref context with data computed by the orchestrator
-/// (removed CSS blocks, dep-repo packages) so that language implementations
-/// can attach them to their extensions without the orchestrator needing to
-/// know the concrete extension type.
+/// so that language implementations can attach them to their extensions
+/// without the orchestrator needing to know the concrete extension type.
+///
+/// The `dep_dir`, `removed_dep_components`, and `dep_repo_packages` fields
+/// support languages with separate dependency repositories (e.g., a CSS
+/// design system repo, a proto definitions repo). Languages without such
+/// dependencies ignore these fields.
 #[derive(Debug, Clone)]
 pub struct ExtendedAnalysisParams {
     /// Path to the primary repository being analyzed.
@@ -480,15 +500,18 @@ pub struct ExtendedAnalysisParams {
     pub from_ref: String,
     /// Git ref for the new (to) version.
     pub to_ref: String,
-    /// Optional path to the dependency CSS repo (already checked out/built).
-    pub dep_css_dir: Option<PathBuf>,
-    /// CSS component blocks removed between old and new dep-repo versions
-    /// (e.g., `["select", "chip"]`). Computed by the orchestrator from
-    /// `detect_removed_css_blocks()`.
-    pub removed_css_blocks: Vec<String>,
+    /// Optional path to a dependency resource repository (already checked
+    /// out and built). For TypeScript/CSS: the PatternFly CSS repo. For
+    /// other languages: proto definitions, IDL files, etc.
+    pub dep_dir: Option<PathBuf>,
+    /// Component/module directories removed between old and new versions
+    /// of the dependency repository. Computed by the orchestrator from
+    /// directory-level diffing. For TypeScript/CSS: removed CSS component
+    /// blocks (e.g., `["select", "chip"]`).
+    pub removed_dep_components: Vec<String>,
     /// Dependency repo packages (name → version at new ref).
     /// Used to generate dep-update rules for packages outside the main
-    /// analyzed monorepo (e.g., `@patternfly/patternfly` CSS package).
+    /// analyzed monorepo.
     pub dep_repo_packages: HashMap<String, String>,
 }
 
@@ -512,12 +535,21 @@ pub struct LlmCategoryDefinition {
 
 /// The core language abstraction.
 ///
-/// Composes `LanguageSemantics + MessageFormatter` and adds four associated
+/// Composes `LanguageSemantics + MessageFormatter` and adds six associated
 /// types representing language-specific data flowing through the pipeline.
 ///
 /// Code that only needs semantic rules can take `&dyn LanguageSemantics`
 /// (no generic parameter). Code that needs the associated types takes
 /// `L: Language`.
+///
+/// ## Konveyor rule generation
+///
+/// Konveyor rule generation is **not** part of this trait. Rule generation
+/// is language-specific and lives in each language crate (e.g.,
+/// `crates/ts/src/konveyor.rs` and `konveyor_v2.rs`). The shared rule
+/// types (`KonveyorRule`, `FixStrategy`) live in `crates/konveyor-core/`.
+/// If a second language needs full rule generation, consider introducing
+/// a `KonveyorGenerator<L>` trait.
 pub trait Language:
     LanguageSemantics<Self::SymbolData> + MessageFormatter + Send + Sync + 'static
 {
@@ -672,6 +704,7 @@ pub trait Language:
     ///
     /// The result is dropped into a `ReportEnvelope` by the caller.
     fn build_report(
+        &self,
         results: &crate::types::AnalysisResult<Self>,
         repo: &Path,
         from_ref: &str,

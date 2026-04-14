@@ -21,7 +21,7 @@
 use anyhow::{Context, Result};
 use semver_analyzer_core::{
     diff_surfaces_with_semantics, should_skip_for_bu, ApiSurface, BehavioralBreak,
-    BehavioralChange, ChangeSubject, ChangedFunction, ContainerChange, EvidenceType, ExpectedChild,
+    BehavioralChange, ChangeSubject, ChangedFunction, EvidenceType, ExpectedChild,
     HierarchyDelta, InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
     InferredRenamePatterns, Language, LlmApiChange, ManifestChange, SharedFindings,
     StructuralChange, StructuralChangeType, Symbol, Visibility,
@@ -229,10 +229,8 @@ impl<L: Language> Analyzer<L> {
 
                 // Phase 2: async LLM file analysis (overlaps with TD + inference)
                 let mut llm_stats = LlmPhaseStats::default();
-                let mut container_changes: Vec<(String, Vec<ContainerChange>)> = vec![];
-
                 if !no_llm && !phase1.files_for_llm.is_empty() {
-                    let (stats, comp) = Self::run_bu_phase2_llm(
+                    llm_stats = Self::run_bu_phase2_llm(
                         phase1.llm_command.as_deref(),
                         &phase1.files_for_llm,
                         &shared_bu_phase2,
@@ -242,11 +240,9 @@ impl<L: Language> Analyzer<L> {
                         &llm_categories,
                     )
                     .await;
-                    llm_stats = stats;
-                    container_changes = comp;
                 }
 
-                Ok::<_, anyhow::Error>((phase1.stats, llm_stats, container_changes))
+                Ok::<_, anyhow::Error>((phase1.stats, llm_stats))
             },
         );
 
@@ -254,7 +250,7 @@ impl<L: Language> Analyzer<L> {
         let (td, old_surface, new_surface, inferred_rename_patterns, _hierarchy_deltas, _new_hierarchies) =
             td_inference_result?;
 
-        let (phase1_stats, llm_stats, container_changes) = bu_result?;
+        let (phase1_stats, llm_stats) = bu_result?;
 
         // Merge behavioral results from both pipelines
         let behavioral_changes = Self::merge_behavioral_breaks(self.lang.as_ref(), &shared);
@@ -299,7 +295,7 @@ impl<L: Language> Analyzer<L> {
             old_surface,
             new_surface,
             inferred_rename_patterns,
-            container_changes,
+            container_changes: vec![],
             extensions: L::AnalysisExtensions::default(),
             degradation: shared.degradation_arc(),
         })
@@ -321,7 +317,7 @@ impl<L: Language> Analyzer<L> {
         no_llm: bool,
         llm_command: Option<&str>,
         build_command: Option<&str>,
-        dep_css_dir: Option<&Path>,
+        dep_dir: Option<&Path>,
         dep_from: Option<&str>,
         dep_to: Option<&str>,
         dep_build_command: Option<&str>,
@@ -345,7 +341,7 @@ impl<L: Language> Analyzer<L> {
         let repo_sd = repo.to_path_buf();
         let from_sd = from_ref.to_string();
         let to_sd = to_ref.to_string();
-        let dep_css_dir_sd = dep_css_dir.map(|p| p.to_path_buf());
+        let dep_dir_sd = dep_dir.map(|p| p.to_path_buf());
         let dep_from_sd = dep_from.map(|s| s.to_string());
         let dep_to_sd = dep_to.map(|s| s.to_string());
         let dep_build_cmd_sd = dep_build_command.map(|s| s.to_string());
@@ -452,7 +448,7 @@ impl<L: Language> Analyzer<L> {
                      // language (no language-specific build tool detection).
                      // The caller-provided build command handles install + build.
                     let dep_worktree_guard = if let (Some(dep_dir), Some(dep_to)) =
-                        (&dep_css_dir_sd, &dep_to_sd)
+                        (&dep_dir_sd, &dep_to_sd)
                     {
                         use semver_analyzer_ts::WorktreeGuard;
                         match WorktreeGuard::create_only(dep_dir, dep_to) {
@@ -520,9 +516,9 @@ impl<L: Language> Analyzer<L> {
 
                     // Detect CSS component blocks removed between dep-repo versions.
                     // Compare component directory listings at dep_from vs dep_to.
-                    // Must run before dep_css_dir_sd is consumed below.
+                    // Must run before dep_dir_sd is consumed below.
                     let removed_css_blocks = if let (Some(dep_dir), Some(from), Some(to)) =
-                        (&dep_css_dir_sd, &dep_from_sd, &dep_to_sd)
+                        (&dep_dir_sd, &dep_from_sd, &dep_to_sd)
                     {
                         detect_removed_css_blocks(dep_dir, from, to)
                     } else {
@@ -531,9 +527,9 @@ impl<L: Language> Analyzer<L> {
 
                     // Detect dep-repo packages (name → version) for dep-update
                     // rule generation. Reads the dep repo's package.json at to_ref.
-                    // Must run before dep_css_dir_sd is consumed below.
+                    // Must run before dep_dir_sd is consumed below.
                     let dep_repo_packages = if let (Some(dep_dir), Some(to_ref)) =
-                        (&dep_css_dir_sd, &dep_to_sd)
+                        (&dep_dir_sd, &dep_to_sd)
                     {
                         detect_dep_repo_packages(dep_dir, to_ref)
                     } else {
@@ -544,14 +540,14 @@ impl<L: Language> Analyzer<L> {
                     let css_dir = dep_worktree_guard
                         .as_ref()
                         .map(|g| g.path().to_path_buf())
-                        .or(dep_css_dir_sd);
+                        .or(dep_dir_sd);
 
                     let params = semver_analyzer_core::ExtendedAnalysisParams {
                         repo: repo_sd.clone(),
                         from_ref: from_sd.clone(),
                         to_ref: to_sd.clone(),
-                        dep_css_dir: css_dir,
-                        removed_css_blocks,
+                        dep_dir: css_dir,
+                        removed_dep_components: removed_css_blocks,
                         dep_repo_packages,
                     };
 
@@ -1444,11 +1440,11 @@ impl<L: Language> Analyzer<L> {
         llm_timeout: u64,
         progress: &ProgressReporter,
         categories: &[semver_analyzer_core::LlmCategoryDefinition],
-    ) -> (LlmPhaseStats, Vec<(String, Vec<ContainerChange>)>) {
+    ) -> LlmPhaseStats {
         let _span = info_span!("bu_pipeline_phase2", file_count = files.len()).entered();
         let cmd = match llm_command {
             Some(c) => c.to_string(),
-            None => return (LlmPhaseStats::default(), vec![]),
+            None => return LlmPhaseStats::default(),
         };
 
         let total = files.len();
@@ -1457,9 +1453,6 @@ impl<L: Language> Analyzer<L> {
         let llm_calls = Arc::new(AtomicUsize::new(0));
         let llm_breaks = Arc::new(AtomicUsize::new(0));
         let llm_failures = Arc::new(AtomicUsize::new(0));
-        let composition_entries: Arc<Mutex<Vec<(String, Vec<ContainerChange>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
-
         info!(total, concurrency, "starting LLM file analysis");
         let bar = progress.start_counted("[BU] LLM Analysis", total as u64);
 
@@ -1472,7 +1465,6 @@ impl<L: Language> Analyzer<L> {
             let calls = llm_calls.clone();
             let breaks = llm_breaks.clone();
             let failures = llm_failures.clone();
-            let comp_entries = composition_entries.clone();
             let cmd = cmd.clone();
             let file_path = task.file_path.clone();
             let diff_content = task.diff_content.clone();
@@ -1527,26 +1519,9 @@ impl<L: Language> Analyzer<L> {
                 calls.fetch_add(1, Ordering::Relaxed);
 
                 match result {
-                    Ok(Ok((file_path, (beh_changes, api_changes, comp_changes)))) => {
+                    Ok(Ok((file_path, (beh_changes, api_changes)))) => {
                         let beh_count = beh_changes.len();
                         let api_cnt = api_changes.len();
-                        let comp_cnt = comp_changes.len();
-
-                        // Store composition pattern changes
-                        if !comp_changes.is_empty() {
-                            let mapped: Vec<ContainerChange> = comp_changes
-                                .into_iter()
-                                .map(|c| ContainerChange {
-                                    symbol: c.component,
-                                    old_container: c.old_parent,
-                                    new_container: c.new_parent,
-                                    description: c.description,
-                                })
-                                .collect();
-                            if let Ok(mut entries) = comp_entries.lock() {
-                                entries.push((file_path.clone(), mapped));
-                            }
-                        }
 
                         for change in beh_changes {
                             breaks.fetch_add(1, Ordering::Relaxed);
@@ -1579,7 +1554,6 @@ impl<L: Language> Analyzer<L> {
                                     change: change.change,
                                     description: change.description,
                                     removal_disposition: change.removal_disposition,
-                                    renders_element: change.renders_element,
                                 });
                             }
                         }
@@ -1588,7 +1562,6 @@ impl<L: Language> Analyzer<L> {
                             file = %file_path,
                             behavioral = beh_count,
                             api = api_cnt,
-                            composition = comp_cnt,
                             "LLM analysis complete"
                         );
                     }
@@ -1623,18 +1596,10 @@ impl<L: Language> Analyzer<L> {
             );
         }
 
-        let comp_results = match Arc::try_unwrap(composition_entries) {
-            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-            Err(arc) => arc.lock().unwrap().clone(),
-        };
-
-        (
-            LlmPhaseStats {
-                llm_calls: llm_calls.load(Ordering::Relaxed),
-                llm_behavioral_breaks: llm_breaks.load(Ordering::Relaxed),
-            },
-            comp_results,
-        )
+        LlmPhaseStats {
+            llm_calls: llm_calls.load(Ordering::Relaxed),
+            llm_behavioral_breaks: llm_breaks.load(Ordering::Relaxed),
+        }
     }
 
     /// Walk UP the call graph from a private function with a behavioral break.
@@ -1756,7 +1721,7 @@ impl<L: Language> Analyzer<L> {
 } // end impl Analyzer<L> (private methods, part 1)
 
 fn git_diff_file(repo: &Path, from_ref: &str, to_ref: &str, file_path: &str) -> Option<String> {
-    semver_analyzer_ts::git_utils::git_diff_file(repo, from_ref, to_ref, file_path)
+    semver_analyzer_core::git::git_diff_file(repo, from_ref, to_ref, file_path)
 }
 
 fn fetch_test_diff<L: Language>(
@@ -1778,7 +1743,7 @@ fn fetch_test_diff<L: Language>(
 }
 
 fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    semver_analyzer_ts::git_utils::read_git_file(repo, git_ref, file_path)
+    semver_analyzer_core::git::read_git_file(repo, git_ref, file_path)
 }
 
 // ── Component Hierarchy Inference ────────────────────────────────────────
@@ -2040,7 +2005,8 @@ impl<L: Language> Analyzer<L> {
                                 .entered();
                             let a =
                                 LlmBehaviorAnalyzer::new(&analyzer_cmd).with_timeout(llm_timeout);
-                            match a.infer_component_hierarchy(&family_name, &content, None) {
+                            let prompt = semver_analyzer_ts::llm_prompts::build_hierarchy_inference_prompt(&family_name, &content, None);
+                            match a.infer_hierarchy_from_prompt(&prompt) {
                                 Ok(h) => Some(h),
                                 Err(e) => {
                                     warn!(
@@ -2073,11 +2039,12 @@ impl<L: Language> Analyzer<L> {
                                 .entered();
                             let analyzer =
                                 LlmBehaviorAnalyzer::new(&llm_cmd).with_timeout(llm_timeout);
-                            match analyzer.infer_component_hierarchy(
+                            let prompt = semver_analyzer_ts::llm_prompts::build_hierarchy_inference_prompt(
                                 &family_name,
                                 &content,
                                 related_sigs.as_deref(),
-                            ) {
+                            );
+                            match analyzer.infer_hierarchy_from_prompt(&prompt) {
                                 Ok(h) => Some(h),
                                 Err(e) => {
                                     warn!(
@@ -2086,11 +2053,7 @@ impl<L: Language> Analyzer<L> {
                                         "new hierarchy failed, retrying"
                                     );
                                     // Retry once
-                                    match analyzer.infer_component_hierarchy(
-                                        &family_name,
-                                        &content,
-                                        related_sigs.as_deref(),
-                                    ) {
+                                    match analyzer.infer_hierarchy_from_prompt(&prompt) {
                                         Ok(h) => Some(h),
                                         Err(e2) => {
                                             error!(

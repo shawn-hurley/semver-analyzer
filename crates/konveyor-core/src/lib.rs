@@ -1,12 +1,40 @@
 //! Shared types and utilities for Konveyor rule generation.
 //!
-//! This crate contains the language-independent types, structs, enums, and
-//! helper functions used by the Konveyor rule generation pipeline. All items
-//! here are agnostic of any specific `Language` implementation (e.g., TypeScript)
-//! and can be consumed by both the TS-specific crate and the binary crate.
+//! This crate provides both language-agnostic infrastructure and some
+//! JS/TS-specific functions that are in the process of being migrated to
+//! `crates/ts/`. The JS-specific functions are re-exported through
+//! `semver_analyzer_ts::konveyor_frontend` for the correct dependency direction.
 //!
-//! Types that are shared with the `frontend-analyzer-provider` are defined in
-//! the `konveyor-core` crate and re-exported here for backward compatibility.
+//! ## Language-agnostic (stays here)
+//!
+//! Rule types, consolidation, regex builders, file I/O, fix strategy types,
+//! rename pattern loading, rule merging/deduplication.
+//!
+//! ## JS/TS-specific (re-exported via `crates/ts/src/konveyor_frontend.rs`)
+//!
+//! ### Public functions
+//! - `build_frontend_condition` — JSX/React component/prop condition builder
+//! - `api_change_to_strategy` — fix strategy with npm/CSS awareness
+//! - `suppress_redundant_prop_rules` — React prop rule deduplication
+//! - `suppress_redundant_prop_value_rules` — JSX prop value rule dedup
+//! - `resolve_npm_package` — npm monorepo package lookup
+//! - `read_package_json_at_ref` / `read_package_json_from_file` — package.json parsing
+//! - `extract_package_from_path` — npm path extraction
+//!
+//! ### Private helpers (called only by the above)
+//! - `extract_package_path` — npm dist/src path parsing
+//! - `detect_version_prefix` — CSS variable version prefix detection
+//! - `parse_value_rename_field` — structured value rename parsing
+//! - `looks_like_import_path` — npm import path heuristic
+//! - `extract_value_filter` — union value extraction for conditions
+//! - `is_single_quoted_value` — quoted string detection
+//! - `extract_component_prop` — `Component.prop` splitting
+//! - `default_ts_file_pattern` — TS/JS file extension regex
+//!
+//! ### Config types
+//! - `PackageInfo`, `CssVarRenameEntry`, `CompositionRuleEntry`,
+//!   `PropRenameEntry`, `ComponentWarningEntry`, `MissingImportEntry`,
+//!   `ValueReviewEntry`
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -15,6 +43,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use semver_analyzer_core::{ApiChange, ApiChangeKind, ApiChangeType, RemovalDisposition};
+
+/// Default file pattern used as a fallback in `merge_rule_group` when no
+/// condition has a file pattern set. Currently defaults to JS/TS files.
+/// Language crates should set `file_pattern` on rule conditions before
+/// consolidation to avoid this fallback.
+pub const DEFAULT_FILE_PATTERN: &str = "*.{ts,tsx,js,jsx,mjs,cjs}";
 
 // ── Re-exports from the shared konveyor-core crate ──────────────────────
 //
@@ -713,10 +747,26 @@ pub fn merge_duplicate_conditions(rules: Vec<KonveyorRule>) -> Vec<KonveyorRule>
 }
 
 /// Consolidate rules by grouping related rules into single combined rules.
+///
+/// Uses a default package extractor that treats the file path as the package
+/// name. For language-specific package extraction (e.g., npm monorepos),
+/// use `consolidate_rules_with` and provide a custom extractor.
 pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMap<String, String>) {
+    consolidate_rules_with(rules, |path| path.to_string())
+}
+
+/// Consolidate rules with a custom package extraction function.
+///
+/// The `package_extractor` maps a file path to a package name for grouping
+/// constant-level rules. For npm: `extract_package_from_path`. For Maven:
+/// extract groupId from directory structure. For generic: identity function.
+pub fn consolidate_rules_with(
+    rules: Vec<KonveyorRule>,
+    package_extractor: impl Fn(&str) -> String,
+) -> (Vec<KonveyorRule>, HashMap<String, String>) {
     let mut groups: BTreeMap<String, Vec<KonveyorRule>> = BTreeMap::new();
     for rule in rules {
-        let key = consolidation_key(&rule);
+        let key = consolidation_key(&rule, &package_extractor);
         groups.entry(key).or_default().push(rule);
     }
     let mut consolidated = Vec::new();
@@ -739,7 +789,14 @@ pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMa
     (consolidated, id_mapping)
 }
 
-pub fn consolidation_key(rule: &KonveyorRule) -> String {
+/// Compute the consolidation group key for a rule.
+///
+/// Uses the provided `package_extractor` to map file paths to package
+/// names when grouping constant-level rules.
+pub fn consolidation_key(
+    rule: &KonveyorRule,
+    package_extractor: &dyn Fn(&str) -> String,
+) -> String {
     // Combined constant rules are already collapsed — never re-merge them.
     if rule.rule_id.contains("-combined") {
         return rule.rule_id.clone();
@@ -781,7 +838,7 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
             .next()
             .is_some_and(|c| c.is_ascii_uppercase());
         if !is_component_constant {
-            let package = extract_package_from_path(file_key);
+            let package = package_extractor(file_key);
             return format!("{}-constant-removed", package);
         }
     }
@@ -805,7 +862,7 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
             .next()
             .is_some_and(|c| c.is_ascii_uppercase());
         if !is_component_constant {
-            let package = extract_package_from_path(file_key);
+            let package = package_extractor(file_key);
             return format!("{}-constant-renamed-has-codemod=false", package);
         }
     }
@@ -1019,8 +1076,12 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
                 },
             }
         } else {
+            // Fallback file pattern when no condition has one.
+            // This default covers JS/TS files. Language crates that
+            // generate rules for other file types should set file_pattern
+            // on each rule's condition before consolidation.
             let file_pattern = extract_file_pattern_from_condition(&group[0].when)
-                .unwrap_or_else(|| "*.{ts,tsx,js,jsx,mjs,cjs}".to_string());
+                .unwrap_or_else(|| DEFAULT_FILE_PATTERN.to_string());
             KonveyorCondition::FileContent {
                 filecontent: FileContentFields {
                     pattern,
@@ -1133,16 +1194,6 @@ pub fn build_common_prefix_pattern(symbols: &[&str]) -> String {
         .into_iter()
         .collect();
     format!("^({})$", alts.join("|"))
-}
-
-/// Increment the version number in a CSS prefix string.
-pub fn increment_version_prefix(prefix: &str) -> String {
-    let re = regex::Regex::new(r"v(\d+)").unwrap();
-    re.replace(prefix, |caps: &regex::Captures| {
-        let ver: u32 = caps[1].parse().unwrap_or(0);
-        format!("v{}", ver + 1)
-    })
-    .to_string()
 }
 
 /// Write conformance rules to a separate file in the output directory.
@@ -2445,7 +2496,6 @@ mod tests {
             description: description.into(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         }
     }
 
@@ -2788,7 +2838,6 @@ mod tests {
             description: "Exported constant `global_success_color_100` was renamed to `t_global_color_status_success_100`".into(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
         let patterns = RenamePatterns::empty();
         let member_renames = HashMap::new();
@@ -2813,7 +2862,6 @@ mod tests {
             description: "renamed".into(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
         let patterns = RenamePatterns::empty();
         let member_renames = HashMap::new();
@@ -2841,7 +2889,6 @@ mod tests {
             description: "renamed".into(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
 
         let mut patterns = RenamePatterns::empty();
@@ -2872,7 +2919,6 @@ mod tests {
             description: "renamed".into(),
             migration_target: None,
             removal_disposition: None,
-            renders_element: None,
         };
 
         // Patterns with some mappings, but not for this symbol

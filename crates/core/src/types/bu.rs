@@ -259,7 +259,7 @@ pub struct BehavioralBreak<L: Language> {
 /// Produced by `BodyAnalysisSemantics::analyze_changed_body` during BU Phase 1.
 /// Each result represents a behavioral change detected without LLM assistance
 /// (e.g., JSX diff, CSS variable scanning for TypeScript).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BodyAnalysisResult {
     /// Human-readable description of the behavioral change.
     pub description: String,
@@ -270,7 +270,7 @@ pub struct BodyAnalysisResult {
 }
 
 /// A function that calls another function (used for call graph walking).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     /// Fully qualified name of the calling function.
     pub qualified_name: String,
@@ -292,7 +292,7 @@ pub struct Caller {
 }
 
 /// A reference to a symbol found by cross-file search (impact analysis).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     /// File that references the symbol.
     pub file: PathBuf,
@@ -308,7 +308,7 @@ pub struct Reference {
 }
 
 /// A test file associated with a source file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestFile {
     /// Path to the test file.
     pub path: PathBuf,

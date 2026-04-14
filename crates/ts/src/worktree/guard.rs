@@ -7,11 +7,11 @@ use super::error::WorktreeError;
 use super::package_manager::PackageManager;
 use super::tsc;
 use super::ExtractionWarning;
+#[cfg(test)]
+use semver_analyzer_core::git::sanitize_ref_name;
+use semver_analyzer_core::git::worktree_path_for;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// The directory name under the repo root where worktrees are created.
-const WORKTREE_DIR_NAME: &str = ".semver-worktrees";
 
 /// RAII guard that manages a git worktree's lifecycle.
 ///
@@ -233,7 +233,13 @@ impl WorktreeGuard {
             ))
         })?;
         let repo = repo.as_path();
-        let worktree_dir = repo.join(WORKTREE_DIR_NAME);
+        // Derive the worktree parent directory from the path computation.
+        // worktree_path_for returns <repo>/.semver-worktrees/<ref>, so
+        // the parent is <repo>/.semver-worktrees/.
+        let worktree_dir = worktree_path_for(repo, "dummy")
+            .parent()
+            .expect("worktree path should have a parent")
+            .to_path_buf();
         if !worktree_dir.exists() {
             return Ok(0);
         }
@@ -280,40 +286,6 @@ impl Drop for WorktreeGuard {
                 let _ = std::fs::remove_dir_all(&self.worktree_path);
             }
         }
-    }
-}
-
-/// Generate a deterministic worktree path for a given ref.
-///
-/// Path format: `<repo>/.semver-worktrees/<sanitized-ref>`
-///
-/// The ref is sanitized by replacing `/` with `_` and removing
-/// characters that are invalid in directory names.
-pub fn worktree_path_for(repo: &Path, git_ref: &str) -> PathBuf {
-    let sanitized = sanitize_ref_name(git_ref);
-    repo.join(WORKTREE_DIR_NAME).join(sanitized)
-}
-
-/// Sanitize a git ref name for use as a directory name.
-///
-/// Replaces `/` with `_`, removes characters that could cause issues
-/// in file paths, and truncates to a reasonable length.
-pub fn sanitize_ref_name(git_ref: &str) -> String {
-    let sanitized: String = git_ref
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' => '_',
-            ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_ascii_control() => '_',
-            c => c,
-        })
-        .collect();
-
-    // Truncate to 100 chars to avoid path length issues
-    if sanitized.len() > 100 {
-        sanitized[..100].to_string()
-    } else {
-        sanitized
     }
 }
 

@@ -335,9 +335,12 @@ where
         .copied()
         .collect();
 
-    let renames = detect_renames(&remaining_removed, &remaining_added, |a, b| {
-        semantics.same_family(a, b)
-    });
+    let renames = detect_renames(
+        &remaining_removed,
+        &remaining_added,
+        |a, b| semantics.same_family(a, b),
+        semantics.primitive_type_names(),
+    );
 
     // ── Rename validation ──────────────────────────────────────────────
     //
@@ -749,7 +752,11 @@ pub fn diff_surfaces<M: Default + Clone + PartialEq>(
 ///
 /// Returns conservative defaults: no member additions are breaking,
 /// symbols in the same directory are the same family, identity is by name only.
-/// No union parsing, no post-processing.
+/// No language-specific filtering, relocation detection, or import subpath logic.
+///
+/// Tests that need language-specific behavior (star re-export filtering,
+/// deprecated/next path handling) should use `diff_surfaces_with_semantics`
+/// with a semantics impl that includes those behaviors.
 pub(crate) struct MinimalSemantics;
 
 impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for MinimalSemantics {
@@ -758,7 +765,7 @@ impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for MinimalSemantics {
     }
 
     fn same_family(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool {
-        // Same directory = same family (generic, no TS assumptions)
+        // Same directory = same family
         let a_dir = a
             .file
             .parent()
@@ -778,44 +785,6 @@ impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for MinimalSemantics {
 
     fn visibility_rank(&self, v: crate::types::Visibility) -> u8 {
         helpers::visibility_rank(v)
-    }
-
-    fn should_skip_symbol(&self, sym: &Symbol<M>) -> bool {
-        // Filter star re-exports for testing compatibility.
-        sym.name == "*"
-    }
-
-    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
-        // Strip /deprecated/ and /next/ for testing compatibility.
-        qualified_name
-            .replace("/deprecated/", "/")
-            .replace("/next/", "/")
-    }
-
-    fn classify_relocation(&self, old_qname: &str, new_qname: &str) -> Option<&'static str> {
-        let old_deprecated = old_qname.contains("/deprecated/");
-        let new_deprecated = new_qname.contains("/deprecated/");
-        let old_next = old_qname.contains("/next/");
-        let new_next = new_qname.contains("/next/");
-
-        match (old_deprecated, new_deprecated, old_next, new_next) {
-            (false, true, _, _) => Some("moved to deprecated"),
-            (true, false, _, _) => Some("promoted from deprecated"),
-            (_, _, true, false) => Some("promoted from next"),
-            (_, _, false, true) => Some("moved to next"),
-            _ => None,
-        }
-    }
-
-    fn derive_import_subpath(&self, package: Option<&str>, qualified_name: &str) -> String {
-        let base = package.unwrap_or("unknown");
-        if qualified_name.contains("/deprecated/") {
-            format!("{}/deprecated", base)
-        } else if qualified_name.contains("/next/") {
-            format!("{}/next", base)
-        } else {
-            base.to_string()
-        }
     }
 }
 
@@ -858,7 +827,9 @@ where
             .and_then(|s| s.return_type.as_deref());
 
         let types_match = match (old_rt, new_rt) {
-            (Some(o), Some(n)) => compare::types_structurally_similar(o, n),
+            (Some(o), Some(n)) => {
+                compare::types_structurally_similar(o, n, semantics.primitive_type_names())
+            }
             _ => true, // No type info → assume compatible
         };
 

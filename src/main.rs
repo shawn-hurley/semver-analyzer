@@ -267,7 +267,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
     // Build report (includes composition changes + hierarchy enrichment)
     let phase = reporter.start_phase("Building analysis report");
     let mut report =
-        <TypeScript as Language>::build_report(&result, &common.repo, &common.from, &common.to);
+        analyzer.lang.build_report(&result, &common.repo, &common.from, &common.to);
     phase.finish("Report built");
 
     // ── Infer CSS suffix renames via LLM ─────────────────────────────
@@ -295,7 +295,8 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                         let analyzer = LlmBehaviorAnalyzer::new(&cmd).with_timeout(llm_timeout);
                         let removed_refs: Vec<&str> = removed.iter().map(|s| s.as_str()).collect();
                         let added_refs: Vec<&str> = added.iter().map(|s| s.as_str()).collect();
-                        analyzer.infer_suffix_renames(&removed_refs, &added_refs)
+                        let prompt = semver_analyzer_ts::llm_prompts::build_suffix_rename_prompt(&removed_refs, &added_refs);
+                        analyzer.infer_suffix_renames_from_prompt(&prompt)
                     }
                 })
                 .await;
@@ -461,7 +462,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         // Print degradation summary if any non-fatal issues were recorded
         diagnostics::print_degradation_summary(&result.degradation, reporter);
 
-        <TypeScript as Language>::build_report(&result, repo, from, to)
+        analyzer.lang.build_report(&result, repo, from, to)
     };
 
     // Build package info cache
@@ -545,7 +546,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let rules = if common.no_consolidate {
         raw_rules
     } else {
-        let (consolidated, _id_mapping) = konveyor::consolidate_rules(raw_rules);
+        let (consolidated, _id_mapping) = konveyor::consolidate_rules_with(
+            raw_rules,
+            semver_analyzer_konveyor_core::extract_package_from_path,
+        );
         info!(
             raw = raw_count,
             consolidated = consolidated.len(),
@@ -568,7 +572,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             let dir_name = name.rsplit('/').next().unwrap_or(name);
             pkg_info_cache
                 .entry(dir_name.to_string())
-                .or_insert_with(|| semver_analyzer_konveyor_core::PackageInfo {
+                .or_insert_with(|| semver_analyzer_ts::konveyor_frontend::PackageInfo {
                     name: name.clone(),
                     version: Some(version.clone()),
                 });
@@ -913,7 +917,7 @@ async fn cmd_analyze_java(
     };
 
     let report =
-        semver_analyzer_java::Java::build_report(&results, &common.repo, &common.from, &common.to);
+        java.build_report(&results, &common.repo, &common.from, &common.to);
 
     report_phase.finish_with_detail(
         "Report built",

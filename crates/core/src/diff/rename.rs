@@ -63,26 +63,20 @@ impl MemberFingerprint {
         }
     }
 
-    /// Returns true if the return type is a primitive (boolean, string, number,
-    /// etc.) or absent entirely. Primitive fingerprints are degenerate — they
-    /// match ALL symbols of the same type, providing zero discriminating signal.
-    /// When the collision group is large (multiple candidates), the similarity
-    /// threshold should be raised to prevent false rename matches among leftovers.
-    fn is_primitive_or_absent(&self) -> bool {
+    /// Returns true if the return type is a primitive or absent entirely.
+    /// Primitive fingerprints are degenerate — they match ALL symbols of the
+    /// same type, providing zero discriminating signal. When the collision
+    /// group is large (multiple candidates), the similarity threshold should
+    /// be raised to prevent false rename matches among leftovers.
+    ///
+    /// The `primitives` list comes from `LanguageSemantics::primitive_type_names()`.
+    fn is_primitive_or_absent(&self, primitives: &[&str]) -> bool {
         match &self.return_type {
             None => true,
-            Some(t) => matches!(
-                t.as_str(),
-                "boolean"
-                    | "string"
-                    | "number"
-                    | "void"
-                    | "null"
-                    | "undefined"
-                    | "any"
-                    | "unknown"
-                    | "never"
-            ),
+            Some(t) => {
+                let lower = t.to_lowercase();
+                primitives.iter().any(|p| p.to_lowercase() == lower)
+            }
         }
     }
 
@@ -119,7 +113,7 @@ impl MemberFingerprint {
 ///   `(category: ToolbarChipGroup | string, chip: ToolbarChip | string) => void`
 ///   → `(_p_: _T_ | string, _p_: _T_ | string) => void`
 ///   `ReactElement<any>` → `_T_` (generic params stripped after normalization)
-pub(crate) fn normalize_type_structure(type_str: &str) -> String {
+fn normalize_type_structure(type_str: &str) -> String {
     // Replace PascalCase identifiers (type references) with _T_
     let result = regex_replace_all_pascal_case(type_str, "_T_");
     // Strip generic type parameters from normalized references.
@@ -274,6 +268,7 @@ fn normalize_type_structure_deep(type_str: &str) -> String {
 }
 
 /// A detected rename: old name → new name, with the matched symbols.
+#[derive(Debug)]
 pub(super) struct RenameMatch<'a, M: Default + Clone + PartialEq = ()> {
     pub old: &'a Symbol<M>,
     pub new: &'a Symbol<M>,
@@ -291,6 +286,7 @@ pub(super) fn detect_renames<'a, M: Default + Clone + PartialEq>(
     removed: &[&'a Symbol<M>],
     added: &[&'a Symbol<M>],
     same_family: impl Fn(&Symbol<M>, &Symbol<M>) -> bool,
+    primitives: &[&str],
 ) -> Vec<RenameMatch<'a, M>> {
     if removed.is_empty() || added.is_empty() {
         return Vec::new();
@@ -347,7 +343,7 @@ pub(super) fn detect_renames<'a, M: Default + Clone + PartialEq>(
      -> f64 {
         if !same_family(rsym, asym) {
             CROSS_FAMILY_MIN_SIMILARITY
-        } else if fp.is_primitive_or_absent() && (removed_count > 2 || added_count > 2) {
+        } else if fp.is_primitive_or_absent(primitives) && (removed_count > 2 || added_count > 2) {
             PRIMITIVE_AMBIGUOUS_MIN_SIMILARITY
         } else {
             MIN_SIMILARITY
@@ -687,9 +683,11 @@ pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
     // ── Value-based fallback for unmatched tokens ───────────────────
     //
     // For tokens that didn't match by name segments, try matching by
-    // their CSS value. Token `.d.ts` type annotations contain the
-    // resolved CSS value (e.g., "#151515", "1rem"). If a removed token
-    // has the same value as exactly one added token, it's a likely match.
+    // their resolved value via `fallback_key_fn`. For CSS design tokens
+    // this extracts the CSS value (e.g., "#151515", "1rem"); other
+    // languages may extract annotation values, enum discriminants, etc.
+    // If a removed token has the same value as exactly one added token,
+    // it's a likely match.
     //
     // This catches renames where the name changed completely but the
     // underlying value stayed the same.
@@ -747,7 +745,7 @@ pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
                         old = %old_sym.name,
                         new = %new_sym.name,
                         value = %old_value,
-                        "Token matched by CSS value"
+                        "Token matched by fallback value"
                     );
 
                     matches.push(RenameMatch {
@@ -760,10 +758,7 @@ pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
         }
 
         if value_matches > 0 {
-            tracing::info!(
-                value_matches,
-                "Additional tokens matched by CSS value fallback"
-            );
+            tracing::info!(value_matches, "Additional tokens matched by value fallback");
         }
     }
 
@@ -1509,7 +1504,12 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| true,
+            &["string", "number", "boolean", "void", "null"],
+        );
 
         assert_eq!(matches.len(), 1, "Should match via Pass 4 name similarity");
         assert_eq!(matches[0].old.name, "splitButtonOptions");
@@ -1524,7 +1524,12 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| true,
+            &["string", "number", "boolean", "void", "null"],
+        );
 
         // similarity("isOpen", "isDisabled") ≈ 0.4 — below 0.6 threshold
         assert!(
@@ -1549,7 +1554,12 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| true,
+            &["string", "number", "boolean", "void", "null"],
+        );
 
         assert!(
             matches.is_empty(),
@@ -1577,14 +1587,24 @@ mod token_tests {
         let added_refs: Vec<&Symbol> = added.iter().collect();
 
         // With same_family = false, should be rejected (0.36 < 0.50)
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| false);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| false,
+            &["string", "number", "boolean", "void", "null"],
+        );
         assert!(
             matches.is_empty(),
             "Cross-family rename with similarity 0.36 should be rejected"
         );
 
         // With same_family = true, should be accepted (0.36 >= 0.15)
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| true,
+            &["string", "number", "boolean", "void", "null"],
+        );
         assert_eq!(
             matches.len(),
             1,
@@ -1603,7 +1623,12 @@ mod token_tests {
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
 
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| false);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| false,
+            &["string", "number", "boolean", "void", "null"],
+        );
         assert_eq!(
             matches.len(),
             1,
@@ -1619,16 +1644,25 @@ mod token_tests {
         // isDisabled → hasAnimations (sim 0.231) should be rejected because
         // the boolean fingerprint group has >2 members on the removed side,
         // triggering the primitive-ambiguous guard (threshold 0.45).
-        let removed = [make_prop("isDisabled", "DLS.DLSProps", "boolean"),
+        let removed = [
+            make_prop("isDisabled", "DLS.DLSProps", "boolean"),
             make_prop("isSearchable", "DLS.DLSProps", "boolean"),
-            make_prop("isCompact", "DLS.DLSProps", "boolean")];
-        let added = [make_prop("hasAnimations", "DLS.DLSProps", "boolean"),
+            make_prop("isCompact", "DLS.DLSProps", "boolean"),
+        ];
+        let added = [
+            make_prop("hasAnimations", "DLS.DLSProps", "boolean"),
             make_prop("hasCheckbox", "DLS.DLSProps", "boolean"),
-            make_prop("hasTooltip", "DLS.DLSProps", "boolean")];
+            make_prop("hasTooltip", "DLS.DLSProps", "boolean"),
+        ];
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| true,
+            &["string", "number", "boolean", "void", "null"],
+        );
 
         // None of these boolean props should match — all similarities are
         // below 0.45 and the group is ambiguous (3 removed, 2 added).
@@ -1651,7 +1685,12 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        let matches = detect_renames(
+            &removed_refs,
+            &added_refs,
+            |_, _| true,
+            &["string", "number", "boolean", "void", "null"],
+        );
 
         // 1:1 group → primitive guard doesn't apply → 0.15 threshold → 0.444 passes
         assert_eq!(matches.len(), 1, "1:1 boolean rename should still match");
@@ -1768,6 +1807,7 @@ mod token_tests {
             &[&old_member],
             &[&new_member],
             |_, _| true, // same family — both are on FormGroupProps
+            &["string", "number", "boolean", "void", "null"],
         );
         assert_eq!(
             matches.len(),

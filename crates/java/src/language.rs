@@ -499,12 +499,25 @@ impl Language for Java {
         &self,
         repo: &Path,
         git_ref: &str,
-        _degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
+        degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface<JavaSymbolData>> {
         let guard = crate::worktree::WorktreeGuard::new(repo, git_ref)?;
         let mut extractor =
             crate::extract::JavaExtractor::new().context("Failed to create Java extractor")?;
-        extractor.extract_from_dir(guard.path())
+        let surface = extractor.extract_from_dir(guard.path())?;
+
+        // Record degradation if extraction produced zero symbols
+        if surface.symbols.is_empty() {
+            if let Some(tracker) = degradation {
+                tracker.record(
+                    "TD",
+                    format!("Java extraction at ref '{}' produced 0 symbols", git_ref),
+                    "API surface may be incomplete. Verify the git ref contains Java source files.",
+                );
+            }
+        }
+
+        Ok(surface)
     }
 
     fn parse_changed_functions(
@@ -517,10 +530,16 @@ impl Language for Java {
         parser.parse_changed_functions(repo, from_ref, to_ref)
     }
 
+    /// Stub: call-graph walking not yet implemented for Java.
+    ///
+    /// The BU pipeline can detect test assertion changes and function body
+    /// changes, but cannot trace "private function X broke → public
+    /// function Y calls X → Y is breaking" without this.
     fn find_callers(&self, _file: &Path, _symbol_name: &str) -> Result<Vec<Caller>> {
         Ok(Vec::new())
     }
 
+    /// Stub: cross-file reference search not yet implemented for Java.
     fn find_references(&self, _file: &Path, _symbol_name: &str) -> Result<Vec<Reference>> {
         Ok(Vec::new())
     }
@@ -569,6 +588,7 @@ impl Language for Java {
     }
 
     fn build_report(
+        &self,
         results: &AnalysisResult<Self>,
         repo: &Path,
         from_ref: &str,
