@@ -1300,13 +1300,25 @@ Tests: `cross_family_absorption_*` in `report::tests`
 #### Family Strategy `new_imports` Scope
 
 The `new_imports` field in family migration strategies must include ALL new
-family members that consumers need to import, not just direct children of the
-root. Consumers must import `MastheadLogo` even though it's a grandchild of
-the root (`Masthead → MastheadMain → MastheadBrand → MastheadLogo`).
+**consumer-facing** family members that need importing, at any depth in the
+composition tree. Consumers must import `MastheadLogo` even though it's a
+grandchild of the root (`Masthead → MastheadMain → MastheadBrand →
+MastheadLogo`).
 
-The computation uses `tree.family_members` (all members at any depth) filtered
-to those not present in the old tree, rather than `new_children` (only root's
-direct edges).
+The computation uses `tree.family_members` (all members at any depth) with
+three filters:
+
+1. **Not in old tree** — only genuinely new members
+2. **Not a context provider** — names ending in `Context` (e.g.,
+   `AlertContext`, `FormContext`) are excluded. Consumers get context
+   implicitly from the parent component, not via direct import.
+3. **Consumer-facing** — only members that participate in at least one
+   non-Internal edge in the composition tree. Members with only Internal
+   edges are rendered by the parent component, not placed by the consumer.
+
+**Never** include context providers or internally-rendered-only components
+in `new_imports`. They add noise to the migration guidance and mislead the
+LLM into adding unnecessary imports.
 
 Key file: `crates/ts/src/konveyor_v2.rs` (search "New imports")
 

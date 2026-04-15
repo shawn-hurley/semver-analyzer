@@ -2009,14 +2009,36 @@ pub fn generate_family_strategies(
         // 5. Removed children (in old tree but not new)
         let removed_children: Vec<String> = removed_members.iter().map(|m| m.to_string()).collect();
 
-        // 6. New imports: ALL family members that consumers need to import
+        // 6. New imports: ALL consumer-facing family members that need importing
         // (at any depth, not just direct children of root). Consumers must
         // import MastheadLogo even though it's a grandchild of the root
         // (MastheadBrand -> MastheadLogo).
+        //
+        // Excludes:
+        //  - Context providers (e.g., AlertContext, FormContext) — consumers
+        //    get context implicitly from the parent, not via direct import.
+        //  - Members with only Internal edges — these are rendered by the
+        //    parent component, not placed by the consumer.
+        let consumer_facing_members: HashSet<&str> = {
+            let mut members = HashSet::new();
+            for edge in &tree.edges {
+                if edge.relationship != ChildRelationship::Internal {
+                    members.insert(edge.parent.as_str());
+                    members.insert(edge.child.as_str());
+                }
+            }
+            members
+        };
         let new_imports: Vec<String> = tree
             .family_members
             .iter()
-            .filter(|member| member.as_str() != tree.root && !old_members.contains(member.as_str()))
+            .filter(|member| {
+                let name = member.as_str();
+                name != tree.root
+                    && !old_members.contains(name)
+                    && !name.ends_with("Context")
+                    && consumer_facing_members.contains(name)
+            })
             .cloned()
             .collect();
 
