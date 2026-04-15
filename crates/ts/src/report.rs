@@ -1060,7 +1060,147 @@ fn build_package_summaries(
         pkg_entry.added_exports.push(added);
     }
 
+    enrich_cross_family_absorption(&mut package_map);
+
     package_map.into_values().collect()
+}
+
+// ─── Cross-family absorption enrichment ──────────────────────────────────
+
+/// After all TypeSummaries are built, cross-check child components with
+/// empty absorbed_members against removed props from OTHER family members.
+///
+/// `discover_child_components` uses name-prefix matching to assign children
+/// to parents. This means a child like `MastheadLogo` (starts with
+/// "Masthead") gets assigned to `Masthead`, not `MastheadBrand`. But
+/// `MastheadBrand.component` was removed and `MastheadLogo.component`
+/// was added — the absorption belongs to MastheadBrand, not Masthead.
+///
+/// This enrichment pass fixes that by checking all family members' removed
+/// props against each un-absorbed child's known_members. When cross-family
+/// absorption is found, the child is moved to the correct parent and its
+/// absorbed_members are updated.
+fn enrich_cross_family_absorption(package_map: &mut BTreeMap<String, PackageChanges<TypeScript>>) {
+    for pkg in package_map.values_mut() {
+        // Group type summary indices by family directory (parent of source_file).
+        let mut family_groups: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        for (idx, ts) in pkg.type_summaries.iter().enumerate() {
+            if let Some(src) = ts.source_files.first() {
+                if let Some(dir) = src.parent() {
+                    family_groups
+                        .entry(dir.to_path_buf())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
+
+        // For each family with >1 members, cross-check absorption.
+        // Collect move operations first, then apply them.
+        struct MoveOp {
+            child: ChildComponent,
+            from_host_idx: usize,
+            child_pos: usize,
+            to_host_idx: usize,
+        }
+        let mut moves: Vec<MoveOp> = Vec::new();
+
+        for indices in family_groups.values() {
+            if indices.len() < 2 {
+                continue;
+            }
+
+            // Build a map: removed_member_name -> [(ts_index, ts_name)]
+            let mut removed_by_member: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+            for &idx in indices {
+                let ts = &pkg.type_summaries[idx];
+                for rm in &ts.removed_members {
+                    removed_by_member
+                        .entry(rm.name.as_str())
+                        .or_default()
+                        .push((idx, ts.name.as_str()));
+                }
+            }
+
+            // Find children with 0 absorbed members and cross-check.
+            for &host_idx in indices {
+                let ts = &pkg.type_summaries[host_idx];
+                for (child_pos, child) in ts.language_data.child_components.iter().enumerate() {
+                    if child.status != ChildComponentStatus::Added
+                        || !child.absorbed_members.is_empty()
+                    {
+                        continue;
+                    }
+
+                    // Check child's known_members against all family members'
+                    // removed props. Collect matches per potential absorbing parent.
+                    let mut best_parent: Option<(usize, Vec<String>)> = None;
+
+                    for member_name in &child.known_members {
+                        // Skip ubiquitous props that don't indicate absorption.
+                        if member_name == "children" || member_name == "className" {
+                            continue;
+                        }
+                        if let Some(sources) = removed_by_member.get(member_name.as_str()) {
+                            for &(src_idx, _) in sources {
+                                if src_idx != host_idx {
+                                    let entry =
+                                        best_parent.get_or_insert_with(|| (src_idx, Vec::new()));
+                                    if entry.0 == src_idx {
+                                        entry.1.push(member_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((to_idx, mut absorbed)) = best_parent {
+                        absorbed.sort();
+                        let mut updated_child = child.clone();
+                        updated_child.absorbed_members = absorbed.clone();
+
+                        tracing::info!(
+                            child = %updated_child.name,
+                            from_parent = %ts.name,
+                            to_parent = %pkg.type_summaries[to_idx].name,
+                            absorbed = ?absorbed,
+                            "Cross-family absorption: moving child to correct parent"
+                        );
+
+                        moves.push(MoveOp {
+                            child: updated_child,
+                            from_host_idx: host_idx,
+                            child_pos,
+                            to_host_idx: to_idx,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Apply move operations: add to new parent, then remove from old.
+        // Process removals in reverse order within each host to preserve indices.
+        for mv in &moves {
+            pkg.type_summaries[mv.to_host_idx]
+                .language_data
+                .child_components
+                .push(mv.child.clone());
+        }
+
+        // Sort removals by (from_host_idx, child_pos) descending to avoid
+        // index shifting problems.
+        let mut removals: Vec<(usize, usize)> = moves
+            .iter()
+            .map(|mv| (mv.from_host_idx, mv.child_pos))
+            .collect();
+        removals.sort_by(|a, b| b.cmp(a));
+        for (host_idx, child_pos) in removals {
+            pkg.type_summaries[host_idx]
+                .language_data
+                .child_components
+                .remove(child_pos);
+        }
+    }
 }
 
 // ─── Child component discovery ───────────────────────────────────────────
@@ -4149,5 +4289,267 @@ mod tests {
     #[test]
     fn test_incompatible_different_identifiers() {
         assert!(!types_structurally_compatible("FooType", "BarType"));
+    }
+
+    // ── enrich_cross_family_absorption tests ─────────────────────────
+
+    #[test]
+    fn cross_family_absorption_moves_child_to_correct_parent() {
+        // Simulates the MastheadLogo scenario:
+        //   - Masthead (root) has child MastheadLogo with 0 absorbed members
+        //   - MastheadBrand has removed member "component"
+        //   - MastheadLogo has "component" in known_members
+        //   → enrichment should move MastheadLogo to MastheadBrand with
+        //     absorbed_members = ["component"]
+
+        let dir = "packages/react-core/src/components/Masthead";
+
+        let mut package_map: BTreeMap<String, PackageChanges<TypeScript>> = BTreeMap::new();
+
+        let masthead_ts = TypeSummary {
+            name: "Masthead".into(),
+            definition_name: "MastheadProps".into(),
+            status: TypeStatus::Modified,
+            member_summary: MemberSummary {
+                total: 3,
+                removed: 1,
+                renamed: 0,
+                type_changed: 0,
+                added: 0,
+                removal_ratio: 0.33,
+            },
+            removed_members: vec![RemovedMember {
+                name: "backgroundColor".into(),
+                old_type: Some("'dark' | 'light' | 'light200'".into()),
+                removal_disposition: None,
+            }],
+            type_changes: vec![],
+            migration_target: None,
+            behavioral_changes: vec![],
+            language_data: TsReportData {
+                child_components: vec![ChildComponent {
+                    name: "MastheadLogo".into(),
+                    status: ChildComponentStatus::Added,
+                    known_members: vec!["children".into(), "className".into(), "component".into()],
+                    absorbed_members: vec![], // <-- empty, the bug
+                }],
+                expected_children: vec![],
+            },
+            source_files: vec![PathBuf::from(format!("{}/Masthead", dir))],
+        };
+
+        let masthead_brand_ts = TypeSummary {
+            name: "MastheadBrand".into(),
+            definition_name: "MastheadBrandProps".into(),
+            status: TypeStatus::Modified,
+            member_summary: MemberSummary {
+                total: 3,
+                removed: 1,
+                renamed: 0,
+                type_changed: 0,
+                added: 0,
+                removal_ratio: 0.33,
+            },
+            removed_members: vec![RemovedMember {
+                name: "component".into(),
+                old_type: Some("ComponentType | ElementType".into()),
+                removal_disposition: None,
+            }],
+            type_changes: vec![],
+            migration_target: None,
+            behavioral_changes: vec![],
+            language_data: TsReportData {
+                child_components: vec![], // no children discovered by name-prefix
+                expected_children: vec![],
+            },
+            source_files: vec![PathBuf::from(format!("{}/MastheadBrand", dir))],
+        };
+
+        package_map.insert(
+            "@patternfly/react-core".into(),
+            PackageChanges {
+                name: "@patternfly/react-core".into(),
+                old_version: None,
+                new_version: None,
+                type_summaries: vec![masthead_ts, masthead_brand_ts],
+                constants: vec![],
+                added_exports: vec![],
+            },
+        );
+
+        enrich_cross_family_absorption(&mut package_map);
+
+        let pkg = &package_map["@patternfly/react-core"];
+
+        // MastheadLogo should have been moved from Masthead to MastheadBrand
+        let masthead = &pkg.type_summaries[0];
+        assert_eq!(masthead.name, "Masthead");
+        assert!(
+            masthead.language_data.child_components.is_empty(),
+            "Masthead should have 0 children after move, found: {:?}",
+            masthead
+                .language_data
+                .child_components
+                .iter()
+                .map(|c| &c.name)
+                .collect::<Vec<_>>()
+        );
+
+        let masthead_brand = &pkg.type_summaries[1];
+        assert_eq!(masthead_brand.name, "MastheadBrand");
+        assert_eq!(
+            masthead_brand.language_data.child_components.len(),
+            1,
+            "MastheadBrand should have 1 child after move"
+        );
+
+        let logo = &masthead_brand.language_data.child_components[0];
+        assert_eq!(logo.name, "MastheadLogo");
+        assert_eq!(
+            logo.absorbed_members,
+            vec!["component"],
+            "MastheadLogo should have absorbed 'component' from MastheadBrand"
+        );
+    }
+
+    #[test]
+    fn cross_family_absorption_skips_already_absorbed() {
+        // If a child already has absorbed_members, don't touch it.
+        let dir = "packages/react-core/src/components/Modal";
+
+        let mut package_map: BTreeMap<String, PackageChanges<TypeScript>> = BTreeMap::new();
+
+        let modal_ts = TypeSummary {
+            name: "Modal".into(),
+            definition_name: "ModalProps".into(),
+            status: TypeStatus::Modified,
+            member_summary: MemberSummary::default(),
+            removed_members: vec![RemovedMember {
+                name: "title".into(),
+                old_type: Some("string".into()),
+                removal_disposition: None,
+            }],
+            type_changes: vec![],
+            migration_target: None,
+            behavioral_changes: vec![],
+            language_data: TsReportData {
+                child_components: vec![ChildComponent {
+                    name: "ModalHeader".into(),
+                    status: ChildComponentStatus::Added,
+                    known_members: vec!["title".into(), "children".into()],
+                    absorbed_members: vec!["title".into()], // already absorbed
+                }],
+                expected_children: vec![],
+            },
+            source_files: vec![PathBuf::from(format!("{}/Modal", dir))],
+        };
+
+        package_map.insert(
+            "@patternfly/react-core".into(),
+            PackageChanges {
+                name: "@patternfly/react-core".into(),
+                old_version: None,
+                new_version: None,
+                type_summaries: vec![modal_ts],
+                constants: vec![],
+                added_exports: vec![],
+            },
+        );
+
+        enrich_cross_family_absorption(&mut package_map);
+
+        let pkg = &package_map["@patternfly/react-core"];
+        let modal = &pkg.type_summaries[0];
+        assert_eq!(modal.language_data.child_components.len(), 1);
+        assert_eq!(
+            modal.language_data.child_components[0].absorbed_members,
+            vec!["title"],
+            "Already-absorbed child should not be modified"
+        );
+    }
+
+    #[test]
+    fn cross_family_absorption_no_false_positives_on_ubiquitous_props() {
+        // children and className should not trigger cross-absorption
+        let dir = "packages/react-core/src/components/Test";
+
+        let mut package_map: BTreeMap<String, PackageChanges<TypeScript>> = BTreeMap::new();
+
+        let parent_a = TypeSummary {
+            name: "TestRoot".into(),
+            definition_name: "TestRootProps".into(),
+            status: TypeStatus::Modified,
+            member_summary: MemberSummary::default(),
+            removed_members: vec![],
+            type_changes: vec![],
+            migration_target: None,
+            behavioral_changes: vec![],
+            language_data: TsReportData {
+                child_components: vec![ChildComponent {
+                    name: "TestChild".into(),
+                    status: ChildComponentStatus::Added,
+                    known_members: vec!["children".into(), "className".into()],
+                    absorbed_members: vec![],
+                }],
+                expected_children: vec![],
+            },
+            source_files: vec![PathBuf::from(format!("{}/TestRoot", dir))],
+        };
+
+        let parent_b = TypeSummary {
+            name: "TestSibling".into(),
+            definition_name: "TestSiblingProps".into(),
+            status: TypeStatus::Modified,
+            member_summary: MemberSummary::default(),
+            removed_members: vec![
+                RemovedMember {
+                    name: "children".into(),
+                    old_type: Some("ReactNode".into()),
+                    removal_disposition: None,
+                },
+                RemovedMember {
+                    name: "className".into(),
+                    old_type: Some("string".into()),
+                    removal_disposition: None,
+                },
+            ],
+            type_changes: vec![],
+            migration_target: None,
+            behavioral_changes: vec![],
+            language_data: TsReportData {
+                child_components: vec![],
+                expected_children: vec![],
+            },
+            source_files: vec![PathBuf::from(format!("{}/TestSibling", dir))],
+        };
+
+        package_map.insert(
+            "test-pkg".into(),
+            PackageChanges {
+                name: "test-pkg".into(),
+                old_version: None,
+                new_version: None,
+                type_summaries: vec![parent_a, parent_b],
+                constants: vec![],
+                added_exports: vec![],
+            },
+        );
+
+        enrich_cross_family_absorption(&mut package_map);
+
+        let pkg = &package_map["test-pkg"];
+        let root = &pkg.type_summaries[0];
+        // TestChild should NOT have been moved — only ubiquitous props match
+        assert_eq!(
+            root.language_data.child_components.len(),
+            1,
+            "TestChild should remain with TestRoot (only ubiquitous props match)"
+        );
+        assert!(
+            root.language_data.child_components[0]
+                .absorbed_members
+                .is_empty(),
+            "TestChild should still have empty absorbed_members"
+        );
     }
 }
