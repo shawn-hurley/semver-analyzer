@@ -1431,6 +1431,23 @@ pub fn api_change_to_strategy(
                     return Some(FixStrategyEntry::rename(old_name, new_member));
                 }
 
+                // Check if this is a removed enum VALUE (e.g., variant='light')
+                // rather than a removed prop. A quoted `before` value indicates
+                // an enum member removal. Use PropValueChange instead of
+                // RemoveProp so the SD pipeline's sd-prop-value-* rule (which
+                // knows the replacement value) takes precedence.
+                if let Some(ref before) = change.before {
+                    if is_single_quoted_value(before) {
+                        let value = &before[1..before.len() - 1];
+                        let (component, prop) = extract_component_prop(&change.symbol);
+                        let mut e = FixStrategyEntry::new("PropValueChange");
+                        e.component = component;
+                        e.prop = prop;
+                        e.from = Some(value.to_string());
+                        return Some(e);
+                    }
+                }
+
                 let (component, prop) = extract_component_prop(&change.symbol);
                 let mut e = FixStrategyEntry::new("RemoveProp");
                 e.component = component;
