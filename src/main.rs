@@ -48,6 +48,7 @@ async fn run(cli: Cli, reporter: &ProgressReporter) -> Result<()> {
     match cli.command {
         Command::Extract { language } => match language {
             ExtractLanguage::Typescript(args) => cmd_extract_ts(args, reporter)?,
+            #[cfg(feature = "java")]
             ExtractLanguage::Java(args) => cmd_extract_java(args, reporter)?,
         },
 
@@ -55,11 +56,13 @@ async fn run(cli: Cli, reporter: &ProgressReporter) -> Result<()> {
 
         Command::Analyze { language } => match language {
             AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args, reporter).await?,
+            #[cfg(feature = "java")]
             AnalyzeLanguage::Java(args) => cmd_analyze_java(args, reporter).await?,
         },
 
         Command::Konveyor { language } => match language {
             KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args, reporter).await?,
+            #[cfg(feature = "java")]
             KonveyorLanguage::Java(args) => cmd_konveyor_java(args, reporter).await?,
         },
 
@@ -818,6 +821,7 @@ fn count_change_types(structural_changes: &[StructuralChange]) -> ChangeTypeCoun
 
 // ─── Extract command (Java) ─────────────────────────────────────────────
 
+#[cfg(feature = "java")]
 fn cmd_extract_java(
     args: semver_analyzer_java::cli::JavaExtractArgs,
     reporter: &ProgressReporter,
@@ -851,6 +855,7 @@ fn cmd_extract_java(
 
 // ─── Analyze command (Java) ─────────────────────────────────────────────
 
+#[cfg(feature = "java")]
 async fn cmd_analyze_java(
     args: semver_analyzer_java::cli::JavaAnalyzeArgs,
     reporter: &ProgressReporter,
@@ -936,6 +941,7 @@ async fn cmd_analyze_java(
 
 // ─── Konveyor command (Java) ────────────────────────────────────────────
 
+#[cfg(feature = "java")]
 async fn cmd_konveyor_java(
     args: semver_analyzer_java::cli::JavaKonveyorArgs,
     reporter: &ProgressReporter,
