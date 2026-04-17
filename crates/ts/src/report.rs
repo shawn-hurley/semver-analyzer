@@ -2474,6 +2474,7 @@ mod tests {
             after: Some("module".into()),
             description: "CJS to ESM".into(),
             is_breaking: true,
+            source_package: None,
         }];
 
         let results = AnalysisResult {

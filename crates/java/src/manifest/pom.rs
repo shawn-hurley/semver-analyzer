@@ -205,6 +205,7 @@ fn diff_project_identity(old: &PomData, new: &PomData, changes: &mut Vec<Manifes
                 new.group_id.as_deref().unwrap_or("(none)")
             ),
             is_breaking: true,
+            source_package: None,
         });
     }
 
@@ -220,6 +221,7 @@ fn diff_project_identity(old: &PomData, new: &PomData, changes: &mut Vec<Manifes
                 new.artifact_id.as_deref().unwrap_or("(none)")
             ),
             is_breaking: true,
+            source_package: None,
         });
     }
 
@@ -235,6 +237,7 @@ fn diff_project_identity(old: &PomData, new: &PomData, changes: &mut Vec<Manifes
                 new.version.as_deref().unwrap_or("(none)")
             ),
             is_breaking: false,
+            source_package: None,
         });
     }
 }
@@ -266,6 +269,7 @@ fn diff_parent(old: &PomData, new: &PomData, changes: &mut Vec<ManifestChange<Ja
                 new.parent_version.as_deref().unwrap_or("(none)")
             ),
             is_breaking: false,
+            source_package: None,
         });
     }
 
@@ -277,6 +281,7 @@ fn diff_parent(old: &PomData, new: &PomData, changes: &mut Vec<ManifestChange<Ja
             after: new_parent,
             description: "Parent POM changed to a different artifact".into(),
             is_breaking: true,
+            source_package: None,
         });
     }
 }
@@ -298,6 +303,7 @@ fn diff_dependencies(
                 after: None,
                 description: format!("Dependency `{}` was removed", key),
                 is_breaking: true,
+                source_package: None,
             });
         }
     }
@@ -311,6 +317,7 @@ fn diff_dependencies(
                 after: Some(format_dep(new_dep)),
                 description: format!("Dependency `{}` was added", key),
                 is_breaking: false,
+                source_package: None,
             });
         }
     }
@@ -330,6 +337,7 @@ fn diff_dependencies(
                         new_dep.version.as_deref().unwrap_or("(managed)")
                     ),
                     is_breaking: false,
+                    source_package: None,
                 });
             }
             if old_dep.scope != new_dep.scope {
@@ -346,6 +354,7 @@ fn diff_dependencies(
                     ),
                     is_breaking: old_dep.scope.as_deref().unwrap_or("compile") == "compile"
                         && new_dep.scope.as_deref().unwrap_or("compile") != "compile",
+                    source_package: None,
                 });
             }
         }
@@ -370,6 +379,7 @@ fn diff_properties(
                         key, old_val, new_val
                     ),
                     is_breaking: false,
+                    source_package: None,
                 });
             }
             None => {
@@ -380,6 +390,7 @@ fn diff_properties(
                     after: None,
                     description: format!("Property `{}` was removed (was `{}`)", key, old_val),
                     is_breaking: false,
+                    source_package: None,
                 });
             }
             _ => {}
@@ -395,6 +406,7 @@ fn diff_properties(
                 after: Some(new_val.clone()),
                 description: format!("Property `{}` was added with value `{}`", key, new_val),
                 is_breaking: false,
+                source_package: None,
             });
         }
     }

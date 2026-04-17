@@ -21,10 +21,10 @@
 use anyhow::{Context, Result};
 use semver_analyzer_core::{
     diff_surfaces_with_semantics, should_skip_for_bu, ApiSurface, BehavioralBreak,
-    BehavioralChange, ChangeSubject, ChangedFunction, EvidenceType, ExpectedChild,
-    HierarchyDelta, InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping,
-    InferredRenamePatterns, Language, LlmApiChange, ManifestChange, SharedFindings,
-    StructuralChange, StructuralChangeType, Symbol, Visibility,
+    BehavioralChange, ChangeSubject, ChangedFunction, EvidenceType, ExpectedChild, HierarchyDelta,
+    InferenceMetadata, InferredConstantPattern, InferredInterfaceMapping, InferredRenamePatterns,
+    Language, LlmApiChange, ManifestChange, SharedFindings, StructuralChange, StructuralChangeType,
+    Symbol, Visibility,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
 
@@ -102,12 +102,12 @@ impl<L: Language> Analyzer<L> {
         let progress_bu_phase2 = progress.clone();
         let llm_api_entries_bu = llm_api_entries.clone();
 
-    // LLM behavioral categories from the Language impl
-    let llm_categories = self.lang.llm_categories();
+        // LLM behavioral categories from the Language impl
+        let llm_categories = self.lang.llm_categories();
 
-    // Additional clones for rename/hierarchy inference (run inside TD branch)
-    let lang_rename = self.lang.clone();
-    let lang_hierarchy = self.lang.clone();
+        // Additional clones for rename/hierarchy inference (run inside TD branch)
+        let lang_rename = self.lang.clone();
+        let lang_hierarchy = self.lang.clone();
         let repo_hierarchy = repo.to_path_buf();
         let from_hierarchy = from_ref.to_string();
         let to_hierarchy = to_ref.to_string();
@@ -139,7 +139,8 @@ impl<L: Language> Analyzer<L> {
                 .context("TD pipeline failed")?;
 
                 // TD done — extract surfaces for inference phases (Arc clones, cheap)
-                let default_surface: Arc<ApiSurface<L::SymbolData>> = Arc::new(ApiSurface::default());
+                let default_surface: Arc<ApiSurface<L::SymbolData>> =
+                    Arc::new(ApiSurface::default());
                 let old_surface = shared_inference
                     .try_get_old_surface()
                     .cloned()
@@ -247,8 +248,14 @@ impl<L: Language> Analyzer<L> {
         );
 
         // Unwrap results from both branches
-        let (td, old_surface, new_surface, inferred_rename_patterns, _hierarchy_deltas, _new_hierarchies) =
-            td_inference_result?;
+        let (
+            td,
+            old_surface,
+            new_surface,
+            inferred_rename_patterns,
+            _hierarchy_deltas,
+            _new_hierarchies,
+        ) = td_inference_result?;
 
         let (phase1_stats, llm_stats) = bu_result?;
 
@@ -360,6 +367,26 @@ impl<L: Language> Analyzer<L> {
         let progress_rename = progress.clone();
         let shared_inference = shared.clone();
 
+        // ── Parse changed functions for transitive behavioral analysis ──
+        // This uses git diff (no worktree needed) so it can run before
+        // TD creates its worktrees. The results are passed to the SD
+        // pipeline for dependency behavioral change detection.
+        let changed_fns_sd = {
+            let lang_cf = self.lang.clone();
+            let repo_cf = repo.to_path_buf();
+            let from_cf = from_ref.to_string();
+            let to_cf = to_ref.to_string();
+            tokio::task::spawn_blocking(move || {
+                lang_cf.parse_changed_functions(&repo_cf, &from_cf, &to_cf)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("parse_changed_functions panicked: {}", e))?
+            .unwrap_or_else(|e| {
+                tracing::warn!(%e, "parse_changed_functions failed, transitive analysis will be skipped");
+                Vec::new()
+            })
+        };
+
         // ── Run TD + SD concurrently ────────────────────────────────
         let (td_inference_result, ext_result) = tokio::join!(
             // TD branch: structural diff → rename inference → hierarchy inference
@@ -383,7 +410,8 @@ impl<L: Language> Analyzer<L> {
                 .context("TD pipeline failed")?;
 
                 // TD done — extract surfaces for inference phases
-                let default_surface: Arc<ApiSurface<L::SymbolData>> = Arc::new(ApiSurface::default());
+                let default_surface: Arc<ApiSurface<L::SymbolData>> =
+                    Arc::new(ApiSurface::default());
                 let old_surface = shared_inference
                     .try_get_old_surface()
                     .cloned()
@@ -549,6 +577,7 @@ impl<L: Language> Analyzer<L> {
                         dep_dir: css_dir,
                         removed_dep_components: removed_css_blocks,
                         dep_repo_packages,
+                        changed_functions: changed_fns_sd,
                     };
 
                     lang_sd.run_extended_analysis(&params)
@@ -594,8 +623,9 @@ impl<L: Language> Analyzer<L> {
         // ── Finalize extensions + summary logging ────────────────────
         // Delegate cross-pipeline processing (e.g., deprecated replacement
         // detection) to the Language impl, then log the summary.
-        let structural_changes =
-            self.lang.finalize_extensions(&mut extensions, td.structural_changes);
+        let structural_changes = self
+            .lang
+            .finalize_extensions(&mut extensions, td.structural_changes);
 
         for line in self.lang.extensions_log_summary(&extensions) {
             progress.println(&format!("  {}", line));
@@ -755,11 +785,35 @@ impl<L: Language> Analyzer<L> {
         // Step 4: Manifest diff (language-specific)
         let _manifest_span = info_span!("manifest_diff").entered();
         let mut manifest_changes = Vec::new();
+
+        // 4a: Diff static root manifest files (e.g., root package.json)
         for manifest_file in L::MANIFEST_FILES {
             let old_content = read_git_file(repo, from_ref, manifest_file);
             let new_content = read_git_file(repo, to_ref, manifest_file);
             if let (Some(old_str), Some(new_str)) = (old_content, new_content) {
                 let changes = L::diff_manifest_content(&old_str, &new_str);
+                manifest_changes.extend(changes);
+            }
+        }
+
+        // 4b: Diff per-package manifests in monorepos (e.g., packages/*/package.json)
+        // Uses the new ref to discover packages, then diffs each against the old ref.
+        let package_manifests = L::discover_package_manifests(repo, to_ref);
+        if !package_manifests.is_empty() {
+            tracing::info!(
+                count = package_manifests.len(),
+                "Diffing per-package manifest files"
+            );
+        }
+        for (manifest_path, package_name) in &package_manifests {
+            let old_content = read_git_file(repo, from_ref, manifest_path);
+            let new_content = read_git_file(repo, to_ref, manifest_path);
+            if let (Some(old_str), Some(new_str)) = (old_content, new_content) {
+                let mut changes = L::diff_manifest_content(&old_str, &new_str);
+                // Tag each change with the source package name
+                for change in &mut changes {
+                    change.source_package = Some(package_name.clone());
+                }
                 manifest_changes.extend(changes);
             }
         }
@@ -2005,7 +2059,12 @@ impl<L: Language> Analyzer<L> {
                                 .entered();
                             let a =
                                 LlmBehaviorAnalyzer::new(&analyzer_cmd).with_timeout(llm_timeout);
-                            let prompt = semver_analyzer_ts::llm_prompts::build_hierarchy_inference_prompt(&family_name, &content, None);
+                            let prompt =
+                                semver_analyzer_ts::llm_prompts::build_hierarchy_inference_prompt(
+                                    &family_name,
+                                    &content,
+                                    None,
+                                );
                             match a.infer_hierarchy_from_prompt(&prompt) {
                                 Ok(h) => Some(h),
                                 Err(e) => {
@@ -2039,11 +2098,12 @@ impl<L: Language> Analyzer<L> {
                                 .entered();
                             let analyzer =
                                 LlmBehaviorAnalyzer::new(&llm_cmd).with_timeout(llm_timeout);
-                            let prompt = semver_analyzer_ts::llm_prompts::build_hierarchy_inference_prompt(
-                                &family_name,
-                                &content,
-                                related_sigs.as_deref(),
-                            );
+                            let prompt =
+                                semver_analyzer_ts::llm_prompts::build_hierarchy_inference_prompt(
+                                    &family_name,
+                                    &content,
+                                    related_sigs.as_deref(),
+                                );
                             match analyzer.infer_hierarchy_from_prompt(&prompt) {
                                 Ok(h) => Some(h),
                                 Err(e) => {

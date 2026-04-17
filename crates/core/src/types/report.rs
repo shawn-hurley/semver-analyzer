@@ -831,6 +831,11 @@ pub struct ManifestChange<L: Language> {
 
     /// Whether this change is breaking.
     pub is_breaking: bool,
+
+    /// Which library package this change came from (e.g., `@patternfly/react-charts`).
+    /// `None` for root manifest changes; `Some(name)` for per-package changes in monorepos.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_package: Option<String>,
 }
 
 /// Metadata about the analysis run.

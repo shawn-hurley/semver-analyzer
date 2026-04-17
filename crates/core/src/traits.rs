@@ -513,6 +513,13 @@ pub struct ExtendedAnalysisParams {
     /// Used to generate dep-update rules for packages outside the main
     /// analyzed monorepo.
     pub dep_repo_packages: HashMap<String, String>,
+
+    /// Functions whose bodies changed between old and new refs.
+    /// Produced by `Language::parse_changed_functions()` and used by the
+    /// SD pipeline to detect transitive behavioral changes — e.g., when a
+    /// helper function like `getOUIAProps()` changes its output, all
+    /// components that import it are transitively affected.
+    pub changed_functions: Vec<ChangedFunction>,
 }
 
 // ── LLM category definitions ────────────────────────────────────────────
@@ -618,6 +625,18 @@ pub trait Language:
     /// unify all git plumbing in the orchestrator so language impls are pure
     /// content processors.
     const MANIFEST_FILES: &'static [&'static str];
+
+    /// Discover per-package manifest files in monorepos.
+    ///
+    /// Returns `(manifest_path, package_name)` pairs for sub-packages.
+    /// The orchestrator diffs each discovered manifest in addition to
+    /// the static `MANIFEST_FILES` and tags resulting changes with
+    /// `source_package`.
+    ///
+    /// Default: empty (non-monorepo projects or languages without workspaces).
+    fn discover_package_manifests(_repo: &Path, _git_ref: &str) -> Vec<(String, String)> {
+        vec![]
+    }
 
     /// Source file glob patterns for `git diff --name-only` filtering.
     ///

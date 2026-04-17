@@ -42,6 +42,7 @@ fn diff_gradle(old: &str, new: &str) -> Vec<ManifestChange<Java>> {
                 after: None,
                 description: format!("Dependency `{}` was removed", key),
                 is_breaking: true,
+                source_package: None,
             });
         }
     }
@@ -55,6 +56,7 @@ fn diff_gradle(old: &str, new: &str) -> Vec<ManifestChange<Java>> {
                 after: Some(new_dep.clone()),
                 description: format!("Dependency `{}` was added", key),
                 is_breaking: false,
+                source_package: None,
             });
         }
     }
@@ -72,6 +74,7 @@ fn diff_gradle(old: &str, new: &str) -> Vec<ManifestChange<Java>> {
                         key, old_dep, new_dep
                     ),
                     is_breaking: false,
+                    source_package: None,
                 });
             }
         }

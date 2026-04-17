@@ -4012,20 +4012,61 @@ fn manifest_change_to_rule(
     let (condition, message) =
         build_manifest_condition_and_message(change, file_pattern, change_type_label);
 
+    // For peer dependency additions, attach an EnsureDependency fix strategy
+    // so the fix engine knows what package to install and at what version.
+    let fix_strategy = match change.change_type {
+        TsManifestChangeType::PeerDependencyAdded => {
+            let dep_name = change
+                .field
+                .strip_prefix("peerDependencies.")
+                .unwrap_or(&change.field);
+            if let Some(version) = &change.after {
+                Some(FixStrategyEntry::ensure_dependency(dep_name, version))
+            } else {
+                Some(FixStrategyEntry::new("Manual"))
+            }
+        }
+        TsManifestChangeType::PeerDependencyRangeChanged => {
+            let dep_name = change
+                .field
+                .strip_prefix("peerDependencies.")
+                .unwrap_or(&change.field);
+            if let Some(version) = &change.after {
+                Some(FixStrategyEntry::ensure_dependency(dep_name, version))
+            } else {
+                Some(FixStrategyEntry::new("Manual"))
+            }
+        }
+        _ => Some(FixStrategyEntry::new("Manual")),
+    };
+
+    // Peer dep rules with EnsureDependency fix strategies carry per-package
+    // data (package name + version) that would be lost if merged with other
+    // rules sharing the same detection condition. Mark them has-codemod=true
+    // to prevent merge_duplicate_conditions() from coalescing them.
+    let mut labels = vec![
+        "source=semver-analyzer".to_string(),
+        "change-type=manifest".to_string(),
+        format!("manifest-field={}", change.field),
+    ];
+    if matches!(
+        change.change_type,
+        TsManifestChangeType::PeerDependencyAdded
+            | TsManifestChangeType::PeerDependencyRangeChanged
+    ) {
+        labels.push("has-codemod=true".to_string());
+    }
+
     KonveyorRule {
         rule_id,
-        labels: vec![
-            "source=semver-analyzer".to_string(),
-            "change-type=manifest".to_string(),
-            format!("manifest-field={}", change.field),
-        ],
+        labels,
         effort,
         category: category.to_string(),
         description: change.description.clone(),
         message,
         links: Vec::new(),
         when: condition,
-        fix_strategy: Some(FixStrategyEntry::new("Manual")),
+        fix_strategy,
     }
 }
 
@@ -4286,61 +4327,84 @@ fn manifest_change_to_fix(change: &ManifestChange<TypeScript>, rule_id: &str) ->
             }
         }
 
-        TsManifestChangeType::PeerDependencyAdded => (
-            FixStrategy::EnsureDependency,
-            FixConfidence::Exact,
-            FixSource::Pattern,
-            format!(
-                "A new peer dependency has been added: '{}'\n\n\
-                     Action required:\n\
-                     1. Install the peer dependency: npm install {}\n\
-                     2. Verify version compatibility with your existing dependencies\n\n\
-                     {}",
-                change.field, change.field, change.description,
-            ),
-            change.field.clone(),
-            change.after.clone(),
-        ),
+        TsManifestChangeType::PeerDependencyAdded => {
+            // change.field is "peerDependencies.victory" — strip prefix to get bare package name
+            let dep_name = change
+                .field
+                .strip_prefix("peerDependencies.")
+                .unwrap_or(&change.field);
+            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
+            (
+                FixStrategy::EnsureDependency,
+                FixConfidence::Exact,
+                FixSource::Pattern,
+                format!(
+                    "Package `{}` now requires `{}` as a peer dependency.\n\n\
+                         Action required:\n\
+                         1. Install the peer dependency: npm install {}\n\
+                         2. Verify version compatibility with your existing dependencies\n\n\
+                         {}",
+                    source_pkg, dep_name, dep_name, change.description,
+                ),
+                dep_name.to_string(),
+                change.after.clone(),
+            )
+        }
 
-        TsManifestChangeType::PeerDependencyRemoved => (
-            FixStrategy::EnsureDependency,
-            FixConfidence::High,
-            FixSource::Pattern,
-            format!(
-                "Peer dependency '{}' has been removed.\n\n\
-                     Action required:\n\
-                     1. Check if you still need '{}' as a direct dependency\n\
-                     2. If it was only required by this package, you may be able \
-                        to remove it\n\
-                     3. Verify that removing it doesn't break other dependencies\n\n\
-                     {}",
-                change.field, change.field, change.description,
-            ),
-            change.field.clone(),
-            None,
-        ),
+        TsManifestChangeType::PeerDependencyRemoved => {
+            let dep_name = change
+                .field
+                .strip_prefix("peerDependencies.")
+                .unwrap_or(&change.field);
+            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
+            (
+                FixStrategy::EnsureDependency,
+                FixConfidence::High,
+                FixSource::Pattern,
+                format!(
+                    "Package `{}` no longer requires `{}` as a peer dependency.\n\n\
+                         Action required:\n\
+                         1. Check if you still need '{}' as a direct dependency\n\
+                         2. If it was only required by this package, you may be able \
+                            to remove it\n\
+                         3. Verify that removing it doesn't break other dependencies\n\n\
+                         {}",
+                    source_pkg, dep_name, dep_name, change.description,
+                ),
+                dep_name.to_string(),
+                None,
+            )
+        }
 
-        TsManifestChangeType::PeerDependencyRangeChanged => (
-            FixStrategy::EnsureDependency,
-            FixConfidence::High,
-            FixSource::Pattern,
-            format!(
-                "Peer dependency '{}' version range changed.\n\n\
-                     Before: {}\n\
-                     After:  {}\n\n\
-                     Action required:\n\
-                     1. Update '{}' to a version that satisfies the new range\n\
-                     2. Test for compatibility with the new version\n\n\
-                     {}",
-                change.field,
-                change.before.as_deref().unwrap_or("(none)"),
-                change.after.as_deref().unwrap_or("(none)"),
-                change.field,
-                change.description,
-            ),
-            change.field.clone(),
-            change.after.clone(),
-        ),
+        TsManifestChangeType::PeerDependencyRangeChanged => {
+            let dep_name = change
+                .field
+                .strip_prefix("peerDependencies.")
+                .unwrap_or(&change.field);
+            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
+            (
+                FixStrategy::EnsureDependency,
+                FixConfidence::High,
+                FixSource::Pattern,
+                format!(
+                    "Package `{}` changed peer dependency `{}` version range.\n\n\
+                         Before: {}\n\
+                         After:  {}\n\n\
+                         Action required:\n\
+                         1. Update '{}' to a version that satisfies the new range\n\
+                         2. Test for compatibility with the new version\n\n\
+                         {}",
+                    source_pkg,
+                    dep_name,
+                    change.before.as_deref().unwrap_or("(none)"),
+                    change.after.as_deref().unwrap_or("(none)"),
+                    dep_name,
+                    change.description,
+                ),
+                dep_name.to_string(),
+                change.after.clone(),
+            )
+        }
 
         TsManifestChangeType::EntryPointChanged | TsManifestChangeType::ExportsEntryRemoved => (
             FixStrategy::UpdateImport,
@@ -4444,27 +4508,63 @@ fn build_manifest_condition_and_message(
         TsManifestChangeType::PeerDependencyAdded
         | TsManifestChangeType::PeerDependencyRemoved
         | TsManifestChangeType::PeerDependencyRangeChanged => {
+            let dep_name = change
+                .field
+                .strip_prefix("peerDependencies.")
+                .unwrap_or(&change.field);
+            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
+
             let message = format!(
-                "Peer dependency change ({}): {}\n\nField: {}\nBefore: {}\nAfter: {}",
+                "Peer dependency change ({}): {}\n\n\
+                 Package `{}` {} peer dependency `{}`.\n\
+                 Before: {}\nAfter: {}",
                 change_type_label,
                 change.description,
-                change.field,
+                source_pkg,
+                match change.change_type {
+                    TsManifestChangeType::PeerDependencyAdded => "added",
+                    TsManifestChangeType::PeerDependencyRemoved => "removed",
+                    _ => "changed",
+                },
+                dep_name,
                 change.before.as_deref().unwrap_or("(none)"),
                 change.after.as_deref().unwrap_or("(none)"),
             );
 
-            (
-                KonveyorCondition::FileContent {
-                    filecontent: FileContentFields {
-                        pattern: format!(
-                            "\"{}\"\\s*:",
-                            change.field.replace('/', r"\/").replace('@', r"\@")
-                        ),
-                        file_pattern: "package\\.json$".to_string(),
+            // Use FrontendDependency condition to match the SOURCE package
+            // (e.g., @patternfly/react-charts) in the consumer's package.json,
+            // NOT the peer dep itself. The consumer depends on the source package;
+            // we're telling them to install its new peer dependency.
+            if let Some(source_package) = &change.source_package {
+                (
+                    KonveyorCondition::FrontendDependency {
+                        dependency: FrontendDependencyFields {
+                            name: Some(source_package.clone()),
+                            nameregex: None,
+                            upperbound: None,
+                            // lowerbound "0.0.0" matches any installed version;
+                            // kantra requires at least one bound to be set.
+                            lowerbound: Some("0.0.0".to_string()),
+                        },
                     },
-                },
-                message,
-            )
+                    message,
+                )
+            } else {
+                // Fallback for root-level manifest changes without source_package:
+                // match on the peer dep name in the consumer's package.json
+                (
+                    KonveyorCondition::FileContent {
+                        filecontent: FileContentFields {
+                            pattern: format!(
+                                "\"{}\"\\s*:",
+                                change.field.replace('/', r"\/").replace('@', r"\@")
+                            ),
+                            file_pattern: "package\\.json$".to_string(),
+                        },
+                    },
+                    message,
+                )
+            }
         }
         _ => {
             // Generic manifest change: use filecontent to match the field name
@@ -4749,6 +4849,7 @@ mod tests {
             after: Some("module".to_string()),
             description: "CJS to ESM".to_string(),
             is_breaking: true,
+            source_package: None,
         }];
 
         let report = make_report(vec![], manifest);
@@ -4785,6 +4886,7 @@ mod tests {
             after: None,
             description: "Peer dependency 'react' was removed".to_string(),
             is_breaking: true,
+            source_package: None,
         }];
 
         let report = make_report(vec![], manifest);
@@ -5116,6 +5218,7 @@ mod tests {
             after: Some("module".to_string()),
             description: "CJS to ESM migration".to_string(),
             is_breaking: true,
+            source_package: None,
         }];
 
         let report = make_report(vec![], manifest);
@@ -5241,6 +5344,7 @@ mod tests {
             after: Some("module".to_string()),
             description: "CJS to ESM".to_string(),
             is_breaking: true,
+            source_package: None,
         }];
 
         let report = make_report(changes, manifest);
@@ -10199,6 +10303,7 @@ mod tests {
             after: Some("module".to_string()),
             description: "Module system changed from CommonJS to ESM".to_string(),
             is_breaking: true,
+            source_package: None,
         }];
         let report = make_report(vec![], manifest);
         let rules = generate_rules(

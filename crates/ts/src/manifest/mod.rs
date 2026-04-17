@@ -54,6 +54,7 @@ fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<
                     after: Some(n.to_string()),
                     description: format!("`{}` entry point changed from `{}` to `{}`", field, o, n),
                     is_breaking: true,
+                    source_package: None,
                 });
             }
             (Some(o), None) => {
@@ -64,6 +65,7 @@ fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<
                     after: None,
                     description: format!("`{}` entry point was removed (was `{}`)", field, o),
                     is_breaking: true,
+                    source_package: None,
                 });
             }
             // Adding an entry point is not breaking
@@ -98,6 +100,7 @@ fn diff_module_system(old: &Value, new: &Value, changes: &mut Vec<ManifestChange
             after: Some(new_type.to_string()),
             description: description.to_string(),
             is_breaking: true,
+            source_package: None,
         });
     }
 }
@@ -126,6 +129,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                 after: None,
                 description: "The `exports` field was removed entirely".to_string(),
                 is_breaking: true,
+                source_package: None,
             });
         }
         (Some(old_exp), Some(new_exp)) => {
@@ -151,6 +155,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                                         path, cond, old_target, new_target
                                     ),
                                     is_breaking: true,
+                    source_package: None,
                                 });
                             }
                         } else {
@@ -165,6 +170,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                                     cond, path
                                 ),
                                 is_breaking: true,
+                                source_package: None,
                             });
                         }
                     }
@@ -177,6 +183,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                         after: None,
                         description: format!("Export path `{}` was removed", path),
                         is_breaking: true,
+                        source_package: None,
                     });
                 }
             }
@@ -191,6 +198,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                         after: Some(path.clone()),
                         description: format!("Export path `{}` was added", path),
                         is_breaking: false,
+                        source_package: None,
                     });
                 }
             }
@@ -277,6 +285,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
                     name, version
                 ),
                 is_breaking: true,
+                source_package: None,
             });
         }
     }
@@ -291,6 +300,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
                 after: None,
                 description: format!("Peer dependency `{}` was removed", name),
                 is_breaking: false,
+                source_package: None,
             });
         }
     }
@@ -315,6 +325,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
                     ),
                     // Conservative: treat any range change as potentially breaking
                     is_breaking: true,
+                    source_package: None,
                 });
             }
         }
@@ -341,6 +352,7 @@ fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                     engine, constraint
                 ),
                 is_breaking: true,
+                    source_package: None,
             });
         }
     }
@@ -360,6 +372,7 @@ fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
                     ),
                     // Conservative: any engine constraint change could be breaking
                     is_breaking: true,
+                    source_package: None,
                 });
             }
         }
@@ -384,6 +397,7 @@ fn diff_bin(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScrip
                 after: None,
                 description: format!("CLI command `{}` was removed", name),
                 is_breaking: true,
+                source_package: None,
             });
         }
     }
