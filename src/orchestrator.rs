@@ -382,10 +382,12 @@ impl<L: Language> Analyzer<L> {
         // TD creates worktrees during extraction. It sends Arc clones
         // through these channels so SD can use the filesystem paths
         // for oxc_resolver-based import resolution.
-        let (from_wt_tx, from_wt_rx) =
-            std::sync::mpsc::channel::<Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>>();
-        let (to_wt_tx, to_wt_rx) =
-            std::sync::mpsc::channel::<Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>>();
+        let (from_wt_tx, from_wt_rx) = std::sync::mpsc::channel::<
+            Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>,
+        >();
+        let (to_wt_tx, to_wt_rx) = std::sync::mpsc::channel::<
+            Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>,
+        >();
 
         // ── Run TD + SD concurrently ────────────────────────────────
         let (td_inference_result, ext_result) = tokio::join!(
@@ -399,10 +401,12 @@ impl<L: Language> Analyzer<L> {
                 let (from_result, to_result) = tokio::join!(
                     tokio::task::spawn_blocking(move || {
                         let _span = info_span!("td_pipeline").entered();
-                        let phase = progress_from.start_phase(
-                            &format!("[TD] Extracting API surface at {} ...", from_extract),
-                        );
-                        let _extract_span = info_span!("extract_surface", git_ref = %from_extract).entered();
+                        let phase = progress_from.start_phase(&format!(
+                            "[TD] Extracting API surface at {} ...",
+                            from_extract
+                        ));
+                        let _extract_span =
+                            info_span!("extract_surface", git_ref = %from_extract).entered();
                         let (surface, wt) = lang_from
                             .extract_keeping_worktree(
                                 &repo_from,
@@ -426,10 +430,12 @@ impl<L: Language> Analyzer<L> {
                     }),
                     tokio::task::spawn_blocking(move || {
                         let _span = info_span!("td_pipeline").entered();
-                        let phase = progress_to.start_phase(
-                            &format!("[TD] Extracting API surface at {} ...", to_extract),
-                        );
-                        let _extract_span = info_span!("extract_surface", git_ref = %to_extract).entered();
+                        let phase = progress_to.start_phase(&format!(
+                            "[TD] Extracting API surface at {} ...",
+                            to_extract
+                        ));
+                        let _extract_span =
+                            info_span!("extract_surface", git_ref = %to_extract).entered();
                         let (surface, wt) = lang_to
                             .extract_keeping_worktree(
                                 &repo_to,
@@ -462,7 +468,8 @@ impl<L: Language> Analyzer<L> {
 
                 // ── Diff + manifest analysis (needs both surfaces) ──
                 let td = tokio::task::spawn_blocking(move || {
-                    let _span = info_span!("td_pipeline", from_ref = %from_td, to_ref = %to_td).entered();
+                    let _span =
+                        info_span!("td_pipeline", from_ref = %from_td, to_ref = %to_td).entered();
                     Self::run_td_analyze(
                         lang_td.as_ref(),
                         &repo_td,
@@ -735,9 +742,13 @@ impl<L: Language> Analyzer<L> {
         // ── Finalize extensions + summary logging ────────────────────
         // Delegate cross-pipeline processing (e.g., deprecated replacement
         // detection) to the Language impl, then log the summary.
-        let structural_changes = self
-            .lang
-            .finalize_extensions(&mut extensions, td.structural_changes, repo, from_ref, to_ref);
+        let structural_changes = self.lang.finalize_extensions(
+            &mut extensions,
+            td.structural_changes,
+            repo,
+            from_ref,
+            to_ref,
+        );
 
         for line in self.lang.extensions_log_summary(&extensions) {
             progress.println(&format!("  {}", line));
@@ -841,9 +852,7 @@ impl<L: Language> Analyzer<L> {
             let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
             let (surface, wt) = lang
                 .extract_keeping_worktree(repo, from_ref, Some(shared.degradation()))
-                .with_context(|| {
-                    format!("Failed to extract API surface at ref {}", from_ref)
-                })?;
+                .with_context(|| format!("Failed to extract API surface at ref {}", from_ref))?;
             (Arc::new(surface), wt)
         };
         let old_count = old_surface.symbols.len();
