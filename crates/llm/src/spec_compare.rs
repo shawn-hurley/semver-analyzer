@@ -135,9 +135,7 @@ fn compare_error_behavior(old: &FunctionSpec, new: &FunctionSpec, reasons: &mut 
             .find(|new_err| normalize(&new_err.trigger) == normalize(&old_err.trigger));
 
         match matched {
-            Some(new_err)
-                if normalize(&old_err.error_type) != normalize(&new_err.error_type) =>
-            {
+            Some(new_err) if normalize(&old_err.error_type) != normalize(&new_err.error_type) => {
                 reasons.push(format!(
                     "Error type changed for trigger '{}': {} → {}",
                     old_err.trigger, old_err.error_type, new_err.error_type
