@@ -1,13 +1,13 @@
 [package]
 name = "semver-analyzer-llm"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "LLM-based behavioral analysis for the semver-analyzer"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.4", path = "../core" }
+semver-analyzer-core = { version = "0.0.5", path = "../core" }
 
 # Serialization (for FunctionSpec JSON)
 serde = { version = "1", features = ["derive"] }

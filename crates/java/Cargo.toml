@@ -1,14 +1,14 @@
 [package]
 name = "semver-analyzer-java"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "Java support for the semver-analyzer"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.4", path = "../core" }
-semver-analyzer-konveyor-core = { version = "0.0.4", path = "../konveyor-core" }
+semver-analyzer-core = { version = "0.0.5", path = "../core" }
+semver-analyzer-konveyor-core = { version = "0.0.5", path = "../konveyor-core" }
 
 # Tree-sitter for Java source parsing
 tree-sitter = "0.24"

@@ -1,14 +1,14 @@
 [package]
 name = "semver-analyzer-ts"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "TypeScript/JavaScript support for the semver-analyzer"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.4", path = "../core" }
-semver-analyzer-konveyor-core = { version = "0.0.4", path = "../konveyor-core" }
+semver-analyzer-core = { version = "0.0.5", path = "../core" }
+semver-analyzer-konveyor-core = { version = "0.0.5", path = "../konveyor-core" }
 
 # OXC - JavaScript/TypeScript toolchain
 oxc_parser = "0.116"

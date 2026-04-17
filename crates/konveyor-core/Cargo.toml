@@ -1,13 +1,13 @@
 [package]
 name = "semver-analyzer-konveyor-core"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "Shared types and utilities for Konveyor rule generation"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.4", path = "../core" }
+semver-analyzer-core = { version = "0.0.5", path = "../core" }
 konveyor-core = "0.0.5"
 
 # Serialization
