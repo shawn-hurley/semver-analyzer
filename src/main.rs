@@ -27,6 +27,7 @@ use semver_analyzer_core::{
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
 use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 use semver_analyzer_ts::report::{count_unique_files, extract_suffix_renames};
+use semver_analyzer_ts::worktree::RefBuildConfig;
 use semver_analyzer_ts::TypeScript;
 
 #[tokio::main]
@@ -130,7 +131,12 @@ fn cmd_extract_ts(args: TsExtractArgs, reporter: &ProgressReporter) -> Result<()
         common.git_ref
     ));
 
-    let ts = TypeScript::new(args.build_command);
+    let config = RefBuildConfig {
+        node_version: args.node_version,
+        install_command: args.install_command,
+        build_command: args.build_command,
+    };
+    let ts = TypeScript::with_ref_config(config);
     let surface = ts
         .extract(&common.repo, &common.git_ref, None)
         .context("Failed to extract API surface")?;
@@ -210,8 +216,23 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
         reporter.println("Mode: static analysis only (--no-llm)");
     }
 
+    let from_config = RefBuildConfig {
+        node_version: args.from_node_version,
+        install_command: args.from_install_command,
+        build_command: args
+            .from_build_command
+            .or_else(|| args.build_command.clone()),
+    };
+    let to_config = RefBuildConfig {
+        node_version: args.to_node_version,
+        install_command: args.to_install_command,
+        build_command: args.to_build_command.or(args.build_command),
+    };
+    let lang = Arc::new(TypeScript::new(from_config.build_command.clone()));
     let analyzer = orchestrator::Analyzer {
-        lang: Arc::new(TypeScript::new(args.build_command)),
+        lang: lang.clone(),
+        lang_from: Arc::new(TypeScript::with_ref_config(from_config)),
+        lang_to: Arc::new(TypeScript::with_ref_config(to_config)),
     };
     let result = if common.behavioral {
         reporter.println("Pipeline: behavioral (TD+BU)");
@@ -428,8 +449,27 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             reporter.println("Mode: static analysis only (--no-llm)");
         }
 
+        let from_config = RefBuildConfig {
+            node_version: args.from_node_version.clone(),
+            install_command: args.from_install_command.clone(),
+            build_command: args
+                .from_build_command
+                .clone()
+                .or_else(|| args.build_command.clone()),
+        };
+        let to_config = RefBuildConfig {
+            node_version: args.to_node_version.clone(),
+            install_command: args.to_install_command.clone(),
+            build_command: args
+                .to_build_command
+                .clone()
+                .or_else(|| args.build_command.clone()),
+        };
+        let lang = Arc::new(TypeScript::new(args.build_command.clone()));
         let analyzer = orchestrator::Analyzer {
-            lang: Arc::new(TypeScript::new(args.build_command.clone())),
+            lang: lang.clone(),
+            lang_from: Arc::new(TypeScript::with_ref_config(from_config)),
+            lang_to: Arc::new(TypeScript::with_ref_config(to_config)),
         };
         let result = if common.behavioral {
             reporter.println("Pipeline: behavioral (TD+BU)");

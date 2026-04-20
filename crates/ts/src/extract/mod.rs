@@ -219,7 +219,11 @@ impl OxcExtractor {
         use semver_analyzer_core::error::DiagnoseWithTip;
 
         // Create worktree, install deps, run tsc --declaration (with fallback)
-        let guard = WorktreeGuard::new(repo, git_ref, build_command).diagnose()?;
+        let config = crate::worktree::RefBuildConfig {
+            build_command: build_command.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        let guard = WorktreeGuard::new(repo, git_ref, &config).diagnose()?;
 
         // Record any extraction warnings as degradation
         if let Some(tracker) = degradation {

@@ -5,12 +5,32 @@
 
 mod error;
 mod guard;
+pub mod nvm;
 mod package_manager;
 mod tsc;
 
 pub use error::WorktreeError;
 pub use guard::WorktreeGuard;
 pub use package_manager::PackageManager;
+
+/// Per-ref build configuration for worktree operations.
+///
+/// Carries Node.js version, install command overrides, and build command
+/// overrides that may differ between the "from" and "to" refs.
+#[derive(Debug, Clone, Default)]
+pub struct RefBuildConfig {
+    /// Node.js version to use (e.g., "18", "18.17.0", "lts/hydrogen").
+    /// Resolved via nvm to a bin directory prepended to PATH.
+    pub node_version: Option<String>,
+
+    /// Override the install command (e.g., "npm ci", "yarn install --frozen-lockfile").
+    /// Bypasses auto-detection from lockfiles.
+    pub install_command: Option<String>,
+
+    /// Override the build command (e.g., "yarn build").
+    /// Replaces the default tsc invocation.
+    pub build_command: Option<String>,
+}
 
 /// Non-fatal issues encountered during worktree setup.
 ///

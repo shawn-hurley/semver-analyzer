@@ -48,8 +48,14 @@ const MAX_INTERFACES_FOR_INFERENCE: usize = 20;
 ///
 /// Constructed once per analysis run. The `run()` method executes the
 /// full concurrent TD+BU pipeline.
+///
+/// `lang_from` and `lang_to` carry per-ref build configuration (Node.js
+/// version, install command, build command). When no per-ref config is
+/// needed, all three fields point to the same `Arc`.
 pub struct Analyzer<L: Language> {
     pub lang: Arc<L>,
+    pub lang_from: Arc<L>,
+    pub lang_to: Arc<L>,
 }
 
 impl<L: Language> Analyzer<L> {
@@ -83,6 +89,8 @@ impl<L: Language> Analyzer<L> {
 
         // Owned clones for TD's spawn_blocking
         let lang_td = self.lang.clone();
+        let lang_td_from = self.lang_from.clone();
+        let lang_td_to = self.lang_to.clone();
         let repo_td = repo.to_path_buf();
         let from_td = from_ref.to_string();
         let to_td = to_ref.to_string();
@@ -126,6 +134,8 @@ impl<L: Language> Analyzer<L> {
                 let td = tokio::task::spawn_blocking(move || {
                     Self::run_td(
                         lang_td.as_ref(),
+                        lang_td_from.as_ref(),
+                        lang_td_to.as_ref(),
                         &repo_td,
                         &from_td,
                         &to_td,
@@ -337,8 +347,8 @@ impl<L: Language> Analyzer<L> {
         // ── Owned clones for TD's parallel extraction ─────────────────
         // Two spawn_blocking tasks run concurrently (from-ref + to-ref),
         // then a third runs the diff + manifest analysis.
-        let lang_from = self.lang.clone();
-        let lang_to = self.lang.clone();
+        let lang_from = self.lang_from.clone();
+        let lang_to = self.lang_to.clone();
         let lang_td = self.lang.clone();
         let repo_from = repo.to_path_buf();
         let repo_to = repo.to_path_buf();
@@ -845,6 +855,8 @@ impl<L: Language> Analyzer<L> {
     /// and analyze manifests. Used by the BU pipeline's `run()`.
     fn run_td(
         lang: &L,
+        lang_from: &L,
+        lang_to: &L,
         repo: &Path,
         from_ref: &str,
         to_ref: &str,
@@ -859,7 +871,7 @@ impl<L: Language> Analyzer<L> {
             progress.start_phase(&format!("[TD] Extracting API surface at {} ...", from_ref));
         let (old_surface, old_worktree) = {
             let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
-            let (surface, wt) = lang
+            let (surface, wt) = lang_from
                 .extract_keeping_worktree(repo, from_ref, Some(shared.degradation()))
                 .with_context(|| format!("Failed to extract API surface at ref {}", from_ref))?;
             (Arc::new(surface), wt)
@@ -876,7 +888,7 @@ impl<L: Language> Analyzer<L> {
         let phase = progress.start_phase(&format!("[TD] Extracting API surface at {} ...", to_ref));
         let (new_surface, new_worktree) = {
             let _extract_span = info_span!("extract_surface", git_ref = %to_ref).entered();
-            let (surface, wt) = lang
+            let (surface, wt) = lang_to
                 .extract_keeping_worktree(repo, to_ref, Some(shared.degradation()))
                 .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?;
             (Arc::new(surface), wt)
