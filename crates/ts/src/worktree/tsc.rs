@@ -34,6 +34,7 @@ pub enum TscOutcome {
 pub fn run_tsc_declaration(
     worktree_dir: &Path,
     git_ref: &str,
+    node_env: &[(String, String)],
 ) -> Result<TscOutcome, WorktreeError> {
     let tsconfig_path = worktree_dir.join("tsconfig.json");
 
@@ -44,7 +45,7 @@ pub fn run_tsc_declaration(
             // This is critical for monorepos where packages depend on sibling
             // packages (e.g., react-charts → react-core).
             tracing::info!("Root tsconfig.json has references, using tsc --build");
-            match run_tsc_build(worktree_dir, &tsconfig_path, git_ref) {
+            match run_tsc_build(worktree_dir, &tsconfig_path, git_ref, node_env) {
                 Ok(()) => {
                     tracing::info!("tsc --build succeeded");
                     return Ok(TscOutcome::Success);
@@ -61,7 +62,7 @@ pub fn run_tsc_declaration(
             }
         } else {
             // Strategy 1b: Standard single-project tsconfig (no references)
-            run_tsc_single(worktree_dir, &tsconfig_path, git_ref)?;
+            run_tsc_single(worktree_dir, &tsconfig_path, git_ref, node_env)?;
             return Ok(TscOutcome::Success);
         }
     }
@@ -75,7 +76,7 @@ pub fn run_tsc_declaration(
             .display();
         tracing::info!(path = %display_path, "Found solution tsconfig");
 
-        match run_tsc_build(worktree_dir, &solution, git_ref) {
+        match run_tsc_build(worktree_dir, &solution, git_ref, node_env) {
             Ok(()) => {
                 tracing::info!("tsc --build succeeded");
                 return Ok(TscOutcome::Success);
@@ -96,7 +97,7 @@ pub fn run_tsc_declaration(
         });
     }
 
-    run_tsc_per_package(worktree_dir, &package_tsconfigs, git_ref)
+    run_tsc_per_package(worktree_dir, &package_tsconfigs, git_ref, node_env)
 }
 
 /// Run tsc individually for each package tsconfig.
@@ -106,6 +107,7 @@ fn run_tsc_per_package(
     worktree_dir: &Path,
     tsconfigs: &[PathBuf],
     git_ref: &str,
+    node_env: &[(String, String)],
 ) -> Result<TscOutcome, WorktreeError> {
     tracing::info!(package_count = tsconfigs.len(), "Running tsc for packages");
 
@@ -118,7 +120,7 @@ fn run_tsc_per_package(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        match run_tsc_single(worktree_dir, tsconfig, git_ref) {
+        match run_tsc_single(worktree_dir, tsconfig, git_ref, node_env) {
             Ok(()) => {
                 successes += 1;
             }
@@ -192,6 +194,7 @@ fn run_tsc_build(
     worktree_dir: &Path,
     tsconfig_path: &Path,
     git_ref: &str,
+    node_env: &[(String, String)],
 ) -> Result<(), WorktreeError> {
     let tsc_bin = find_tsc_binary(worktree_dir);
     let tsconfig_str = tsconfig_path.to_string_lossy().to_string();
@@ -199,6 +202,7 @@ fn run_tsc_build(
     let output = Command::new(&tsc_bin)
         .args(["--build", &tsconfig_str, "--force"])
         .current_dir(worktree_dir)
+        .envs(node_env.iter().map(|(k, v)| (k, v)))
         .output()
         .map_err(|e| WorktreeError::CommandFailed(format!("Failed to run tsc --build: {e}")))?;
 
@@ -224,6 +228,7 @@ fn run_tsc_build(
 pub fn run_project_build(
     worktree_dir: &Path,
     build_command: Option<&str>,
+    node_env: &[(String, String)],
 ) -> Result<(), WorktreeError> {
     // Determine whether we need a shell to interpret the command.
     // Compound commands (using &&, ||, ;, |, or shell expansions) must
@@ -258,7 +263,10 @@ pub fn run_project_build(
     tracing::info!(command = %cmd, args = %args.join(" "), "Running project build");
 
     let mut command = Command::new(&cmd);
-    command.args(&args).current_dir(worktree_dir);
+    command
+        .args(&args)
+        .current_dir(worktree_dir)
+        .envs(node_env.iter().map(|(k, v)| (k, v)));
 
     // Only set NODE_ENV=production for auto-detected build commands.
     // User-provided build commands may need devDependencies (e.g., gulp,
@@ -333,6 +341,7 @@ fn run_tsc_single(
     worktree_dir: &Path,
     tsconfig_path: &Path,
     git_ref: &str,
+    node_env: &[(String, String)],
 ) -> Result<(), WorktreeError> {
     // Check for noEmit conflict
     if let Ok(contents) = std::fs::read_to_string(tsconfig_path) {
@@ -356,6 +365,7 @@ fn run_tsc_single(
         Command::new(&tsc_bin)
             .args(["--build", &tsconfig_str, "--force"])
             .current_dir(worktree_dir)
+            .envs(node_env.iter().map(|(k, v)| (k, v)))
             .output()
             .map_err(|e| WorktreeError::CommandFailed(format!("Failed to run tsc: {e}")))?
     } else {
@@ -370,6 +380,7 @@ fn run_tsc_single(
                 "false",
             ])
             .current_dir(worktree_dir)
+            .envs(node_env.iter().map(|(k, v)| (k, v)))
             .output()
             .map_err(|e| WorktreeError::CommandFailed(format!("Failed to run tsc: {e}")))?
     };

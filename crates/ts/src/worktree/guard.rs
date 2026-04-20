@@ -46,18 +46,19 @@ impl WorktreeGuard {
     /// This is the primary entry point. It performs the full worktree lifecycle:
     /// 1. Validate the repo and ref
     /// 2. Create the worktree via `git worktree add`
-    /// 3. Detect and run the package manager install
-    /// 4. Run `tsc --declaration --emitDeclarationOnly`
-    /// 5. If tsc fails partially, try the project build as a fallback
+    /// 3. Resolve Node.js version (if configured via `config.node_version`)
+    /// 4. Detect and run the package manager install (or use `config.install_command`)
+    /// 5. Run `tsc --declaration --emitDeclarationOnly`
+    /// 6. If tsc fails partially, try the project build as a fallback
     ///
-    /// An optional `build_command` can be provided to customize the build step.
-    /// If not provided and tsc fails, the project's `build` script is tried.
+    /// The `config` parameter allows per-ref overrides for Node.js version,
+    /// install command, and build command.
     ///
     /// On any failure, the worktree is cleaned up before the error propagates.
     pub fn new(
         repo: &Path,
         git_ref: &str,
-        build_command: Option<&str>,
+        config: &super::RefBuildConfig,
     ) -> Result<Self, WorktreeError> {
         // Canonicalize repo path to avoid relative path mismatches between
         // git (which resolves paths relative to its CWD) and Rust filesystem
@@ -99,24 +100,30 @@ impl WorktreeGuard {
         create_worktree(repo, git_ref, &worktree_path)?;
         guard.created = true;
 
-        // Detect and install dependencies
-        let pm = PackageManager::detect(&worktree_path).ok_or_else(|| {
-            WorktreeError::NoLockfileFound {
-                git_ref: git_ref.to_string(),
-            }
-        })?;
+        // Resolve Node.js environment (prepends nvm bin dir to PATH if configured)
+        let node_env = super::nvm::build_node_env(config.node_version.as_deref())?;
 
-        run_package_install(&worktree_path, pm)?;
+        // Install dependencies
+        if let Some(ref install_cmd) = config.install_command {
+            run_custom_install(&worktree_path, install_cmd, &node_env)?;
+        } else {
+            let pm = PackageManager::detect(&worktree_path).ok_or_else(|| {
+                WorktreeError::NoLockfileFound {
+                    git_ref: git_ref.to_string(),
+                }
+            })?;
+            run_package_install(&worktree_path, pm, &node_env)?;
+        }
 
         // If user provided a build command, run it instead of tsc
-        if let Some(cmd) = build_command {
+        if let Some(ref cmd) = config.build_command {
             tracing::info!("Running user-provided build command");
-            tsc::run_project_build(&worktree_path, Some(cmd))?;
+            tsc::run_project_build(&worktree_path, Some(cmd), &node_env)?;
             return Ok(guard);
         }
 
         // Run tsc --declaration (tries solution tsconfig, then per-package)
-        match tsc::run_tsc_declaration(&worktree_path, git_ref) {
+        match tsc::run_tsc_declaration(&worktree_path, git_ref, &node_env) {
             Ok(tsc::TscOutcome::Success) => {
                 // Full success — all packages compiled
             }
@@ -127,7 +134,7 @@ impl WorktreeGuard {
                     failed = failed,
                     "tsc partial success, trying project build"
                 );
-                match tsc::run_project_build(&worktree_path, None) {
+                match tsc::run_project_build(&worktree_path, None, &node_env) {
                     Ok(()) => {
                         // Project build succeeded — should have better coverage now
                     }
@@ -147,7 +154,7 @@ impl WorktreeGuard {
             Err(e) => {
                 // Total tsc failure — try project build as last resort
                 tracing::warn!(error = %e, "tsc failed completely, trying project build as fallback");
-                match tsc::run_project_build(&worktree_path, None) {
+                match tsc::run_project_build(&worktree_path, None, &node_env) {
                     Ok(()) => {
                         // Project build succeeded as fallback
                         guard
@@ -387,13 +394,18 @@ fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<(), WorktreeErro
 }
 
 /// Run the package manager install command in the worktree directory.
-fn run_package_install(worktree_dir: &Path, pm: PackageManager) -> Result<(), WorktreeError> {
+fn run_package_install(
+    worktree_dir: &Path,
+    pm: PackageManager,
+    node_env: &[(String, String)],
+) -> Result<(), WorktreeError> {
     let (cmd, args) = pm.install_command(worktree_dir);
     let display_cmd = format!("{cmd} {}", args.join(" "));
 
     let output = Command::new(cmd)
         .args(args)
         .current_dir(worktree_dir)
+        .envs(node_env.iter().map(|(k, v)| (k, v)))
         .output()
         .map_err(|e| WorktreeError::PackageInstallFailed {
             command: display_cmd.clone(),
@@ -406,6 +418,53 @@ fn run_package_install(worktree_dir: &Path, pm: PackageManager) -> Result<(), Wo
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(WorktreeError::PackageInstallFailed {
             command: display_cmd,
+            reason: stderr.trim().to_string(),
+        })
+    }
+}
+
+/// Run a user-provided install command in the worktree directory.
+fn run_custom_install(
+    worktree_dir: &Path,
+    install_cmd: &str,
+    node_env: &[(String, String)],
+) -> Result<(), WorktreeError> {
+    tracing::info!(command = %install_cmd, "Running user-provided install command");
+
+    let needs_shell =
+        install_cmd.contains("&&") || install_cmd.contains("||") || install_cmd.contains(';');
+
+    let output = if needs_shell {
+        Command::new("sh")
+            .args(["-c", install_cmd])
+            .current_dir(worktree_dir)
+            .envs(node_env.iter().map(|(k, v)| (k, v)))
+            .output()
+    } else {
+        let parts: Vec<&str> = install_cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(WorktreeError::PackageInstallFailed {
+                command: install_cmd.to_string(),
+                reason: "Empty install command".to_string(),
+            });
+        }
+        Command::new(parts[0])
+            .args(&parts[1..])
+            .current_dir(worktree_dir)
+            .envs(node_env.iter().map(|(k, v)| (k, v)))
+            .output()
+    }
+    .map_err(|e| WorktreeError::PackageInstallFailed {
+        command: install_cmd.to_string(),
+        reason: format!("Failed to execute: {e}"),
+    })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(WorktreeError::PackageInstallFailed {
+            command: install_cmd.to_string(),
             reason: stderr.trim().to_string(),
         })
     }
@@ -676,7 +735,11 @@ mod tests {
         // and proceeds to `npm ci`, which fails in the test environment.
         // Without the fix, it fails with NoLockfileFound because git
         // created the worktree at a double-nested path.
-        let result = WorktreeGuard::new(relative_repo, "v1.0.0", None);
+        let result = WorktreeGuard::new(
+            relative_repo,
+            "v1.0.0",
+            &crate::worktree::RefBuildConfig::default(),
+        );
 
         if let Err(WorktreeError::NoLockfileFound { .. }) = result {
             panic!(

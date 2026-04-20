@@ -32,8 +32,38 @@ pub struct TsAnalyzeArgs {
     /// Custom build command to run before API extraction.
     /// If not set, the analyzer detects the package manager and runs tsc
     /// with monorepo-aware fallbacks (solution tsconfig, project build script).
+    /// Used as the default for both refs unless overridden by
+    /// --from-build-command / --to-build-command.
     #[arg(long, help_heading = "Build")]
     pub build_command: Option<String>,
+
+    /// Build command for the "from" ref only (overrides --build-command).
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub from_build_command: Option<String>,
+
+    /// Build command for the "to" ref only (overrides --build-command).
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub to_build_command: Option<String>,
+
+    /// Node.js version for the "from" ref (e.g., "16", "18.19.0").
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub from_node_version: Option<String>,
+
+    /// Node.js version for the "to" ref (e.g., "18", "20.11.0").
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub to_node_version: Option<String>,
+
+    /// Install command for the "from" ref (e.g., "npm ci", "yarn install --frozen-lockfile").
+    /// Overrides auto-detection from lockfiles.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub from_install_command: Option<String>,
+
+    /// Install command for the "to" ref (e.g., "npm ci", "yarn install --immutable").
+    /// Overrides auto-detection from lockfiles.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub to_install_command: Option<String>,
 
     /// Path to a dependency git repository (e.g., @patternfly/patternfly CSS repo).
     /// When provided, the SD pipeline extracts CSS profiles from this repo
@@ -66,6 +96,16 @@ pub struct TsExtractArgs {
     /// with monorepo-aware fallbacks (solution tsconfig, project build script).
     #[arg(long, help_heading = "Build")]
     pub build_command: Option<String>,
+
+    /// Node.js version to use (e.g., "18", "18.19.0").
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, help_heading = "Build")]
+    pub node_version: Option<String>,
+
+    /// Install command override (e.g., "npm ci", "yarn install --frozen-lockfile").
+    /// Overrides auto-detection from lockfiles.
+    #[arg(long, help_heading = "Build")]
+    pub install_command: Option<String>,
 }
 
 /// TypeScript-specific arguments for the `konveyor` command.
@@ -94,8 +134,38 @@ pub struct TsKonveyorArgs {
     /// Custom build command to run before API extraction.
     /// If not set, the analyzer detects the package manager and runs tsc
     /// with monorepo-aware fallbacks (solution tsconfig, project build script).
+    /// Used as the default for both refs unless overridden by
+    /// --from-build-command / --to-build-command.
     #[arg(long, help_heading = "Build")]
     pub build_command: Option<String>,
+
+    /// Build command for the "from" ref only (overrides --build-command).
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub from_build_command: Option<String>,
+
+    /// Build command for the "to" ref only (overrides --build-command).
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub to_build_command: Option<String>,
+
+    /// Node.js version for the "from" ref (e.g., "16", "18.19.0").
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub from_node_version: Option<String>,
+
+    /// Node.js version for the "to" ref (e.g., "18", "20.11.0").
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub to_node_version: Option<String>,
+
+    /// Install command for the "from" ref (e.g., "npm ci", "yarn install --frozen-lockfile").
+    /// Overrides auto-detection from lockfiles.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub from_install_command: Option<String>,
+
+    /// Install command for the "to" ref (e.g., "npm ci", "yarn install --immutable").
+    /// Overrides auto-detection from lockfiles.
+    #[arg(long, help_heading = "Per-Ref Build")]
+    pub to_install_command: Option<String>,
 
     /// File glob pattern for filecontent rules.
     /// Determines which files Konveyor will scan for violations.
