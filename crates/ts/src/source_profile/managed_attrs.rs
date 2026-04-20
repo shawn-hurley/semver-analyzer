@@ -11,12 +11,12 @@
 //! The detection is generic — it works for any prop/helper/attribute pattern,
 //! not just OUIA.
 
-use crate::sd_types::ManagedAttributeBinding;
+use crate::sd_types::{ManagedAttributeBinding, TrackedAttributes};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 /// Result of analyzing destructuring patterns in a function's parameters
 /// or body (for class components using `this.props`).
@@ -76,7 +76,7 @@ pub fn extract_managed_attributes(
     source: &str,
     _component_name: &str,
     known_props: &BTreeSet<String>,
-    data_attributes: &BTreeMap<(String, String), String>,
+    data_attributes: &TrackedAttributes<(String, String)>,
 ) -> Vec<ManagedAttributeBinding> {
     let allocator = Allocator::default();
     let source_type = SourceType::tsx();
@@ -131,7 +131,7 @@ fn build_bindings(
     flows: &[PropFunctionFlow],
     jsx_spreads: &[JsxElementSpreads],
     rest_prop: &RestPropagation,
-    data_attributes: &BTreeMap<(String, String), String>,
+    data_attributes: &TrackedAttributes<(String, String)>,
 ) -> Vec<ManagedAttributeBinding> {
     let mut bindings = Vec::new();
 
@@ -1064,11 +1064,12 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    fn data_attrs(entries: &[(&str, &str)]) -> BTreeMap<(String, String), String> {
-        entries
-            .iter()
-            .map(|(elem, attr)| ((elem.to_string(), attr.to_string()), String::new()))
-            .collect()
+    fn data_attrs(entries: &[(&str, &str)]) -> TrackedAttributes<(String, String)> {
+        let mut tracked = TrackedAttributes::default();
+        for (elem, attr) in entries {
+            tracked.insert((elem.to_string(), attr.to_string()), String::new(), false);
+        }
+        tracked
     }
 
     /// Test: MenuToggle class component pattern.

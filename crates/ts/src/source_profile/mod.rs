@@ -23,7 +23,7 @@ use bem::{extract_style_tokens, parse_bem_structure, StyleToken};
 use children_slot::{has_children_prop, trace_children_slot_both};
 // clone_element detection is done inline during the main AST walk
 // (via clone_element::try_extract_clone_element_from_call)
-use crate::sd_types::ComponentSourceProfile;
+use crate::sd_types::{ComponentSourceProfile, TrackedAttributes};
 use managed_attrs::extract_managed_attributes;
 use prop_defaults::extract_prop_defaults;
 use prop_style::extract_prop_style_bindings;
@@ -68,17 +68,9 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
             conditional: !ast_info.unconditional_tags.contains(tag),
         })
         .collect();
-    profile.aria_attributes = ast_info
-        .aria_attrs
-        .iter()
-        .map(|((elem, attr), val)| ((elem.clone(), attr.clone()), val.clone()))
-        .collect();
-    profile.role_attributes = ast_info.role_attrs.clone();
-    profile.data_attributes = ast_info
-        .data_attrs
-        .iter()
-        .map(|((elem, attr), val)| ((elem.clone(), attr.clone()), val.clone()))
-        .collect();
+    profile.aria_attributes = ast_info.aria_attrs;
+    profile.role_attributes = ast_info.role_attrs;
+    profile.data_attributes = ast_info.data_attrs;
 
     // 2. BEM token analysis — use import-derived block as ground truth
     let style_tokens = extract_style_tokens(source);
@@ -184,9 +176,9 @@ struct FullSourceInfo {
     /// If a tag is in `element_tags` but NOT in `unconditional_tags`,
     /// it was only found inside conditional branches (ternary, &&, if).
     unconditional_tags: BTreeSet<String>,
-    aria_attrs: BTreeMap<(String, String), String>,
-    role_attrs: BTreeMap<String, String>,
-    data_attrs: BTreeMap<(String, String), String>,
+    aria_attrs: TrackedAttributes<(String, String)>,
+    role_attrs: TrackedAttributes<String>,
+    data_attrs: TrackedAttributes<(String, String)>,
 
     // ── React Context (from JSX AST) ────────────────────────────────
     /// Context names provided via `<XContext.Provider>` JSX elements.
@@ -740,12 +732,13 @@ fn visit_jsx_element_info<'a>(
 
             if attr_name.starts_with("aria-") {
                 info.aria_attrs
-                    .insert((tag_name.clone(), attr_name), attr_value);
+                    .insert((tag_name.clone(), attr_name), attr_value, conditional);
             } else if attr_name == "role" {
-                info.role_attrs.insert(tag_name.clone(), attr_value);
+                info.role_attrs
+                    .insert(tag_name.clone(), attr_value, conditional);
             } else if attr_name.starts_with("data-") {
                 info.data_attrs
-                    .insert((tag_name.clone(), attr_name), attr_value);
+                    .insert((tag_name.clone(), attr_name), attr_value, conditional);
             }
         }
     }

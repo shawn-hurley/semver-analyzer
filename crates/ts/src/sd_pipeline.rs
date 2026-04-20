@@ -709,6 +709,8 @@ pub fn run_sd(
         dep_repo_packages: HashMap::new(), // populated by orchestrator from --dep-repo
         removed_css_blocks: Vec::new(),    // populated by orchestrator from dep-repo diff
         dead_css_classes_after_swap: Vec::new(), // populated by orchestrator from CSS inventory diff
+        old_css_class_inventory: HashSet::new(), // populated by orchestrator from dep-repo CSS
+        new_css_class_inventory: HashSet::new(), // populated by orchestrator from dep-repo CSS
         deprecated_replacements: Vec::new(),     // populated by orchestrator from rendering swaps
         old_profiles,
         new_profiles,

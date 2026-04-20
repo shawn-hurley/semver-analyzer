@@ -631,20 +631,25 @@ impl<L: Language> Analyzer<L> {
                         Vec::new()
                     };
 
-                    // Detect CSS classes where a naive prefix swap produces a
-                    // non-existent v6 class (e.g., pf-v5-c-form__actions--right
-                    // → pf-v6-c-form__actions--right, but the latter doesn't exist).
-                    let dead_css_classes_after_swap = if let (Some(dep_dir), Some(from), Some(to)) =
+                    // Analyze CSS class inventories: extract full class lists from
+                    // both versions and detect dead classes (prefix swap → non-existent).
+                    // Builds a worktree for from_ref too so we get compiled CSS.
+                    let css_inventory = if let (Some(dep_dir), Some(from), Some(to)) =
                         (&dep_dir_sd, &dep_from_sd, &dep_to_sd)
                     {
-                        detect_dead_css_classes(
+                        analyze_css_class_inventories(
                             dep_dir,
                             from,
                             to,
                             dep_worktree_guard.as_ref().map(|g| g.path()),
+                            dep_build_cmd_sd.as_deref(),
                         )
                     } else {
-                        Vec::new()
+                        CssInventoryResult {
+                            dead_classes_after_swap: Vec::new(),
+                            old_inventory: std::collections::HashSet::new(),
+                            new_inventory: std::collections::HashSet::new(),
+                        }
                     };
 
                     // Detect dep-repo packages (name → version) for dep-update
@@ -694,7 +699,9 @@ impl<L: Language> Analyzer<L> {
                         dep_repo_packages,
                         from_worktree_path: from_wt_path,
                         to_worktree_path: to_wt_path,
-                        dead_css_classes_after_swap,
+                        dead_css_classes_after_swap: css_inventory.dead_classes_after_swap,
+                        old_css_class_inventory: css_inventory.old_inventory,
+                        new_css_class_inventory: css_inventory.new_inventory,
                     };
 
                     // Keep worktree handles alive until analysis completes.
@@ -946,6 +953,7 @@ impl<L: Language> Analyzer<L> {
         shared.insert_structural_breaks(breaking_changes);
 
         // Manifest diff (language-specific)
+        let manifest_phase = progress.start_phase("[TD] Diffing manifest files ...");
         let _manifest_span = info_span!("manifest_diff").entered();
         let mut manifest_changes = Vec::new();
 
@@ -975,6 +983,20 @@ impl<L: Language> Analyzer<L> {
                 }
                 manifest_changes.extend(changes);
             }
+        }
+
+        let manifest_breaking = manifest_changes.iter().filter(|c| c.is_breaking).count();
+        if manifest_changes.is_empty() {
+            manifest_phase.finish("[TD] No manifest changes detected");
+        } else {
+            manifest_phase.finish_with_detail(
+                "[TD] Manifest diff complete",
+                &format!(
+                    "{} changes ({} breaking)",
+                    manifest_changes.len(),
+                    manifest_breaking
+                ),
+            );
         }
 
         let total_changes = structural_changes.len();
@@ -2451,35 +2473,129 @@ fn detect_removed_css_blocks(dep_dir: &Path, from_ref: &str, to_ref: &str) -> Ve
         .collect()
 }
 
-/// Detect CSS classes where a version prefix swap produces a non-existent class.
+/// Result of CSS class inventory analysis between two dep-repo versions.
+struct CssInventoryResult {
+    /// CSS classes where a prefix swap produces a non-existent class.
+    dead_classes_after_swap: Vec<(String, String)>,
+    /// Full CSS class inventory from the old version (compiled CSS).
+    old_inventory: std::collections::HashSet<String>,
+    /// Full CSS class inventory from the new version (compiled CSS).
+    new_inventory: std::collections::HashSet<String>,
+}
+
+/// Extract CSS class inventories from both dep-repo versions and detect dead classes.
 ///
-/// Compares the CSS class inventories at the old and new dep-repo refs.
-/// For each old class containing the version prefix (e.g., `pf-v5-`), applies
-/// the swap to the new prefix (e.g., `pf-v6-`) and checks if the result
-/// exists in the new inventory. Classes where the swap produces a non-existent
-/// class are returned as `(old_class, dead_swapped_class)` pairs.
-fn detect_dead_css_classes(
+/// Builds a worktree for `from_ref` (if a build command is provided) to get
+/// compiled CSS — the dep repo typically has no pre-built CSS checked into git.
+/// For `to_ref`, uses the already-built worktree if available.
+///
+/// Returns the full inventories for both versions plus the dead class list.
+/// The inventories are used to generate enumerated per-class rules instead
+/// of a single catch-all prefix swap rule.
+fn analyze_css_class_inventories(
     dep_dir: &Path,
     from_ref: &str,
     to_ref: &str,
     to_worktree: Option<&Path>,
-) -> Vec<(String, String)> {
+    build_command: Option<&str>,
+) -> CssInventoryResult {
     use semver_analyzer_ts::css_profile::{
         extract_css_class_inventory, extract_css_class_inventory_from_dir,
     };
 
-    // Extract old class inventory via git (no build needed)
-    let old_classes = match extract_css_class_inventory(dep_dir, from_ref) {
-        Ok(classes) => {
-            tracing::info!(
-                count = classes.len(),
-                "Old CSS class inventory extracted for dead-class detection"
-            );
-            classes
+    let empty_result = CssInventoryResult {
+        dead_classes_after_swap: Vec::new(),
+        old_inventory: std::collections::HashSet::new(),
+        new_inventory: std::collections::HashSet::new(),
+    };
+
+    // Extract old class inventory.
+    // Build a worktree for from_ref so we get compiled CSS (SCSS source
+    // in git doesn't contain usable class selectors).
+    let from_worktree = {
+        use semver_analyzer_ts::WorktreeGuard;
+        match WorktreeGuard::create_only(dep_dir, from_ref) {
+            Ok(guard) => {
+                // Run build command to compile SCSS → CSS
+                if let Some(cmd) = build_command {
+                    tracing::info!(
+                        command = %cmd,
+                        worktree = %guard.path().display(),
+                        ref_name = %from_ref,
+                        "Building dep repo worktree for old CSS class inventory"
+                    );
+                    match std::process::Command::new("sh")
+                        .args(["-c", cmd])
+                        .current_dir(guard.path())
+                        .output()
+                    {
+                        Ok(output) if output.status.success() => {
+                            tracing::info!(ref_name = %from_ref, "Dep repo build succeeded for old ref");
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let tail: String = stderr
+                                .lines()
+                                .rev()
+                                .take(10)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            tracing::warn!(
+                                ref_name = %from_ref,
+                                exit_code = ?output.status.code(),
+                                stderr = %tail,
+                                "Dep repo build failed for old ref"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, ref_name = %from_ref, "Failed to run dep repo build for old ref");
+                        }
+                    }
+                }
+                Some(guard)
+            }
+            Err(e) => {
+                tracing::warn!(%e, "Failed to create dep repo worktree for old ref");
+                None
+            }
         }
-        Err(e) => {
-            tracing::warn!(%e, "Failed to extract old CSS class inventory, skipping dead-class detection");
-            return Vec::new();
+    };
+
+    // Extract old classes — prefer built worktree, fall back to git
+    let old_classes = if let Some(ref guard) = from_worktree {
+        match extract_css_class_inventory_from_dir(guard.path()) {
+            Ok(classes) if !classes.is_empty() => {
+                tracing::info!(
+                    count = classes.len(),
+                    "Old CSS class inventory extracted from built worktree"
+                );
+                classes
+            }
+            Ok(_) => {
+                tracing::warn!("Old CSS worktree produced empty inventory, falling back to git");
+                extract_css_class_inventory(dep_dir, from_ref).unwrap_or_default()
+            }
+            Err(e) => {
+                tracing::warn!(%e, "Failed to extract old CSS from worktree, falling back to git");
+                extract_css_class_inventory(dep_dir, from_ref).unwrap_or_default()
+            }
+        }
+    } else {
+        match extract_css_class_inventory(dep_dir, from_ref) {
+            Ok(classes) => {
+                tracing::info!(
+                    count = classes.len(),
+                    "Old CSS class inventory extracted via git"
+                );
+                classes
+            }
+            Err(e) => {
+                tracing::warn!(%e, "Failed to extract old CSS class inventory");
+                return empty_result;
+            }
         }
     };
 
@@ -2489,17 +2605,21 @@ fn detect_dead_css_classes(
             Ok(classes) => {
                 tracing::info!(
                     count = classes.len(),
-                    "New CSS class inventory extracted from worktree for dead-class detection"
+                    "New CSS class inventory extracted from worktree"
                 );
                 classes
             }
             Err(e) => {
-                tracing::warn!(%e, "Failed to extract new CSS class inventory from worktree, falling back to git");
+                tracing::warn!(%e, "Failed to extract new CSS from worktree, falling back to git");
                 match extract_css_class_inventory(dep_dir, to_ref) {
                     Ok(classes) => classes,
                     Err(e2) => {
-                        tracing::warn!(%e2, "Failed to extract new CSS class inventory, skipping dead-class detection");
-                        return Vec::new();
+                        tracing::warn!(%e2, "Failed to extract new CSS class inventory");
+                        return CssInventoryResult {
+                            dead_classes_after_swap: Vec::new(),
+                            old_inventory: old_classes,
+                            new_inventory: std::collections::HashSet::new(),
+                        };
                     }
                 }
             }
@@ -2508,61 +2628,66 @@ fn detect_dead_css_classes(
         match extract_css_class_inventory(dep_dir, to_ref) {
             Ok(classes) => classes,
             Err(e) => {
-                tracing::warn!(%e, "Failed to extract new CSS class inventory, skipping dead-class detection");
-                return Vec::new();
+                tracing::warn!(%e, "Failed to extract new CSS class inventory");
+                return CssInventoryResult {
+                    dead_classes_after_swap: Vec::new(),
+                    old_inventory: old_classes,
+                    new_inventory: std::collections::HashSet::new(),
+                };
             }
         }
     };
 
     // Auto-detect the prefix swap from the class inventories.
-    // Look for the most common versioned prefix pattern in each set.
     let old_prefix = detect_version_prefix(&old_classes);
     let new_prefix = detect_version_prefix(&new_classes);
 
-    let (old_prefix, new_prefix) = match (old_prefix, new_prefix) {
-        (Some(old), Some(new)) if old != new => (old, new),
+    let dead_classes_after_swap = match (old_prefix, new_prefix) {
+        (Some(ref old_pfx), Some(ref new_pfx)) if old_pfx != new_pfx => {
+            tracing::info!(
+                old_prefix = %old_pfx,
+                new_prefix = %new_pfx,
+                old_count = old_classes.len(),
+                new_count = new_classes.len(),
+                "Detected CSS class prefix change for dead-class analysis"
+            );
+
+            let mut dead: Vec<(String, String)> = old_classes
+                .iter()
+                .filter(|cls| cls.starts_with(old_pfx))
+                .filter_map(|old_class| {
+                    let swapped = format!("{}{}", new_pfx, &old_class[old_pfx.len()..]);
+                    if !new_classes.contains(&swapped) {
+                        Some((old_class.clone(), swapped))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            dead.sort();
+
+            if !dead.is_empty() {
+                tracing::info!(
+                    count = dead.len(),
+                    "Detected CSS classes where prefix swap produces non-existent class"
+                );
+            }
+            dead
+        }
         _ => {
             tracing::debug!("No version prefix change detected, skipping dead-class detection");
-            return Vec::new();
+            Vec::new()
         }
     };
 
-    tracing::info!(
-        old_prefix = %old_prefix,
-        new_prefix = %new_prefix,
-        "Detected CSS class prefix change for dead-class analysis"
-    );
+    // Drop the from_worktree guard before returning (cleanup)
+    drop(from_worktree);
 
-    // Find old classes where the prefix swap produces a non-existent new class.
-    // Only consider classes with the old prefix (e.g., pf-v5-c-*, pf-v5-u-*, pf-v5-l-*).
-    let mut dead_classes: Vec<(String, String)> = old_classes
-        .iter()
-        .filter(|cls| cls.starts_with(&old_prefix))
-        .filter_map(|old_class| {
-            let swapped = format!("{}{}", new_prefix, &old_class[old_prefix.len()..]);
-            if !new_classes.contains(&swapped) {
-                Some((old_class.clone(), swapped))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    dead_classes.sort();
-
-    if !dead_classes.is_empty() {
-        tracing::info!(
-            count = dead_classes.len(),
-            "Detected CSS classes where prefix swap produces non-existent v6 class"
-        );
-        if dead_classes.len() <= 20 {
-            for (old, dead) in &dead_classes {
-                tracing::debug!(old = %old, dead = %dead, "Dead CSS class after swap");
-            }
-        }
+    CssInventoryResult {
+        dead_classes_after_swap,
+        old_inventory: old_classes,
+        new_inventory: new_classes,
     }
-
-    dead_classes
 }
 
 /// Detect the most common version prefix from a set of CSS class names.

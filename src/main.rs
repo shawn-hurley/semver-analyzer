@@ -713,6 +713,22 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             strategies.extend(family_strategies);
 
             all_rules.extend(sd_rules);
+
+            // Suppress the v1 catch-all CSS class prefix rule when
+            // enumerated per-class rules are available from SD.
+            if !sd.old_css_class_inventory.is_empty() {
+                let before = all_rules.len();
+                all_rules.retain(|r| !r.rule_id.starts_with("semver-consumer-css-stale-class-"));
+                let suppressed = before - all_rules.len();
+                if suppressed > 0 {
+                    info!(
+                        suppressed,
+                        "Suppressed catch-all CSS class prefix rules \
+                         (replaced by enumerated per-class rules)"
+                    );
+                }
+            }
+
             sd_rule_phase.finish_with_detail("SD rules generated", &format!("{} rules", sd_count));
         }
     }
@@ -732,6 +748,36 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     // (konveyor_v2::generate_conformance_rules) from composition trees.
     write_phase.finish("Output written");
 
+    // Count rules by category for summary
+    let css_count = all_rules
+        .iter()
+        .filter(|r| r.labels.iter().any(|l| l.starts_with("change-type=css")))
+        .count();
+    let deps_count = all_rules
+        .iter()
+        .filter(|r| {
+            r.labels
+                .iter()
+                .any(|l| l == "change-type=manifest" || l == "change-type=dependency-update")
+        })
+        .count();
+    let composition_count = all_rules
+        .iter()
+        .filter(|r| {
+            r.labels.iter().any(|l| {
+                l == "change-type=composition"
+                    || l == "change-type=conformance"
+                    || l == "change-type=context-dependency"
+                    || l == "change-type=prop-to-child"
+                    || l == "change-type=child-to-prop"
+                    || l == "change-type=deprecated-migration"
+                    || l == "change-type=composition-inversion"
+                    || l == "change-type=prop-attribute-override"
+            })
+        })
+        .count();
+    let api_count = rule_count - css_count - deps_count - composition_count;
+
     // Summary
     reporter.println(&format!(
         "\nGenerated {} Konveyor rules in {}",
@@ -739,32 +785,40 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         common.output_dir.display()
     ));
     reporter.println(&format!(
-        "  Ruleset:  {}/ruleset.yaml",
+        "  Ruleset:       {}/ruleset.yaml",
         common.output_dir.display()
     ));
     reporter.println(&format!(
-        "  Rules:    {}/breaking-changes.yaml",
-        common.output_dir.display()
+        "  API rules:     {}/breaking-changes-api.yaml ({} rules)",
+        common.output_dir.display(),
+        api_count
     ));
-    // Conformance rules disabled (see above)
-    // if !conformance_rules.is_empty() {
-    //     reporter.println(&format!(
-    //         "  Conformance: {}/conformance-rules.yaml ({} rules)",
-    //         common.output_dir.display(),
-    //         conformance_rules.len(),
-    //     ));
-    // }
     reporter.println(&format!(
-        "  Fixes:    {}/fix-guidance.yaml",
+        "  CSS rules:     {}/breaking-changes-css.yaml ({} rules)",
+        common.output_dir.display(),
+        css_count
+    ));
+    reporter.println(&format!(
+        "  Composition:   {}/breaking-changes-composition.yaml ({} rules)",
+        common.output_dir.display(),
+        composition_count
+    ));
+    reporter.println(&format!(
+        "  Dependencies:  {}/breaking-changes-deps.yaml ({} rules)",
+        common.output_dir.display(),
+        deps_count
+    ));
+    reporter.println(&format!(
+        "  Fixes:         {}/fix-guidance.yaml",
         fix_dir.display()
     ));
     reporter.println(&format!(
-        "  Strategies: {}/fix-strategies.json ({} entries)",
+        "  Strategies:    {}/fix-strategies.json ({} entries)",
         fix_dir.display(),
         strategies.len()
     ));
     reporter.println(&format!(
-        "  Summary:  {} auto-fixable, {} need review, {} manual only",
+        "  Summary:       {} auto-fixable, {} need review, {} manual only",
         fix_guidance.summary.auto_fixable,
         fix_guidance.summary.needs_review,
         fix_guidance.summary.manual_only,

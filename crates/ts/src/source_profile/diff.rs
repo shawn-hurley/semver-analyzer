@@ -28,6 +28,7 @@ pub fn diff_profiles(
     diff_aria_attributes(old, new, component, &mut changes);
     diff_role_attributes(old, new, component, &mut changes);
     diff_data_attributes(old, new, component, &mut changes);
+    diff_attribute_conditionality(old, new, component, &mut changes);
     diff_css_tokens(old, new, component, &mut changes);
     diff_prop_style_bindings(old, new, component, &mut changes);
     diff_managed_attributes(old, new, component, &mut changes);
@@ -428,11 +429,9 @@ fn diff_aria_attributes(
     changes: &mut Vec<SourceLevelChange>,
 ) {
     // Added
-    for ((elem, attr), val) in &new.aria_attributes {
-        if !old
-            .aria_attributes
-            .contains_key(&(elem.clone(), attr.clone()))
-        {
+    for ((elem, attr), val) in new.aria_attributes.iter() {
+        let key = (elem.clone(), attr.clone());
+        if !old.aria_attributes.contains_key(&key) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::AriaChange,
@@ -447,7 +446,7 @@ fn diff_aria_attributes(
                 migration_from: None,
                 dependency_chain: None,
             });
-        } else if let Some(old_val) = old.aria_attributes.get(&(elem.clone(), attr.clone())) {
+        } else if let Some(old_val) = old.aria_attributes.get(&key) {
             if old_val != val {
                 changes.push(SourceLevelChange {
                     component: component.to_string(),
@@ -470,11 +469,9 @@ fn diff_aria_attributes(
     }
 
     // Removed
-    for ((elem, attr), old_val) in &old.aria_attributes {
-        if !new
-            .aria_attributes
-            .contains_key(&(elem.clone(), attr.clone()))
-        {
+    for ((elem, attr), old_val) in old.aria_attributes.iter() {
+        let key = (elem.clone(), attr.clone());
+        if !new.aria_attributes.contains_key(&key) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::AriaChange,
@@ -501,7 +498,7 @@ fn diff_role_attributes(
     component: &str,
     changes: &mut Vec<SourceLevelChange>,
 ) {
-    for (elem, new_role) in &new.role_attributes {
+    for (elem, new_role) in new.role_attributes.iter() {
         match old.role_attributes.get(elem) {
             Some(old_role) if old_role != new_role => {
                 changes.push(SourceLevelChange {
@@ -541,7 +538,7 @@ fn diff_role_attributes(
         }
     }
 
-    for (elem, old_role) in &old.role_attributes {
+    for (elem, old_role) in old.role_attributes.iter() {
         if !new.role_attributes.contains_key(elem) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
@@ -569,11 +566,9 @@ fn diff_data_attributes(
     component: &str,
     changes: &mut Vec<SourceLevelChange>,
 ) {
-    for ((elem, attr), val) in &new.data_attributes {
-        if !old
-            .data_attributes
-            .contains_key(&(elem.clone(), attr.clone()))
-        {
+    for ((elem, attr), val) in new.data_attributes.iter() {
+        let key = (elem.clone(), attr.clone());
+        if !old.data_attributes.contains_key(&key) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::DataAttribute,
@@ -591,11 +586,9 @@ fn diff_data_attributes(
         }
     }
 
-    for ((elem, attr), old_val) in &old.data_attributes {
-        if !new
-            .data_attributes
-            .contains_key(&(elem.clone(), attr.clone()))
-        {
+    for ((elem, attr), old_val) in old.data_attributes.iter() {
+        let key = (elem.clone(), attr.clone());
+        if !new.data_attributes.contains_key(&key) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::DataAttribute,
@@ -605,6 +598,109 @@ fn diff_data_attributes(
                 has_test_implications: true,
                 test_description: Some(format!(
                     "Removed {attr} from <{elem}> will break selectors using this attribute"
+                )),
+                element: Some(elem.clone()),
+                migration_from: None,
+                dependency_chain: None,
+            });
+        }
+    }
+}
+
+// ── Attribute conditionality ────────────────────────────────────────────
+//
+// Detects when an attribute transitions from unconditional (always-present)
+// to conditional (sometimes-absent) rendering. This catches the common PFv6
+// pattern where an attribute like `aria-disabled` was always rendered in v5
+// (set to "false" when not disabled) but is omitted entirely in v6 when
+// not active. Tests using `getAttribute()` expecting a string value will
+// now receive `null`.
+
+fn diff_attribute_conditionality(
+    old: &ComponentSourceProfile,
+    new: &ComponentSourceProfile,
+    component: &str,
+    changes: &mut Vec<SourceLevelChange>,
+) {
+    // ARIA attributes: unconditional → conditional
+    for key in old.aria_attributes.keys() {
+        if !new.aria_attributes.contains_key(key) {
+            continue; // Removed entirely — handled by diff_aria_attributes
+        }
+        let (ref elem, ref attr) = key;
+        if old.aria_attributes.is_unconditional(key) && !new.aria_attributes.is_unconditional(key) {
+            let old_val = old.aria_attributes.get(key).cloned().unwrap_or_default();
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::AttributeConditionality,
+                description: format!(
+                    "{attr} on <{elem}> in {component} changed from always-present \
+                     to conditional — getAttribute('{attr}') may now return null"
+                ),
+                old_value: Some(format!("always-present (value: {old_val})")),
+                new_value: Some("conditional".into()),
+                has_test_implications: true,
+                test_description: Some(format!(
+                    "getAttribute('{attr}') on <{elem}> may now return null instead of \
+                     a string value. Update assertions from .toBe('false') to \
+                     .toBeNull() or .not.toHaveAttribute('{attr}')"
+                )),
+                element: Some(elem.clone()),
+                migration_from: None,
+                dependency_chain: None,
+            });
+        }
+    }
+
+    // Role attributes: unconditional → conditional
+    for key in old.role_attributes.keys() {
+        if !new.role_attributes.contains_key(key) {
+            continue; // Removed — handled by diff_role_attributes
+        }
+        if old.role_attributes.is_unconditional(key) && !new.role_attributes.is_unconditional(key) {
+            let old_val = old.role_attributes.get(key).cloned().unwrap_or_default();
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::AttributeConditionality,
+                description: format!(
+                    "role on <{key}> in {component} changed from always-present \
+                     to conditional — getAttribute('role') may now return null"
+                ),
+                old_value: Some(format!("always-present (value: {old_val})")),
+                new_value: Some("conditional".into()),
+                has_test_implications: true,
+                test_description: Some(format!(
+                    "getAttribute('role') on <{key}> may now return null. \
+                     Update assertions accordingly."
+                )),
+                element: Some(key.clone()),
+                migration_from: None,
+                dependency_chain: None,
+            });
+        }
+    }
+
+    // Data attributes: unconditional → conditional
+    for key in old.data_attributes.keys() {
+        if !new.data_attributes.contains_key(key) {
+            continue; // Removed — handled by diff_data_attributes
+        }
+        let (ref elem, ref attr) = key;
+        if old.data_attributes.is_unconditional(key) && !new.data_attributes.is_unconditional(key) {
+            let old_val = old.data_attributes.get(key).cloned().unwrap_or_default();
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::AttributeConditionality,
+                description: format!(
+                    "{attr} on <{elem}> in {component} changed from always-present \
+                     to conditional"
+                ),
+                old_value: Some(format!("always-present (value: {old_val})")),
+                new_value: Some("conditional".into()),
+                has_test_implications: true,
+                test_description: Some(format!(
+                    "getAttribute('{attr}') on <{elem}> may now return null. \
+                     Update selectors and assertions accordingly."
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
@@ -1023,10 +1119,12 @@ mod tests {
     #[test]
     fn test_diff_role_changed() {
         let mut old = make_profile("Menu");
-        old.role_attributes.insert("ul".into(), "menu".into());
+        old.role_attributes
+            .insert("ul".into(), "menu".into(), false);
 
         let mut new = make_profile("Menu");
-        new.role_attributes.insert("ul".into(), "listbox".into());
+        new.role_attributes
+            .insert("ul".into(), "listbox".into(), false);
 
         let changes = diff_profiles(&old, &new);
         assert_eq!(changes.len(), 1);
@@ -1338,5 +1436,153 @@ mod tests {
             managed.is_empty(),
             "Expected no changes for identical managed attributes"
         );
+    }
+
+    // ── Attribute conditionality tests ──────────────────────────────
+
+    #[test]
+    fn test_diff_aria_unconditional_to_conditional() {
+        let mut old = make_profile("Button");
+        old.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "{isDisabled}".into(),
+            false, // unconditional in v5
+        );
+
+        let mut new = make_profile("Button");
+        new.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "true".into(),
+            true, // conditional in v6
+        );
+
+        let changes = diff_profiles(&old, &new);
+        let cond_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::AttributeConditionality)
+            .collect();
+        assert_eq!(cond_changes.len(), 1);
+        assert!(cond_changes[0].description.contains("aria-disabled"));
+        assert!(cond_changes[0].description.contains("always-present"));
+        assert!(cond_changes[0].description.contains("conditional"));
+        assert!(cond_changes[0].has_test_implications);
+        assert!(cond_changes[0].element.as_deref() == Some("button"));
+    }
+
+    #[test]
+    fn test_diff_aria_conditional_to_conditional_no_change() {
+        let mut old = make_profile("Button");
+        old.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "true".into(),
+            true,
+        );
+
+        let mut new = make_profile("Button");
+        new.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "true".into(),
+            true,
+        );
+
+        let changes = diff_profiles(&old, &new);
+        let cond_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::AttributeConditionality)
+            .collect();
+        assert!(cond_changes.is_empty());
+    }
+
+    #[test]
+    fn test_diff_aria_removed_not_conditionality() {
+        // When attribute is fully removed, it should be AriaChange, not AttributeConditionality
+        let mut old = make_profile("Button");
+        old.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "false".into(),
+            false,
+        );
+
+        let new = make_profile("Button");
+        // aria-disabled not present at all in new
+
+        let changes = diff_profiles(&old, &new);
+        assert!(changes
+            .iter()
+            .all(|c| c.category != SourceLevelCategory::AttributeConditionality));
+        assert!(changes
+            .iter()
+            .any(|c| c.category == SourceLevelCategory::AriaChange));
+    }
+
+    #[test]
+    fn test_diff_role_unconditional_to_conditional() {
+        let mut old = make_profile("Menu");
+        old.role_attributes
+            .insert("ul".into(), "menu".into(), false);
+
+        let mut new = make_profile("Menu");
+        new.role_attributes.insert("ul".into(), "menu".into(), true); // same value, now conditional
+
+        let changes = diff_profiles(&old, &new);
+        let cond_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::AttributeConditionality)
+            .collect();
+        assert_eq!(cond_changes.len(), 1);
+        assert!(cond_changes[0].description.contains("role"));
+        assert!(cond_changes[0].description.contains("always-present"));
+    }
+
+    #[test]
+    fn test_diff_data_unconditional_to_conditional() {
+        let mut old = make_profile("Button");
+        old.data_attributes.insert(
+            ("button".into(), "data-ouia-component-type".into()),
+            "Button".into(),
+            false,
+        );
+
+        let mut new = make_profile("Button");
+        new.data_attributes.insert(
+            ("button".into(), "data-ouia-component-type".into()),
+            "Button".into(),
+            true,
+        );
+
+        let changes = diff_profiles(&old, &new);
+        let cond_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::AttributeConditionality)
+            .collect();
+        assert_eq!(cond_changes.len(), 1);
+        assert!(cond_changes[0]
+            .description
+            .contains("data-ouia-component-type"));
+    }
+
+    #[test]
+    fn test_diff_unconditional_both_sides_no_change() {
+        // Attribute is unconditional in both versions — no conditionality change
+        let mut old = make_profile("Button");
+        old.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "{isDisabled}".into(),
+            false,
+        );
+
+        let mut new = make_profile("Button");
+        new.aria_attributes.insert(
+            ("button".into(), "aria-disabled".into()),
+            "{isDisabled}".into(),
+            false,
+        );
+
+        let changes = diff_profiles(&old, &new);
+        let cond_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::AttributeConditionality)
+            .collect();
+        assert!(cond_changes.is_empty());
     }
 }

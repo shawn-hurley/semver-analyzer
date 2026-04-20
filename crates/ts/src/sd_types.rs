@@ -12,42 +12,168 @@
 //! 5. `ConformanceCheck` — a structural validity rule derived from the composition tree
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Serialize a BTreeMap<(String, String), String> as a JSON object with
-/// `"key1::key2"` string keys. This allows tuple-keyed maps to roundtrip
-/// through JSON.
-fn serialize_tuple_map<S>(
-    map: &BTreeMap<(String, String), String>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    use serde::ser::SerializeMap;
-    let mut m = serializer.serialize_map(Some(map.len()))?;
-    for ((k1, k2), v) in map {
-        m.serialize_entry(&format!("{}::{}", k1, k2), v)?;
-    }
-    m.end()
+// ── TrackedAttributes ───────────────────────────────────────────────────
+
+/// JSX attribute observations with conditionality tracking.
+///
+/// Tracks both attribute values and whether each attribute appears in
+/// an unconditional rendering context. Uses "unconditional wins"
+/// semantics: if an attribute appears both conditionally and
+/// unconditionally across JSX branches, it is classified as
+/// unconditional.
+///
+/// Generic over the key type `K`:
+/// - `TrackedAttributes<(String, String)>` for `(element_tag, attr_name)` keyed maps
+///   (aria-* and data-* attributes).
+/// - `TrackedAttributes<String>` for element-keyed maps (role attributes).
+///
+/// Custom `Serialize`/`Deserialize` implementations are provided for
+/// both key types to ensure YAML-compatible map keys. Tuple keys use
+/// `"key1::key2"` encoding.
+#[derive(Debug, Clone, Default)]
+pub struct TrackedAttributes<K: Ord + Clone> {
+    /// Key → attribute value (last-seen wins for duplicates).
+    pub entries: BTreeMap<K, String>,
+    /// Keys that appeared in at least one unconditional context.
+    /// "Unconditional wins": if an attribute appears both inside and
+    /// outside conditional branches, it is classified as unconditional.
+    pub unconditional: BTreeSet<K>,
 }
 
-/// Deserialize a JSON object with `"key1::key2"` string keys back into
-/// a BTreeMap<(String, String), String>.
-fn deserialize_tuple_map<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<(String, String), String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let string_map: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
-    let mut result = BTreeMap::new();
-    for (key, value) in string_map {
-        if let Some((k1, k2)) = key.split_once("::") {
-            result.insert((k1.to_string(), k2.to_string()), value);
+// ── Serde for TrackedAttributes<String> (trivial) ───────────────────────
+
+/// Intermediate form for serializing `TrackedAttributes<String>`.
+#[derive(Serialize, Deserialize)]
+struct TrackedStringRepr {
+    entries: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unconditional: BTreeSet<String>,
+}
+
+impl Serialize for TrackedAttributes<String> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let repr = TrackedStringRepr {
+            entries: self.entries.clone(),
+            unconditional: self.unconditional.clone(),
+        };
+        repr.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TrackedAttributes<String> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = TrackedStringRepr::deserialize(deserializer)?;
+        Ok(TrackedAttributes {
+            entries: repr.entries,
+            unconditional: repr.unconditional,
+        })
+    }
+}
+
+// ── Serde for TrackedAttributes<(String, String)> (tuple → "k1::k2") ────
+
+/// Intermediate form for serializing `TrackedAttributes<(String, String)>`.
+/// Uses `"key1::key2"` string encoding for tuple keys, ensuring YAML
+/// compatibility (YAML requires string map keys).
+#[derive(Serialize, Deserialize)]
+struct TrackedTupleRepr {
+    entries: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unconditional: Vec<String>,
+}
+
+impl Serialize for TrackedAttributes<(String, String)> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let entries: BTreeMap<String, String> = self
+            .entries
+            .iter()
+            .map(|((k1, k2), v)| (format!("{k1}::{k2}"), v.clone()))
+            .collect();
+        let unconditional: Vec<String> = self
+            .unconditional
+            .iter()
+            .map(|(k1, k2)| format!("{k1}::{k2}"))
+            .collect();
+        let repr = TrackedTupleRepr {
+            entries,
+            unconditional,
+        };
+        repr.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TrackedAttributes<(String, String)> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = TrackedTupleRepr::deserialize(deserializer)?;
+        let entries: BTreeMap<(String, String), String> = repr
+            .entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                key.split_once("::")
+                    .map(|(k1, k2)| ((k1.to_string(), k2.to_string()), value))
+            })
+            .collect();
+        let unconditional: BTreeSet<(String, String)> = repr
+            .unconditional
+            .into_iter()
+            .filter_map(|key| {
+                key.split_once("::")
+                    .map(|(k1, k2)| (k1.to_string(), k2.to_string()))
+            })
+            .collect();
+        Ok(TrackedAttributes {
+            entries,
+            unconditional,
+        })
+    }
+}
+
+impl<K: Ord + Clone> TrackedAttributes<K> {
+    /// Insert an attribute observation. If `conditional` is false,
+    /// the key is also added to the unconditional set.
+    pub fn insert(&mut self, key: K, value: String, conditional: bool) {
+        self.entries.insert(key.clone(), value);
+        if !conditional {
+            self.unconditional.insert(key);
         }
     }
-    Ok(result)
+
+    /// Whether the key exists but was only observed in conditional contexts.
+    pub fn is_conditional(&self, key: &K) -> bool {
+        self.entries.contains_key(key) && !self.unconditional.contains(key)
+    }
+
+    /// Whether the key exists and was observed unconditionally at least once.
+    pub fn is_unconditional(&self, key: &K) -> bool {
+        self.unconditional.contains(key)
+    }
+
+    /// Whether the key exists in the entries map.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Look up an attribute value by key.
+    pub fn get(&self, key: &K) -> Option<&String> {
+        self.entries.get(key)
+    }
+
+    /// Iterate over all `(key, value)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &String)> {
+        self.entries.iter()
+    }
+
+    /// Iterate over all keys.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.entries.keys()
+    }
+
+    /// Whether the entries map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// A React component rendered internally by another component.
@@ -125,26 +251,18 @@ pub struct ComponentSourceProfile {
     /// e.g., [RenderedComponent { name: "Menu", conditional: false }]
     pub rendered_components: Vec<RenderedComponent>,
 
-    /// ARIA attributes on rendered elements.
+    /// ARIA attributes on rendered elements, with conditionality tracking.
     /// Key: (element_tag, attribute_name), Value: attribute_value.
-    /// e.g., { ("div", "aria-label"): "Navigation", ("button", "role"): "menuitem" }
-    #[serde(
-        serialize_with = "serialize_tuple_map",
-        deserialize_with = "deserialize_tuple_map"
-    )]
-    pub aria_attributes: BTreeMap<(String, String), String>,
+    /// e.g., { ("div", "aria-label"): "Navigation" }
+    pub aria_attributes: TrackedAttributes<(String, String)>,
 
-    /// `role` attributes on rendered elements.
+    /// `role` attributes on rendered elements, with conditionality tracking.
     /// Key: element_tag, Value: role value.
-    pub role_attributes: BTreeMap<String, String>,
+    pub role_attributes: TrackedAttributes<String>,
 
-    /// `data-*` attributes on rendered elements.
+    /// `data-*` attributes on rendered elements, with conditionality tracking.
     /// Key: (element_tag, attribute_name), Value: attribute_value.
-    #[serde(
-        serialize_with = "serialize_tuple_map",
-        deserialize_with = "deserialize_tuple_map"
-    )]
-    pub data_attributes: BTreeMap<(String, String), String>,
+    pub data_attributes: TrackedAttributes<(String, String)>,
 
     // ── Prop defaults ───────────────────────────────────────────────
     /// Default values for props, extracted from destructuring patterns.
@@ -430,6 +548,11 @@ pub enum SourceLevelCategory {
     /// and the result is spread onto a JSX element after the rest props,
     /// silently overriding any matching HTML attribute the consumer passes.
     PropAttributeOverride,
+    /// Attribute rendering changed from unconditional to conditional (or vice versa).
+    /// The attribute still exists in both versions, but its presence in the DOM
+    /// is no longer guaranteed. Tests using `getAttribute()` expecting a specific
+    /// value may now receive `null`.
+    AttributeConditionality,
 }
 
 // ── Composition Tree ────────────────────────────────────────────────────
@@ -787,6 +910,16 @@ pub struct SdPipelineResult {
     /// the `CssVariablePrefix` fix from creating broken CSS.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dead_css_classes_after_swap: Vec<(String, String)>,
+
+    /// Full CSS class inventory from the old (from) version of the dep repo.
+    /// Used to generate enumerated per-class rules.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub old_css_class_inventory: HashSet<String>,
+
+    /// Full CSS class inventory from the new (to) version of the dep repo.
+    /// Used together with `old_css_class_inventory` for class rename vs removal.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub new_css_class_inventory: HashSet<String>,
 
     /// Deprecated component → replacement mappings detected via rendering swaps.
     ///

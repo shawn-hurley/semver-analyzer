@@ -18,8 +18,8 @@ use crate::sd_types::{
 use semver_analyzer_core::types::MigrationTarget;
 use semver_analyzer_core::{AnalysisReport, ApiChangeType};
 use semver_analyzer_konveyor_core::{
-    FixStrategyEntry, FrontendPatternFields, FrontendReferencedFields, KonveyorCondition,
-    KonveyorRule,
+    FileContentFields, FixStrategyEntry, FrontendPatternFields, FrontendReferencedFields,
+    KonveyorCondition, KonveyorRule,
 };
 
 use crate::TypeScript;
@@ -114,6 +114,23 @@ pub fn generate_sd_rules(
     rules.extend(generate_dead_css_class_rules(
         &sd.dead_css_classes_after_swap,
     ));
+
+    // ── Enumerated CSS class rules ──────────────────────────────────
+    // When CSS inventories are available, generate individual per-class
+    // rules instead of relying on the catch-all prefix swap from v1.
+    if !sd.old_css_class_inventory.is_empty() && !sd.new_css_class_inventory.is_empty() {
+        let enumerated = generate_enumerated_css_class_rules(
+            &sd.old_css_class_inventory,
+            &sd.new_css_class_inventory,
+        );
+        if !enumerated.is_empty() {
+            tracing::info!(
+                count = enumerated.len(),
+                "Enumerated CSS class rules will replace catch-all prefix rule"
+            );
+            rules.extend(enumerated);
+        }
+    }
 
     rules
 }
@@ -2075,7 +2092,68 @@ pub fn generate_family_strategies(
             }
         }
 
-        // 10. Deprecated migration context: cross-reference MigrationTarget
+        // 10. Prop type changes: compare old and new prop types for each
+        //     component in the family to detect callback signature changes,
+        //     type narrowing/broadening, and other per-prop type differences.
+        let prop_type_changes = {
+            let mut changes: BTreeMap<String, Vec<semver_analyzer_konveyor_core::MappingEntry>> =
+                BTreeMap::new();
+            for member in std::iter::once(&tree.root).chain(tree.family_members.iter()) {
+                let old_types = sd.old_component_prop_types.get(member.as_str());
+                let new_types = sd.new_component_prop_types.get(member.as_str());
+                match (old_types, new_types) {
+                    (Some(old_map), Some(new_map)) => {
+                        // Props that exist in both versions with different types
+                        for (prop_name, old_type) in old_map {
+                            if let Some(new_type) = new_map.get(prop_name) {
+                                if old_type != new_type {
+                                    let key = if member == &tree.root {
+                                        prop_name.clone()
+                                    } else {
+                                        format!("{}.{}", member, prop_name)
+                                    };
+                                    changes.entry(key).or_default().push(
+                                        semver_analyzer_konveyor_core::MappingEntry {
+                                            from: Some(old_type.clone()),
+                                            to: Some(new_type.clone()),
+                                            component: Some(member.clone()),
+                                            prop: Some(prop_name.clone()),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (None, Some(new_map)) => {
+                        // New-only: component had no explicit props in old version
+                        // (all inherited) but now has explicit declarations.
+                        // Include callback/function types so the LLM knows the
+                        // current signatures.
+                        for (prop_name, new_type) in new_map {
+                            if new_type.contains("=>") {
+                                let key = if member == &tree.root {
+                                    prop_name.clone()
+                                } else {
+                                    format!("{}.{}", member, prop_name)
+                                };
+                                changes.entry(key).or_default().push(
+                                    semver_analyzer_konveyor_core::MappingEntry {
+                                        from: None,
+                                        to: Some(new_type.clone()),
+                                        component: Some(member.clone()),
+                                        prop: Some(prop_name.clone()),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            changes
+        };
+
+        // 11. Deprecated migration context: cross-reference MigrationTarget
         //     with prop type maps to build a complete old→new mapping.
         //
         //     Look for a MigrationTarget whose replacement matches this family's
@@ -2149,6 +2227,7 @@ pub fn generate_family_strategies(
             && child_props_to_parent.is_empty()
             && removed_children.is_empty()
             && deprecated_migration.is_none()
+            && prop_type_changes.is_empty()
         {
             continue;
         }
@@ -2163,6 +2242,7 @@ pub fn generate_family_strategies(
             child_props_to_parent,
             removed_children,
             prop_value_changes,
+            prop_type_changes,
             new_imports,
             removed_imports,
             import_source,
@@ -3306,6 +3386,75 @@ fn generate_test_impact_rules(
                 }
             }
 
+            // ── Attribute conditionality: match getAttribute('attrName') ─
+            SourceLevelCategory::AttributeConditionality => {
+                // Extract the attribute name from the description.
+                // Format: "{attr} on <{elem}> in {component} changed from..."
+                let attr_name = match change.description.split(" on <").next() {
+                    Some(name) if !name.is_empty() => name.to_string(),
+                    _ => continue,
+                };
+
+                let elem_part = change
+                    .element
+                    .as_deref()
+                    .map(|e| format!("-{}", sanitize(e)))
+                    .unwrap_or_default();
+                let prefix = rule_prefix(&change.migration_from);
+                let rule_id = format!(
+                    "{}-test-{}-attr-conditionality-{}{}",
+                    prefix,
+                    sanitize(&change.component),
+                    sanitize(&attr_name),
+                    elem_part,
+                );
+
+                let elem_display = change.element.as_deref().unwrap_or("element");
+                let message = format!(
+                    "{component} no longer always renders `{attr}` on `<{elem}>`.\n\n\
+                     Previously, `getAttribute('{attr}')` returned a string value \
+                     (e.g., `\"false\"`) even when the attribute was semantically \"off\". \
+                     Now the attribute is omitted entirely when not active, so \
+                     `getAttribute('{attr}')` returns `null`.\n\n\
+                     Update test assertions:\n  \
+                     `.getAttribute('{attr}').toBe('false')` → `.not.toHaveAttribute('{attr}')`\n  \
+                     or: `.getAttribute('{attr}').toBeNull()`\n  \
+                     or: `expect(element).not.toHaveAttribute('{attr}')`",
+                    component = change.component,
+                    attr = attr_name,
+                    elem = elem_display,
+                );
+
+                rules.push(KonveyorRule {
+                    rule_id,
+                    labels: vec![
+                        "source=semver-analyzer".into(),
+                        "change-type=test-impact".into(),
+                        "change-type=attribute-conditionality".into(),
+                        "impact=frontend-testing".into(),
+                        format!("package={}", pkg),
+                    ],
+                    effort: 1,
+                    category: "optional".into(),
+                    description: format!(
+                        "Test impact: {} `{}` now conditionally rendered",
+                        change.component, attr_name,
+                    ),
+                    message,
+                    links: vec![],
+                    when: KonveyorCondition::FileContent {
+                        filecontent: FileContentFields {
+                            pattern: format!(
+                                "getAttribute\\(\\s*['\"]{}['\"]\\s*\\)",
+                                regex_escape(&attr_name),
+                            ),
+                            file_pattern: TEST_FILE_PATTERN.into(),
+                        },
+                    },
+                    fix_strategy: Some(FixStrategyEntry::new("Manual")),
+                });
+            }
+
             _ => {}
         }
     }
@@ -3774,6 +3923,149 @@ fn generate_dead_css_class_rules(dead_classes: &[(String, String)]) -> Vec<Konve
     }
 
     rules
+}
+
+/// Generate enumerated per-class CSS rules from the full class inventories.
+///
+/// Instead of a single catch-all rule that matches any `pf-v5-*` class and
+/// blindly renames it to `pf-v6-*`, this generates individual rules for each
+/// class in the old inventory:
+///
+/// - Classes with a valid v6 counterpart → `Rename` strategy (exact match)
+/// - Classes with no v6 counterpart → `Manual` review (class was removed)
+///
+/// Third-party classes that use the `pf-v5-` prefix but aren't in the library's
+/// CSS are not in the inventory, so no rule is generated for them — they are
+/// left untouched.
+pub fn generate_enumerated_css_class_rules(
+    old_inventory: &HashSet<String>,
+    new_inventory: &HashSet<String>,
+) -> Vec<KonveyorRule> {
+    use semver_analyzer_konveyor_core::sanitize_id;
+
+    // Detect the version prefix from each inventory
+    let old_prefix = detect_inventory_prefix(old_inventory);
+    let new_prefix = detect_inventory_prefix(new_inventory);
+
+    let (old_prefix, new_prefix) = match (old_prefix, new_prefix) {
+        (Some(old), Some(new)) if old != new => (old, new),
+        _ => {
+            tracing::debug!(
+                "Cannot detect version prefix change from inventories, \
+                 skipping enumerated CSS class rule generation"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut rename_rules = Vec::new();
+    let mut removed_rules = Vec::new();
+
+    // Sort for deterministic output
+    let mut old_classes: Vec<&String> = old_inventory.iter().collect();
+    old_classes.sort();
+
+    for old_class in old_classes {
+        // Only process classes with the version prefix
+        if !old_class.starts_with(&old_prefix) {
+            continue;
+        }
+
+        let base = &old_class[old_prefix.len()..];
+        let new_class = format!("{}{}", new_prefix, base);
+
+        if new_inventory.contains(&new_class) {
+            // 1:1 rename — exact match rule with Rename strategy
+            let rule_id = format!("semver-css-class-rename-{}", sanitize_id(base));
+            rename_rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=css-class".into(),
+                    "has-codemod=true".into(),
+                ],
+                effort: 1,
+                category: "mandatory".into(),
+                description: format!("CSS class '{}' renamed to '{}'", old_class, new_class),
+                message: format!(
+                    "CSS class '{}' has been renamed to '{}'. \
+                     Update all references in className props, CSS/SCSS files, \
+                     and CSS-in-JS.",
+                    old_class, new_class
+                ),
+                links: vec![],
+                when: KonveyorCondition::FrontendCssClass {
+                    cssclass: FrontendPatternFields {
+                        pattern: old_class.clone(),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry::with_from_to(
+                    "CssVariablePrefix",
+                    old_class,
+                    &new_class,
+                )),
+            });
+        } else {
+            // No v6 counterpart — class was removed
+            let rule_id = format!("semver-css-class-removed-{}", sanitize_id(base));
+            removed_rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=css-dead-class".into(),
+                    "impact=visual-regression".into(),
+                ],
+                effort: 3,
+                category: "mandatory".into(),
+                description: format!("CSS class '{}' was removed in the new version", old_class),
+                message: format!(
+                    "The CSS class '{}' has no equivalent in the new version. \
+                     There is no valid '{}' class — this class was removed, not renamed.\n\n\
+                     Remove this class reference or replace it with appropriate custom CSS \
+                     or a component prop.",
+                    old_class, new_class
+                ),
+                links: vec![],
+                when: KonveyorCondition::FrontendCssClass {
+                    cssclass: FrontendPatternFields {
+                        pattern: old_class.clone(),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: None,
+            });
+        }
+    }
+
+    tracing::info!(
+        rename_count = rename_rules.len(),
+        removed_count = removed_rules.len(),
+        "Generated enumerated CSS class rules"
+    );
+
+    let mut all = rename_rules;
+    all.extend(removed_rules);
+    all
+}
+
+/// Detect the most common version prefix from a set of CSS class names.
+/// Looks for patterns like `pf-v5-` or `pf-v6-`.
+fn detect_inventory_prefix(classes: &HashSet<String>) -> Option<String> {
+    static VER_PREFIX_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^(pf-v\d+-)").unwrap());
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for cls in classes {
+        if let Some(caps) = VER_PREFIX_RE.captures(cls) {
+            *counts.entry(caps[1].to_string()).or_default() += 1;
+        }
+    }
+
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(prefix, _)| prefix)
 }
 
 // ── Helper functions ────────────────────────────────────────────────────
@@ -4542,6 +4834,105 @@ mod tests {
         for r in &rules {
             assert!(seen.insert(&r.rule_id), "Duplicate rule ID: {}", r.rule_id);
         }
+    }
+
+    #[test]
+    fn test_attr_conditionality_rule_generation() {
+        let changes = vec![SourceLevelChange {
+            component: "Button".into(),
+            category: SourceLevelCategory::AttributeConditionality,
+            description:
+                "aria-disabled on <button> in Button changed from always-present to conditional"
+                    .into(),
+            old_value: Some("always-present (value: {isDisabled})".into()),
+            new_value: Some("conditional".into()),
+            has_test_implications: true,
+            test_description: Some("getAttribute('aria-disabled') may now return null".into()),
+            element: Some("button".into()),
+            migration_from: None,
+            dependency_chain: None,
+        }];
+
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Button".into(), "@patternfly/react-core".into());
+
+        let rules = generate_test_impact_rules(&changes, &pkgs);
+        assert_eq!(rules.len(), 1, "Should produce exactly one rule");
+
+        let rule = &rules[0];
+        assert!(
+            rule.rule_id.contains("attr-conditionality"),
+            "Rule ID should contain 'attr-conditionality': {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.rule_id.contains("aria-disabled"),
+            "Rule ID should contain attribute name: {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.message.contains("getAttribute"),
+            "Message should mention getAttribute"
+        );
+        assert!(
+            rule.message.contains(".toBeNull()"),
+            "Message should suggest .toBeNull()"
+        );
+        assert!(
+            rule.message.contains(".not.toHaveAttribute"),
+            "Message should suggest .not.toHaveAttribute"
+        );
+        assert!(rule
+            .labels
+            .contains(&"change-type=attribute-conditionality".to_string()));
+        assert!(rule.labels.contains(&"impact=frontend-testing".to_string()));
+
+        if let KonveyorCondition::FileContent { filecontent } = &rule.when {
+            assert!(
+                filecontent.pattern.contains("aria-disabled"),
+                "Pattern should match aria-disabled: {}",
+                filecontent.pattern
+            );
+            assert!(
+                filecontent.file_pattern.contains("test|spec"),
+                "Should scope to test files"
+            );
+        } else {
+            panic!("Expected FileContent condition, got {:?}", rule.when);
+        }
+
+        assert!(
+            rule.fix_strategy.is_some(),
+            "Should have a fix strategy (Manual)"
+        );
+    }
+
+    #[test]
+    fn test_attr_conditionality_no_rule_without_test_implications() {
+        // Changes without has_test_implications should not produce rules
+        let changes = vec![SourceLevelChange {
+            component: "Button".into(),
+            category: SourceLevelCategory::AttributeConditionality,
+            description:
+                "aria-disabled on <button> in Button changed from always-present to conditional"
+                    .into(),
+            old_value: Some("always-present (value: {isDisabled})".into()),
+            new_value: Some("conditional".into()),
+            has_test_implications: false, // no test implications
+            test_description: None,
+            element: Some("button".into()),
+            migration_from: None,
+            dependency_chain: None,
+        }];
+
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Button".into(), "@patternfly/react-core".into());
+
+        let rules = generate_test_impact_rules(&changes, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "Should not produce rules when has_test_implications is false"
+        );
     }
 
     #[test]

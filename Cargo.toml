@@ -50,3 +50,6 @@ owo-colors = "4"
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 
+[patch.crates-io]
+konveyor-core = { path = "../konveyor-core" }
+

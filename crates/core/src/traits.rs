@@ -17,7 +17,7 @@ use crate::types::{
 };
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -551,6 +551,20 @@ pub struct ExtendedAnalysisParams {
     /// Each entry is `(old_class, dead_swapped_class)`. Used to generate rules
     /// that flag these dead classes and suppress the blind prefix swap fix.
     pub dead_css_classes_after_swap: Vec<(String, String)>,
+
+    /// Full CSS class inventory from the old (from) version of the dep repo.
+    ///
+    /// Used to generate enumerated per-class rules instead of a single
+    /// catch-all prefix swap rule. Only classes in this inventory are
+    /// considered "official" library classes; consumer classes that happen
+    /// to use the same prefix are left untouched.
+    pub old_css_class_inventory: HashSet<String>,
+
+    /// Full CSS class inventory from the new (to) version of the dep repo.
+    ///
+    /// Used together with `old_css_class_inventory` to determine which
+    /// classes have a direct 1:1 rename (prefix swap) vs which were removed.
+    pub new_css_class_inventory: HashSet<String>,
 }
 
 // ── LLM category definitions ────────────────────────────────────────────

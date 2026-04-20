@@ -3431,11 +3431,44 @@ pub fn generate_fix_guidance(
     }
 }
 
-/// Write a Konveyor ruleset directory.
+/// CSS-related change-type labels used for partitioning rules into the CSS file.
+const CSS_CHANGE_TYPES: &[&str] = &[
+    "change-type=css-class",
+    "change-type=css-variable",
+    "change-type=css-removal",
+    "change-type=css-dead-class",
+];
+
+/// Dependency/manifest change-type labels.
+const DEPS_CHANGE_TYPES: &[&str] = &["change-type=manifest", "change-type=dependency-update"];
+
+/// Composition/structural change-type labels.
+const COMPOSITION_CHANGE_TYPES: &[&str] = &[
+    "change-type=composition",
+    "change-type=conformance",
+    "change-type=context-dependency",
+    "change-type=prop-to-child",
+    "change-type=child-to-prop",
+    "change-type=deprecated-migration",
+    "change-type=composition-inversion",
+    "change-type=prop-attribute-override",
+];
+
+/// Check if a rule's labels match any of the given change-type labels.
+fn rule_has_change_type(rule: &KonveyorRule, change_types: &[&str]) -> bool {
+    rule.labels
+        .iter()
+        .any(|l| change_types.contains(&l.as_str()))
+}
+
+/// Write a Konveyor ruleset directory with rules split into category files.
 ///
 /// Creates:
-///   `<output_dir>/ruleset.yaml`         — ruleset metadata
-///   `<output_dir>/breaking-changes.yaml` — all generated rules
+///   `<output_dir>/ruleset.yaml`                    — ruleset metadata
+///   `<output_dir>/breaking-changes-api.yaml`       — component API rules
+///   `<output_dir>/breaking-changes-css.yaml`        — CSS class & variable rules
+///   `<output_dir>/breaking-changes-composition.yaml` — composition/conformance rules
+///   `<output_dir>/breaking-changes-deps.yaml`       — dependency update rules
 pub fn write_ruleset_dir(
     output_dir: &Path,
     ruleset_name: &str,
@@ -3462,11 +3495,46 @@ pub fn write_ruleset_dir(
     std::fs::write(&ruleset_path, &ruleset_yaml)
         .with_context(|| format!("Failed to write {}", ruleset_path.display()))?;
 
-    // Write rules file
-    let rules_path = output_dir.join("breaking-changes.yaml");
-    let rules_yaml = serde_yaml::to_string(&rules).context("Failed to serialize rules")?;
-    std::fs::write(&rules_path, &rules_yaml)
-        .with_context(|| format!("Failed to write {}", rules_path.display()))?;
+    // Partition rules by category
+    let mut css_rules = Vec::new();
+    let mut deps_rules = Vec::new();
+    let mut composition_rules = Vec::new();
+    let mut api_rules = Vec::new();
+
+    for rule in rules {
+        if rule_has_change_type(rule, CSS_CHANGE_TYPES) {
+            css_rules.push(rule);
+        } else if rule_has_change_type(rule, DEPS_CHANGE_TYPES) {
+            deps_rules.push(rule);
+        } else if rule_has_change_type(rule, COMPOSITION_CHANGE_TYPES) {
+            composition_rules.push(rule);
+        } else {
+            api_rules.push(rule);
+        }
+    }
+
+    // Write each partition to its own file
+    let partitions: &[(&str, &[&KonveyorRule])] = &[
+        ("breaking-changes-api.yaml", &api_rules),
+        ("breaking-changes-css.yaml", &css_rules),
+        ("breaking-changes-composition.yaml", &composition_rules),
+        ("breaking-changes-deps.yaml", &deps_rules),
+    ];
+
+    for (filename, partition) in partitions {
+        if partition.is_empty() {
+            continue;
+        }
+        let path = output_dir.join(filename);
+        let yaml = serde_yaml::to_string(partition).context("Failed to serialize rules")?;
+        std::fs::write(&path, &yaml)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        tracing::info!(
+            file = %filename,
+            count = partition.len(),
+            "Wrote rule partition"
+        );
+    }
 
     Ok(())
 }
@@ -4979,9 +5047,17 @@ mod tests {
         write_ruleset_dir(&dir, "test-ruleset", &report, &rules).unwrap();
         let fix_dir = write_fix_guidance_dir(&dir, &fix_guidance).unwrap();
 
-        // Ruleset dir contains rules only
+        // Ruleset dir contains rules only (split into category files)
         assert!(dir.join("ruleset.yaml").exists());
-        assert!(dir.join("breaking-changes.yaml").exists());
+        // Rules are split into category files — at least one should exist
+        let has_rules = dir.join("breaking-changes-api.yaml").exists()
+            || dir.join("breaking-changes-css.yaml").exists()
+            || dir.join("breaking-changes-composition.yaml").exists()
+            || dir.join("breaking-changes-deps.yaml").exists();
+        assert!(
+            has_rules || rules.is_empty(),
+            "Expected at least one rule file"
+        );
         assert!(!dir.join("fix-guidance.yaml").exists()); // NOT in rules dir
 
         // Fix guidance is in sibling directory
