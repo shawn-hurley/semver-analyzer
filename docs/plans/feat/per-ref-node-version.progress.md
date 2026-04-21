@@ -150,3 +150,61 @@ worktree module that run Node.js tooling and therefore need the
 The git commands in `guard.rs` (`validate_git_repo`, `validate_git_ref`,
 `create_worktree`, `remove_worktree`) do **not** need the node env —
 they are pure git operations unrelated to Node.js.
+
+## Integration testing: PatternFly v5.3.3 → v6.4.1
+
+### Yarn not found under nvm-managed Node 18
+
+**Symptom:** `Package install failed (yarn install --frozen-lockfile):
+Failed to execute: No such file or directory (os error 2)`
+
+**Root cause:** PatternFly v5.3.3's `package.json` does not have a
+`packageManager` field. The tool detected Yarn Classic from `yarn.lock`,
+built the install command as `yarn install --frozen-lockfile`, but the
+nvm-managed Node 18 bin directory only contains `corepack`, `node`,
+`npm`, and `npx` — no `yarn` binary. Without the `packageManager` field,
+the corepack wrapping logic in `PackageManager::install_command()` is
+skipped, so bare `yarn` is invoked and fails.
+
+By contrast, v6.4.1 declares `"packageManager": "yarn@4.7.0"` which
+triggers corepack wrapping (`corepack yarn install --immutable`), so the
+to-ref worktree works fine.
+
+**Fix:** Used `--from-install-command "corepack yarn install"` to
+explicitly force corepack for the v5.3.3 worktree. This bypasses the
+auto-detection path entirely.
+
+**Lesson:** When using `--from-node-version` / `--to-node-version` with
+nvm, the nvm-managed Node installation may not have global packages like
+`yarn` installed. Older repos that lack a `packageManager` field in
+`package.json` won't trigger corepack wrapping automatically. Users
+should pair `--from-node-version` with `--from-install-command` when the
+from-ref repo doesn't declare its package manager.
+
+**Possible improvement:** The tool could detect this situation (Yarn
+Classic detected, but `yarn` binary not found on PATH) and automatically
+try `corepack yarn install` as a fallback before failing. This would
+eliminate the need for the manual `--from-install-command` override in
+the common case. Alternatively, the tool could always use corepack when
+a `yarn.lock` is present, regardless of whether `packageManager` is
+declared.
+
+### Missing output directory
+
+**Symptom:** `Failed to write output to testrun_output/analysis/patternfly-report.json:
+No such file or directory (os error 2)` — the analysis completed
+successfully (6+ minutes of extraction and diffing) but failed at the
+very end when writing the report.
+
+**Fix:** Added `mkdir -p ${ANALYSIS_DIR}` to the test script. This was
+a script issue, not a tool issue, but it's worth noting that the tool
+does not create parent directories for the output file — it expects
+them to exist.
+
+### Successful run
+
+After both fixes, the analysis completed in ~6 minutes and produced a
+27MB report with 12,831 breaking changes across 773 files for the
+PatternFly v5.3.3 → v6.4.1 upgrade. This validates that the per-ref
+Node version and install command features work end-to-end for a real
+cross-version-boundary analysis.
