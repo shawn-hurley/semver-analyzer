@@ -13,11 +13,15 @@
 #   --output FILE    Output report path (default: patternfly-report.json)
 #   --keep           Keep the cloned repo after analysis (default: clean up)
 #   --repo DIR       Use an existing clone instead of fetching a new one
-#   --build-command  Custom build command (default: "yarn build")
+#   --build-command  Custom build command (default: "corepack yarn build")
 #   --llm-command    LLM command for behavioral analysis (omit for static-only)
 #   --release        Build semver-analyzer in release mode
 #   --konveyor       Generate Konveyor rules and fix guidance from the report
 #   --konveyor-dir   Output directory for Konveyor rules (default: ./konveyor-rules)
+#   --from-node-version  Node.js version for from-ref worktree (resolved via nvm)
+#   --to-node-version    Node.js version for to-ref worktree (resolved via nvm)
+#   --from-install-command  Install command override for from-ref worktree
+#   --to-install-command    Install command override for to-ref worktree
 #   --help           Show this help message
 #
 # Examples:
@@ -41,6 +45,12 @@
 #
 #   # Full pipeline: analyze + generate rules + fix guidance
 #   ./hack/run-patternfly.sh --konveyor --konveyor-dir ./pf-migration-rules
+#
+#   # Analyze across a Node.js version boundary (e.g., PF v5.3.3 → v6.4.1)
+#   ./hack/run-patternfly.sh --from v5.3.3 --to v6.4.1 \
+#       --from-node-version 18 --to-node-version 20 \
+#       --from-install-command "corepack yarn install" \
+#       --konveyor
 
 set -euo pipefail
 
@@ -54,12 +64,16 @@ TO_REF="v6.4.0"
 OUTPUT="patternfly-report.json"
 KEEP=false
 REPO=""
-BUILD_COMMAND="yarn build"
+BUILD_COMMAND="corepack yarn build"
 LLM_COMMAND=""
 RELEASE=false
 KONVEYOR=false
 KONVEYOR_DIR="./konveyor-rules"
 PF_REPO_URL="https://github.com/patternfly/patternfly-react.git"
+FROM_NODE_VERSION=""
+TO_NODE_VERSION=""
+FROM_INSTALL_COMMAND=""
+TO_INSTALL_COMMAND=""
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 
@@ -80,6 +94,10 @@ while [[ $# -gt 0 ]]; do
         --release)    RELEASE=true;        shift   ;;
         --konveyor)   KONVEYOR=true;       shift   ;;
         --konveyor-dir) KONVEYOR_DIR="$2"; shift 2 ;;
+        --from-node-version)    FROM_NODE_VERSION="$2";    shift 2 ;;
+        --to-node-version)      TO_NODE_VERSION="$2";      shift 2 ;;
+        --from-install-command) FROM_INSTALL_COMMAND="$2";  shift 2 ;;
+        --to-install-command)   TO_INSTALL_COMMAND="$2";    shift 2 ;;
         --help|-h)    usage ;;
         *)
             echo "Unknown option: $1" >&2
@@ -168,13 +186,26 @@ echo "    Output: $OUTPUT"
 echo ""
 
 ANALYZE_ARGS=(
-    analyze
+    analyze typescript
     --repo "$PF_DIR"
     --from "$FROM_REF"
     --to "$TO_REF"
     --output "$OUTPUT"
     --build-command "$BUILD_COMMAND"
 )
+
+if [[ -n "$FROM_NODE_VERSION" ]]; then
+    ANALYZE_ARGS+=(--from-node-version "$FROM_NODE_VERSION")
+fi
+if [[ -n "$TO_NODE_VERSION" ]]; then
+    ANALYZE_ARGS+=(--to-node-version "$TO_NODE_VERSION")
+fi
+if [[ -n "$FROM_INSTALL_COMMAND" ]]; then
+    ANALYZE_ARGS+=(--from-install-command "$FROM_INSTALL_COMMAND")
+fi
+if [[ -n "$TO_INSTALL_COMMAND" ]]; then
+    ANALYZE_ARGS+=(--to-install-command "$TO_INSTALL_COMMAND")
+fi
 
 if [[ -z "$LLM_COMMAND" ]]; then
     ANALYZE_ARGS+=(--no-llm)
@@ -229,7 +260,7 @@ if [[ "$KONVEYOR" == true ]] && [[ -f "$OUTPUT" ]]; then
     echo "    Fix dir:    $(dirname "$KONVEYOR_DIR")/fix-guidance"
     echo ""
 
-    "$BINARY" konveyor \
+    "$BINARY" konveyor typescript \
         --from-report "$OUTPUT" \
         --output-dir "$KONVEYOR_DIR"
 
