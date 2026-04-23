@@ -69,7 +69,7 @@ impl LlmBehaviorAnalyzer {
             Ok(response) => {
                 tracing::debug!(
                     response_bytes = response.len(),
-                    response_tail = %&response[response.len().saturating_sub(200)..],
+                    response_tail = %&response[response.floor_char_boundary(response.len().saturating_sub(200))..],
                     "LLM response received"
                 );
             }
@@ -231,5 +231,24 @@ impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
         );
         let response = self.run_llm(&prompt)?;
         invoke::parse_propagation_result(&response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn response_tail_handles_multibyte_boundary() {
+        // Verifies that floor_char_boundary prevents panics when the
+        // 200-byte-from-end offset lands inside a multi-byte UTF-8
+        // character (e.g. '→' = 3 bytes E2 86 92).
+        let arrow = "→";
+        // 198 bytes of ASCII + 3-byte arrow = 201 bytes total
+        // saturating_sub(200) = byte 1, which is mid-character
+        let response = format!("{}{}", arrow, "x".repeat(198));
+        assert_eq!(response.len(), 201);
+        let start = response.floor_char_boundary(response.len().saturating_sub(200));
+        let tail = &response[start..];
+        // floor_char_boundary rounds down to 0 (start of '→'), so we get the full string
+        assert_eq!(tail, response);
     }
 }
