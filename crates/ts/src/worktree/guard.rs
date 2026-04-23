@@ -7,6 +7,7 @@ use super::error::WorktreeError;
 use super::package_manager::PackageManager;
 use super::tsc;
 use super::ExtractionWarning;
+use super::RefBuildConfig;
 #[cfg(test)]
 use semver_analyzer_core::git::sanitize_ref_name;
 use semver_analyzer_core::git::worktree_path_for;
@@ -58,7 +59,7 @@ impl WorktreeGuard {
     pub fn new(
         repo: &Path,
         git_ref: &str,
-        config: &super::RefBuildConfig,
+        config: &RefBuildConfig,
     ) -> Result<Self, WorktreeError> {
         // Canonicalize repo path to avoid relative path mismatches between
         // git (which resolves paths relative to its CWD) and Rust filesystem
@@ -470,6 +471,7 @@ fn run_custom_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::RefBuildConfig;
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -735,7 +737,7 @@ mod tests {
         let result = WorktreeGuard::new(
             relative_repo,
             "v1.0.0",
-            &crate::worktree::RefBuildConfig::default(),
+            &RefBuildConfig::default(),
         );
 
         if let Err(WorktreeError::NoLockfileFound { .. }) = result {

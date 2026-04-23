@@ -13,6 +13,8 @@ use semver_analyzer_core::Symbol as CoreSymbol;
 use semver_analyzer_core::{
     AccessorKind, Parameter, Signature, SymbolKind, TypeParameter, Visibility,
 };
+
+use crate::worktree::RefBuildConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -212,7 +214,7 @@ impl OxcExtractor {
         &self,
         repo: &Path,
         git_ref: &str,
-        config: &crate::worktree::RefBuildConfig,
+        config: &RefBuildConfig,
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface> {
         use crate::worktree::{ExtractionWarning, WorktreeGuard};

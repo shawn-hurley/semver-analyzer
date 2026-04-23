@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::extensions::TsAnalysisExtensions;
+use crate::worktree::RefBuildConfig;
 use crate::TsSymbolData;
 
 // ── TypeScript language type ────────────────────────────────────────────
@@ -29,20 +30,20 @@ use crate::TsSymbolData;
 /// The TypeScript language implementation.
 #[derive(Debug, Clone)]
 pub struct TypeScript {
-    ref_config: crate::worktree::RefBuildConfig,
+    ref_config: RefBuildConfig,
 }
 
 impl TypeScript {
     pub fn new(build_command: Option<String>) -> Self {
         Self {
-            ref_config: crate::worktree::RefBuildConfig {
+            ref_config: RefBuildConfig {
                 build_command,
                 ..Default::default()
             },
         }
     }
 
-    pub fn with_ref_config(config: crate::worktree::RefBuildConfig) -> Self {
+    pub fn with_ref_config(config: RefBuildConfig) -> Self {
         Self { ref_config: config }
     }
 }
@@ -50,7 +51,7 @@ impl TypeScript {
 impl Default for TypeScript {
     fn default() -> Self {
         Self {
-            ref_config: crate::worktree::RefBuildConfig {
+            ref_config: RefBuildConfig {
                 build_command: Some("yarn build".to_string()),
                 ..Default::default()
             },
