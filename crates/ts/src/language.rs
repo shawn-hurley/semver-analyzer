@@ -29,7 +29,6 @@ use crate::TsSymbolData;
 /// The TypeScript language implementation.
 #[derive(Debug, Clone)]
 pub struct TypeScript {
-    build_command: Option<String>,
     ref_config: crate::worktree::RefBuildConfig,
 }
 
@@ -37,25 +36,20 @@ impl TypeScript {
     pub fn new(build_command: Option<String>) -> Self {
         Self {
             ref_config: crate::worktree::RefBuildConfig {
-                build_command: build_command.clone(),
+                build_command,
                 ..Default::default()
             },
-            build_command,
         }
     }
 
     pub fn with_ref_config(config: crate::worktree::RefBuildConfig) -> Self {
-        Self {
-            build_command: config.build_command.clone(),
-            ref_config: config,
-        }
+        Self { ref_config: config }
     }
 }
 
 impl Default for TypeScript {
     fn default() -> Self {
         Self {
-            build_command: Some("yarn build".to_string()),
             ref_config: crate::worktree::RefBuildConfig {
                 build_command: Some("yarn build".to_string()),
                 ..Default::default()
@@ -388,7 +382,7 @@ impl Language for TypeScript {
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface<TsSymbolData>> {
         let extractor = crate::extract::OxcExtractor::new();
-        extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref(), degradation)
+        extractor.extract_at_ref(repo, git_ref, &self.ref_config, degradation)
     }
 
     fn extract_keeping_worktree(

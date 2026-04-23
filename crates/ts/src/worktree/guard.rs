@@ -431,10 +431,7 @@ fn run_custom_install(
 ) -> Result<(), WorktreeError> {
     tracing::info!(command = %install_cmd, "Running user-provided install command");
 
-    let needs_shell =
-        install_cmd.contains("&&") || install_cmd.contains("||") || install_cmd.contains(';');
-
-    let output = if needs_shell {
+    let output = if super::needs_shell(install_cmd) {
         Command::new("sh")
             .args(["-c", install_cmd])
             .current_dir(worktree_dir)

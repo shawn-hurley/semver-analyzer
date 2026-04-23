@@ -5,7 +5,7 @@
 
 mod error;
 mod guard;
-pub mod nvm;
+pub(crate) mod nvm;
 mod package_manager;
 mod tsc;
 
@@ -30,6 +30,12 @@ pub struct RefBuildConfig {
     /// Override the build command (e.g., "yarn build").
     /// Replaces the default tsc invocation.
     pub build_command: Option<String>,
+}
+
+/// Returns true when the command string contains shell operators that
+/// require `sh -c` to interpret (pipes, logical operators, semicolons).
+pub(crate) fn needs_shell(cmd: &str) -> bool {
+    cmd.contains("&&") || cmd.contains("||") || cmd.contains(';') || cmd.contains('|')
 }
 
 /// Non-fatal issues encountered during worktree setup.

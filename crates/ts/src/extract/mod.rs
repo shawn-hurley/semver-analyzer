@@ -206,24 +206,20 @@ impl OxcExtractor {
     /// Extract API surface from a repo at a given git ref.
     ///
     /// Creates a worktree, installs dependencies, runs tsc, and parses .d.ts files.
-    /// An optional `build_command` can override the default tsc invocation for
-    /// projects that require custom build steps (e.g., monorepos with code generation).
+    /// The `config` parameter controls Node.js version, install command, and
+    /// build command overrides for the worktree.
     pub fn extract_at_ref(
         &self,
         repo: &Path,
         git_ref: &str,
-        build_command: Option<&str>,
+        config: &crate::worktree::RefBuildConfig,
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface> {
         use crate::worktree::{ExtractionWarning, WorktreeGuard};
         use semver_analyzer_core::error::DiagnoseWithTip;
 
         // Create worktree, install deps, run tsc --declaration (with fallback)
-        let config = crate::worktree::RefBuildConfig {
-            build_command: build_command.map(|s| s.to_string()),
-            ..Default::default()
-        };
-        let guard = WorktreeGuard::new(repo, git_ref, &config).diagnose()?;
+        let guard = WorktreeGuard::new(repo, git_ref, config).diagnose()?;
 
         // Record any extraction warnings as degradation
         if let Some(tracker) = degradation {

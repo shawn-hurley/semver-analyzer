@@ -230,11 +230,8 @@ pub fn run_project_build(
     build_command: Option<&str>,
     node_env: &[(String, String)],
 ) -> Result<(), WorktreeError> {
-    // Determine whether we need a shell to interpret the command.
-    // Compound commands (using &&, ||, ;, |, or shell expansions) must
-    // be run through `sh -c` so the shell handles chaining and quoting.
     let needs_shell = build_command
-        .map(|c| c.contains("&&") || c.contains("||") || c.contains(';') || c.contains('|'))
+        .map(|c| super::needs_shell(c))
         .unwrap_or(false);
 
     let (cmd, args) = if let Some(custom) = build_command {

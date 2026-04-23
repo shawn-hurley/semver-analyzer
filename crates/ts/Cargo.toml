@@ -45,3 +45,4 @@ lightningcss = "1.0.0-alpha.71"
 tempfile = "3"
 insta = { version = "1", features = ["yaml"] }
 serde = { version = "1", features = ["derive"] }
+serial_test = "3.4.0"

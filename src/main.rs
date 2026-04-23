@@ -228,7 +228,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
         install_command: args.to_install_command,
         build_command: args.to_build_command.or(args.build_command),
     };
-    let lang = Arc::new(TypeScript::new(from_config.build_command.clone()));
+    let lang = Arc::new(TypeScript::new(None));
     let analyzer = orchestrator::Analyzer {
         lang: lang.clone(),
         lang_from: Arc::new(TypeScript::with_ref_config(from_config)),
@@ -465,7 +465,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                 .clone()
                 .or_else(|| args.build_command.clone()),
         };
-        let lang = Arc::new(TypeScript::new(args.build_command.clone()));
+        let lang = Arc::new(TypeScript::new(None));
         let analyzer = orchestrator::Analyzer {
             lang: lang.clone(),
             lang_from: Arc::new(TypeScript::with_ref_config(from_config)),

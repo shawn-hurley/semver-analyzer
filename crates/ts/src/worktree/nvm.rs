@@ -82,6 +82,7 @@ pub fn build_node_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn build_node_env_none_returns_empty() {
@@ -90,8 +91,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn build_node_env_without_nvm_dir_returns_error() {
-        // Temporarily unset NVM_DIR if it exists
         let original = std::env::var("NVM_DIR").ok();
         std::env::remove_var("NVM_DIR");
 
@@ -100,7 +101,6 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NVM_DIR"), "error should mention NVM_DIR: {err}");
 
-        // Restore
         if let Some(val) = original {
             std::env::set_var("NVM_DIR", val);
         }
