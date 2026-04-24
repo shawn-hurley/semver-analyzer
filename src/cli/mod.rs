@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use semver_analyzer_core::cli::{DiffArgs, LoggingArgs};
+#[cfg(feature = "java")]
 use semver_analyzer_java::cli::{JavaAnalyzeArgs, JavaExtractArgs, JavaKonveyorArgs};
 use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 
@@ -37,15 +38,18 @@ impl Cli {
         match &self.command {
             Command::Analyze { language } => match language {
                 AnalyzeLanguage::Typescript(args) => &args.common.logging,
+                #[cfg(feature = "java")]
                 AnalyzeLanguage::Java(args) => &args.common.logging,
             },
             Command::Extract { language } => match language {
                 ExtractLanguage::Typescript(args) => &args.common.logging,
+                #[cfg(feature = "java")]
                 ExtractLanguage::Java(args) => &args.common.logging,
             },
             Command::Diff(args) => &args.logging,
             Command::Konveyor { language } => match language {
                 KonveyorLanguage::Typescript(args) => &args.common.logging,
+                #[cfg(feature = "java")]
                 KonveyorLanguage::Java(args) => &args.common.logging,
             },
             Command::Serve => {
@@ -96,6 +100,7 @@ pub enum AnalyzeLanguage {
     /// Analyze a TypeScript/JavaScript project.
     Typescript(TsAnalyzeArgs),
     /// Analyze a Java project.
+    #[cfg(feature = "java")]
     Java(JavaAnalyzeArgs),
 }
 
@@ -105,6 +110,7 @@ pub enum ExtractLanguage {
     /// Extract API surface from a TypeScript/JavaScript project.
     Typescript(TsExtractArgs),
     /// Extract API surface from a Java project.
+    #[cfg(feature = "java")]
     Java(JavaExtractArgs),
 }
 
@@ -114,5 +120,6 @@ pub enum KonveyorLanguage {
     /// Generate Konveyor rules for a TypeScript/JavaScript project.
     Typescript(TsKonveyorArgs),
     /// Generate Konveyor rules for a Java project.
+    #[cfg(feature = "java")]
     Java(JavaKonveyorArgs),
 }

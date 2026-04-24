@@ -10,6 +10,10 @@ license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "Deterministic semantic breaking change analyzer for TypeScript/JavaScript"
 
+[features]
+default = []
+java = ["dep:semver-analyzer-java"]
+
 [dependencies]
 semver-analyzer-core = { version = "0.0.5", path = "crates/core" }
 semver-analyzer-ts = { version = "0.0.5", path = "crates/ts" }
