@@ -17,7 +17,7 @@ java = ["dep:semver-analyzer-java"]
 [dependencies]
 semver-analyzer-core = { version = "0.0.5", path = "crates/core" }
 semver-analyzer-ts = { version = "0.0.5", path = "crates/ts" }
-semver-analyzer-java = { version = "0.0.5", path = "crates/java" }
+semver-analyzer-java = { version = "0.0.5", path = "crates/java", optional = true }
 semver-analyzer-llm = { version = "0.0.5", path = "crates/llm" }
 semver-analyzer-konveyor-core = { version = "0.0.5", path = "crates/konveyor-core" }
 
