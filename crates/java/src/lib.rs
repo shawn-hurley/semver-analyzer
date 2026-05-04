@@ -27,6 +27,7 @@ pub mod extract;
 pub mod index;
 pub mod konveyor;
 pub mod manifest;
+pub mod migration_examples;
 pub mod report;
 pub mod sd_pipeline;
 pub mod sd_types;

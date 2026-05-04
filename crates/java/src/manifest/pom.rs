@@ -294,8 +294,54 @@ fn diff_dependencies(
     let old_map: HashMap<String, &PomDependency> = old_deps.iter().map(|d| (d.key(), d)).collect();
     let new_map: HashMap<String, &PomDependency> = new_deps.iter().map(|d| (d.key(), d)).collect();
 
+    let mut removed: Vec<(String, &PomDependency)> = Vec::new();
+    let mut added: Vec<(String, &PomDependency)> = Vec::new();
+
     for (key, old_dep) in &old_map {
         if !new_map.contains_key(key) {
+            removed.push((key.clone(), old_dep));
+        }
+    }
+
+    for (key, new_dep) in &new_map {
+        if !old_map.contains_key(key) {
+            added.push((key.clone(), new_dep));
+        }
+    }
+
+    // Detect coordinate renames (e.g., javax→jakarta)
+    let mut renamed_old = std::collections::HashSet::new();
+    let mut renamed_new = std::collections::HashSet::new();
+
+    for (old_key, old_dep) in &removed {
+        let old_artifact = &old_dep.artifact_id;
+        for (new_key, new_dep) in &added {
+            if renamed_new.contains(new_key) {
+                continue;
+            }
+            if super::artifacts_are_related(old_artifact, &new_dep.artifact_id) {
+                changes.push(ManifestChange {
+                    field: format!("dependency:{}", old_key),
+                    change_type: JavaManifestChangeType::DependencyCoordinateChanged,
+                    before: Some(format_dep(old_dep)),
+                    after: Some(format_dep(new_dep)),
+                    description: format!(
+                        "Dependency coordinate changed: `{}` → `{}`",
+                        old_key, new_key
+                    ),
+                    is_breaking: true,
+                    source_package: None,
+                });
+                renamed_old.insert(old_key.clone());
+                renamed_new.insert(new_key.clone());
+                break;
+            }
+        }
+    }
+
+    // Remaining removals
+    for (key, old_dep) in &removed {
+        if !renamed_old.contains(key) {
             changes.push(ManifestChange {
                 field: format!("dependency:{}", key),
                 change_type: JavaManifestChangeType::DependencyRemoved,
@@ -308,8 +354,9 @@ fn diff_dependencies(
         }
     }
 
-    for (key, new_dep) in &new_map {
-        if !old_map.contains_key(key) {
+    // Remaining additions
+    for (key, new_dep) in &added {
+        if !renamed_new.contains(key) {
             changes.push(ManifestChange {
                 field: format!("dependency:{}", key),
                 change_type: JavaManifestChangeType::DependencyAdded,

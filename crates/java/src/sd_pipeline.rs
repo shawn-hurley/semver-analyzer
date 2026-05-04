@@ -64,6 +64,14 @@ pub fn run_java_sd(
         source_changes.append(&mut changes);
     }
 
+    // ── Phase A.5: Mine migration examples from test files ────────
+    let (migration_examples, migration_mappings) =
+        crate::migration_examples::mine_migration_examples(repo, to_ref, None)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Migration example mining failed: {}", e);
+                (Vec::new(), Vec::new())
+            });
+
     // ── Phase B: Full extraction at to-ref ──────────────────────────
     tracing::info!("SD Phase B: extracting all profiles at to-ref");
 
@@ -121,6 +129,8 @@ pub fn run_java_sd(
         new_profiles,
         module_changes,
         inheritance_summary,
+        migration_examples,
+        migration_mappings,
     })
 }
 

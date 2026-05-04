@@ -3656,6 +3656,12 @@ fn generate_test_impact_rules(
 ///
 /// These complement the IMPORT-level transitive behavioral change rules by
 /// providing specific prop-level detection.
+///
+/// Both **direct** and **transitive** portal changes are processed. Transitive
+/// changes (e.g., Tooltip → Popper `appendTo` default changed) are included
+/// because the consumer-facing component (Tooltip) still exposes `appendTo`
+/// and `popperProps` to the consumer, and the `'inline'` string value is no
+/// longer valid in the prop's type signature.
 fn generate_portal_prop_rules(
     changes: &[SourceLevelChange],
     component_packages: &HashMap<String, String>,
@@ -3665,10 +3671,6 @@ fn generate_portal_prop_rules(
 
     for change in changes {
         if change.category != SourceLevelCategory::PortalUsage {
-            continue;
-        }
-        // Only process direct changes (not transitive)
-        if change.dependency_chain.is_some() {
             continue;
         }
 
@@ -4697,6 +4699,38 @@ pub fn generate_enumerated_css_class_rules(
         removed_count = removed_rules.len(),
         "Generated enumerated CSS class rules"
     );
+
+    // Verify expected utility sub-categories are represented.
+    // If a known PF utility category produced zero rules (neither rename nor
+    // removed), it likely means the dep-repo build didn't compile that
+    // utility SCSS file.
+    let expected_subcategories = [
+        ("u-text-align-", "Text alignment"),
+        ("u-text-transform-", "Text transform"),
+        ("u-text-wrap", "Text wrap"),
+        ("u-text-nowrap", "Text nowrap"),
+        ("u-text-break-word", "Text break-word"),
+        ("u-display-", "Display"),
+        ("u-flex-", "Flex"),
+        ("u-float-", "Float"),
+        ("u-w-", "Width sizing"),
+        ("u-h-", "Height sizing"),
+        ("u-m-", "Margin spacing"),
+        ("u-p-", "Padding spacing"),
+    ];
+
+    for (subcat, label) in &expected_subcategories {
+        let full_prefix = format!("{}{}", old_prefix, subcat);
+        let has_any = old_inventory.iter().any(|c| c.starts_with(&full_prefix));
+        if !has_any {
+            tracing::warn!(
+                prefix = %full_prefix,
+                category = %label,
+                "Expected utility sub-category has zero classes in old inventory — \
+                 no rename or removal rules will be generated for these classes"
+            );
+        }
+    }
 
     let mut all = rename_rules;
     all.extend(removed_rules);

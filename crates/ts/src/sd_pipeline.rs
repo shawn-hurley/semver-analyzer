@@ -2503,6 +2503,66 @@ fn enrich_all_props_from_extends(
 ///
 /// Uses a cache so each helper file is parsed only once even when 30+
 /// components import the same helper.
+/// Cached result from parsing a helper function: either a rich param mapping
+/// (which return keys reference which parameters) or a flat list of return keys.
+#[derive(Debug, Clone)]
+enum HelperResolution {
+    /// Rich mapping: we know which parameters flow to which return keys.
+    Mapped(crate::source_profile::managed_attrs::ReturnKeyParamMapping),
+    /// Flat fallback: we only know the return object keys, not which params produce them.
+    FlatKeys(Vec<String>),
+}
+
+impl HelperResolution {
+    fn all_keys(&self) -> Vec<String> {
+        match self {
+            HelperResolution::Mapped(m) => m.key_to_params.iter().map(|(k, _)| k.clone()).collect(),
+            HelperResolution::FlatKeys(keys) => keys.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            HelperResolution::Mapped(m) => m.key_to_params.is_empty(),
+            HelperResolution::FlatKeys(keys) => keys.is_empty(),
+        }
+    }
+
+    /// Get the return keys that a specific argument position controls.
+    /// If we have param mapping, only return keys whose value expression
+    /// references the parameter at `arg_position`. Falls back to all keys
+    /// if no mapping is available or arg_position is out of range.
+    fn keys_for_arg_position(&self, arg_position: Option<usize>) -> Vec<String> {
+        match (self, arg_position) {
+            (HelperResolution::Mapped(mapping), Some(pos)) => {
+                if pos < mapping.param_names.len() {
+                    let param_name = &mapping.param_names[pos];
+                    // Only include keys whose value references this parameter
+                    let scoped: Vec<String> = mapping
+                        .key_to_params
+                        .iter()
+                        .filter(|(_, params)| params.iter().any(|p| p == param_name))
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    if scoped.is_empty() {
+                        // Param doesn't flow to any return key — no attrs to override
+                        Vec::new()
+                    } else {
+                        scoped
+                    }
+                } else {
+                    // arg_position out of range — fall back to all keys
+                    self.all_keys()
+                }
+            }
+            _ => {
+                // No mapping or no arg_position — fall back to all keys
+                self.all_keys()
+            }
+        }
+    }
+}
+
 fn enrich_overridden_attributes(
     repo: &Path,
     git_ref: &str,
@@ -2511,8 +2571,8 @@ fn enrich_overridden_attributes(
 ) -> usize {
     let _span = info_span!("enrich_overridden_attributes").entered();
 
-    // Cache: (resolved_file_path, function_name) -> Vec<String> (attribute keys)
-    let mut helper_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
+    // Cache: (resolved_file_path, function_name) -> HelperResolution
+    let mut helper_cache: HashMap<(String, String), HelperResolution> = HashMap::new();
     let mut enriched_count = 0usize;
 
     // Collect component names to iterate (avoid borrow conflict)
@@ -2575,72 +2635,37 @@ fn enrich_overridden_attributes(
             let cache_key = (resolved_path.clone(), bare_name.to_string());
 
             if !helper_cache.contains_key(&cache_key) {
-                // Read the resolved file
                 let resolved_source = read_git_file(repo, git_ref, &resolved_path);
 
-                // Try extracting directly from the resolved file first
-                let mut keys = resolved_source
-                    .as_ref()
-                    .map(|src| {
-                        crate::source_profile::managed_attrs::extract_return_object_keys(
-                            src,
-                            bare_name,
-                        )
-                    })
-                    .unwrap_or_default();
+                // Try to extract a rich param mapping first, then fall back to flat keys.
+                let resolution = resolve_helper_function(
+                    &resolved_source,
+                    bare_name,
+                    repo,
+                    git_ref,
+                    &resolved_path,
+                );
 
-                // If direct extraction failed (function not found — probably a
-                // barrel file that re-exports from another module), follow
-                // re-export chains to find the actual helper source.
-                if keys.is_empty() {
-                    if let Some(ref barrel_source) = resolved_source {
-                        let reexport_sources =
-                            find_reexport_sources(barrel_source, bare_name, &resolved_path);
-                        for candidate in &reexport_sources {
-                            // Try the candidate directly, then probe extensions
-                            let try_paths = [
-                                candidate.clone(),
-                                format!("{}.ts", candidate.trim_end_matches(".ts")),
-                                format!("{}.tsx", candidate.trim_end_matches(".ts")),
-                            ];
-                            for try_path in &try_paths {
-                                if let Some(src) = read_git_file(repo, git_ref, try_path) {
-                                    let found =
-                                        crate::source_profile::managed_attrs::extract_return_object_keys(
-                                            &src,
-                                            bare_name,
-                                        );
-                                    if !found.is_empty() {
-                                        keys = found;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !keys.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if !keys.is_empty() {
+                if !resolution.is_empty() {
                     debug!(
                         helper = %bare_name,
                         file = %resolved_path,
-                        keys = ?keys,
-                        "Extracted return object keys from helper function"
+                        keys = ?resolution.all_keys(),
+                        mapped = matches!(resolution, HelperResolution::Mapped(_)),
+                        "Extracted return object info from helper function"
                     );
                 }
 
-                helper_cache.insert(cache_key.clone(), keys);
+                helper_cache.insert(cache_key.clone(), resolution);
             }
 
-            let keys = match helper_cache.get(&cache_key) {
-                Some(k) if !k.is_empty() => k.clone(),
+            let resolution = match helper_cache.get(&cache_key) {
+                Some(r) if !r.is_empty() => r,
                 _ => continue,
             };
 
-            // Update the profile's managed_attributes with the resolved keys
+            // Update the profile's managed_attributes with the resolved keys,
+            // scoped per-binding using the param mapping when available.
             if let Some(profile) = profiles.get_mut(component_name) {
                 let mut any_updated = false;
                 for binding in &mut profile.managed_attributes {
@@ -2651,7 +2676,10 @@ fn enrich_overridden_attributes(
                         .unwrap_or(&binding.generator_function);
 
                     if binding_bare == bare_name && binding.overridden_attributes.is_empty() {
-                        binding.overridden_attributes = keys.clone();
+                        // Use param mapping to scope attrs to this specific prop's
+                        // argument position, falling back to all keys if unavailable.
+                        binding.overridden_attributes =
+                            resolution.keys_for_arg_position(binding.arg_position);
                         any_updated = true;
                     }
                 }
@@ -2660,7 +2688,7 @@ fn enrich_overridden_attributes(
                     trace!(
                         component = %component_name,
                         generator = %generator_function,
-                        attrs = ?keys,
+                        attrs = ?resolution.all_keys(),
                         "Enriched overridden_attributes from helper return object"
                     );
                 }
@@ -2669,6 +2697,69 @@ fn enrich_overridden_attributes(
     }
 
     enriched_count
+}
+
+/// Try to resolve a helper function's return structure. First attempts
+/// `extract_return_key_param_mapping` for a rich param→key mapping; falls
+/// back to `extract_return_object_keys` for flat key list. Follows barrel
+/// file re-export chains as needed.
+fn resolve_helper_function(
+    resolved_source: &Option<String>,
+    bare_name: &str,
+    repo: &Path,
+    git_ref: &str,
+    resolved_path: &str,
+) -> HelperResolution {
+    // Try rich mapping first, then fall back to flat keys
+    if let Some(ref src) = resolved_source {
+        // Attempt param mapping (rich)
+        if let Some(mapping) =
+            crate::source_profile::managed_attrs::extract_return_key_param_mapping(src, bare_name)
+        {
+            return HelperResolution::Mapped(mapping);
+        }
+        // Attempt flat keys
+        let keys =
+            crate::source_profile::managed_attrs::extract_return_object_keys(src, bare_name);
+        if !keys.is_empty() {
+            return HelperResolution::FlatKeys(keys);
+        }
+    }
+
+    // If direct extraction failed (function not found — probably a barrel
+    // file that re-exports from another module), follow re-export chains.
+    if let Some(ref barrel_source) = resolved_source {
+        let reexport_sources = find_reexport_sources(barrel_source, bare_name, resolved_path);
+        for candidate in &reexport_sources {
+            let try_paths = [
+                candidate.clone(),
+                format!("{}.ts", candidate.trim_end_matches(".ts")),
+                format!("{}.tsx", candidate.trim_end_matches(".ts")),
+            ];
+            for try_path in &try_paths {
+                if let Some(src) = read_git_file(repo, git_ref, try_path) {
+                    // Try rich mapping first
+                    if let Some(mapping) =
+                        crate::source_profile::managed_attrs::extract_return_key_param_mapping(
+                            &src, bare_name,
+                        )
+                    {
+                        return HelperResolution::Mapped(mapping);
+                    }
+                    // Fall back to flat keys
+                    let found =
+                        crate::source_profile::managed_attrs::extract_return_object_keys(
+                            &src, bare_name,
+                        );
+                    if !found.is_empty() {
+                        return HelperResolution::FlatKeys(found);
+                    }
+                }
+            }
+        }
+    }
+
+    HelperResolution::FlatKeys(Vec::new())
 }
 
 /// Parse import declarations from a source file.

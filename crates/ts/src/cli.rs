@@ -203,4 +203,10 @@ pub struct TsKonveyorArgs {
     /// Runs in the worktree before CSS extraction.
     #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
     pub dep_build_command: Option<String>,
+
+    /// Dump CSS class inventories to files in the output directory.
+    /// Writes old-css-inventory.txt and new-css-inventory.txt for
+    /// offline analysis of which classes were extracted from each version.
+    #[arg(long, help_heading = "Diagnostics")]
+    pub dump_css_inventory: bool,
 }

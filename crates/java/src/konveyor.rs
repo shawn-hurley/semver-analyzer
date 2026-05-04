@@ -8,11 +8,11 @@
 //! - `generate_sd_rules()` — SD rules from source-level behavioral analysis
 
 use crate::language::Java;
-use crate::sd_types::{JavaSdPipelineResult, JavaSourceCategory, JavaSourceChange};
+use crate::sd_types::{JavaSdPipelineResult, JavaSourceCategory, JavaSourceChange, MigrationMapping};
 use semver_analyzer_core::AnalysisReport;
 use semver_analyzer_konveyor_core::{
     FixStrategyEntry, JavaDependencyFields, JavaReferencedFields, KonveyorCondition, KonveyorLink,
-    KonveyorRule, KonveyorRuleset,
+    KonveyorRule, KonveyorRuleset, MemberMappingEntry,
 };
 use std::collections::HashMap;
 
@@ -139,17 +139,24 @@ pub fn generate_rules_with_config(
                     if let Some(ref mt) = ac.migration_target {
                         // Reject migration targets with incompatible base types
                         // or unrelated packages -- treat as plain removal instead.
+                        //
+                        // Exception: zero-overlap targets from name-prefix fallback
+                        // (e.g., MySQL5InnoDBDialect → MySQLDialect) are allowed
+                        // despite base type differences, since the relationship is
+                        // established by naming convention in a type consolidation
+                        // pattern (many versioned subclasses → one base class).
+                        let is_name_prefix_match = mt.overlap_ratio == 0.0
+                            && mt.matching_members.is_empty();
                         let is_valid_target = packages_are_related(
                             &mt.removed_qualified_name,
                             &mt.replacement_qualified_name,
-                        ) && !has_incompatible_base_type(
+                        ) && (is_name_prefix_match || !has_incompatible_base_type(
                             mt.old_extends.as_deref(),
                             mt.new_extends.as_deref(),
-                        );
+                        ));
 
                         if !is_valid_target {
-                            let qname = ac.before.as_deref().unwrap_or(&ac.symbol);
-                            if !is_type_parameter_pattern(qname) {
+                            if !is_type_parameter_pattern(&mt.removed_qualified_name) {
                                 rules.push(make_removal_rule(
                                     &ac.symbol,
                                     &mt.removed_qualified_name,
@@ -170,7 +177,16 @@ pub fn generate_rules_with_config(
                             &mut id_counts,
                         ));
                     } else {
-                        let qname = ac.before.as_deref().unwrap_or(&ac.symbol);
+                        // Use the qualified_name for the scanner pattern, NOT the
+                        // `before` field. `before` contains a descriptive format
+                        // like "class: Restrictions" which doesn't match the scanner's
+                        // regex-based FQN/simple-name matching. `qualified_name` has
+                        // the proper FQN (e.g., "org.hibernate.criterion.Restrictions").
+                        let qname = if ac.qualified_name.is_empty() {
+                            ac.before.as_deref().unwrap_or(&ac.symbol)
+                        } else {
+                            &ac.qualified_name
+                        };
 
                         // Skip type parameter removals -- patterns like "T", "E", "R"
                         // are too short and match nearly every Java file. Type parameter
@@ -290,6 +306,156 @@ pub fn generate_sd_rules(
     }
 
     rules
+}
+
+// ── Migration mapping enrichment ────────────────────────────────────────
+
+/// Enrich removal rules with migration context from mined migration examples.
+///
+/// For each removal rule (rules with `change-type=removed` and no fix strategy),
+/// checks if a migration mapping exists that maps the removed class to a
+/// replacement. If found, attaches an `LlmAssisted` fix strategy with:
+/// - `from`/`to`: old → new FQN
+/// - `member_mappings`: method-level old → new name pairs
+/// - `replacement`: the new class name
+/// - Context string with mapping table and representative code examples
+pub fn enrich_rules_with_migration_mappings(
+    rules: &mut [KonveyorRule],
+    mappings: &[MigrationMapping],
+) -> usize {
+    if mappings.is_empty() {
+        return 0;
+    }
+
+    // Build lookup: old_class_simple_name → best mapping (most examples).
+    // Mappings are pre-sorted by example_count descending, so use
+    // entry().or_insert() to keep the first (strongest) match.
+    let mut by_name: HashMap<&str, &MigrationMapping> = HashMap::new();
+    let mut by_fqn: HashMap<&str, &MigrationMapping> = HashMap::new();
+    for m in mappings {
+        by_name.entry(m.old_class.as_str()).or_insert(m);
+        by_fqn.entry(m.old_fqn.as_str()).or_insert(m);
+    }
+
+    let mut enriched = 0;
+
+    for rule in rules.iter_mut() {
+        // Only enrich removal rules that lack a fix strategy
+        if rule.fix_strategy.is_some() {
+            continue;
+        }
+        if !rule
+            .labels
+            .iter()
+            .any(|l| l == "change-type=removed")
+        {
+            continue;
+        }
+
+        // Extract the removed class name from the rule's when condition
+        let pattern = match &rule.when {
+            KonveyorCondition::JavaReferenced { referenced } => &referenced.pattern,
+            _ => continue,
+        };
+
+        // Try to find a mapping by FQN match first, then by simple name.
+        // Patterns can be:
+        //   - FQN: "org.hibernate.criterion.Restrictions"
+        //   - Kind-prefixed: "class: Restrictions" or "interface: Criterion"
+        let mapping = by_fqn
+            .get(pattern.as_str())
+            .or_else(|| {
+                // Extract simple name: strip "class: ", "interface: ", or take last dotted segment
+                let simple = if let Some(after_colon) = pattern.split(": ").nth(1) {
+                    after_colon.trim()
+                } else {
+                    pattern.rsplit('.').next().unwrap_or(pattern)
+                };
+                by_name.get(simple)
+            });
+
+        let mapping = match mapping {
+            Some(m) => *m,
+            None => continue,
+        };
+
+        // Build context string for the LLM
+        let context = format_migration_context(mapping);
+
+        // Build member mappings
+        let member_mappings: Vec<MemberMappingEntry> = mapping
+            .method_mappings
+            .iter()
+            .map(|mm| MemberMappingEntry {
+                old_name: mm.old_method.clone(),
+                new_name: mm.new_method.clone(),
+            })
+            .collect();
+
+        // Update the rule
+        rule.fix_strategy = Some(FixStrategyEntry {
+            strategy: "LlmAssisted".into(),
+            from: Some(mapping.old_fqn.clone()),
+            to: Some(mapping.new_fqn.clone()),
+            replacement: Some(mapping.new_class.clone()),
+            member_mappings,
+            removed_members: Vec::new(),
+            overlap_ratio: Some(mapping.example_count as f64),
+            ..Default::default()
+        });
+
+        // Update the rule message to include migration guidance
+        rule.message = format!(
+            "{}\n\n{}", rule.message.trim_end_matches("\n\nThis class has been removed with no direct replacement."), context
+        );
+        rule.effort = 7; // Higher effort since it's a paradigm shift
+
+        enriched += 1;
+    }
+
+    enriched
+}
+
+/// Format migration mapping into a human-readable context string for the LLM.
+fn format_migration_context(mapping: &MigrationMapping) -> String {
+    let mut ctx = String::new();
+
+    ctx.push_str(&format!(
+        "Migration: `{}` → `{}`\n",
+        mapping.old_fqn, mapping.new_fqn,
+    ));
+
+    if !mapping.method_mappings.is_empty() {
+        ctx.push_str("\nMethod mappings (old → new):\n");
+        for mm in &mapping.method_mappings {
+            ctx.push_str(&format!(
+                "  {}.{}() → {}.{}()",
+                mapping.old_class, mm.old_method, mapping.new_class, mm.new_method
+            ));
+            if mm.confidence > 1 {
+                ctx.push_str(&format!("  [{} examples]", mm.confidence));
+            }
+            ctx.push('\n');
+        }
+    }
+
+    // Add representative code examples (max 2)
+    let examples_to_show = mapping.pattern_examples.len().min(2);
+    if examples_to_show > 0 {
+        ctx.push_str("\nMigration examples from library tests:\n");
+        for ex in mapping.pattern_examples.iter().take(examples_to_show) {
+            ctx.push_str("\n  Before (old API):\n");
+            for line in ex.old_code.lines() {
+                ctx.push_str(&format!("    {}\n", line.trim()));
+            }
+            ctx.push_str("  After (new API):\n");
+            for line in ex.new_code.lines() {
+                ctx.push_str(&format!("    {}\n", line.trim()));
+            }
+        }
+    }
+
+    ctx
 }
 
 fn make_sd_rule(
@@ -905,8 +1071,9 @@ fn make_dependency_rule(
             dependency: JavaDependencyFields {
                 name: Some(dep_name.to_string()),
                 nameregex: None,
-                upperbound: None,
-                lowerbound: None,
+                // Match any version (kantra requires at least one bound)
+                upperbound: Some("99.99.99".into()),
+                lowerbound: Some("0".into()),
             },
         },
         fix_strategy: None,
@@ -1248,15 +1415,101 @@ fn make_namespace_dependency_rule(
             dependency: JavaDependencyFields {
                 name: None,
                 nameregex: Some(old_artifact_pattern),
-                upperbound: None,
-                lowerbound: None,
+                // Match any version (kantra requires at least one bound)
+                upperbound: Some("99.99.99".into()),
+                lowerbound: Some("0".into()),
             },
         },
-        fix_strategy: Some(FixStrategyEntry::ensure_dependency(
+        fix_strategy: Some(FixStrategyEntry::ensure_dependency_with_old(
             new_coordinate,
             new_version,
+            old_ns,
         )),
     }
+}
+
+/// Generate `EnsureDependency` rules for a library group ID change.
+///
+/// When a library changes its Maven group ID (e.g., `org.hibernate` → `org.hibernate.orm`),
+/// consumers need to update their dependency coordinates. This generates one rule per
+/// published submodule so the fix engine can find and replace each dependency in the
+/// consumer's build files.
+///
+/// `to_ref` is the library's target version (used as the new dependency version).
+/// `submodules` contains the artifact names (e.g., `["hibernate-core", "hibernate-c3p0"]`).
+pub fn generate_group_id_migration_rules(
+    old_group: &str,
+    new_group: &str,
+    to_ref: &str,
+    submodules: &[String],
+    config: &JavaKonveyorConfig,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+
+    // For each submodule, generate an EnsureDependency rule
+    let artifacts: Vec<&str> = if submodules.is_empty() {
+        // If no submodules found, generate a generic rule for the root artifact
+        vec![]
+    } else {
+        submodules.iter().map(|s| s.as_str()).collect()
+    };
+
+    for artifact in &artifacts {
+        let old_coordinate = format!("{}:{}", old_group, artifact);
+        let new_coordinate = format!("{}:{}", new_group, artifact);
+
+        let rule_id = unique_id(
+            &format!(
+                "{}-dep-group-{}",
+                config.rule_id_prefix,
+                slugify(artifact)
+            ),
+            &mut id_counts,
+        );
+
+        // Clean up the version: strip "Final" suffix variations, use just major.minor.patch
+        let version = to_ref
+            .trim_end_matches(".Final")
+            .trim_end_matches("-SNAPSHOT");
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=dependency-update".into(),
+                "has-codemod=true".into(),
+                "language=java".into(),
+            ],
+            effort: 1,
+            category: "mandatory".into(),
+            description: format!(
+                "Update dependency: `{}` → `{}`",
+                old_coordinate, new_coordinate
+            ),
+            message: format!(
+                "The library's Maven group ID changed from `{}` to `{}`.\n\n\
+                 Update your build file: `{}:*` → `{}:{}`.",
+                old_group, new_group, old_coordinate, new_coordinate, version
+            ),
+            links: vec![],
+            when: KonveyorCondition::JavaDependency {
+                dependency: JavaDependencyFields {
+                    name: Some(old_coordinate.clone()),
+                    nameregex: None,
+                    upperbound: Some("99.99.99".into()),
+                    lowerbound: Some("0".into()),
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry::ensure_dependency_with_old(
+                &new_coordinate,
+                version,
+                &old_coordinate,
+            )),
+        });
+    }
+
+    rules
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

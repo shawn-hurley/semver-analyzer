@@ -2733,6 +2733,9 @@ fn analyze_css_class_inventories(
                 "Detected CSS class prefix change for dead-class analysis"
             );
 
+            // Log category breakdown and warn about missing expected utility categories
+            log_css_inventory_diagnostics(&old_classes, &new_classes, old_pfx, new_pfx);
+
             let mut dead: Vec<(String, String)> = old_classes
                 .iter()
                 .filter(|cls| cls.starts_with(old_pfx))
@@ -2790,6 +2793,126 @@ fn detect_version_prefix(classes: &std::collections::HashSet<String>) -> Option<
         .into_iter()
         .max_by_key(|(_, count)| *count)
         .map(|(prefix, _)| prefix)
+}
+
+/// Log a summary of CSS class inventory categories (c-, u-, l-, m-, etc.)
+/// and warn about known PF utility categories that are expected but missing.
+fn log_css_inventory_diagnostics(
+    old_classes: &std::collections::HashSet<String>,
+    new_classes: &std::collections::HashSet<String>,
+    old_prefix: &str,
+    new_prefix: &str,
+) {
+    let categorize = |classes: &std::collections::HashSet<String>, prefix: &str| {
+        let mut cats: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for cls in classes {
+            if let Some(rest) = cls.strip_prefix(prefix) {
+                // Extract category segment: "c-button" → "c-", "u-w-25" → "u-", "l-flex" → "l-"
+                let cat = if let Some(idx) = rest.find('-') {
+                    format!("{}-", &rest[..idx])
+                } else {
+                    rest.to_string()
+                };
+                *cats.entry(cat).or_default() += 1;
+            }
+        }
+        cats
+    };
+
+    let old_cats = categorize(old_classes, old_prefix);
+    let new_cats = categorize(new_classes, new_prefix);
+
+    let old_summary: Vec<String> = old_cats
+        .iter()
+        .map(|(k, v)| format!("{}*({v})", k))
+        .collect();
+    let new_summary: Vec<String> = new_cats
+        .iter()
+        .map(|(k, v)| format!("{}*({v})", k))
+        .collect();
+
+    tracing::info!(
+        old_total = old_classes.len(),
+        new_total = new_classes.len(),
+        old_categories = %old_summary.join(", "),
+        new_categories = %new_summary.join(", "),
+        "CSS class inventory category breakdown"
+    );
+
+    // Warn about known PatternFly utility sub-categories that should be present
+    // but are missing from the old (v5) inventory. These are canonical PF v5
+    // utility class prefixes that the dep-repo build should produce.
+    let expected_old_subcategories = [
+        ("u-text-align-", "Text alignment utilities"),
+        ("u-text-transform-", "Text transform utilities"),
+        ("u-text-wrap", "Text wrap utilities"),
+        ("u-text-nowrap", "Text nowrap utilities"),
+        ("u-text-break-word", "Text break-word utilities"),
+        ("u-display-", "Display utilities"),
+        ("u-flex-", "Flex utilities"),
+        ("u-float-", "Float utilities"),
+        ("u-w-", "Width sizing utilities"),
+        ("u-h-", "Height sizing utilities"),
+        ("u-m-", "Margin spacing utilities"),
+        ("u-p-", "Padding spacing utilities"),
+    ];
+
+    for (subcat, label) in &expected_old_subcategories {
+        let full_prefix = format!("{}{}", old_prefix, subcat);
+        let count = old_classes
+            .iter()
+            .filter(|c| c.starts_with(&full_prefix))
+            .count();
+        if count == 0 {
+            tracing::warn!(
+                prefix = %full_prefix,
+                category = %label,
+                "Expected utility class category missing from old CSS inventory — \
+                 dep-repo build may not have compiled this utility SCSS"
+            );
+        } else {
+            tracing::debug!(
+                prefix = %full_prefix,
+                count,
+                category = %label,
+                "Utility class category present in old inventory"
+            );
+        }
+    }
+}
+
+/// Dump CSS class inventories to text files for offline analysis.
+pub fn dump_css_inventory_to_files(
+    old_classes: &std::collections::HashSet<String>,
+    new_classes: &std::collections::HashSet<String>,
+    output_dir: &Path,
+) {
+    let write_sorted = |classes: &std::collections::HashSet<String>, filename: &str| {
+        let path = output_dir.join(filename);
+        let mut sorted: Vec<&String> = classes.iter().collect();
+        sorted.sort();
+        let content = sorted
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match std::fs::write(&path, content) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                count = classes.len(),
+                "Dumped CSS class inventory"
+            ),
+            Err(e) => tracing::warn!(
+                %e,
+                path = %path.display(),
+                "Failed to dump CSS class inventory"
+            ),
+        }
+    };
+
+    write_sorted(old_classes, "old-css-inventory.txt");
+    write_sorted(new_classes, "new-css-inventory.txt");
 }
 
 /// Convert PascalCase to kebab-case.

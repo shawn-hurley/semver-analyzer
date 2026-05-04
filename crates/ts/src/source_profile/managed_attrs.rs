@@ -31,8 +31,11 @@ struct PropsDestructuring {
 /// A flow from a destructured prop through a function call to a result variable.
 #[derive(Debug)]
 struct PropFunctionFlow {
-    /// The destructured prop names used as arguments to the function.
-    prop_args: Vec<String>,
+    /// The destructured prop names used as arguments to the function,
+    /// with their 0-based argument positions in the call expression.
+    /// e.g., for `getOUIAProps('MenuToggle', ouiaId, ouiaSafe)`:
+    ///   [(1, "ouiaId"), (2, "ouiaSafe")]
+    prop_args: Vec<(usize, String)>,
     /// The name of the helper function called.
     function_name: String,
     /// The variable name where the result is stored.
@@ -140,7 +143,7 @@ fn build_bindings(
         if flow
             .prop_args
             .iter()
-            .all(|p| !destructuring.named_props.contains(p))
+            .all(|(_, p)| !destructuring.named_props.contains(p))
         {
             continue;
         }
@@ -175,7 +178,7 @@ fn build_bindings(
                 .map(|(_elem, attr)| attr.clone())
                 .collect();
 
-            for prop_name in &flow.prop_args {
+            for (arg_pos, prop_name) in &flow.prop_args {
                 if destructuring.named_props.contains(prop_name) {
                     bindings.push(ManagedAttributeBinding {
                         prop_name: prop_name.clone(),
@@ -183,7 +186,7 @@ fn build_bindings(
                         target_element: element.tag_name.clone(),
                         overridden_attributes: overridden.clone(),
                         component_overrides: has_rest_before,
-                        arg_position: None,
+                        arg_position: Some(*arg_pos),
                     });
                 }
             }
@@ -814,11 +817,18 @@ fn check_function_flow<'a>(
         _ => return,
     };
 
-    // Collect all known prop names used as arguments (including through ??, ||)
-    let mut prop_args = Vec::new();
-    for arg in &call.arguments {
+    // Collect all known prop names used as arguments (including through ??, ||),
+    // tracking their 0-based argument position in the call expression.
+    let mut prop_args: Vec<(usize, String)> = Vec::new();
+    for (arg_idx, arg) in call.arguments.iter().enumerate() {
         if let Some(expr) = arg.as_expression() {
-            collect_prop_refs_from_expr(expr, source, known_props, &mut prop_args);
+            let mut refs = Vec::new();
+            collect_prop_refs_from_expr(expr, source, known_props, &mut refs);
+            for prop_name in refs {
+                if !prop_args.iter().any(|(_, n)| n == &prop_name) {
+                    prop_args.push((arg_idx, prop_name));
+                }
+            }
         }
     }
 
@@ -977,12 +987,13 @@ fn collect_jsx_spreads_from_child<'a>(
 /// conditionals, and logical operators to find a `CallExpression`.
 ///
 /// Returns `Some((function_name, prop_args))` if a call is found with
-/// known prop references in its arguments.
+/// known prop references in its arguments. Each prop arg includes its
+/// 0-based argument position in the call.
 fn extract_inline_call(
     expr: &Expression,
     source: &str,
     known_props: &BTreeSet<String>,
-) -> Option<(String, Vec<String>)> {
+) -> Option<(String, Vec<(usize, String)>)> {
     match expr {
         // Direct call: `getOUIAProps(name, ouiaId)`
         Expression::CallExpression(call) => {
@@ -997,10 +1008,16 @@ fn extract_inline_call(
                 }
                 _ => return None,
             };
-            let mut prop_args = Vec::new();
-            for arg in &call.arguments {
+            let mut prop_args: Vec<(usize, String)> = Vec::new();
+            for (arg_idx, arg) in call.arguments.iter().enumerate() {
                 if let Some(arg_expr) = arg.as_expression() {
-                    collect_prop_refs_from_expr(arg_expr, source, known_props, &mut prop_args);
+                    let mut refs = Vec::new();
+                    collect_prop_refs_from_expr(arg_expr, source, known_props, &mut refs);
+                    for prop_name in refs {
+                        if !prop_args.iter().any(|(_, n)| n == &prop_name) {
+                            prop_args.push((arg_idx, prop_name));
+                        }
+                    }
                 }
             }
             if prop_args.is_empty() {
@@ -1081,6 +1098,394 @@ fn jsx_member_obj_name(obj: &JSXMemberExpressionObject) -> String {
             )
         }
         JSXMemberExpressionObject::ThisExpression(_) => "this".to_string(),
+    }
+}
+
+// ── Return key → parameter mapping ──────────────────────────────────────
+
+/// Mapping from a helper function's return-object keys to the parameter names
+/// referenced in each key's value expression.
+#[derive(Debug, Clone)]
+pub struct ReturnKeyParamMapping {
+    /// Parameter names in declaration order.
+    pub param_names: Vec<String>,
+    /// For each return key, which parameter names are referenced in its value.
+    /// e.g., `("data-ouia-component-id", ["id"])` means the `id` parameter
+    /// flows into the `data-ouia-component-id` return key.
+    pub key_to_params: Vec<(String, Vec<String>)>,
+}
+
+/// Extract a mapping from return-object keys to the parameters they reference.
+///
+/// Given the source of a helper file and a function name, parses the file to
+/// find the function, extracts its parameter names and return object, then for
+/// each return key determines which parameters are referenced in the value
+/// expression.
+///
+/// For `getOUIAProps(componentType, id, ouiaSafe)` returning:
+/// ```js
+/// {
+///   'data-ouia-component-type': `PF6/${componentType}`,
+///   'data-ouia-safe': ouiaSafe,
+///   'data-ouia-component-id': id,
+/// }
+/// ```
+/// Returns:
+/// ```text
+/// param_names: ["componentType", "id", "ouiaSafe"]
+/// key_to_params: [
+///   ("data-ouia-component-id", ["id"]),
+///   ("data-ouia-component-type", ["componentType"]),
+///   ("data-ouia-safe", ["ouiaSafe"]),
+/// ]
+/// ```
+pub fn extract_return_key_param_mapping(
+    source: &str,
+    function_name: &str,
+) -> Option<ReturnKeyParamMapping> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::tsx();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+
+    for stmt in &parsed.program.body {
+        if let Some(mapping) = extract_mapping_from_stmt(stmt, function_name) {
+            return Some(mapping);
+        }
+    }
+
+    None
+}
+
+/// Walk top-level statements to find a named function and extract its
+/// parameter-to-return-key mapping.
+fn extract_mapping_from_stmt<'a>(
+    stmt: &'a Statement<'a>,
+    function_name: &str,
+) -> Option<ReturnKeyParamMapping> {
+    match stmt {
+        Statement::FunctionDeclaration(f)
+            if f.id.as_ref().is_some_and(|id| id.name == function_name) =>
+        {
+            let params = extract_param_names(&f.params);
+            let key_to_params = f
+                .body
+                .as_ref()
+                .map(|body| extract_key_params_from_body_stmts(&body.statements, &params))
+                .unwrap_or_default();
+            if !key_to_params.is_empty() {
+                return Some(ReturnKeyParamMapping {
+                    param_names: params,
+                    key_to_params,
+                });
+            }
+        }
+        Statement::VariableDeclaration(var_decl) => {
+            for declarator in &var_decl.declarations {
+                let name = match &declarator.id {
+                    BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+                    _ => continue,
+                };
+                if name != function_name {
+                    continue;
+                }
+                if let Some(init) = &declarator.init {
+                    if let Some(mapping) =
+                        extract_mapping_from_arrow_or_function(init, function_name)
+                    {
+                        return Some(mapping);
+                    }
+                }
+            }
+        }
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(decl) = &export.declaration {
+                match decl {
+                    Declaration::FunctionDeclaration(f)
+                        if f.id.as_ref().is_some_and(|id| id.name == function_name) =>
+                    {
+                        let params = extract_param_names(&f.params);
+                        let key_to_params = f
+                            .body
+                            .as_ref()
+                            .map(|body| {
+                                extract_key_params_from_body_stmts(&body.statements, &params)
+                            })
+                            .unwrap_or_default();
+                        if !key_to_params.is_empty() {
+                            return Some(ReturnKeyParamMapping {
+                                param_names: params,
+                                key_to_params,
+                            });
+                        }
+                    }
+                    Declaration::VariableDeclaration(var_decl) => {
+                        for declarator in &var_decl.declarations {
+                            let name = match &declarator.id {
+                                BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+                                _ => continue,
+                            };
+                            if name != function_name {
+                                continue;
+                            }
+                            if let Some(init) = &declarator.init {
+                                if let Some(mapping) =
+                                    extract_mapping_from_arrow_or_function(init, function_name)
+                                {
+                                    return Some(mapping);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Extract parameter-to-return-key mapping from an arrow function or function expression.
+fn extract_mapping_from_arrow_or_function<'a>(
+    expr: &'a Expression<'a>,
+    _function_name: &str,
+) -> Option<ReturnKeyParamMapping> {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            let params = extract_param_names(&arrow.params);
+            let key_to_params = if arrow.expression {
+                // Arrow expression body: `=> ({ key1: ..., key2: ... })`
+                let mut result = Vec::new();
+                for stmt in &arrow.body.statements {
+                    if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                        extract_key_params_from_object_expr(
+                            &expr_stmt.expression,
+                            &params,
+                            &mut result,
+                        );
+                    }
+                }
+                result
+            } else {
+                // Arrow block body: `=> { return { ... }; }`
+                extract_key_params_from_body_stmts(&arrow.body.statements, &params)
+            };
+            if !key_to_params.is_empty() {
+                Some(ReturnKeyParamMapping {
+                    param_names: params,
+                    key_to_params,
+                })
+            } else {
+                None
+            }
+        }
+        Expression::FunctionExpression(func) => {
+            let params = extract_param_names(&func.params);
+            let key_to_params = func
+                .body
+                .as_ref()
+                .map(|body| extract_key_params_from_body_stmts(&body.statements, &params))
+                .unwrap_or_default();
+            if !key_to_params.is_empty() {
+                Some(ReturnKeyParamMapping {
+                    param_names: params,
+                    key_to_params,
+                })
+            } else {
+                None
+            }
+        }
+        // Unwrap call expressions like React.memo(() => ...)
+        Expression::CallExpression(call) => {
+            for arg in &call.arguments {
+                if let Some(e) = arg.as_expression() {
+                    if let Some(mapping) = extract_mapping_from_arrow_or_function(e, _function_name)
+                    {
+                        return Some(mapping);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract parameter names from a function's formal parameters.
+fn extract_param_names(params: &FormalParameters) -> Vec<String> {
+    params
+        .items
+        .iter()
+        .map(|p| match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+            _ => String::new(), // destructured params — unnamed positionally
+        })
+        .collect()
+}
+
+/// Extract key→param mappings from function body statements (handles return + if/else).
+fn extract_key_params_from_body_stmts<'a>(
+    stmts: &'a [Statement<'a>],
+    param_names: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut result = Vec::new();
+    for stmt in stmts {
+        if let Statement::ReturnStatement(ret) = stmt {
+            if let Some(arg) = &ret.argument {
+                extract_key_params_from_object_expr(arg, param_names, &mut result);
+            }
+        }
+        // Also check if/else blocks for conditional returns
+        if let Statement::IfStatement(if_stmt) = stmt {
+            if let Statement::BlockStatement(block) = &if_stmt.consequent {
+                let branch = extract_key_params_from_body_stmts(&block.body, param_names);
+                merge_key_params(&mut result, branch);
+            }
+            if let Some(Statement::BlockStatement(block)) = if_stmt.alternate.as_ref() {
+                let branch = extract_key_params_from_body_stmts(&block.body, param_names);
+                merge_key_params(&mut result, branch);
+            }
+        }
+    }
+    result
+}
+
+/// Merge key→param entries from a branch into the accumulator (union params per key).
+fn merge_key_params(result: &mut Vec<(String, Vec<String>)>, branch: Vec<(String, Vec<String>)>) {
+    for (key, params) in branch {
+        if let Some(existing) = result.iter_mut().find(|(k, _)| k == &key) {
+            for p in params {
+                if !existing.1.contains(&p) {
+                    existing.1.push(p);
+                }
+            }
+        } else {
+            result.push((key, params));
+        }
+    }
+}
+
+/// Extract key→param mappings from an object expression (potentially wrapped).
+fn extract_key_params_from_object_expr<'a>(
+    expr: &'a Expression<'a>,
+    param_names: &[String],
+    result: &mut Vec<(String, Vec<String>)>,
+) {
+    match expr {
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    // Extract the key name
+                    let key_name = match &p.key {
+                        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+                        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                        _ => None, // Computed keys — skip
+                    };
+                    if let Some(key) = key_name {
+                        // Walk the value expression to find referenced params
+                        let mut referenced = Vec::new();
+                        collect_param_refs_in_expr(&p.value, param_names, &mut referenced);
+                        result.push((key, referenced));
+                    }
+                }
+            }
+        }
+        // Unwrap parentheses: `({ ... })`
+        Expression::ParenthesizedExpression(paren) => {
+            extract_key_params_from_object_expr(&paren.expression, param_names, result);
+        }
+        // Unwrap TS casts: `{ ... } as ReturnType`
+        Expression::TSAsExpression(ts) => {
+            extract_key_params_from_object_expr(&ts.expression, param_names, result);
+        }
+        Expression::TSSatisfiesExpression(ts) => {
+            extract_key_params_from_object_expr(&ts.expression, param_names, result);
+        }
+        _ => {}
+    }
+}
+
+/// Recursively walk an expression to collect all identifier references that
+/// match any of the given parameter names. Handles:
+/// - Direct identifiers: `ouiaSafe`
+/// - Template literals: `` `PF6/${componentType}` ``
+/// - Function calls: `useOUIAId(componentType, id, variant)`
+/// - Binary/logical/conditional expressions
+/// - Spread, array, object expressions
+fn collect_param_refs_in_expr<'a>(
+    expr: &'a Expression<'a>,
+    param_names: &[String],
+    out: &mut Vec<String>,
+) {
+    match expr {
+        Expression::Identifier(id) => {
+            let name = id.name.as_str();
+            if param_names.contains(&name.to_string()) && !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+        }
+        Expression::TemplateLiteral(tmpl) => {
+            for expr in &tmpl.expressions {
+                collect_param_refs_in_expr(expr, param_names, out);
+            }
+        }
+        Expression::CallExpression(call) => {
+            // Don't walk the callee — we care about argument references
+            for arg in &call.arguments {
+                if let Some(arg_expr) = arg.as_expression() {
+                    collect_param_refs_in_expr(arg_expr, param_names, out);
+                }
+            }
+        }
+        Expression::BinaryExpression(bin) => {
+            collect_param_refs_in_expr(&bin.left, param_names, out);
+            collect_param_refs_in_expr(&bin.right, param_names, out);
+        }
+        Expression::LogicalExpression(logical) => {
+            collect_param_refs_in_expr(&logical.left, param_names, out);
+            collect_param_refs_in_expr(&logical.right, param_names, out);
+        }
+        Expression::ConditionalExpression(cond) => {
+            collect_param_refs_in_expr(&cond.test, param_names, out);
+            collect_param_refs_in_expr(&cond.consequent, param_names, out);
+            collect_param_refs_in_expr(&cond.alternate, param_names, out);
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            collect_param_refs_in_expr(&paren.expression, param_names, out);
+        }
+        Expression::TSAsExpression(ts) => {
+            collect_param_refs_in_expr(&ts.expression, param_names, out);
+        }
+        Expression::TSSatisfiesExpression(ts) => {
+            collect_param_refs_in_expr(&ts.expression, param_names, out);
+        }
+        Expression::TSNonNullExpression(ts) => {
+            collect_param_refs_in_expr(&ts.expression, param_names, out);
+        }
+        Expression::TSTypeAssertion(ts) => {
+            collect_param_refs_in_expr(&ts.expression, param_names, out);
+        }
+        Expression::UnaryExpression(unary) => {
+            collect_param_refs_in_expr(&unary.argument, param_names, out);
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                match elem {
+                    ArrayExpressionElement::SpreadElement(s) => {
+                        collect_param_refs_in_expr(&s.argument, param_names, out);
+                    }
+                    _ => {
+                        if let Some(e) = elem.as_expression() {
+                            collect_param_refs_in_expr(e, param_names, out);
+                        }
+                    }
+                }
+            }
+        }
+        Expression::AssignmentExpression(assign) => {
+            collect_param_refs_in_expr(&assign.right, param_names, out);
+        }
+        _ => {}
     }
 }
 
@@ -1191,10 +1596,7 @@ fn extract_keys_from_stmt<'a>(
 }
 
 /// Extract return object keys from an arrow function or function expression.
-fn extract_keys_from_arrow_or_function<'a>(
-    expr: &'a Expression<'a>,
-    keys: &mut Vec<String>,
-) {
+fn extract_keys_from_arrow_or_function<'a>(expr: &'a Expression<'a>, keys: &mut Vec<String>) {
     match expr {
         Expression::ArrowFunctionExpression(arrow) => {
             // Arrow with expression body: `=> ({ key1: ..., key2: ... })`
@@ -1227,10 +1629,7 @@ fn extract_keys_from_arrow_or_function<'a>(
 }
 
 /// Extract return object keys from a list of function body statements.
-fn extract_keys_from_body_stmts<'a>(
-    stmts: &'a [Statement<'a>],
-    keys: &mut Vec<String>,
-) {
+fn extract_keys_from_body_stmts<'a>(stmts: &'a [Statement<'a>], keys: &mut Vec<String>) {
     for stmt in stmts {
         if let Statement::ReturnStatement(ret) = stmt {
             if let Some(arg) = &ret.argument {
@@ -1250,10 +1649,7 @@ fn extract_keys_from_body_stmts<'a>(
 }
 
 /// Extract property keys from an object expression (potentially wrapped).
-fn extract_keys_from_object_expr<'a>(
-    expr: &'a Expression<'a>,
-    keys: &mut Vec<String>,
-) {
+fn extract_keys_from_object_expr<'a>(expr: &'a Expression<'a>, keys: &mut Vec<String>) {
     match expr {
         Expression::ObjectExpression(obj) => {
             for prop in &obj.properties {
@@ -1720,5 +2116,202 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&"data-testid".to_string()));
         assert!(keys.contains(&"role".to_string()));
+    }
+
+    // ── extract_return_key_param_mapping tests ─────────────────────────
+
+    /// Test: getOUIAProps — the primary use case. Each param maps to specific keys.
+    #[test]
+    fn test_param_mapping_get_ouia_props() {
+        let source = r#"
+            export function getOUIAProps(componentType: string, id: OuiaId, ouiaSafe: boolean = true) {
+                return {
+                    'data-ouia-component-type': `PF6/${componentType}`,
+                    'data-ouia-safe': ouiaSafe,
+                    'data-ouia-component-id': id,
+                };
+            }
+        "#;
+
+        let mapping = extract_return_key_param_mapping(source, "getOUIAProps")
+            .expect("Should parse getOUIAProps");
+
+        assert_eq!(mapping.param_names, vec!["componentType", "id", "ouiaSafe"]);
+
+        // data-ouia-component-type uses componentType (via template literal)
+        let ct_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-ouia-component-type")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert_eq!(ct_params, vec!["componentType"]);
+
+        // data-ouia-safe uses ouiaSafe (direct identifier)
+        let safe_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-ouia-safe")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert_eq!(safe_params, vec!["ouiaSafe"]);
+
+        // data-ouia-component-id uses id (direct identifier)
+        let id_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-ouia-component-id")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert_eq!(id_params, vec!["id"]);
+    }
+
+    /// Test: useOUIAProps — arrow expression body with a function call in value.
+    #[test]
+    fn test_param_mapping_use_ouia_props() {
+        let source = r#"
+            export const useOUIAProps = (componentType: string, id?: OuiaId, ouiaSafe: boolean = true, variant?: string) => ({
+                'data-ouia-component-type': `PF6/${componentType}`,
+                'data-ouia-safe': ouiaSafe,
+                'data-ouia-component-id': useOUIAId(componentType, id, variant),
+            });
+        "#;
+
+        let mapping = extract_return_key_param_mapping(source, "useOUIAProps")
+            .expect("Should parse useOUIAProps");
+
+        assert_eq!(
+            mapping.param_names,
+            vec!["componentType", "id", "ouiaSafe", "variant"]
+        );
+
+        // data-ouia-component-type uses componentType
+        let ct_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-ouia-component-type")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert_eq!(ct_params, vec!["componentType"]);
+
+        // data-ouia-safe uses ouiaSafe
+        let safe_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-ouia-safe")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert_eq!(safe_params, vec!["ouiaSafe"]);
+
+        // data-ouia-component-id uses componentType, id, variant (via useOUIAId call)
+        let id_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-ouia-component-id")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert!(id_params.contains(&"componentType".to_string()));
+        assert!(id_params.contains(&"id".to_string()));
+        assert!(id_params.contains(&"variant".to_string()));
+    }
+
+    /// Test: Function not found returns None.
+    #[test]
+    fn test_param_mapping_not_found() {
+        let source = r#"
+            export function foo() { return { key: 'value' }; }
+        "#;
+        assert!(extract_return_key_param_mapping(source, "bar").is_none());
+    }
+
+    /// Test: Function with no return object returns None.
+    #[test]
+    fn test_param_mapping_no_return_object() {
+        let source = r#"
+            export function helper(x: number): number {
+                return x + 1;
+            }
+        "#;
+        assert!(extract_return_key_param_mapping(source, "helper").is_none());
+    }
+
+    /// Test: Conditional/ternary in value expression.
+    #[test]
+    fn test_param_mapping_conditional_value() {
+        let source = r#"
+            export function getAttrs(id: string, fallback: string) {
+                return {
+                    'data-id': id || fallback,
+                    'data-static': 'always',
+                };
+            }
+        "#;
+
+        let mapping =
+            extract_return_key_param_mapping(source, "getAttrs").expect("Should parse getAttrs");
+
+        // data-id references both id and fallback
+        let id_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-id")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert!(id_params.contains(&"id".to_string()));
+        assert!(id_params.contains(&"fallback".to_string()));
+
+        // data-static references no params (string literal)
+        let static_params = mapping
+            .key_to_params
+            .iter()
+            .find(|(k, _)| k == "data-static")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert!(static_params.is_empty());
+    }
+
+    /// Test: arg_position correctly scopes overridden_attributes via HelperResolution
+    #[test]
+    fn test_param_mapping_scoping_via_arg_position() {
+        let source = r#"
+            export function getOUIAProps(componentType: string, id: OuiaId, ouiaSafe: boolean = true) {
+                return {
+                    'data-ouia-component-type': `PF6/${componentType}`,
+                    'data-ouia-safe': ouiaSafe,
+                    'data-ouia-component-id': id,
+                };
+            }
+        "#;
+
+        let mapping = extract_return_key_param_mapping(source, "getOUIAProps")
+            .expect("Should parse getOUIAProps");
+
+        // Simulate what HelperResolution::keys_for_arg_position does:
+        // arg_position 0 = componentType → data-ouia-component-type
+        let keys_for_0: Vec<String> = mapping
+            .key_to_params
+            .iter()
+            .filter(|(_, params)| params.contains(&mapping.param_names[0]))
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys_for_0, vec!["data-ouia-component-type"]);
+
+        // arg_position 1 = id → data-ouia-component-id
+        let keys_for_1: Vec<String> = mapping
+            .key_to_params
+            .iter()
+            .filter(|(_, params)| params.contains(&mapping.param_names[1]))
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys_for_1, vec!["data-ouia-component-id"]);
+
+        // arg_position 2 = ouiaSafe → data-ouia-safe
+        let keys_for_2: Vec<String> = mapping
+            .key_to_params
+            .iter()
+            .filter(|(_, params)| params.contains(&mapping.param_names[2]))
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys_for_2, vec!["data-ouia-safe"]);
     }
 }

@@ -415,7 +415,115 @@ where
         }
     }
 
+    // Fallback: name-prefix stripping for zero-member removed classes.
+    //
+    // Classes like MySQL5InnoDBDialect have zero extractable public methods
+    // (only protected overrides or constructors), so the member-overlap
+    // algorithm skips them. When such a class is removed, try stripping
+    // version numbers from the name to find a consolidated base class.
+    //
+    // Pattern: "FooV5BarDialect" → strip digits/version suffixes → "FooDialect"
+    // If a class named "FooDialect" exists in the new API in the same package,
+    // treat it as a migration target with 0% overlap but high naming confidence.
+    for removed_sym in &removed_interfaces {
+        // Skip if already matched
+        if matched_removed.contains(removed_sym.qualified_name.as_str()) {
+            continue;
+        }
+        // Only apply to zero-member classes
+        if !removed_sym.members.is_empty() {
+            continue;
+        }
+
+        let name = &removed_sym.name;
+        // Try stripping version numbers and common suffixes like "InnoDB"
+        if let Some(base_name) = strip_version_from_name(name) {
+            // Look for the base-name class in the same package in the new API
+            if let Some(replacement) = new_containers.iter().find(|c| {
+                c.name == base_name && semantics.same_family(removed_sym, c)
+            }) {
+                if !matched_removed.contains(removed_sym.qualified_name.as_str()) {
+                    matched_removed.insert(&removed_sym.qualified_name);
+
+                    let old_extends = removed_sym.extends.clone();
+                    let new_extends = replacement.extends.clone();
+                    let (old_ext, new_ext) = if old_extends != new_extends {
+                        (old_extends, new_extends)
+                    } else {
+                        (None, None)
+                    };
+
+                    results.push(MigrationMatch {
+                        removed: removed_sym,
+                        target: MigrationTarget {
+                            removed_symbol: removed_sym.name.clone(),
+                            removed_qualified_name: removed_sym.qualified_name.clone(),
+                            removed_package: removed_sym.package.clone(),
+                            replacement_symbol: replacement.name.clone(),
+                            replacement_qualified_name: replacement.qualified_name.clone(),
+                            replacement_package: replacement.package.clone(),
+                            matching_members: Vec::new(),
+                            removed_only_members: Vec::new(),
+                            overlap_ratio: 0.0,
+                            old_extends: old_ext,
+                            new_extends: new_ext,
+                        },
+                    });
+
+                    tracing::debug!(
+                        removed = %removed_sym.name,
+                        replacement = %replacement.name,
+                        "Name-prefix fallback: stripped version from class name"
+                    );
+                }
+            }
+        }
+    }
+
     results
+}
+
+/// Strip version numbers and version-related suffixes from a class name.
+///
+/// Examples:
+/// - `MySQL5InnoDBDialect` → `MySQLDialect` (strip "5InnoDB")
+/// - `MySQL57InnoDBDialect` → `MySQLDialect` (strip "57InnoDB")
+/// - `PostgreSQL10Dialect` → `PostgreSQLDialect` (strip "10")
+/// - `PostgreSQL92Dialect` → `PostgreSQLDialect` (strip "92")
+/// - `H2Dialect` → None (single digit, too ambiguous)
+///
+/// The heuristic: find runs of digits optionally followed by a non-digit
+/// suffix (like "InnoDB") that sits between the letter-only prefix and the
+/// trailing base suffix (like "Dialect"). Returns None if no version pattern
+/// is found or if stripping would leave less than 3 characters.
+fn strip_version_from_name(name: &str) -> Option<String> {
+    // Find common trailing suffixes to preserve
+    let suffixes = ["Dialect", "Type", "Strategy", "Factory", "Provider", "Handler"];
+    let trailing_suffix = suffixes.iter().find(|s| name.ends_with(*s))?;
+
+    let prefix_part = &name[..name.len() - trailing_suffix.len()];
+    if prefix_part.len() < 2 {
+        return None;
+    }
+
+    // Find where the version part starts: first digit in the prefix
+    let digit_start = prefix_part.find(|c: char| c.is_ascii_digit())?;
+    if digit_start == 0 {
+        return None; // Name starts with digit, not a version suffix
+    }
+
+    let base_prefix = &prefix_part[..digit_start];
+    if base_prefix.len() < 2 {
+        return None; // Too short to be meaningful
+    }
+
+    let result = format!("{}{}", base_prefix, trailing_suffix);
+    // Don't return if result equals original (no version to strip)
+    if result == name {
+        return None;
+    }
+
+    Some(result)
 }
 
 /// Check if a symbol kind is a "container" (has members).
@@ -431,6 +539,32 @@ mod tests {
     use super::*;
     use crate::diff::MinimalSemantics;
     use crate::types::{Symbol, SymbolKind, Visibility};
+
+    #[test]
+    fn test_strip_version_from_name_dialects() {
+        assert_eq!(
+            strip_version_from_name("MySQL5InnoDBDialect"),
+            Some("MySQLDialect".to_string())
+        );
+        assert_eq!(
+            strip_version_from_name("MySQL57InnoDBDialect"),
+            Some("MySQLDialect".to_string())
+        );
+        assert_eq!(
+            strip_version_from_name("PostgreSQL10Dialect"),
+            Some("PostgreSQLDialect".to_string())
+        );
+        assert_eq!(
+            strip_version_from_name("PostgreSQL92Dialect"),
+            Some("PostgreSQLDialect".to_string())
+        );
+        // Already the base name -- no version to strip
+        assert_eq!(strip_version_from_name("MySQLDialect"), None);
+        // Too short after stripping
+        assert_eq!(strip_version_from_name("H2Dialect"), None);
+        // No recognized suffix
+        assert_eq!(strip_version_from_name("MySQL5"), None);
+    }
 
     fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
         let mut sym = Symbol::new(

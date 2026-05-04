@@ -190,6 +190,10 @@ pub enum JavaManifestChangeType {
     ProjectIdentityChanged,
     /// A dependency scope changed (compile → runtime, etc.).
     DependencyScopeChanged,
+    /// A dependency's Maven/Gradle coordinates changed (e.g.,
+    /// `javax.persistence:javax.persistence-api` → `jakarta.persistence:jakarta.persistence-api`).
+    /// The `before` field contains the old `group:artifact:version` and `after` contains the new.
+    DependencyCoordinateChanged,
 }
 
 // ── Evidence types ──────────────────────────────────────────────────────
