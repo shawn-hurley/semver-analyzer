@@ -183,6 +183,7 @@ fn build_bindings(
                         target_element: element.tag_name.clone(),
                         overridden_attributes: overridden.clone(),
                         component_overrides: has_rest_before,
+                        arg_position: None,
                     });
                 }
             }
