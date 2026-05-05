@@ -727,8 +727,9 @@ pub fn generate_rules(
     pkg_cache: &HashMap<String, String>,
     rename_patterns: &RenamePatterns,
     member_renames: &HashMap<String, String>,
-) -> Vec<KonveyorRule> {
+) -> (Vec<KonveyorRule>, HashMap<String, FixGuidanceEntry>) {
     let mut rules = Vec::new();
+    let mut guidance_map: HashMap<String, FixGuidanceEntry> = HashMap::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
 
     // ── Pre-scan: build component → family root lookup ──────────────────────
@@ -1467,6 +1468,15 @@ pub fn generate_rules(
                 member_renames,
                 &component_to_family,
             );
+            if let Some(primary) = new_rules.first() {
+                let entry = api_change_to_fix(
+                    api_change,
+                    file_changes,
+                    &primary.rule_id,
+                    file_pattern,
+                );
+                guidance_map.insert(primary.rule_id.clone(), entry);
+            }
             rules.extend(new_rules);
         }
 
@@ -1506,6 +1516,12 @@ pub fn generate_rules(
                     from_pkg.as_deref(),
                     &mut id_counts,
                 ) {
+                    let entry = behavioral_change_to_fix(
+                        behavioral,
+                        file_changes,
+                        &rule.rule_id,
+                    );
+                    guidance_map.insert(rule.rule_id.clone(), entry);
                     rules.push(rule);
                 }
             }
@@ -1873,15 +1889,36 @@ pub fn generate_rules(
                         p0c_labels.push(format!("family={}", family));
                     }
 
+                    let p0c_description = format!(
+                        "{} has significant breaking changes — {} of {} props removed",
+                        component_name, comp.member_summary.removed, comp.member_summary.total
+                    );
+                    guidance_map.insert(
+                        rule_id.clone(),
+                        FixGuidanceEntry {
+                            rule_id: rule_id.clone(),
+                            strategy: FixStrategy::ManualReview,
+                            confidence: FixConfidence::Medium,
+                            source: FixSource::Llm,
+                            symbol: component_name.clone(),
+                            file: comp
+                                .source_files
+                                .first()
+                                .map(|f| f.display().to_string())
+                                .unwrap_or_default(),
+                            fix_description: p0c_description.clone(),
+                            before: None,
+                            after: None,
+                            search_pattern: format!(r"\b{}\b", regex_escape(component_name)),
+                            replacement: None,
+                        },
+                    );
                     rules.push(KonveyorRule {
                         rule_id,
                         labels: p0c_labels,
                         effort: 3,
                         category: "mandatory".to_string(),
-                        description: format!(
-                            "{} has significant breaking changes — {} of {} props removed",
-                            component_name, comp.member_summary.removed, comp.member_summary.total
-                        ),
+                        description: p0c_description,
                         message,
                         links: Vec::new(),
                         when,
@@ -1907,6 +1944,8 @@ pub fn generate_rules(
                 | TsManifestChangeType::PeerDependencyRangeChanged
         ) {
             let rule = manifest_change_to_rule(manifest, file_pattern, &mut id_counts);
+            let entry = manifest_change_to_fix(manifest, &rule.rule_id);
+            guidance_map.insert(rule.rule_id.clone(), entry);
             rules.push(rule);
         }
     }
@@ -2690,7 +2729,7 @@ pub fn generate_rules(
     // were removed — superseded by sd-composition, sd-prop-to-child,
     // sd-child-to-prop, and sd-deprecated rules in konveyor_v2.rs.
 
-    rules
+    (rules, guidance_map)
 }
 
 /// Generate Konveyor rules and fix strategies for dependency version updates.
@@ -3377,44 +3416,9 @@ fn detect_css_prefix_changes(report: &AnalysisReport<TypeScript>) -> Vec<(String
 
 pub fn generate_fix_guidance(
     report: &AnalysisReport<TypeScript>,
-    rules: &[KonveyorRule],
-    file_pattern: &str,
+    guidance_map: HashMap<String, FixGuidanceEntry>,
 ) -> FixGuidanceDoc {
-    let mut fixes = Vec::new();
-    let mut rule_idx = 0;
-
-    // API + behavioral changes (per-file, in same order as generate_rules)
-    for file_changes in &report.changes {
-        for api_change in &file_changes.breaking_api_changes {
-            if rule_idx < rules.len() {
-                let fix = api_change_to_fix(
-                    api_change,
-                    file_changes,
-                    &rules[rule_idx].rule_id,
-                    file_pattern,
-                );
-                fixes.push(fix);
-                rule_idx += 1;
-            }
-        }
-        for behavioral in &file_changes.breaking_behavioral_changes {
-            if rule_idx < rules.len() {
-                let fix =
-                    behavioral_change_to_fix(behavioral, file_changes, &rules[rule_idx].rule_id);
-                fixes.push(fix);
-                rule_idx += 1;
-            }
-        }
-    }
-
-    // Manifest changes
-    for manifest in &report.manifest_changes {
-        if rule_idx < rules.len() {
-            let fix = manifest_change_to_fix(manifest, &rules[rule_idx].rule_id);
-            fixes.push(fix);
-            rule_idx += 1;
-        }
-    }
+    let fixes: Vec<FixGuidanceEntry> = guidance_map.into_values().collect();
 
     let auto_fixable = fixes
         .iter()
@@ -4857,7 +4861,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx,js,jsx}",
             &empty_cache,
@@ -4902,7 +4906,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &empty_cache,
@@ -4933,7 +4937,7 @@ mod tests {
 
         let report = make_report(vec![], manifest);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx,js,jsx}",
             &empty_cache,
@@ -4970,7 +4974,7 @@ mod tests {
 
         let report = make_report(vec![], manifest);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx,js,jsx}",
             &empty_cache,
@@ -5025,7 +5029,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
@@ -5046,14 +5050,14 @@ mod tests {
 
         let report = make_report(vec![], vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let fix_guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let fix_guidance = generate_fix_guidance(&report, _guidance_map);
 
         write_ruleset_dir(&dir, "test-ruleset", &report, &rules).unwrap();
         let fix_dir = write_fix_guidance_dir(&dir, &fix_guidance).unwrap();
@@ -5109,7 +5113,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &empty_cache,
@@ -5149,14 +5153,14 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.{ts,tsx}");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         assert_eq!(guidance.fixes.len(), 1);
         let fix = &guidance.fixes[0];
@@ -5192,14 +5196,14 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         assert_eq!(guidance.fixes.len(), 1);
         let fix = &guidance.fixes[0];
@@ -5233,14 +5237,14 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         assert_eq!(guidance.fixes.len(), 1);
         let fix = &guidance.fixes[0];
@@ -5278,14 +5282,14 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         assert_eq!(guidance.fixes.len(), 1);
         let fix = &guidance.fixes[0];
@@ -5310,14 +5314,14 @@ mod tests {
 
         let report = make_report(vec![], manifest);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         assert_eq!(guidance.fixes.len(), 1);
         let fix = &guidance.fixes[0];
@@ -5374,14 +5378,14 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         assert_eq!(guidance.summary.total_fixes, 3);
         // Rename=Exact (auto), Removed=Low/Manual, Behavioral=Medium/LLM
@@ -5436,14 +5440,14 @@ mod tests {
 
         let report = make_report(changes, manifest);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &empty_cache,
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let guidance = generate_fix_guidance(&report, &rules, "*.{ts,tsx}");
+        let guidance = generate_fix_guidance(&report, _guidance_map);
 
         let yaml = serde_yaml::to_string(&guidance).unwrap();
         assert!(yaml.contains("strategy"));
@@ -5484,7 +5488,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
@@ -5525,7 +5529,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
@@ -5571,7 +5575,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
@@ -5608,7 +5612,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
@@ -5714,7 +5718,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -5751,7 +5755,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -5952,7 +5956,7 @@ mod tests {
         .collect();
 
         let report = make_report(vec![], vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -6045,7 +6049,7 @@ mod tests {
         );
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -6101,7 +6105,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -6154,7 +6158,7 @@ mod tests {
         );
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -6270,7 +6274,7 @@ mod tests {
             .insert("global_token_5".into(), "correct_target_5".into());
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(&report, "*.ts", &pkg_cache, &patterns, &HashMap::new());
+        let (rules, _guidance_map) = generate_rules(&report, "*.ts", &pkg_cache, &patterns, &HashMap::new());
 
         let combined_rules: Vec<&KonveyorRule> = rules
             .iter()
@@ -6374,7 +6378,7 @@ mod tests {
             "@patternfly/react-core".to_string(),
         );
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -6424,7 +6428,7 @@ mod tests {
             )],
         );
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -6471,7 +6475,7 @@ mod tests {
         ];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -7140,7 +7144,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -7194,7 +7198,7 @@ mod tests {
 
         let pkg_cache = make_pkg_cache(&[("react-core", "@patternfly/react-core")]);
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -7266,7 +7270,7 @@ mod tests {
 
         let pkg_cache = make_pkg_cache(&[("react-tokens", "@patternfly/react-tokens")]);
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -7322,7 +7326,7 @@ mod tests {
             )],
         );
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -7376,7 +7380,7 @@ mod tests {
             ("react-icons", "@patternfly/react-icons"),
         ]);
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -7435,7 +7439,7 @@ mod tests {
 
         let pkg_cache = make_pkg_cache(&[("react-core", "@patternfly/react-core")]);
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &pkg_cache,
@@ -7497,7 +7501,7 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &empty_cache,
@@ -7588,7 +7592,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -7713,7 +7717,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -7797,7 +7801,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -7872,7 +7876,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -7938,7 +7942,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -8002,7 +8006,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -8423,7 +8427,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -8513,7 +8517,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -8583,7 +8587,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -8823,7 +8827,7 @@ mod tests {
             added_exports: vec![],
         }];
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -8920,7 +8924,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9003,7 +9007,7 @@ mod tests {
         )];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9054,7 +9058,7 @@ mod tests {
         ];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9104,7 +9108,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9167,7 +9171,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9226,7 +9230,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9303,7 +9307,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9378,7 +9382,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.ts",
             &HashMap::new(),
@@ -9915,7 +9919,7 @@ mod tests {
         );
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &pkg_cache,
@@ -10070,7 +10074,7 @@ mod tests {
         let mut report = make_report(changes, vec![]);
         report.packages = packages;
 
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &pkg_cache,
@@ -10131,7 +10135,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &HashMap::new(),
@@ -10202,7 +10206,7 @@ mod tests {
         }];
 
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &HashMap::new(),
@@ -10278,7 +10282,7 @@ mod tests {
             vec![],
         )];
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx,js,jsx}",
             &HashMap::new(),
@@ -10309,7 +10313,7 @@ mod tests {
             container_changes: vec![],
         }];
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx,js,jsx}",
             &HashMap::new(),
@@ -10340,7 +10344,7 @@ mod tests {
             container_changes: vec![],
         }];
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &HashMap::new(),
@@ -10371,7 +10375,7 @@ mod tests {
             container_changes: vec![],
         }];
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &HashMap::new(),
@@ -10393,7 +10397,7 @@ mod tests {
             source_package: None,
         }];
         let report = make_report(vec![], manifest);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx,js,jsx}",
             &HashMap::new(),
@@ -10435,7 +10439,7 @@ mod tests {
             "react-tokens".to_string(),
             "@patternfly/react-tokens".to_string(),
         );
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &pkg_cache,
@@ -10457,7 +10461,7 @@ mod tests {
             )],
         )];
         let report = make_report(changes, vec![]);
-        let rules = generate_rules(
+        let (rules, _guidance_map) = generate_rules(
             &report,
             "*.{ts,tsx}",
             &HashMap::new(),

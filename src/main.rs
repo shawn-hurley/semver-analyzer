@@ -578,7 +578,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
 
     // Generate rules
     let rule_phase = reporter.start_phase("Generating Konveyor rules");
-    let raw_rules = konveyor::generate_rules(
+    let (raw_rules, mut guidance_map) = konveyor::generate_rules(
         &report,
         &args.file_pattern,
         &pkg_cache,
@@ -590,10 +590,18 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let rules = if common.no_consolidate {
         raw_rules
     } else {
-        let (consolidated, _id_mapping) = konveyor::consolidate_rules_with(
+        let (consolidated, id_mapping) = konveyor::consolidate_rules_with(
             raw_rules,
             semver_analyzer_konveyor_core::extract_package_from_path,
         );
+        // Remap guidance entries: old rule_id → consolidated rule_id
+        for (old_id, new_id) in &id_mapping {
+            if old_id != new_id {
+                if let Some(entry) = guidance_map.remove(old_id) {
+                    guidance_map.entry(new_id.clone()).or_insert(entry);
+                }
+            }
+        }
         info!(
             raw = raw_count,
             consolidated = consolidated.len(),
@@ -773,7 +781,12 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         }
     }
 
-    let fix_guidance = konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
+    // Filter guidance map to only include entries for surviving rule_ids
+    let surviving_ids: std::collections::HashSet<String> =
+        all_rules.iter().map(|r| r.rule_id.clone()).collect();
+    guidance_map.retain(|id, _| surviving_ids.contains(id));
+
+    let fix_guidance = konveyor::generate_fix_guidance(&report, guidance_map);
     let rule_count = all_rules.len();
     rule_phase.finish_with_detail("Rules generated", &format!("{} rules", rule_count));
 
