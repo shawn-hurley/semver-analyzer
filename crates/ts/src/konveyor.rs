@@ -774,6 +774,24 @@ pub fn generate_rules(
                         .or_insert_with(|| tree.root.clone());
                 }
             }
+
+            // Remap deprecated components to their replacement families so that
+            // rules for deprecated-and-replaced components (e.g., Tile → Card,
+            // Chip → Label) get the replacement family's label. This lets the
+            // fix engine consolidate them with the replacement family's strategy
+            // entry (target_structure, retained_props, unmapped_removed_props),
+            // giving the LLM full context about the target component's v6 API.
+            for dr in &sd.deprecated_replacements {
+                if let Some(new_family) = map.get(&dr.new_component).cloned() {
+                    let old_family = dr.old_component.clone();
+                    for value in map.values_mut() {
+                        if *value == old_family {
+                            *value = new_family.clone();
+                        }
+                    }
+                }
+            }
+
             map
         } else {
             HashMap::new()
@@ -2738,8 +2756,10 @@ pub fn generate_dependency_update_rules(
         }
     }
 
-    // Source 2: any package with a major version bump vs the from_ref.
-    let from_major = report
+    // Source 2: any package with a major version bump.
+    // Prefer per-package old_version to detect the bump; fall back to the
+    // repo-level from_ref major when per-package old version is unavailable.
+    let repo_from_major = report
         .comparison
         .from_ref
         .trim_start_matches('v')
@@ -2758,7 +2778,13 @@ pub fn generate_dependency_update_rules(
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            if new_major > from_major {
+            let old_major = info
+                .old_version
+                .as_ref()
+                .and_then(|v| v.split('.').next())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(repo_from_major);
+            if new_major > old_major {
                 packages_with_changes
                     .entry(info.name.clone())
                     .or_insert(info);
@@ -2880,17 +2906,28 @@ pub fn generate_dependency_update_rules(
                 name: Some(npm_name.clone()),
                 nameregex: None,
                 // Fire when the dependency version is at or below the old (pre-breaking) version.
-                // The old version is the from_ref version (e.g., "5.4.0").
                 // Use a high patch number to catch all patch releases of the old major.
+                //
+                // Prefer per-package old_version (handles packages like react-charts
+                // that have independent versioning: v7.x in PF5, v8.x in PF6).
+                // Fall back to repo-level from_ref when per-package version is unavailable.
                 upperbound: {
-                    // Extract the major version from the from_ref (e.g., "v5.4.0" -> "5")
-                    let from_ref = &report.comparison.from_ref;
-                    let major = from_ref
-                        .trim_start_matches('v')
-                        .split('.')
-                        .next()
+                    let major = info
+                        .old_version
+                        .as_ref()
+                        .and_then(|v| v.split('.').next())
                         .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
+                        .unwrap_or_else(|| {
+                            // Fallback to repo-level from_ref
+                            report
+                                .comparison
+                                .from_ref
+                                .trim_start_matches('v')
+                                .split('.')
+                                .next()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                        });
                     Some(format!("{}.99.99", major))
                 },
                 lowerbound: None,
@@ -3168,15 +3205,63 @@ pub fn build_package_name_cache(report: &AnalysisReport<TypeScript>) -> HashMap<
 
 /// Build a cache of package directory name -> PackageInfo (name + version).
 ///
-/// Reads package.json from the to_ref (new version) using `git show` to get
-/// the target version for dependency update rules. Falls back to reading from
-/// disk if git fails.
+/// Reads package.json from both `from_ref` (old version) and `to_ref` (new version)
+/// using `git show` to get per-package version information for dependency update rules.
+/// The old version is needed because packages in a monorepo may have independent
+/// version numbers (e.g., `@patternfly/react-charts` is v7.x in PF5, v8.x in PF6),
+/// so the repo-level git tag cannot be used as a universal upperbound.
+/// Infer the path prefix before `packages/` from report file paths.
+///
+/// Standard repos use `packages/` at the repo root (prefix = ""), but some
+/// repos like `openshift/console` nest packages under `frontend/packages/`.
+/// This function scans file paths in the report to detect the most common
+/// prefix before the `packages/` segment.
+///
+/// Returns the prefix string including trailing slash (e.g., `"frontend/"`)
+/// or empty string if packages are at the root.
+fn infer_packages_prefix(report: &AnalysisReport<TypeScript>) -> String {
+    let mut prefix_counts: HashMap<String, usize> = HashMap::new();
+
+    for file_changes in &report.changes {
+        let file_str = file_changes.file.to_string_lossy();
+        // Find the "packages/" segment and extract everything before it
+        if let Some(pos) = file_str.find("/packages/") {
+            let prefix = &file_str[..pos + 1]; // include trailing slash
+            *prefix_counts.entry(prefix.to_string()).or_insert(0) += 1;
+        } else if file_str.starts_with("packages/") {
+            *prefix_counts.entry(String::new()).or_insert(0) += 1;
+        }
+    }
+
+    let inferred = prefix_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(prefix, _)| prefix)
+        .unwrap_or_default();
+
+    if !inferred.is_empty() {
+        tracing::info!(
+            prefix = %inferred,
+            "Inferred packages prefix from report file paths"
+        );
+    }
+
+    inferred
+}
+
 pub fn build_package_info_cache(
     report: &AnalysisReport<TypeScript>,
 ) -> HashMap<String, PackageInfo> {
     let mut cache: HashMap<String, PackageInfo> = HashMap::new();
     let repo_path = &report.repository;
     let to_ref = &report.comparison.to_ref;
+    let from_ref = &report.comparison.from_ref;
+
+    // Infer the packages prefix from report file paths.
+    // Standard repos use "packages/" at the root, but some (e.g., openshift/console)
+    // use "frontend/packages/". We scan all file paths to find the prefix before
+    // "packages/" and use that for git and disk lookups.
+    let packages_prefix = infer_packages_prefix(report);
 
     for file_changes in &report.changes {
         let file_str = file_changes.file.to_string_lossy();
@@ -3190,12 +3275,18 @@ pub fn build_package_info_cache(
 
                 // Read package.json at the to_ref to get the target version.
                 // Use `git show <ref>:path` to avoid depending on the checkout state.
-                let pkg_json_git_path = format!("packages/{}/package.json", pkg_dir_name);
+                // Use the inferred prefix (e.g., "frontend/packages/" or "packages/").
+                let pkg_json_git_path =
+                    format!("{}packages/{}/package.json", packages_prefix, pkg_dir_name);
                 let (npm_name, npm_version) =
                     read_package_json_at_ref(repo_path, to_ref, &pkg_json_git_path)
                         .or_else(|| {
                             // Fallback: read from disk (current checkout)
-                            let pkg_json_path = repo_path
+                            let mut pkg_json_path = repo_path.to_path_buf();
+                            for seg in packages_prefix.split('/').filter(|s| !s.is_empty()) {
+                                pkg_json_path = pkg_json_path.join(seg);
+                            }
+                            pkg_json_path = pkg_json_path
                                 .join("packages")
                                 .join(pkg_dir_name)
                                 .join("package.json");
@@ -3203,9 +3294,16 @@ pub fn build_package_info_cache(
                         })
                         .unwrap_or((None, None));
 
+                // Read package.json at the from_ref to get the old version.
+                // This is critical for packages with independent versioning.
+                let old_version =
+                    read_package_json_at_ref(repo_path, from_ref, &pkg_json_git_path)
+                        .and_then(|(_, v)| v);
+
                 let info = PackageInfo {
                     name: npm_name.unwrap_or_else(|| pkg_dir_name.to_string()),
                     version: npm_version,
+                    old_version,
                 };
                 cache.insert(pkg_dir_name.to_string(), info);
             }
@@ -3215,15 +3313,17 @@ pub fn build_package_info_cache(
     // Discover ALL workspace packages via `git ls-tree` so packages without
     // breaking API changes (e.g., react-styles) still get dependency-update
     // rules when they have a major version bump.
+    let ls_tree_path = format!("{}packages/", packages_prefix);
     if let Ok(output) = std::process::Command::new("git")
-        .args(["ls-tree", "--name-only", to_ref, "packages/"])
+        .args(["ls-tree", "--name-only", to_ref, &ls_tree_path])
         .current_dir(repo_path)
         .output()
     {
         if output.status.success() {
             let listing = String::from_utf8_lossy(&output.stdout);
+            let strip_prefix = format!("{}packages/", packages_prefix);
             for line in listing.lines() {
-                let dir_name = line.trim_start_matches("packages/");
+                let dir_name = line.trim_start_matches(&strip_prefix);
                 if dir_name.is_empty() || cache.contains_key(dir_name) {
                     continue;
                 }
@@ -3231,9 +3331,15 @@ pub fn build_package_info_cache(
                 if let Some((npm_name, npm_version)) =
                     read_package_json_at_ref(repo_path, to_ref, &pkg_json_git_path)
                 {
+                    // Read old version from from_ref
+                    let old_version =
+                        read_package_json_at_ref(repo_path, from_ref, &pkg_json_git_path)
+                            .and_then(|(_, v)| v);
+
                     let info = PackageInfo {
                         name: npm_name.unwrap_or_else(|| dir_name.to_string()),
                         version: npm_version,
+                        old_version,
                     };
                     cache.insert(dir_name.to_string(), info);
                 }
@@ -3254,7 +3360,12 @@ pub fn build_package_info_cache(
             .or_insert_with(|| PackageInfo {
                 name: dir_name.to_string(),
                 version: None,
+                old_version: None,
             });
+        // Enrich old_version from report.packages if not already set
+        if entry.old_version.is_none() {
+            entry.old_version.clone_from(&pkg.old_version);
+        }
         // If the cache has a bare directory name but the report has the scoped name, upgrade
         if !pkg.name.starts_with('@') || entry.name.starts_with('@') {
             continue;
@@ -3267,10 +3378,11 @@ pub fn build_package_info_cache(
             entries = ?cache
                 .iter()
                 .map(|(k, v)| format!(
-                    "{}: {} ({})",
+                    "{}: {} ({} -> {})",
                     k,
                     v.name,
-                    v.version.as_deref().unwrap_or("?")
+                    v.old_version.as_deref().unwrap_or("?"),
+                    v.version.as_deref().unwrap_or("?"),
                 ))
                 .collect::<Vec<_>>(),
             "Package info cache built"
@@ -10465,5 +10577,91 @@ mod tests {
             &HashMap::new(),
         );
         insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    // ── Deprecated replacement family remapping tests ────────────────────
+
+    #[test]
+    fn test_deprecated_replacement_remaps_family_label() {
+        // When a component is deprecated and replaced by a different-name
+        // component (e.g., Tile → Card), rules for the deprecated component
+        // should get the replacement family's label (family=Card, not family=Tile).
+        use crate::sd_types::{
+            CompositionTree, DeprecatedReplacement, ReplacementEvidence, SdPipelineResult,
+        };
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Tile/Tile.d.ts",
+            vec![make_api_change(
+                "Tile",
+                ApiChangeKind::Constant,
+                ApiChangeType::SignatureChanged,
+                "Component Tile was deprecated and replaced by Card",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.extensions.sd_result = Some(SdPipelineResult {
+            // New (v6) composition tree: Card family
+            composition_trees: vec![CompositionTree {
+                root: "Card".into(),
+                family_members: vec![
+                    "Card".into(),
+                    "CardHeader".into(),
+                    "CardBody".into(),
+                    "CardTitle".into(),
+                ],
+                edges: vec![],
+            }],
+            // Old (v5) composition tree: Tile was its own family
+            old_composition_trees: vec![
+                CompositionTree {
+                    root: "Tile".into(),
+                    family_members: vec!["Tile".into()],
+                    edges: vec![],
+                },
+                CompositionTree {
+                    root: "Card".into(),
+                    family_members: vec![
+                        "Card".into(),
+                        "CardHeader".into(),
+                        "CardBody".into(),
+                    ],
+                    edges: vec![],
+                },
+            ],
+            // Deprecated replacement: Tile → Card
+            deprecated_replacements: vec![DeprecatedReplacement {
+                old_component: "Tile".into(),
+                new_component: "Card".into(),
+                evidence_hosts: vec![],
+                evidence_source: ReplacementEvidence::CommitCoChange,
+            }],
+            ..SdPipelineResult::default()
+        });
+
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Find the Tile rule and verify it has family=Card
+        let tile_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("tile"))
+            .expect("should have a rule for Tile");
+        assert!(
+            tile_rule.labels.contains(&"family=Card".to_string()),
+            "Tile rule should have family=Card label, got: {:?}",
+            tile_rule.labels
+        );
+        assert!(
+            !tile_rule.labels.contains(&"family=Tile".to_string()),
+            "Tile rule should NOT have family=Tile label"
+        );
     }
 }

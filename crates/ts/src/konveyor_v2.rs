@@ -2324,7 +2324,27 @@ fn build_deprecated_migration_context(
         }
     }
 
-    let mt = best_mt?;
+    let mt = match best_mt {
+        Some(mt) => mt,
+        None => {
+            // No MigrationTarget found. Check deprecated_replacements for
+            // cross-name replacements (e.g., Tile → Card detected via commit
+            // co-change or rendering swap). Build the migration context
+            // manually from prop type maps.
+            let dr = sd
+                .deprecated_replacements
+                .iter()
+                .find(|dr| dr.new_component == family_root);
+            if let Some(dr) = dr {
+                return build_deprecated_migration_from_replacement(
+                    family_root,
+                    &dr.old_component,
+                    sd,
+                );
+            }
+            return None;
+        }
+    };
 
     // Determine old/new package from component_packages or the file path.
     let old_package = mt
@@ -2404,6 +2424,83 @@ fn build_deprecated_migration_context(
     let removed_props = mt.removed_only_members.clone();
 
     // Only return if we have meaningful data
+    if matching_props.is_empty() && new_props.is_empty() && removed_props.is_empty() {
+        return None;
+    }
+
+    Some(semver_analyzer_konveyor_core::DeprecatedMigrationContext {
+        old_package,
+        new_package,
+        matching_props,
+        new_props,
+        removed_props,
+    })
+}
+
+/// Build a `DeprecatedMigrationContext` for cross-name replacements
+/// (e.g., Tile → Card) by comparing old and new prop type maps directly,
+/// without requiring a `MigrationTarget` from the diff engine.
+///
+/// This handles cases where the deprecated component has a differently-named
+/// replacement detected via rendering swap or commit co-change analysis.
+/// The prop overlap is computed by exact name matching between the old
+/// component's props and the new (replacement) component's props.
+fn build_deprecated_migration_from_replacement(
+    family_root: &str,
+    old_component: &str,
+    sd: &SdPipelineResult,
+) -> Option<semver_analyzer_konveyor_core::DeprecatedMigrationContext> {
+    let old_types = sd.old_component_prop_types.get(old_component)?;
+    let new_types = sd.new_component_prop_types.get(family_root)?;
+
+    let old_package = sd
+        .old_component_packages
+        .get(old_component)
+        .cloned()
+        .unwrap_or_else(|| "@patternfly/react-core".to_string());
+    let new_package = sd
+        .component_packages
+        .get(family_root)
+        .cloned()
+        .unwrap_or_else(|| "@patternfly/react-core".to_string());
+
+    // Compute matching props (same name in both old and new).
+    let matching_props: Vec<semver_analyzer_konveyor_core::PropMigrationEntry> = old_types
+        .iter()
+        .filter(|(name, _)| new_types.contains_key(name.as_str()))
+        .filter(|(name, _)| name.as_str() != "children" && name.as_str() != "className")
+        .map(|(name, old_type)| {
+            let new_type = new_types.get(name).cloned();
+            let type_changed = new_type
+                .as_ref()
+                .map(|nt| nt != old_type)
+                .unwrap_or(false);
+            semver_analyzer_konveyor_core::PropMigrationEntry {
+                old_name: name.clone(),
+                new_name: name.clone(),
+                old_type: Some(old_type.clone()),
+                new_type,
+                type_changed,
+            }
+        })
+        .collect();
+
+    // Props only on old component (no equivalent on new).
+    let removed_props: Vec<String> = old_types
+        .keys()
+        .filter(|name| !new_types.contains_key(name.as_str()))
+        .filter(|name| name.as_str() != "children" && name.as_str() != "className")
+        .cloned()
+        .collect();
+
+    // Props only on new component (not on old).
+    let new_props: BTreeMap<String, String> = new_types
+        .iter()
+        .filter(|(name, _)| !old_types.contains_key(name.as_str()))
+        .filter(|(name, _)| name.as_str() != "children" && name.as_str() != "className")
+        .map(|(name, typ)| (name.clone(), typ.clone()))
+        .collect();
+
     if matching_props.is_empty() && new_props.is_empty() && removed_props.is_empty() {
         return None;
     }
@@ -3024,8 +3121,10 @@ fn generate_test_impact_rules(
     // ── Phase 1: Direct changes — process individually ──────────────
     //
     // Changes with no dependency_chain are direct (the component's own
-    // source changed). These have unique discriminators (different
-    // old_values, different elements) and don't collide.
+    // source changed). Components that exist in both regular and deprecated
+    // families (e.g., WizardHeader in Wizard and deprecated/Wizard) can
+    // produce duplicate SourceLevelChange entries with identical rule IDs.
+    // Deduplicated after the loop via retain().
     for change in changes {
         if !change.has_test_implications {
             continue;
@@ -3216,16 +3315,118 @@ fn generate_test_impact_rules(
                 }
             }
 
-            // ── ARIA label changes: match getByLabelText('oldValue') ─
+            // ── ARIA changes ─────────────────────────────────────────
             SourceLevelCategory::AriaChange => {
-                if !change.description.contains("aria-label") {
-                    continue;
-                }
+                if change.description.contains("aria-label") {
+                    // ── aria-label changes: match getByLabelText('oldValue') ─
+                    if let Some(ref old_val) = change.old_value {
+                        if !is_concrete_value(old_val) {
+                            continue;
+                        }
 
-                if let Some(ref old_val) = change.old_value {
-                    if !is_concrete_value(old_val) {
+                        let prefix = rule_prefix(&change.migration_from);
+                        let elem_part = change
+                            .element
+                            .as_deref()
+                            .map(|e| format!("-{}", sanitize(e)))
+                            .unwrap_or_default();
+                        let rule_id = format!(
+                            "{}-test-{}-aria-label-{}{}-{}",
+                            prefix,
+                            sanitize(&change.component),
+                            sanitize(old_val),
+                            elem_part,
+                            if change.new_value.is_some() {
+                                "changed"
+                            } else {
+                                "removed"
+                            },
+                        );
+
+                        let message = if let Some(ref new_val) = change.new_value {
+                            if is_concrete_value(new_val) {
+                                format!(
+                                    "{} aria-label changed from '{}' to '{}'.\n\n\
+                                     Update test queries:\n  \
+                                     getByLabelText('{}') → getByLabelText('{}')",
+                                    change.component, old_val, new_val, old_val, new_val
+                                )
+                            } else {
+                                format!(
+                                    "{} aria-label '{}' changed to a dynamic value.\n\n\
+                                     Tests using getByLabelText('{}') may need updating.\n\n\
+                                     {}",
+                                    change.component, old_val, old_val, change.description
+                                )
+                            }
+                        } else {
+                            format!(
+                                "{} no longer has aria-label='{}'.\n\n\
+                                 Tests using getByLabelText('{}') to find this component will fail.\n\n\
+                                 {}",
+                                change.component, old_val, old_val, change.description
+                            )
+                        };
+
+                        rules.push(KonveyorRule {
+                            rule_id,
+                            labels: vec![
+                                "source=semver-analyzer".into(),
+                                "change-type=test-impact".into(),
+                                "impact=frontend-testing".into(),
+                                format!("package={}", pkg),
+                            ],
+                            effort: 1,
+                            category: "optional".into(),
+                            description: format!(
+                                "Test impact: {} aria-label '{}' {}",
+                                change.component,
+                                old_val,
+                                if change.new_value.is_some() {
+                                    "changed"
+                                } else {
+                                    "removed"
+                                }
+                            ),
+                            message,
+                            links: vec![],
+                            when: KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern: LABEL_QUERY_PATTERN.into(),
+                                    location: "FUNCTION_CALL".into(),
+                                    component: None,
+                                    parent: None,
+                                    not_parent: None,
+                                    child: None,
+                                    not_child: None,
+                                    requires_child: None,
+                                    parent_from: None,
+                                    value: Some(format!("^{}$", old_val)),
+                                    from: None,
+                                    file_pattern: Some(TEST_FILE_PATTERN.into()),
+                                },
+                            },
+                            fix_strategy: None,
+                        });
+                    }
+                } else {
+                    // ── Other ARIA attribute changes (aria-disabled, etc.):
+                    //    match getAttribute('attrName') in test files ─────
+                    //
+                    // When an ARIA attribute other than aria-label is removed
+                    // or changed, tests using getAttribute() or toHaveAttribute()
+                    // with that attribute will break. Generate a FileContent rule
+                    // (same approach as AttributeConditionality).
+
+                    // Skip "added" — new attributes don't break existing tests
+                    if change.description.contains("attribute added") {
                         continue;
                     }
+
+                    let attr_name = match extract_aria_attr_name(&change.description) {
+                        Some(name) => name,
+                        None => continue,
+                    };
 
                     let prefix = rule_prefix(&change.migration_from);
                     let elem_part = change
@@ -3234,10 +3435,10 @@ fn generate_test_impact_rules(
                         .map(|e| format!("-{}", sanitize(e)))
                         .unwrap_or_default();
                     let rule_id = format!(
-                        "{}-test-{}-aria-label-{}{}-{}",
+                        "{}-test-{}-aria-{}{}-{}",
                         prefix,
                         sanitize(&change.component),
-                        sanitize(old_val),
+                        sanitize(&attr_name),
                         elem_part,
                         if change.new_value.is_some() {
                             "changed"
@@ -3246,28 +3447,28 @@ fn generate_test_impact_rules(
                         },
                     );
 
-                    let message = if let Some(ref new_val) = change.new_value {
-                        if is_concrete_value(new_val) {
-                            format!(
-                                "{} aria-label changed from '{}' to '{}'.\n\n\
-                                 Update test queries:\n  \
-                                 getByLabelText('{}') → getByLabelText('{}')",
-                                change.component, old_val, new_val, old_val, new_val
-                            )
-                        } else {
-                            format!(
-                                "{} aria-label '{}' changed to a dynamic value.\n\n\
-                                 Tests using getByLabelText('{}') may need updating.\n\n\
-                                 {}",
-                                change.component, old_val, old_val, change.description
-                            )
-                        }
+                    let elem_display = change.element.as_deref().unwrap_or("element");
+                    let message = if change.new_value.is_none() {
+                        format!(
+                            "{component} no longer renders `{attr}` on `<{elem}>`.\n\n\
+                             Tests using `getAttribute('{attr}')` will now get `null`.\n\n\
+                             Update test assertions:\n  \
+                             `.getAttribute('{attr}')` → check the native HTML attribute instead \
+                             (e.g., `.toBeDisabled()` or `.toHaveAttribute('disabled')`)\n  \
+                             `.getAttribute('{attr}').toBe('false')` → `.not.toHaveAttribute('{attr}')`",
+                            component = change.component,
+                            attr = attr_name,
+                            elem = elem_display,
+                        )
                     } else {
                         format!(
-                            "{} no longer has aria-label='{}'.\n\n\
-                             Tests using getByLabelText('{}') to find this component will fail.\n\n\
+                            "{component} changed how `{attr}` is rendered on `<{elem}>`.\n\n\
+                             Tests using `getAttribute('{attr}')` may return different values.\n\n\
                              {}",
-                            change.component, old_val, old_val, change.description
+                            change.description,
+                            component = change.component,
+                            attr = attr_name,
+                            elem = elem_display,
                         )
                     };
 
@@ -3282,34 +3483,27 @@ fn generate_test_impact_rules(
                         effort: 1,
                         category: "optional".into(),
                         description: format!(
-                            "Test impact: {} aria-label '{}' {}",
+                            "Test impact: {} `{}` {}",
                             change.component,
-                            old_val,
+                            attr_name,
                             if change.new_value.is_some() {
                                 "changed"
                             } else {
                                 "removed"
-                            }
+                            },
                         ),
                         message,
                         links: vec![],
-                        when: KonveyorCondition::FrontendReferenced {
-                            referenced: FrontendReferencedFields {
-                                pattern: LABEL_QUERY_PATTERN.into(),
-                                location: "FUNCTION_CALL".into(),
-                                component: None,
-                                parent: None,
-                                not_parent: None,
-                                child: None,
-                                not_child: None,
-                                requires_child: None,
-                                parent_from: None,
-                                value: Some(format!("^{}$", old_val)),
-                                from: None,
-                                file_pattern: Some(TEST_FILE_PATTERN.into()),
+                        when: KonveyorCondition::FileContent {
+                            filecontent: FileContentFields {
+                                pattern: format!(
+                                    "(getAttribute|toHaveAttribute|\\.not\\.toHaveAttribute)\\(\\s*['\"]{}['\"]\\s*[,)]",
+                                    regex_escape(&attr_name),
+                                ),
+                                file_pattern: TEST_FILE_PATTERN.into(),
                             },
                         },
-                        fix_strategy: None,
+                        fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
                     });
                 }
             }
@@ -3543,6 +3737,14 @@ fn generate_test_impact_rules(
             // DataAttribute and PortalUsage are transitive-only — handled in Phase 2
             _ => {}
         }
+    }
+
+    // Deduplicate Phase 1 rules. Components that exist in both regular and
+    // deprecated families (e.g., WizardHeader in Wizard and deprecated/Wizard)
+    // produce duplicate SourceLevelChange entries with identical rule IDs.
+    {
+        let mut seen = HashSet::new();
+        rules.retain(|r| seen.insert(r.rule_id.clone()));
     }
 
     // ── Phase 2: Transitive changes — one consolidated rule per component ─
@@ -3829,33 +4031,50 @@ fn build_when_for_transitive_change(
         }
 
         SourceLevelCategory::AriaChange => {
-            if !change.description.contains("aria-label") {
-                return None;
-            }
-            let old_val = change.old_value.as_ref()?;
-            if !is_concrete_value(old_val) {
-                return None;
-            }
-            let key = format!("aria-label:{}", old_val);
-            Some((
-                KonveyorCondition::FrontendReferenced {
-                    referenced: FrontendReferencedFields {
-                        pattern: LABEL_QUERY_PATTERN.into(),
-                        location: "FUNCTION_CALL".into(),
-                        component: None,
-                        parent: None,
-                        not_parent: None,
-                        child: None,
-                        not_child: None,
-                        requires_child: None,
-                        parent_from: None,
-                        value: Some(format!("^{}$", old_val)),
-                        from: None,
-                        file_pattern: Some(TEST_FILE_PATTERN.into()),
+            if change.description.contains("aria-label") {
+                // aria-label changes: match getByLabelText('oldValue')
+                let old_val = change.old_value.as_ref()?;
+                if !is_concrete_value(old_val) {
+                    return None;
+                }
+                let key = format!("aria-label:{}", old_val);
+                Some((
+                    KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: LABEL_QUERY_PATTERN.into(),
+                            location: "FUNCTION_CALL".into(),
+                            component: None,
+                            parent: None,
+                            not_parent: None,
+                            child: None,
+                            not_child: None,
+                            requires_child: None,
+                            parent_from: None,
+                            value: Some(format!("^{}$", old_val)),
+                            from: None,
+                            file_pattern: Some(TEST_FILE_PATTERN.into()),
+                        },
                     },
-                },
-                key,
-            ))
+                    key,
+                ))
+            } else {
+                // Other ARIA attribute changes (aria-disabled, etc.):
+                // match getAttribute('attrName') in test files.
+                let attr_name = extract_aria_attr_name(&change.description)?;
+                let key = format!("aria-attr:{}", attr_name);
+                Some((
+                    KonveyorCondition::FileContent {
+                        filecontent: FileContentFields {
+                            pattern: format!(
+                                "(getAttribute|toHaveAttribute|\\.not\\.toHaveAttribute)\\(\\s*['\"]{}['\"]\\s*[,)]",
+                                regex_escape(&attr_name),
+                            ),
+                            file_pattern: TEST_FILE_PATTERN.into(),
+                        },
+                    },
+                    key,
+                ))
+            }
         }
 
         SourceLevelCategory::DomStructure => {
@@ -4284,6 +4503,23 @@ fn generate_prop_attribute_override_rules(
     }
 
     rules
+}
+
+/// Extract the ARIA attribute name from a source-level change description.
+///
+/// Handles these description formats from `diff_aria_attributes`:
+/// - `"{attr} attribute removed from <{elem}> in {component}"`
+/// - `"{attr} attribute added to <{elem}> in {component}"`
+/// - `"{attr} on <{elem}> in {component} changed from ..."`
+///
+/// Returns `None` if the first token is not an ARIA attribute (`aria-*`) or `role`.
+fn extract_aria_attr_name(description: &str) -> Option<String> {
+    let attr = description.split_whitespace().next()?;
+    if attr.starts_with("aria-") || attr == "role" {
+        Some(attr.to_string())
+    } else {
+        None
+    }
 }
 
 /// Escape special regex characters in a string.
@@ -7016,5 +7252,456 @@ mod tests {
 
         let rules = generate_conformance_rules(&[tree], &[], &pkgs);
         insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    // ── build_deprecated_migration_from_replacement tests ───────────────
+
+    #[test]
+    fn test_deprecated_migration_from_replacement_basic() {
+        // Simulate Tile → Card replacement: Tile has props {isSelected, title, icon},
+        // Card has props {isSelected, isClickable, isCompact}.
+        // Expected: isSelected matches, title/icon are removed, isClickable/isCompact are new.
+        let mut old_prop_types = HashMap::new();
+        let mut tile_props = BTreeMap::new();
+        tile_props.insert("isSelected".into(), "boolean".into());
+        tile_props.insert("title".into(), "React.ReactNode".into());
+        tile_props.insert("icon".into(), "React.ReactNode".into());
+        tile_props.insert("children".into(), "React.ReactNode".into()); // should be filtered
+        old_prop_types.insert("Tile".into(), tile_props);
+
+        let mut new_prop_types = HashMap::new();
+        let mut card_props = BTreeMap::new();
+        card_props.insert("isSelected".into(), "boolean".into());
+        card_props.insert("isClickable".into(), "boolean".into());
+        card_props.insert("isCompact".into(), "boolean".into());
+        card_props.insert("children".into(), "React.ReactNode".into()); // should be filtered
+        card_props.insert("className".into(), "string".into()); // should be filtered
+        new_prop_types.insert("Card".into(), card_props);
+
+        let mut component_packages = HashMap::new();
+        component_packages.insert("Card".into(), "@patternfly/react-core".into());
+
+        let mut old_component_packages = HashMap::new();
+        old_component_packages.insert("Tile".into(), "@patternfly/react-core".into());
+
+        let sd = SdPipelineResult {
+            old_component_prop_types: old_prop_types,
+            new_component_prop_types: new_prop_types,
+            component_packages,
+            old_component_packages,
+            ..SdPipelineResult::default()
+        };
+
+        let result =
+            super::build_deprecated_migration_from_replacement("Card", "Tile", &sd);
+        assert!(result.is_some(), "should produce a migration context");
+
+        let ctx = result.unwrap();
+        assert_eq!(ctx.old_package, "@patternfly/react-core");
+        assert_eq!(ctx.new_package, "@patternfly/react-core");
+
+        // Matching props: isSelected (same name, same type)
+        assert_eq!(ctx.matching_props.len(), 1);
+        assert_eq!(ctx.matching_props[0].old_name, "isSelected");
+        assert_eq!(ctx.matching_props[0].new_name, "isSelected");
+        assert!(!ctx.matching_props[0].type_changed);
+
+        // Removed props: title, icon (on Tile but not Card)
+        assert!(ctx.removed_props.contains(&"title".to_string()));
+        assert!(ctx.removed_props.contains(&"icon".to_string()));
+        assert_eq!(ctx.removed_props.len(), 2);
+        // children and className should NOT appear
+        assert!(!ctx.removed_props.contains(&"children".to_string()));
+
+        // New props: isClickable, isCompact (on Card but not Tile)
+        assert!(ctx.new_props.contains_key("isClickable"));
+        assert!(ctx.new_props.contains_key("isCompact"));
+        assert_eq!(ctx.new_props.len(), 2);
+        // children and className should NOT appear
+        assert!(!ctx.new_props.contains_key("children"));
+        assert!(!ctx.new_props.contains_key("className"));
+    }
+
+    #[test]
+    fn test_deprecated_migration_from_replacement_type_changed() {
+        // Test that type changes are correctly detected between matching props.
+        let mut old_prop_types = HashMap::new();
+        let mut old_props = BTreeMap::new();
+        old_props.insert("onSelect".into(), "(event: MouseEvent) => void".into());
+        old_prop_types.insert("OldComp".into(), old_props);
+
+        let mut new_prop_types = HashMap::new();
+        let mut new_props = BTreeMap::new();
+        new_props.insert(
+            "onSelect".into(),
+            "(event: MouseEvent | KeyboardEvent) => void".into(),
+        );
+        new_prop_types.insert("NewComp".into(), new_props);
+
+        let sd = SdPipelineResult {
+            old_component_prop_types: old_prop_types,
+            new_component_prop_types: new_prop_types,
+            ..SdPipelineResult::default()
+        };
+
+        let result =
+            super::build_deprecated_migration_from_replacement("NewComp", "OldComp", &sd);
+        let ctx = result.unwrap();
+        assert_eq!(ctx.matching_props.len(), 1);
+        assert!(ctx.matching_props[0].type_changed);
+        assert_eq!(
+            ctx.matching_props[0].old_type.as_deref(),
+            Some("(event: MouseEvent) => void")
+        );
+        assert_eq!(
+            ctx.matching_props[0].new_type.as_deref(),
+            Some("(event: MouseEvent | KeyboardEvent) => void")
+        );
+    }
+
+    #[test]
+    fn test_deprecated_migration_from_replacement_no_old_props() {
+        // If the old component has no prop types in the map, return None.
+        let mut new_prop_types = HashMap::new();
+        new_prop_types.insert("Card".into(), BTreeMap::new());
+
+        let sd = SdPipelineResult {
+            new_component_prop_types: new_prop_types,
+            ..SdPipelineResult::default()
+        };
+
+        let result =
+            super::build_deprecated_migration_from_replacement("Card", "Tile", &sd);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_deprecated_migration_context_fallback_to_replacement() {
+        // Test the full build_deprecated_migration_context function:
+        // no MigrationTarget in report, but deprecated_replacements has Tile → Card.
+        let report = {
+            use semver_analyzer_core::*;
+            AnalysisReport {
+                repository: std::path::PathBuf::from("/tmp/test"),
+                comparison: Comparison {
+                    from_ref: "v5".into(),
+                    to_ref: "v6".into(),
+                    from_sha: "aaa".into(),
+                    to_sha: "bbb".into(),
+                    commit_count: 1,
+                    analysis_timestamp: "2026-01-01".into(),
+                },
+                summary: Summary {
+                    total_breaking_changes: 0,
+                    breaking_api_changes: 0,
+                    breaking_behavioral_changes: 0,
+                    files_with_breaking_changes: 0,
+                },
+                changes: vec![],
+                manifest_changes: vec![],
+                added_files: vec![],
+                packages: vec![],
+                member_renames: HashMap::new(),
+                inferred_rename_patterns: None,
+                extensions: crate::extensions::TsAnalysisExtensions {
+                    sd_result: None,
+                    hierarchy_deltas: Vec::new(),
+                    new_hierarchies: Default::default(),
+                },
+                metadata: AnalysisMetadata {
+                    call_graph_analysis: "none".into(),
+                    tool_version: "0.1.0".into(),
+                    llm_usage: None,
+                },
+            }
+        };
+
+        let mut old_prop_types = HashMap::new();
+        let mut tile_props = BTreeMap::new();
+        tile_props.insert("isSelected".into(), "boolean".into());
+        tile_props.insert("title".into(), "string".into());
+        old_prop_types.insert("Tile".into(), tile_props);
+
+        let mut new_prop_types = HashMap::new();
+        let mut card_props = BTreeMap::new();
+        card_props.insert("isSelected".into(), "boolean".into());
+        card_props.insert("isClickable".into(), "boolean".into());
+        new_prop_types.insert("Card".into(), card_props);
+
+        let sd = SdPipelineResult {
+            old_component_prop_types: old_prop_types,
+            new_component_prop_types: new_prop_types,
+            deprecated_replacements: vec![crate::sd_types::DeprecatedReplacement {
+                old_component: "Tile".into(),
+                new_component: "Card".into(),
+                evidence_hosts: vec![],
+                evidence_source: crate::sd_types::ReplacementEvidence::CommitCoChange,
+            }],
+            ..SdPipelineResult::default()
+        };
+
+        let result =
+            super::build_deprecated_migration_context("Card", &report, &sd);
+        assert!(result.is_some(), "should fall back to deprecated_replacements");
+
+        let ctx = result.unwrap();
+        assert_eq!(ctx.matching_props.len(), 1);
+        assert_eq!(ctx.matching_props[0].old_name, "isSelected");
+        assert!(ctx.removed_props.contains(&"title".to_string()));
+        assert!(ctx.new_props.contains_key("isClickable"));
+    }
+
+    // ── extract_aria_attr_name tests ────────────────────────────────
+
+    #[test]
+    fn test_extract_aria_attr_name_removed() {
+        assert_eq!(
+            super::extract_aria_attr_name(
+                "aria-disabled attribute removed from <Component> in Button"
+            ),
+            Some("aria-disabled".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_aria_attr_name_added() {
+        assert_eq!(
+            super::extract_aria_attr_name(
+                "aria-expanded attribute added to <button> in Button"
+            ),
+            Some("aria-expanded".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_aria_attr_name_changed() {
+        assert_eq!(
+            super::extract_aria_attr_name(
+                "aria-label on <button> in Button changed from 'Close' to 'Dismiss'"
+            ),
+            Some("aria-label".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_aria_attr_name_role() {
+        assert_eq!(
+            super::extract_aria_attr_name("role on <div> in Modal changed"),
+            Some("role".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_aria_attr_name_not_aria() {
+        assert_eq!(
+            super::extract_aria_attr_name("class attribute changed on <div> in Card"),
+            None
+        );
+    }
+
+    // ── AriaChange test-impact rule generation tests ────────────────
+
+    #[test]
+    fn test_aria_disabled_removed_generates_filecontent_rule() {
+        // When aria-disabled is removed from Button, Phase 1 should
+        // generate a FileContent rule matching getAttribute('aria-disabled')
+        // in test files.
+        let changes = vec![SourceLevelChange {
+            component: "Button".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-disabled attribute removed from <Component> in Button"
+                .into(),
+            old_value: Some("true".into()),
+            new_value: None,
+            has_test_implications: true,
+            test_description: Some(
+                "Removed aria-disabled will break getAttribute queries".into(),
+            ),
+            element: Some("Component".into()),
+            migration_from: None,
+            dependency_chain: None,
+        }];
+
+        let mut pkgs = HashMap::new();
+        pkgs.insert("Button".into(), "@patternfly/react-core".into());
+
+        let rules = super::generate_test_impact_rules(&changes, &pkgs);
+
+        assert_eq!(rules.len(), 1, "should generate exactly one rule");
+        let rule = &rules[0];
+        assert!(
+            rule.rule_id.contains("button"),
+            "rule ID should contain component name: {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.rule_id.contains("aria-disabled"),
+            "rule ID should contain attribute name: {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.rule_id.ends_with("removed"),
+            "rule ID should end with 'removed': {}",
+            rule.rule_id
+        );
+        assert!(rule.labels.contains(&"change-type=test-impact".to_string()));
+
+        // Verify FileContent condition with getAttribute pattern
+        if let KonveyorCondition::FileContent { ref filecontent } = rule.when {
+            assert!(
+                filecontent.pattern.contains("getAttribute"),
+                "pattern should match getAttribute: {}",
+                filecontent.pattern
+            );
+            assert!(
+                filecontent.pattern.contains("aria-disabled"),
+                "pattern should match aria-disabled: {}",
+                filecontent.pattern
+            );
+            assert!(
+                filecontent.file_pattern.contains("spec"),
+                "should be scoped to test files: {}",
+                filecontent.file_pattern
+            );
+        } else {
+            panic!(
+                "Expected FileContent condition, got: {:?}",
+                rule.when
+            );
+        }
+
+        // Verify LlmAssisted fix strategy
+        assert!(
+            rule.fix_strategy.is_some(),
+            "should have a fix strategy"
+        );
+        assert_eq!(
+            rule.fix_strategy.as_ref().unwrap().strategy,
+            "LlmAssisted"
+        );
+    }
+
+    #[test]
+    fn test_aria_label_still_generates_function_call_rule() {
+        // Regression: aria-label changes should still use the existing
+        // FUNCTION_CALL / LABEL_QUERY_PATTERN approach.
+        let changes = vec![SourceLevelChange {
+            component: "PageToggleButton".into(),
+            category: SourceLevelCategory::AriaChange,
+            description:
+                "aria-label on <button> in PageToggleButton changed from 'Navigation' to 'Menu'"
+                    .into(),
+            old_value: Some("Navigation".into()),
+            new_value: Some("Menu".into()),
+            has_test_implications: true,
+            test_description: None,
+            element: Some("button".into()),
+            migration_from: None,
+            dependency_chain: None,
+        }];
+
+        let mut pkgs = HashMap::new();
+        pkgs.insert(
+            "PageToggleButton".into(),
+            "@patternfly/react-core".into(),
+        );
+
+        let rules = super::generate_test_impact_rules(&changes, &pkgs);
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert!(rule.rule_id.contains("aria-label"));
+
+        // Should be FrontendReferenced with FUNCTION_CALL, NOT FileContent
+        if let KonveyorCondition::FrontendReferenced { ref referenced } = rule.when {
+            assert_eq!(referenced.location, "FUNCTION_CALL");
+            assert!(referenced.pattern.contains("getByLabelText"));
+            assert_eq!(
+                referenced.value.as_deref(),
+                Some("^Navigation$")
+            );
+        } else {
+            panic!(
+                "Expected FrontendReferenced condition for aria-label, got: {:?}",
+                rule.when
+            );
+        }
+
+        // aria-label rules should NOT have fix strategy (existing behavior)
+        assert!(rule.fix_strategy.is_none());
+    }
+
+    #[test]
+    fn test_aria_added_skipped() {
+        // "attribute added" entries should not generate rules — new
+        // attributes don't break existing tests.
+        let changes = vec![SourceLevelChange {
+            component: "Button".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-expanded attribute added to <button> in Button".into(),
+            old_value: None,
+            new_value: Some("false".into()),
+            has_test_implications: true,
+            test_description: None,
+            element: Some("button".into()),
+            migration_from: None,
+            dependency_chain: None,
+        }];
+
+        let mut pkgs = HashMap::new();
+        pkgs.insert("Button".into(), "@patternfly/react-core".into());
+
+        let rules = super::generate_test_impact_rules(&changes, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "should not generate rules for added attributes"
+        );
+    }
+
+    #[test]
+    fn test_transitive_aria_disabled_generates_filecontent_condition() {
+        // When aria-disabled removal propagates transitively to a parent
+        // component, build_when_for_transitive_change should return a
+        // FileContent condition matching getAttribute('aria-disabled').
+        let change = SourceLevelChange {
+            component: "SearchInput".into(),
+            category: SourceLevelCategory::AriaChange,
+            description:
+                "aria-disabled attribute removed from <Component> in Button".into(),
+            old_value: Some("true".into()),
+            new_value: None,
+            has_test_implications: true,
+            test_description: None,
+            element: Some("Component".into()),
+            migration_from: None,
+            dependency_chain: Some(vec!["SearchInput → Button".into()]),
+        };
+
+        let result = super::build_when_for_transitive_change(
+            &change,
+            "SearchInput",
+            "@patternfly/react-core",
+        );
+
+        assert!(result.is_some(), "should produce a condition");
+        let (cond, key) = result.unwrap();
+        assert!(
+            key.contains("aria-attr:aria-disabled"),
+            "key should contain attribute name: {}",
+            key
+        );
+
+        if let KonveyorCondition::FileContent { ref filecontent } = cond {
+            assert!(
+                filecontent.pattern.contains("aria-disabled"),
+                "pattern should match aria-disabled: {}",
+                filecontent.pattern
+            );
+        } else {
+            panic!(
+                "Expected FileContent condition, got: {:?}",
+                cond
+            );
+        }
     }
 }
