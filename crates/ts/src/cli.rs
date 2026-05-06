@@ -209,4 +209,23 @@ pub struct TsKonveyorArgs {
     /// offline analysis of which classes were extracted from each version.
     #[arg(long, help_heading = "Diagnostics")]
     pub dump_css_inventory: bool,
+
+    /// Map internal package names to published npm names.
+    /// Format: INTERNAL_NAME=PUBLISHED_NAME (repeatable).
+    /// Example: --package-name-map "@console/dynamic-plugin-sdk=@openshift-console/dynamic-plugin-sdk"
+    ///
+    /// Used when the repo's package.json has an internal workspace name
+    /// (e.g., "@console/dynamic-plugin-sdk") that differs from the published
+    /// npm package name consumers install.
+    #[arg(long, value_name = "INTERNAL=PUBLISHED", help_heading = "Package Overrides")]
+    pub package_name_map: Vec<String>,
+
+    /// Override package versions for dependency rule generation.
+    /// Format: PACKAGE_NAME=OLD_VERSION:NEW_VERSION (repeatable).
+    /// Example: --package-version "@openshift-console/dynamic-plugin-sdk=1.4.0:4.21.0"
+    ///
+    /// Used when the repo's package.json has a placeholder version (e.g.,
+    /// "0.0.0-fixed") that doesn't match the actual published npm versions.
+    #[arg(long, value_name = "PKG=OLD:NEW", help_heading = "Package Overrides")]
+    pub package_version: Vec<String>,
 }

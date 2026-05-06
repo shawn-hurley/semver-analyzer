@@ -624,35 +624,51 @@ impl Language for TypeScript {
     fn discover_package_manifests(repo: &Path, git_ref: &str) -> Vec<(String, String)> {
         let mut results = Vec::new();
 
-        // Use `git ls-tree` to discover workspace packages under packages/
-        let output = match std::process::Command::new("git")
-            .args(["ls-tree", "--name-only", git_ref, "packages/"])
-            .current_dir(repo)
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
-            _ => return results,
-        };
+        // Try multiple potential packages locations.
+        // Standard repos use "packages/" at root; some repos (e.g., openshift/console)
+        // nest them under "frontend/packages/" or similar.
+        let candidate_prefixes = ["packages/", "frontend/packages/"];
 
-        let listing = String::from_utf8_lossy(&output.stdout);
-        for line in listing.lines() {
-            let dir_name = line.trim_start_matches("packages/");
-            if dir_name.is_empty() {
-                continue;
+        for prefix in &candidate_prefixes {
+            let output = match std::process::Command::new("git")
+                .args(["ls-tree", "--name-only", git_ref, prefix])
+                .current_dir(repo)
+                .output()
+            {
+                Ok(o) if o.status.success() && !o.stdout.is_empty() => o,
+                _ => continue,
+            };
+
+            let listing = String::from_utf8_lossy(&output.stdout);
+            for line in listing.lines() {
+                let dir_name = line.trim_start_matches(prefix);
+                if dir_name.is_empty() {
+                    continue;
+                }
+
+                let pkg_json_path = format!("{}/package.json", line);
+
+                // Read the package.json at this ref to get the npm package name
+                if let Some(content) =
+                    semver_analyzer_core::git::read_git_file(repo, git_ref, &pkg_json_path)
+                {
+                    let name = serde_json::from_str::<serde_json::Value>(&content)
+                        .ok()
+                        .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| dir_name.to_string());
+
+                    results.push((pkg_json_path, name));
+                }
             }
 
-            let pkg_json_path = format!("{}/package.json", line);
-
-            // Read the package.json at this ref to get the npm package name
-            if let Some(content) =
-                semver_analyzer_core::git::read_git_file(repo, git_ref, &pkg_json_path)
-            {
-                let name = serde_json::from_str::<serde_json::Value>(&content)
-                    .ok()
-                    .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| dir_name.to_string());
-
-                results.push((pkg_json_path, name));
+            // If we found packages at this prefix, don't try others
+            if !results.is_empty() {
+                tracing::info!(
+                    prefix = %prefix,
+                    count = results.len(),
+                    "Found workspace packages"
+                );
+                break;
             }
         }
 

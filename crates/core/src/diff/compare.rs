@@ -201,35 +201,74 @@ fn diff_hierarchy<M: Default + Clone + PartialEq>(
     }
 
     // implements (interfaces) — detect added and removed
-    let old_impls: std::collections::HashSet<&str> =
-        old.implements.iter().map(|s| s.as_str()).collect();
-    let new_impls: std::collections::HashSet<&str> =
-        new.implements.iter().map(|s| s.as_str()).collect();
+    // Normalize generics: "UserType<RevisionType>" → "UserType" for set comparison,
+    // so gaining a type parameter doesn't appear as removal + addition.
+    fn strip_generic(s: &str) -> &str {
+        s.split('<').next().unwrap_or(s)
+    }
 
-    for added in new_impls.difference(&old_impls) {
+    let old_impls_raw: Vec<&str> = old.implements.iter().map(|s| s.as_str()).collect();
+    let new_impls_raw: Vec<&str> = new.implements.iter().map(|s| s.as_str()).collect();
+
+    let old_base_names: std::collections::HashSet<&str> =
+        old_impls_raw.iter().map(|s| strip_generic(s)).collect();
+    let new_base_names: std::collections::HashSet<&str> =
+        new_impls_raw.iter().map(|s| strip_generic(s)).collect();
+
+    // Build maps from base name to full string for change reporting
+    let old_impl_map: std::collections::HashMap<&str, &str> =
+        old_impls_raw.iter().map(|s| (strip_generic(s), *s)).collect();
+    let new_impl_map: std::collections::HashMap<&str, &str> =
+        new_impls_raw.iter().map(|s| (strip_generic(s), *s)).collect();
+
+    for added in new_base_names.difference(&old_base_names) {
+        let full_name = new_impl_map.get(added).unwrap_or(added);
         changes.push(change(
             old,
             StructuralChangeType::Added(ChangeSubject::InterfaceImpl {
-                interface_name: added.to_string(),
+                interface_name: full_name.to_string(),
             }),
             None,
-            Some(added.to_string()),
-            format!("`{}` now implements `{}`", old.name, added),
+            Some(full_name.to_string()),
+            format!("`{}` now implements `{}`", old.name, full_name),
             false,
         ));
     }
 
-    for removed in old_impls.difference(&new_impls) {
+    for removed in old_base_names.difference(&new_base_names) {
+        let full_name = old_impl_map.get(removed).unwrap_or(removed);
         changes.push(change(
             old,
             StructuralChangeType::Removed(ChangeSubject::InterfaceImpl {
-                interface_name: removed.to_string(),
+                interface_name: full_name.to_string(),
             }),
-            Some(removed.to_string()),
+            Some(full_name.to_string()),
             None,
-            format!("`{}` no longer implements `{}`", old.name, removed),
+            format!("`{}` no longer implements `{}`", old.name, full_name),
             true,
         ));
+    }
+
+    // Detect parameterization changes: same base name but different full string
+    // (e.g., "UserType" → "UserType<RevisionType>")
+    for base_name in old_base_names.intersection(&new_base_names) {
+        let old_full = old_impl_map.get(base_name).unwrap_or(base_name);
+        let new_full = new_impl_map.get(base_name).unwrap_or(base_name);
+        if old_full != new_full {
+            changes.push(change(
+                old,
+                StructuralChangeType::Changed(ChangeSubject::InterfaceImpl {
+                    interface_name: base_name.to_string(),
+                }),
+                Some(old_full.to_string()),
+                Some(new_full.to_string()),
+                format!(
+                    "`{}` implements clause changed: `{}` → `{}`",
+                    old.name, old_full, new_full
+                ),
+                true,
+            ));
+        }
     }
 }
 
@@ -261,9 +300,19 @@ fn diff_signatures<M, S>(
                 true,
             ));
         }
-        (None, Some(_)) => {
-            // Signature was added — symbol became callable
-            // This is informational, not necessarily breaking
+        (None, Some(new_sig)) => {
+            // Signature was added — symbol gained type parameters or became callable.
+            // Diff type parameters against an empty signature to detect added type params
+            // (e.g., UserType → UserType<J>).
+            if !new_sig.type_parameters.is_empty() {
+                let empty_sig = Signature {
+                    parameters: Vec::new(),
+                    return_type: None,
+                    type_parameters: Vec::new(),
+                    is_async: false,
+                };
+                diff_type_parameters(old, &empty_sig, new_sig, changes);
+            }
         }
         (None, None) => {
             // Neither has a signature — compare return_type if stored in signature

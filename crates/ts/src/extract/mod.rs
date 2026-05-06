@@ -275,8 +275,23 @@ impl OxcExtractor {
 fn remap_dist_to_src(path: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
 
-    // Known dist output directory names (from tsconfig outDir patterns)
+    // Known dist output directory names (from tsconfig outDir patterns).
+    // Audience variants (core/internal/webpack) with nested lib/ come from
+    // packages with multiple tsconfig files that compile different entry
+    // points into separate dist subdirectories (e.g., console-dynamic-plugin-sdk
+    // has dist/core/lib/, dist/internal/lib/, dist/webpack/lib/).  All must
+    // collapse to src/ so that identical types don't get distinct qualified
+    // names that the diff engine would treat as separate symbols.
+    //
+    // Audience variants are listed BEFORE format variants so that longer,
+    // more-specific prefixes match first (e.g., "/dist/core/lib/" before
+    // "/dist/lib/").
     let dist_segments = [
+        // Audience variants with nested lib/ (multi-tsconfig output dirs)
+        "/dist/core/lib/",
+        "/dist/internal/lib/",
+        "/dist/webpack/lib/",
+        // Format variants (esm, cjs, etc.)
         "/dist/esm/",
         "/dist/js/",
         "/dist/cjs/",
@@ -761,7 +776,16 @@ fn entry_point_subpath(entry_point_relative: &Path) -> Option<String> {
 /// Build output directory priority. Lower index = higher priority.
 /// When multiple `dist/<variant>/` directories exist in the same package,
 /// only the highest-priority variant is kept.
-const DIST_VARIANT_PRIORITY: &[&str] = &["esm", "mjs", "es", "js", "cjs", "commonjs", "lib"];
+///
+/// Audience variants (`core`, `internal`, `webpack`) come from packages with
+/// multiple tsconfig files that compile different entry points into separate
+/// `dist/` subdirectories. `core` is preferred as the canonical public-facing
+/// output; `internal` and `webpack` are excluded as redundant when all three
+/// exist (their shared types are identical copies of the core types).
+const DIST_VARIANT_PRIORITY: &[&str] = &[
+    "esm", "mjs", "es", "js", "cjs", "commonjs", "lib", // format variants
+    "core", "internal", "webpack", // audience variants
+];
 
 /// Identify redundant `dist/<variant>/` directories that should be excluded.
 ///
@@ -3963,6 +3987,78 @@ export declare const Foo: MyReact.Component;
             )),
             PathBuf::from("packages/react-core/src/deprecated/components/Chip/Chip.d.ts")
         );
+    }
+
+    #[test]
+    fn remap_dist_core_lib_to_src() {
+        // Multi-tsconfig: dist/core/lib/ should strip both the audience variant and lib/
+        assert_eq!(
+            remap_dist_to_src(Path::new(
+                "frontend/packages/console-dynamic-plugin-sdk/dist/core/lib/extensions/navigation.d.ts"
+            )),
+            PathBuf::from(
+                "frontend/packages/console-dynamic-plugin-sdk/src/extensions/navigation.d.ts"
+            )
+        );
+    }
+
+    #[test]
+    fn remap_dist_internal_lib_to_src() {
+        assert_eq!(
+            remap_dist_to_src(Path::new(
+                "frontend/packages/console-dynamic-plugin-sdk/dist/internal/lib/extensions/navigation.d.ts"
+            )),
+            PathBuf::from(
+                "frontend/packages/console-dynamic-plugin-sdk/src/extensions/navigation.d.ts"
+            )
+        );
+    }
+
+    #[test]
+    fn remap_dist_webpack_lib_to_src() {
+        assert_eq!(
+            remap_dist_to_src(Path::new(
+                "frontend/packages/console-dynamic-plugin-sdk/dist/webpack/lib/webpack/ConsoleRemotePlugin.d.ts"
+            )),
+            PathBuf::from(
+                "frontend/packages/console-dynamic-plugin-sdk/src/webpack/ConsoleRemotePlugin.d.ts"
+            )
+        );
+    }
+
+    #[test]
+    fn remap_audience_variants_collapse_to_same_src() {
+        // Core and internal paths for the same file must produce identical src paths
+        let core = remap_dist_to_src(Path::new(
+            "pkg/dist/core/lib/extensions/actions.d.ts",
+        ));
+        let internal = remap_dist_to_src(Path::new(
+            "pkg/dist/internal/lib/extensions/actions.d.ts",
+        ));
+        assert_eq!(core, internal);
+        assert_eq!(core, PathBuf::from("pkg/src/extensions/actions.d.ts"));
+    }
+
+    #[test]
+    fn find_redundant_dist_dirs_audience_variants() {
+        // When core, internal, and webpack all exist under the same dist/ parent,
+        // core wins (higher priority) and internal + webpack are excluded.
+        let files = vec![
+            PathBuf::from("pkg/dist/core/lib/index.d.ts"),
+            PathBuf::from("pkg/dist/internal/lib/index.d.ts"),
+            PathBuf::from("pkg/dist/webpack/lib/index.d.ts"),
+        ];
+        let excluded = find_redundant_dist_dirs(&files);
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.contains(&PathBuf::from("pkg/dist/internal")));
+        assert!(excluded.contains(&PathBuf::from("pkg/dist/webpack")));
+    }
+
+    #[test]
+    fn find_redundant_dist_dirs_single_audience_variant_kept() {
+        // When only core exists, nothing is excluded
+        let files = vec![PathBuf::from("pkg/dist/core/lib/index.d.ts")];
+        assert!(find_redundant_dist_dirs(&files).is_empty());
     }
 
     // ─── populate_rendered_components tests ───────────────────────────────

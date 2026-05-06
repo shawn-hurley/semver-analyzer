@@ -413,6 +413,13 @@ pub struct PackageInfo {
     pub name: String,
     /// Package version at the new ref (read from disk).
     pub version: Option<String>,
+    /// Package version at the old ref (from_ref).
+    ///
+    /// Used to calculate the `upperbound` for dependency update rules.
+    /// Packages in a monorepo may have independent version numbers
+    /// (e.g., `@patternfly/react-charts` is v7.x in PF5, v8.x in PF6),
+    /// so the repo-level git tag cannot be used as a universal bound.
+    pub old_version: Option<String>,
 }
 
 // ── Shared functions ────────────────────────────────────────────────────

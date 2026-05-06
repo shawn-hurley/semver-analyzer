@@ -517,6 +517,45 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
 
     // Build package info cache
     let mut pkg_info_cache = konveyor::build_package_info_cache(&report);
+
+    // Apply CLI package name mappings (e.g., internal workspace name → published npm name)
+    for mapping in &args.package_name_map {
+        if let Some((internal, published)) = mapping.split_once('=') {
+            // Find the cache entry whose name matches the internal name and rename it
+            for info in pkg_info_cache.values_mut() {
+                if info.name == internal {
+                    info!(
+                        internal = %internal,
+                        published = %published,
+                        "Applying package name mapping"
+                    );
+                    info.name = published.to_string();
+                }
+            }
+        }
+    }
+
+    // Apply CLI package version overrides (e.g., "0.0.0-fixed" → actual npm versions)
+    for version_spec in &args.package_version {
+        if let Some((pkg_name, versions)) = version_spec.split_once('=') {
+            if let Some((old_ver, new_ver)) = versions.split_once(':') {
+                // Find the cache entry by published name (after name mapping)
+                for info in pkg_info_cache.values_mut() {
+                    if info.name == pkg_name {
+                        info!(
+                            package = %pkg_name,
+                            old_version = %old_ver,
+                            new_version = %new_ver,
+                            "Applying package version override"
+                        );
+                        info.old_version = Some(old_ver.to_string());
+                        info.version = Some(new_ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let pkg_cache: HashMap<String, String> = pkg_info_cache
         .iter()
         .map(|(k, v)| (k.clone(), v.name.clone()))
@@ -625,6 +664,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                 .or_insert_with(|| semver_analyzer_ts::konveyor_frontend::PackageInfo {
                     name: name.clone(),
                     version: Some(version.clone()),
+                    old_version: None,
                 });
         }
     }
