@@ -272,7 +272,216 @@ pub fn generate_rules_with_config(
         }
     }
 
+    // Post-processing: consolidate "interface became generic" patterns.
+    // When an interface gains a type parameter (e.g., UserType → UserType<J>),
+    // the diff emits N individual type-changed rules for each method where
+    // Object→J (the type param name). These are misleading individually — the
+    // fix isn't to replace Object with "J" literally but to bind the type parameter.
+    // Consolidate them into a single LlmAssisted rule.
+    consolidate_generic_interface_rules(&mut rules, report, config, &mut id_counts);
+
     rules
+}
+
+/// Consolidate per-method `Object→<type_param>` type-changed rules into a single
+/// composite "interface became generic" rule when the pattern is detected.
+///
+/// Detection: multiple type-changed rules for methods of the same interface where
+/// `before` = a common type (Object, Serializable) and `after` = a single uppercase
+/// letter or short name (J, T, E) that matches a type parameter.
+fn consolidate_generic_interface_rules(
+    rules: &mut Vec<KonveyorRule>,
+    report: &AnalysisReport<Java>,
+    config: &JavaKonveyorConfig,
+    id_counts: &mut HashMap<String, usize>,
+) {
+    // Group type-changed rules by declaring interface
+    let mut interface_rules: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut type_param_names: HashMap<String, String> = HashMap::new();
+
+    for (idx, rule) in rules.iter().enumerate() {
+        if !rule.labels.iter().any(|l| l == "change-type=type-changed") {
+            continue;
+        }
+        // Extract declaring class from the rule's fix strategy
+        if let Some(ref strategy) = rule.fix_strategy {
+            if let (Some(ref from), Some(ref to)) = (&strategy.from, &strategy.to) {
+                // Pattern: from is a common base type, to is a short type parameter name
+                let to_trimmed = to.trim();
+                let is_type_param = to_trimmed.len() <= 3
+                    && to_trimmed.chars().next().is_some_and(|c| c.is_uppercase());
+
+                if is_type_param
+                    && (from == "Object"
+                        || from == "Serializable"
+                        || from == "Comparable")
+                {
+                    // Extract the declaring interface from the rule description
+                    // by looking at the original API changes
+                    for ac in report.changes.iter().flat_map(|fc| &fc.breaking_api_changes) {
+                        if let Some(rule_qn) = extract_qualified_name_from_rule(rule) {
+                            if ac.qualified_name == rule_qn {
+                                let (class_opt, _) =
+                                    extract_class_and_member(&ac.qualified_name);
+                                if let Some(class) = class_opt {
+                                    interface_rules
+                                        .entry(class.clone())
+                                        .or_default()
+                                        .push(idx);
+                                    type_param_names
+                                        .entry(class)
+                                        .or_insert_with(|| to_trimmed.to_string());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // For interfaces with 3+ consolidated type-changed rules, replace with a single composite rule
+    let mut indices_to_remove = Vec::new();
+
+    for (interface_name, rule_indices) in &interface_rules {
+        if rule_indices.len() < 3 {
+            continue; // Not enough to be a generic interface pattern
+        }
+
+        let type_param = type_param_names
+            .get(interface_name)
+            .cloned()
+            .unwrap_or_else(|| "T".to_string());
+
+        // Collect affected method names
+        let mut affected_methods = Vec::new();
+        for &idx in rule_indices {
+            let method_part = rules[idx]
+                .description
+                .strip_prefix("Type of `")
+                .and_then(|s| s.split('`').next())
+                .unwrap_or("unknown");
+            affected_methods.push(method_part.to_string());
+        }
+
+        // Find the interface FQN from the API changes
+        let interface_fqn = report
+            .changes
+            .iter()
+            .flat_map(|fc| &fc.breaking_api_changes)
+            .find(|ac| {
+                let (class_opt, _) = extract_class_and_member(&ac.qualified_name);
+                class_opt.as_deref() == Some(interface_name.as_str())
+            })
+            .map(|ac| {
+                ac.qualified_name
+                    .rsplit_once('.')
+                    .map(|(pkg, _)| pkg.to_string())
+                    .unwrap_or_else(|| interface_name.clone())
+            })
+            .unwrap_or_else(|| interface_name.clone());
+
+        let rule_id = unique_id(
+            &format!(
+                "{}-generic-interface-{}",
+                config.rule_id_prefix,
+                slugify(interface_name)
+            ),
+            id_counts,
+        );
+
+        let composite_rule = KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=generic-interface".into(),
+                "language=java".into(),
+            ],
+            effort: 5,
+            category: "mandatory".into(),
+            description: format!(
+                "Interface `{}` is now generic `{}<{}>`",
+                interface_name, interface_name, type_param
+            ),
+            message: format!(
+                "Interface `{}` gained type parameter `<{}>`. All implementing classes must:\n\n\
+                 1. Update their `implements` clause: `implements {}<YourConcreteType>` \
+                 (e.g., `implements {}<String>`)\n\
+                 2. Replace `Object` with your concrete type in all overridden method \
+                 signatures ({} methods affected: {})\n\
+                 3. Remove unnecessary casts in method bodies (parameters are now typed)\n\n\
+                 The concrete type should match your `returnedClass()` return value.\n\n\
+                 Do NOT use `{}` as a literal type — it is a type parameter that must be \
+                 bound to a concrete type in each implementing class.",
+                interface_name,
+                type_param,
+                interface_name,
+                interface_name,
+                affected_methods.len(),
+                affected_methods.join(", "),
+                type_param,
+            ),
+            links: vec![],
+            when: KonveyorCondition::JavaReferenced {
+                referenced: JavaReferencedFields {
+                    pattern: regex_escape(&interface_fqn),
+                    scope: Some("IMPORT".into()),
+                    ..Default::default()
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry {
+                strategy: "LlmAssisted".into(),
+                from: Some(format!("implements {}", interface_name)),
+                to: Some(format!("implements {}<ConcreteType>", interface_name)),
+                replacement: Some(format!(
+                    "Interface `{}` is now generic. Add the type parameter to \
+                     your `implements` clause and replace `Object` with your \
+                     concrete type in all {} overridden methods. The concrete type \
+                     should match what `returnedClass()` returns. Do NOT use `{}` \
+                     as a literal type name.",
+                    interface_name,
+                    affected_methods.len(),
+                    type_param,
+                )),
+                ..Default::default()
+            }),
+        };
+
+        // Mark individual rules for removal and add composite
+        indices_to_remove.extend(rule_indices.iter().copied());
+        rules.push(composite_rule);
+    }
+
+    // Remove the individual rules (in reverse order to preserve indices)
+    indices_to_remove.sort_unstable();
+    indices_to_remove.dedup();
+    for idx in indices_to_remove.into_iter().rev() {
+        rules.remove(idx);
+    }
+}
+
+/// Try to extract the qualified name from a rule's scanner condition.
+fn extract_qualified_name_from_rule(rule: &KonveyorRule) -> Option<String> {
+    match &rule.when {
+        KonveyorCondition::JavaReferenced { referenced } => {
+            // Unescape the regex pattern to get the original FQN
+            Some(referenced.pattern.replace(r"\.", "."))
+        }
+        KonveyorCondition::Or { or } => {
+            // Find the first condition with a full FQN pattern (contains dots)
+            for cond in or {
+                if let KonveyorCondition::JavaReferenced { referenced } = cond {
+                    let pattern = referenced.pattern.replace(r"\.", ".");
+                    if pattern.contains('.') {
+                        return Some(pattern);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 // ── SD rule generation ──────────────────────────────────────────────────
@@ -453,6 +662,38 @@ fn format_migration_context(mapping: &MigrationMapping) -> String {
                 ctx.push_str(&format!("    {}\n", line.trim()));
             }
         }
+    }
+
+    // Add common pitfalls for Criteria API migration
+    if mapping.old_class == "Restrictions"
+        || mapping.old_class == "DetachedCriteria"
+        || mapping.old_class == "Criteria"
+        || mapping.old_class == "Order"
+        || mapping.old_class == "Projections"
+    {
+        ctx.push_str("\n## IMPORTANT: Common Pitfalls\n\n");
+        ctx.push_str(
+            "1. CriteriaQuery vs TypedQuery: These are DIFFERENT types.\n\
+             - CriteriaQuery<T> = the query definition (from criteriaBuilder.createQuery())\n\
+             - TypedQuery<T> = the executable query (from entityManager.createQuery(criteriaQuery))\n\
+             Do NOT convert CriteriaQuery to TypedQuery before passing to factory/wrapper methods \
+             that expect CriteriaQuery.\n\n\
+             2. Do NOT introduce JPA static metamodel classes (e.g., Entity_, Consumer_) unless \
+             they already exist in the project. Use string-based property access: root.get(\"fieldName\")\n\n\
+             3. If the existing code passes DetachedCriteria to a wrapper/factory method (e.g., \
+             buildQuery(session, criteria)), pass the new CriteriaQuery directly to that same method.\n\
+             Do NOT call entityManager.createQuery() first and do NOT materialize results to a List \
+             before passing.\n\n\
+             4. When removing an import for a removed class, DELETE the import line entirely. \
+             Do NOT comment it out or add TODO markers.\n\n\
+             5. If a type from the removed import is used in method signatures inherited from an \
+             interface, change the method signature to use the replacement type (e.g., Criterion → \
+             Predicate, DetachedCriteria → CriteriaQuery).\n\n\
+             6. If you add a new method that implements a replacement interface contract (e.g., \
+             getQueryRestriction replacing getCriteriaRestrictions), DELETE the old method entirely \
+             along with its import. The old interface no longer declares it — it is dead code. Do NOT \
+             keep both the old and new methods in the same class.\n",
+        );
     }
 
     ctx
@@ -909,6 +1150,22 @@ fn make_signature_changed_rule(
     config: &JavaKonveyorConfig,
     id_counts: &mut HashMap<String, usize>,
 ) -> KonveyorRule {
+    // Detect annotation element changes: when qualified_name contains
+    // ".annotations." and before/after are "method: <name>: <type>",
+    // this is an annotation parameter rename (e.g., @Type(type=...) → @Type(value=...)).
+    // Use AnnotationParamRewrite strategy with IMPORT scope instead of UpdateSignature.
+    if let Some(annotation_rule) = try_make_annotation_param_rule(
+        symbol,
+        qualified_name,
+        before,
+        after,
+        description,
+        config,
+        id_counts,
+    ) {
+        return annotation_rule;
+    }
+
     let rule_id = unique_id(
         &format!(
             "{}-sig-changed-{}",
@@ -986,6 +1243,114 @@ fn make_signature_changed_rule(
             after,
         )),
     }
+}
+
+/// Detect annotation element changes and generate an AnnotationParamRewrite rule.
+///
+/// Annotation elements appear as signature changes where:
+/// - `qualified_name` contains `.annotations.` (e.g., `org.hibernate.annotations.Type.type`)
+/// - `before`/`after` follow the pattern `method: <name>: <type>`
+///
+/// For these, we generate a rule with IMPORT scope (to match files importing the annotation)
+/// and an `AnnotationParamRewrite` fix strategy that handles the param rename + value transform.
+fn try_make_annotation_param_rule(
+    symbol: &str,
+    qualified_name: &str,
+    before: &str,
+    after: &str,
+    description: &str,
+    config: &JavaKonveyorConfig,
+    id_counts: &mut HashMap<String, usize>,
+) -> Option<KonveyorRule> {
+    // Only handle annotation elements
+    if !qualified_name.contains(".annotations.") {
+        return None;
+    }
+
+    // Parse before/after to extract param names: "method: <name>: <type>"
+    let parse_method_name = |s: &str| -> Option<String> {
+        let s = s.strip_prefix("method: ")?;
+        let colon_pos = s.find(':')?;
+        Some(s[..colon_pos].trim().to_string())
+    };
+
+    let old_param = parse_method_name(before)?;
+    let new_param = parse_method_name(after)?;
+
+    // Only generate AnnotationParamRewrite when the element was actually renamed
+    if old_param == new_param {
+        return None;
+    }
+
+    // Extract the annotation class FQN: e.g., org.hibernate.annotations.Type from
+    // org.hibernate.annotations.Type.type
+    let annotation_fqn = qualified_name.rsplit_once('.')?.0;
+
+    let rule_id = unique_id(
+        &format!(
+            "{}-annotation-param-{}",
+            config.rule_id_prefix,
+            slugify(symbol)
+        ),
+        id_counts,
+    );
+
+    // Determine value transform based on old/new types
+    // "method: type: String" → String value (FQN) → Class literal
+    // For other type changes, use Identity
+    let old_type = before.rsplit(": ").next().unwrap_or("");
+    let new_type = after.rsplit(": ").next().unwrap_or("");
+    let value_transform = if old_type == "String" && new_type.contains("Class") {
+        "StringFqnToClassLiteral"
+    } else {
+        "Identity"
+    };
+
+    // Use IMPORT scope to match files that import this annotation
+    let when = KonveyorCondition::JavaReferenced {
+        referenced: JavaReferencedFields {
+            pattern: regex_escape(annotation_fqn),
+            scope: Some("IMPORT".into()),
+            ..Default::default()
+        },
+    };
+
+    let mut fix_entry = FixStrategyEntry::with_from_to(
+        "AnnotationParamRewrite",
+        &old_param,
+        &new_param,
+    );
+    fix_entry.replacement = Some(value_transform.to_string());
+
+    Some(KonveyorRule {
+        rule_id,
+        labels: vec![
+            "source=semver-analyzer".into(),
+            "change-type=annotation-param-changed".into(),
+            "language=java".into(),
+        ],
+        effort: 2,
+        category: "mandatory".into(),
+        description: format!(
+            "Annotation `{}` parameter `{}` renamed to `{}`",
+            annotation_fqn.rsplit('.').next().unwrap_or(annotation_fqn),
+            old_param,
+            new_param,
+        ),
+        message: format!(
+            "{}\n\nRewrite `@{}({} = ...)` to `@{}({} = ...)`.\n\nBefore: `{}`\nAfter: `{}`",
+            description,
+            annotation_fqn.rsplit('.').next().unwrap_or(annotation_fqn),
+            old_param,
+            annotation_fqn.rsplit('.').next().unwrap_or(annotation_fqn),
+            new_param,
+            before,
+            after,
+        ),
+        links: vec![],
+        when,
+        fix_strategy: Some(fix_entry),
+    })
 }
 
 fn make_visibility_changed_rule(
@@ -1157,9 +1522,18 @@ pub fn generate_class_migration_rules(
              Consumers extending this class should migrate to implementing the \
              corresponding interface directly.\n\n\
              Removed methods:\n{}\n\n\
-             Update your class to implement the interface instead of extending \
-             this base class. Add `@Override` implementations for the methods \
-             you need.",
+             ## Migration instructions\n\n\
+             1. If this file wraps APIs that were completely removed (e.g., `DetachedCriteria`, \
+             `CriteriaImpl`, `Criteria`) and has NO external callers (no other file references \
+             this class by name), **delete this file entirely** — it is dead code.\n\n\
+             2. If a factory or caller already references a replacement class that doesn't exist \
+             yet (e.g., `CriteriaCandlepinQuery`), **create that replacement class** as a new file \
+             in the same package. The replacement should implement the same interface using the \
+             new JPA Criteria API (`jakarta.persistence.criteria.*`). Look for other implementations \
+             of the same interface (e.g., `EmptyCandlepinQuery`) as a reference for the method \
+             contract.\n\n\
+             3. Otherwise, update your class to implement the interface instead of extending \
+             this base class. Add `@Override` implementations for the methods you need.",
             class_name,
             removed_methods.len(),
             method_list.join("\n"),
