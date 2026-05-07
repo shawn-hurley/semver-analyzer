@@ -797,6 +797,19 @@ pub fn generate_rules(
             HashMap::new()
         };
 
+    // ── Pre-scan: extract old component prop types for enum member rules ────
+    //
+    // Used by api_change_to_rules to resolve which components have props typed
+    // as a specific enum (e.g., DrawerColorVariant → DrawerPanelContent.colorVariant).
+    // This lets enum member removal rules target the correct component+prop+value
+    // instead of treating the enum as a JSX component.
+    let old_component_prop_types: HashMap<String, BTreeMap<String, String>> = report
+        .extensions
+        .sd_result
+        .as_ref()
+        .map(|sd| sd.old_component_prop_types.clone())
+        .unwrap_or_default();
+
     // ── Pre-scan: collect components referenced in composition pattern changes ──
     //
     // Components that appear as the `component` in a composition_pattern_change
@@ -1484,6 +1497,7 @@ pub fn generate_rules(
                 rename_patterns,
                 member_renames,
                 &component_to_family,
+                &old_component_prop_types,
             );
             rules.extend(new_rules);
         }
@@ -3664,6 +3678,7 @@ pub fn write_ruleset_dir(
 
 // ── Rule generators ─────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn api_change_to_rules(
     change: &ApiChange,
     file_changes: &FileChanges<TypeScript>,
@@ -3672,6 +3687,7 @@ fn api_change_to_rules(
     rename_patterns: &RenamePatterns,
     member_renames: &HashMap<String, String>,
     component_to_family: &HashMap<String, String>,
+    old_component_prop_types: &HashMap<String, BTreeMap<String, String>>,
 ) -> Vec<KonveyorRule> {
     let file_path = file_changes.file.display().to_string();
     let leaf_symbol = extract_leaf_symbol(&change.symbol);
@@ -3876,7 +3892,72 @@ fn api_change_to_rules(
         labels.push(format!("family={}", family));
     }
 
-    let condition = build_frontend_condition(change, leaf_symbol, from_pkg);
+    // For enum member changes (e.g., DrawerColorVariant.light200 removed),
+    // build JSX_PROP conditions scoped to the specific components that use
+    // the enum, with the member name as the value filter. This produces the
+    // same pattern as prop-value-change rules (e.g., variant="darker" on
+    // PageSection) and uses the scanner's existing StaticMemberExpression
+    // extraction for prop values.
+    let condition = if change.kind == ApiChangeKind::EnumMember && change.symbol.contains('.') {
+        let parts: Vec<&str> = change.symbol.splitn(2, '.').collect();
+        let enum_name = parts[0];
+        let member_name = parts[1];
+        let from = from_pkg.map(|s| s.to_string());
+
+        // Find all components that have props typed as this enum by
+        // scanning old_component_prop_types for type strings that contain
+        // the enum name.
+        let mut conditions: Vec<KonveyorCondition> = Vec::new();
+        for (component, props) in old_component_prop_types {
+            for (prop_name, type_str) in props {
+                if type_str.contains(enum_name) {
+                    conditions.push(KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: format!("^{}$", regex_escape(prop_name)),
+                            location: "JSX_PROP".to_string(),
+                            component: Some(format!("^{}$", regex_escape(component))),
+                            parent: None,
+                            value: Some(format!("^{}$", regex_escape(member_name))),
+                            from: from.clone(),
+                            file_pattern: None,
+                            parent_from: None,
+                            not_parent: None,
+                            child: None,
+                            not_child: None,
+                            requires_child: None,
+                        },
+                    });
+                }
+            }
+        }
+
+        if conditions.is_empty() {
+            // Fallback: no component uses this enum as a prop type, detect
+            // via import of the parent enum.
+            KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", regex_escape(enum_name)),
+                    location: "IMPORT".to_string(),
+                    component: None,
+                    parent: None,
+                    value: None,
+                    from,
+                    file_pattern: None,
+                    parent_from: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                },
+            }
+        } else if conditions.len() == 1 {
+            conditions.into_iter().next().unwrap()
+        } else {
+            KonveyorCondition::Or { or: conditions }
+        }
+    } else {
+        build_frontend_condition(change, leaf_symbol, from_pkg)
+    };
     let mut fix_strategy =
         api_change_to_strategy(change, rename_patterns, member_renames, &file_path);
 

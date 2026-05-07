@@ -228,6 +228,8 @@ pub enum ApiChangeKind {
     Field,
     Property,
     ModuleExport,
+    #[serde(rename = "enum_member")]
+    EnumMember,
 }
 
 impl From<super::surface::SymbolKind> for ApiChangeKind {
@@ -243,7 +245,7 @@ impl From<super::surface::SymbolKind> for ApiChangeKind {
             SymbolKind::Constant | SymbolKind::Variable => ApiChangeKind::Constant,
             SymbolKind::Property => ApiChangeKind::Property,
             SymbolKind::Enum => ApiChangeKind::Enum,
-            SymbolKind::EnumMember => ApiChangeKind::Constant,
+            SymbolKind::EnumMember => ApiChangeKind::EnumMember,
             SymbolKind::Constructor => ApiChangeKind::Constructor,
             SymbolKind::GetAccessor | SymbolKind::SetAccessor => ApiChangeKind::Property,
             SymbolKind::Namespace => ApiChangeKind::ModuleExport,

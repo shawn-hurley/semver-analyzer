@@ -2322,7 +2322,7 @@ fn symbol_kind_to_api_kind(kind: SymbolKind) -> ApiChangeKind {
         SymbolKind::Property => ApiChangeKind::Property,
         SymbolKind::Namespace => ApiChangeKind::ModuleExport,
         SymbolKind::Struct => ApiChangeKind::Class,
-        SymbolKind::EnumMember => ApiChangeKind::Property,
+        SymbolKind::EnumMember => ApiChangeKind::EnumMember,
         SymbolKind::Constructor => ApiChangeKind::Method,
         SymbolKind::GetAccessor | SymbolKind::SetAccessor => ApiChangeKind::Property,
     }

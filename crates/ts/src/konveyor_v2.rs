@@ -1972,9 +1972,17 @@ pub fn generate_family_strategies(
             continue;
         }
 
-        // Only generate for families that have composition changes
+        // Generate for families that have composition changes OR are the
+        // replacement target for a deprecated component (e.g., Label replaces
+        // Chip, Card replaces Tile). Replacement targets need a family entry
+        // so the deprecated_migration context (removed/matching/new props)
+        // reaches the LLM prompt via fix-strategies.json.
         let has_changes = sd.composition_changes.iter().any(|c| c.family == tree.root);
-        if !has_changes {
+        let is_replacement_target = sd
+            .deprecated_replacements
+            .iter()
+            .any(|dr| dr.new_component == tree.root);
+        if !has_changes && !is_replacement_target {
             continue;
         }
 

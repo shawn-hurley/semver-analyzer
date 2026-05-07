@@ -1927,6 +1927,35 @@ pub fn build_frontend_condition(
             }
         }
 
+        ApiChangeKind::EnumMember => {
+            // Enum member changes are best handled by the language-specific
+            // rule generator (which can look up components that reference the
+            // enum). If we reach here, fall back to IMPORT-level detection on
+            // the parent enum name.
+            let parent_pattern = if change.symbol.contains('.') {
+                let parent = change.symbol.split('.').next().unwrap_or(&change.symbol);
+                format!("^{}$", regex_escape(parent))
+            } else {
+                pattern
+            };
+            KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: parent_pattern,
+                    location: "IMPORT".to_string(),
+                    component: None,
+                    parent: None,
+                    value: None,
+                    from,
+                    file_pattern: None,
+                    parent_from: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                },
+            }
+        }
+
         _ => {
             let is_component = match_name
                 .chars()
@@ -2228,6 +2257,7 @@ pub fn api_kind_label(kind: &ApiChangeKind) -> &'static str {
         ApiChangeKind::Field => "field",
         ApiChangeKind::Property => "property",
         ApiChangeKind::ModuleExport => "module-export",
+        ApiChangeKind::EnumMember => "enum-member",
     }
 }
 
