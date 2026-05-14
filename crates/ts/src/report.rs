@@ -7147,4 +7147,346 @@ mod tests {
             change.change
         );
     }
+
+    /// Helper: build a FileChanges with one Renamed prop entry.
+    fn renamed_prop_change(component: &str, old_prop: &str, new_prop: &str) -> FileChanges<TypeScript> {
+        FileChanges {
+            file: PathBuf::from(format!("src/{}.d.ts", component)),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: format!("{}.{}", component, old_prop),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some(old_prop.to_string()),
+                after: Some(new_prop.to_string()),
+                description: format!("property `{}` was renamed to `{}`", old_prop, new_prop),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }
+    }
+
+    /// Page.isTertiaryNavGrouped → isHorizontalSubnavGrouped is a TRUE rename.
+    /// Neither modifier appears in BEM or CSS data, so the check should be
+    /// inconclusive and the rename should be preserved.
+    #[test]
+    fn step0_css_inconclusive_preserves_rename_page_tertiary_nav_grouped() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("Page", "isTertiaryNavGrouped", "isHorizontalSubnavGrouped")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Page".into();
+        old_profile.bem_block = Some("page".into());
+        sd.old_profiles.insert("Page".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Page".into();
+        new_profile.bem_block = Some("page".into());
+        sd.new_profiles.insert("Page".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Page.isTertiaryNavGrouped → isHorizontalSubnavGrouped should remain Renamed \
+             (no CSS modifier data → inconclusive → preserve)"
+        );
+    }
+
+    /// Page.isTertiaryNavWidthLimited → isHorizontalSubnavWidthLimited is a TRUE rename.
+    /// Same as above — no CSS modifier data, should be inconclusive and preserved.
+    #[test]
+    fn step0_css_inconclusive_preserves_rename_page_tertiary_nav_width() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("Page", "isTertiaryNavWidthLimited", "isHorizontalSubnavWidthLimited")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Page".into();
+        old_profile.bem_block = Some("page".into());
+        sd.old_profiles.insert("Page".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Page".into();
+        new_profile.bem_block = Some("page".into());
+        sd.new_profiles.insert("Page".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Page.isTertiaryNavWidthLimited → isHorizontalSubnavWidthLimited should remain Renamed \
+             (no CSS modifier data → inconclusive → preserve)"
+        );
+    }
+
+    /// Non-boolean prop renames (no is/has/use prefix) should be untouched
+    /// by the CSS resolved-value check since prop_to_bem_modifier returns None.
+    #[test]
+    fn step0_css_skips_non_boolean_renames() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("FormGroup", "labelIcon", "labelHelp")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "FormGroup".into();
+        old_profile.bem_block = Some("formGroup".into());
+        sd.old_profiles.insert("FormGroup".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "FormGroup".into();
+        new_profile.bem_block = Some("formGroup".into());
+        sd.new_profiles.insert("FormGroup".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "FormGroup.labelIcon → labelHelp should remain Renamed \
+             (no boolean prefix → CSS check skipped)"
+        );
+    }
+
+    /// Toolbar.customChipGroupContent → customLabelGroupContent is a non-boolean
+    /// rename (ReactNode type). Should be untouched by CSS check.
+    #[test]
+    fn step0_css_skips_reactnode_renames() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("Toolbar", "customChipGroupContent", "customLabelGroupContent")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Toolbar".into();
+        old_profile.bem_block = Some("toolbar".into());
+        sd.old_profiles.insert("Toolbar".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Toolbar".into();
+        new_profile.bem_block = Some("toolbar".into());
+        sd.new_profiles.insert("Toolbar".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Toolbar.customChipGroupContent → customLabelGroupContent should remain Renamed \
+             (no boolean prefix → CSS check skipped)"
+        );
+    }
+
+    /// The existing isOverflowLabel case uses prop_style_bindings (original
+    /// Step 0 path). Verify the CSS resolved-value check doesn't interfere
+    /// when prop_style_bindings are present and the original check already
+    /// invalidates.
+    #[test]
+    fn step0_css_does_not_conflict_with_prop_style_bindings_path() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        // Label: isOverflowLabel → isClickable (false rename)
+        // prop_style_bindings says: isOverflowLabel → modifiers.overflow
+        // BEM says: overflow still in v6
+        // CSS resolved-value says: different effects (if data were present)
+        let changes = vec![renamed_prop_change("Label", "isOverflowLabel", "isClickable")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Label".into();
+        old_profile.bem_block = Some("label".into());
+        old_profile.prop_style_bindings.insert(
+            "isOverflowLabel".into(),
+            ["styles.modifiers.overflow"].iter().map(|s| s.to_string()).collect(),
+        );
+        old_profile.bem_modifiers = ["compact", "overflow"]
+            .iter().map(|s| s.to_string()).collect();
+        sd.old_profiles.insert("Label".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Label".into();
+        new_profile.bem_block = Some("label".into());
+        new_profile.prop_style_bindings.insert(
+            "isClickable".into(),
+            ["styles.modifiers.clickable"].iter().map(|s| s.to_string()).collect(),
+        );
+        new_profile.bem_modifiers = ["clickable", "compact", "overflow"]
+            .iter().map(|s| s.to_string()).collect();
+        sd.new_profiles.insert("Label".into(), new_profile);
+
+        // Also provide CSS modifier data to test the resolved-value path
+        let mut old_overflow = CssModifierEffect::default();
+        old_overflow.resolved_overrides.insert(
+            "--pf-v5-c-label--m-overflow--MaxWidth".into(), "16ch".into(),
+        );
+        let mut old_label_mods = CssModifierMap::new();
+        old_label_mods.insert("pf-m-overflow".into(), old_overflow);
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("label".into(), old_label_mods);
+        sd.old_css_modifiers = old_css;
+
+        let mut new_clickable = CssModifierEffect::default();
+        new_clickable.resolved_overrides.insert(
+            "--pf-v6-c-label--m-clickable--cursor".into(), "pointer".into(),
+        );
+        let mut new_label_mods = CssModifierMap::new();
+        new_label_mods.insert("pf-m-clickable".into(), new_clickable);
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("label".into(), new_label_mods);
+        sd.new_css_modifiers = new_css;
+
+        sd.old_component_props.insert(
+            "Label".into(),
+            ["isOverflowLabel", "variant"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Label".into(),
+            ["isClickable", "variant"].iter().map(|s| s.to_string()).collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Removed,
+            "Label.isOverflowLabel → isClickable should be invalidated \
+             (overflow modifier survives in v6 BEM, clickable is different)"
+        );
+    }
+
+    /// When a component has no BEM block, the CSS check should be inconclusive
+    /// and the rename should be preserved.
+    #[test]
+    fn step0_css_inconclusive_when_no_bem_block() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("SomeComponent", "isOldProp", "isNewProp")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "SomeComponent".into();
+        // No bem_block set
+        sd.old_profiles.insert("SomeComponent".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "SomeComponent".into();
+        sd.new_profiles.insert("SomeComponent".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Rename should be preserved when component has no BEM block"
+        );
+    }
+
+    /// When only the old modifier has CSS data but the new one doesn't,
+    /// the check should be inconclusive.
+    #[test]
+    fn step0_css_inconclusive_when_only_old_has_data() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        let changes = vec![renamed_prop_change("Widget", "isActive", "isEnabled")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Widget".into();
+        old_profile.bem_block = Some("widget".into());
+        sd.old_profiles.insert("Widget".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Widget".into();
+        new_profile.bem_block = Some("widget".into());
+        sd.new_profiles.insert("Widget".into(), new_profile);
+
+        // Only old has CSS modifier data
+        let mut old_active = CssModifierEffect::default();
+        old_active.resolved_overrides.insert(
+            "--pf-v5-c-widget--Color".into(), "blue".into(),
+        );
+        let mut old_mods = CssModifierMap::new();
+        old_mods.insert("pf-m-active".into(), old_active);
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("widget".into(), old_mods);
+        sd.old_css_modifiers = old_css;
+
+        // New CSS has the block but no pf-m-enabled entry
+        let new_mods = CssModifierMap::new();
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("widget".into(), new_mods);
+        sd.new_css_modifiers = new_css;
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Rename should be preserved when only old modifier has CSS data (inconclusive)"
+        );
+    }
+
+    /// Verify prop_to_bem_modifier helper correctly strips prefixes.
+    #[test]
+    fn test_prop_to_bem_modifier() {
+        assert_eq!(prop_to_bem_modifier("isActive"), Some("active".into()));
+        assert_eq!(prop_to_bem_modifier("isClicked"), Some("clicked".into()));
+        assert_eq!(prop_to_bem_modifier("usePageInsets"), Some("pageInsets".into()));
+        assert_eq!(prop_to_bem_modifier("hasNoPadding"), Some("noPadding".into()));
+        assert_eq!(prop_to_bem_modifier("shouldAnimate"), Some("animate".into()));
+        assert_eq!(prop_to_bem_modifier("isSecondary"), Some("secondary".into()));
+        assert_eq!(prop_to_bem_modifier("isSubtab"), Some("subtab".into()));
+
+        // No boolean prefix → None
+        assert_eq!(prop_to_bem_modifier("variant"), None);
+        assert_eq!(prop_to_bem_modifier("labelIcon"), None);
+        assert_eq!(prop_to_bem_modifier("customChipGroupContent"), None);
+        assert_eq!(prop_to_bem_modifier("spacer"), None);
+        assert_eq!(prop_to_bem_modifier("header"), None);
+
+        // Prefix but next char is lowercase → None (e.g., "island")
+        assert_eq!(prop_to_bem_modifier("island"), None);
+        assert_eq!(prop_to_bem_modifier("useful"), None);
+        assert_eq!(prop_to_bem_modifier("has"), None);
+    }
+
+    /// Verify modifier_to_css_class helper correctly converts to kebab-case.
+    #[test]
+    fn test_modifier_to_css_class() {
+        assert_eq!(modifier_to_css_class("active"), "pf-m-active");
+        assert_eq!(modifier_to_css_class("pageInsets"), "pf-m-page-insets");
+        assert_eq!(modifier_to_css_class("noPadding"), "pf-m-no-padding");
+        assert_eq!(modifier_to_css_class("secondary"), "pf-m-secondary");
+        assert_eq!(modifier_to_css_class("subtab"), "pf-m-subtab");
+        assert_eq!(modifier_to_css_class("horizontalSubnavGrouped"), "pf-m-horizontal-subnav-grouped");
+        assert_eq!(modifier_to_css_class("fullHeight"), "pf-m-full-height");
+    }
 }
