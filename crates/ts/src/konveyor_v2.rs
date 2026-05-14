@@ -131,9 +131,24 @@ pub fn generate_sd_rules(
     ));
 
     // ── New absorbing prop rules (children→prop migration hints) ────
+    // Build a set of (component, new_prop_name) pairs for props that are
+    // rename targets. Absorbing-prop rules should not fire for these because
+    // a dedicated rename rule already covers the migration.
+    let rename_targets: HashSet<(String, String)> = report
+        .changes
+        .iter()
+        .flat_map(|fc| &fc.breaking_api_changes)
+        .filter(|api| api.change == ApiChangeType::Renamed)
+        .filter_map(|api| {
+            let (component, _old_prop) = api.symbol.split_once('.')?;
+            let new_prop = api.after.as_ref()?;
+            Some((component.to_string(), new_prop.to_string()))
+        })
+        .collect();
     rules.extend(generate_new_absorbing_prop_rules(
         sd,
         &component_packages,
+        &rename_targets,
     ));
 
     // ── Deprecated prop rules (@deprecated JSDoc) ────────────────────
@@ -4533,6 +4548,7 @@ fn generate_prop_default_changed_rules(
 fn generate_new_absorbing_prop_rules(
     sd: &SdPipelineResult,
     component_packages: &HashMap<String, String>,
+    rename_targets: &HashSet<(String, String)>,
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
 
@@ -4565,6 +4581,17 @@ fn generate_new_absorbing_prop_rules(
         for prop in &added {
             // Skip `children` itself
             if prop.as_str() == "children" {
+                continue;
+            }
+
+            // Skip props that are rename targets — a dedicated rename rule
+            // already covers the migration. Without this filter, absorbing-prop
+            // rules fire redundantly on every component usage, creating noise
+            // that causes the LLM to over-modify (e.g., Page.masthead already
+            // has a rename rule from header→masthead; the absorbing-prop rule
+            // for masthead would fire on every <Page> and push the LLM toward
+            // wholesale restructuring).
+            if rename_targets.contains(&(component.clone(), prop.to_string())) {
                 continue;
             }
 
@@ -11867,7 +11894,7 @@ mod tests {
             .insert("MenuToggle".into(), "@patternfly/react-core".into());
         let pkgs = sd.component_packages.clone();
 
-        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &HashSet::new());
 
         let icon_rule = rules
             .iter()
@@ -11932,7 +11959,7 @@ mod tests {
             .insert("NavItem".into(), "@patternfly/react-core".into());
         let pkgs = sd.component_packages.clone();
 
-        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &HashSet::new());
 
         assert!(
             rules.iter().any(|r| r.rule_id.contains("navitem") && r.rule_id.contains("icon")),
@@ -11972,7 +11999,7 @@ mod tests {
             .insert("Toolbar".into(), "@patternfly/react-core".into());
         let pkgs = sd.component_packages.clone();
 
-        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &HashSet::new());
         assert!(
             rules.is_empty(),
             "boolean props should not generate new-absorbing-prop rules"
@@ -12012,7 +12039,7 @@ mod tests {
             .insert("Button".into(), "@patternfly/react-core".into());
         let pkgs = sd.component_packages.clone();
 
-        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &HashSet::new());
         assert!(
             rules.is_empty(),
             "Props that already existed should not generate rules"
@@ -12052,10 +12079,78 @@ mod tests {
             .insert("Badge".into(), "@patternfly/react-core".into());
         let pkgs = sd.component_packages.clone();
 
-        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &HashSet::new());
         assert!(
             rules.is_empty(),
             "Components without children should not generate rules"
+        );
+    }
+
+    /// Absorbing-prop rules should NOT fire for props that are rename targets.
+    /// Page.masthead is a rename of Page.header, and Page.horizontalSubnav is
+    /// a rename of Page.tertiaryNav. These should NOT generate absorbing-prop
+    /// rules because dedicated rename rules already handle the migration.
+    /// Only genuinely new props (like Page.banner) should generate rules.
+    #[test]
+    fn test_new_absorbing_prop_skips_rename_targets() {
+        let mut sd = SdPipelineResult::default();
+        // Page: old props include header, tertiaryNav (to be renamed)
+        sd.old_component_props.insert(
+            "Page".into(),
+            ["children", "header", "tertiaryNav", "sidebar"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        // Page: new props include masthead (renamed from header),
+        // horizontalSubnav (renamed from tertiaryNav), and banner (genuinely new)
+        sd.new_component_props.insert(
+            "Page".into(),
+            ["children", "masthead", "horizontalSubnav", "sidebar", "banner"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Page".into(),
+            [
+                ("masthead".into(), "React.ReactNode".into()),
+                ("horizontalSubnav".into(), "React.ReactNode".into()),
+                ("banner".into(), "React.ReactNode".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = true;
+        sd.new_profiles.insert("Page".into(), profile);
+        sd.component_packages
+            .insert("Page".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        // Rename targets: header→masthead, tertiaryNav→horizontalSubnav
+        let rename_targets: HashSet<(String, String)> = [
+            ("Page".to_string(), "masthead".to_string()),
+            ("Page".to_string(), "horizontalSubnav".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &rename_targets);
+
+        // Only "banner" should generate a rule — masthead and horizontalSubnav
+        // are rename targets and should be suppressed
+        assert_eq!(
+            rules.len(),
+            1,
+            "Should generate exactly 1 rule (banner only). \
+             masthead and horizontalSubnav are rename targets. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        assert!(
+            rules[0].rule_id.contains("banner"),
+            "The one rule should be for 'banner'. Got: {}",
+            rules[0].rule_id
         );
     }
 
