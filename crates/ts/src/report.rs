@@ -2332,18 +2332,20 @@ fn enrich_removal_dispositions_from_sd(report: &mut AnalysisReport<TypeScript>) 
                     None => continue,
                 };
 
-                // Look up old prop's CSS modifier
+                // Look up old prop's CSS modifier — first from prop_style_bindings,
+                // then fall back to deriving from the prop name (strip is/has/use prefix).
                 let old_profile = match sd.old_profiles.get(comp) {
                     Some(p) => p,
                     None => continue,
                 };
-                let old_css_tokens = match old_profile.prop_style_bindings.get(old_prop) {
-                    Some(t) => t,
-                    None => continue, // No CSS binding → can't verify
-                };
-                let old_modifier = match extract_css_modifier_name(old_css_tokens) {
+                let old_modifier = old_profile
+                    .prop_style_bindings
+                    .get(old_prop)
+                    .and_then(extract_css_modifier_name)
+                    .or_else(|| prop_to_bem_modifier(old_prop));
+                let old_modifier = match old_modifier {
                     Some(m) => m,
-                    None => continue,
+                    None => continue, // Can't derive modifier name → can't verify
                 };
 
                 // Check if old modifier still exists in new BEM modifiers
@@ -2351,16 +2353,55 @@ fn enrich_removal_dispositions_from_sd(report: &mut AnalysisReport<TypeScript>) 
                     Some(p) => p,
                     None => continue,
                 };
-                if !new_profile.bem_modifiers.contains(&old_modifier) {
-                    continue; // Modifier was removed → rename might be valid
+                // ── CSS resolved-value validation ────────────────────────
+                //
+                // Whether the old modifier was removed or survives in v6 BEM,
+                // compare the resolved CSS effects of the old and new modifiers.
+                // If both have CSS modifier data and there's zero overlap in
+                // normalized property keys → the modifiers affect completely
+                // different CSS properties → false rename.
+                match check_css_resolved_value_mismatch(sd, old_profile, old_prop, &new_prop) {
+                    CssRenameVerdict::Invalidate(reason) => {
+                        tracing::info!(
+                            component = comp,
+                            old_prop = old_prop,
+                            false_target = &new_prop,
+                            reason = %reason,
+                            "Invalidating TD rename: CSS resolved-value comparison \
+                             shows old and new modifiers affect different CSS properties"
+                        );
+                        change.change = ApiChangeType::Removed;
+                        change.after = None;
+                        change.before = Some(format!("property: {}: boolean", old_prop));
+                        change.removal_disposition = None;
+                        change.description = format!(
+                            "property `{}` was removed from `{}` \
+                             (TD rename to `{}` invalidated: {})",
+                            old_prop, comp, new_prop, reason
+                        );
+                        invalidated += 1;
+                        continue;
+                    }
+                    CssRenameVerdict::Validate => {
+                        // CSS confirms the modifiers affect the same properties.
+                        // The rename is valid regardless of BEM modifier survival.
+                        continue;
+                    }
+                    CssRenameVerdict::Inconclusive => {
+                        // No CSS data available. Fall back to BEM modifier survival check.
+                    }
                 }
 
-                // Old modifier survives. Check if the rename target maps to
-                // the same or a different modifier.
-                let new_css_tokens = new_profile.prop_style_bindings.get(&new_prop);
-                let new_modifier = new_css_tokens.and_then(extract_css_modifier_name);
+                if !new_profile.bem_modifiers.contains(&old_modifier) {
+                    continue; // Modifier was removed, CSS check inconclusive → allow rename
+                }
 
-                if new_modifier.as_deref() == Some(old_modifier.as_str()) {
+                // Old modifier survives in v6 BEM. Check if the rename target
+                // maps to the same modifier (continuity).
+                let new_css_tokens = new_profile.prop_style_bindings.get(&new_prop);
+                let new_modifier_from_bindings = new_css_tokens.and_then(extract_css_modifier_name);
+
+                if new_modifier_from_bindings.as_deref() == Some(old_modifier.as_str()) {
                     continue; // Same modifier → rename is valid (modifier continuity)
                 }
 
@@ -2371,7 +2412,7 @@ fn enrich_removal_dispositions_from_sd(report: &mut AnalysisReport<TypeScript>) 
                     old_prop = old_prop,
                     false_target = new_prop,
                     old_modifier = %old_modifier,
-                    new_modifier = ?new_modifier,
+                    new_modifier = ?new_modifier_from_bindings,
                     "Invalidating TD rename: old CSS modifier still exists in new BEM, \
                      rename target has different modifier"
                 );
@@ -3070,6 +3111,160 @@ fn augmented_prop_similarity_with_component(a: &str, b: &str, component: &str) -
     best = best.max(sim);
 
     best
+}
+
+/// Derive a BEM modifier name from a boolean prop name by stripping common
+/// prefixes (`is`, `has`, `use`, `should`).
+///
+/// Returns `None` if no prefix matches (prop doesn't follow the boolean naming
+/// convention).
+///
+/// Examples:
+/// - `isActive` → `Some("active")`
+/// - `usePageInsets` → `Some("pageInsets")`
+/// - `hasNoPadding` → `Some("noPadding")`
+/// - `variant` → `None` (no boolean prefix)
+fn prop_to_bem_modifier(prop: &str) -> Option<String> {
+    for prefix in &["is", "has", "use", "should"] {
+        if let Some(rest) = prop.strip_prefix(prefix) {
+            if !rest.is_empty() && rest.starts_with(|c: char| c.is_uppercase()) {
+                let mut result = String::with_capacity(rest.len());
+                let mut chars = rest.chars();
+                if let Some(first) = chars.next() {
+                    result.push(first.to_ascii_lowercase());
+                }
+                result.extend(chars);
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a camelCase modifier name to a kebab-case CSS class name with `pf-m-` prefix.
+///
+/// Examples:
+/// - `"pageInsets"` → `"pf-m-page-insets"`
+/// - `"noPadding"` → `"pf-m-no-padding"`
+/// - `"active"` → `"pf-m-active"`
+fn modifier_to_css_class(modifier: &str) -> String {
+    let mut result = String::from("pf-m-");
+    for (i, ch) in modifier.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('-');
+        }
+        result.push(ch.to_ascii_lowercase());
+    }
+    result
+}
+
+/// Result of CSS resolved-value comparison for rename validation.
+enum CssRenameVerdict {
+    /// CSS data confirms the modifiers affect different properties → false rename.
+    Invalidate(String),
+    /// CSS data confirms the modifiers affect the same properties → true rename.
+    Validate,
+    /// Insufficient CSS data to make a determination.
+    Inconclusive,
+}
+
+/// Check whether a proposed boolean prop rename is supported or contradicted
+/// by CSS resolved-value comparison.
+///
+/// Derives BEM modifier names from old/new prop names, looks up their
+/// CSS effects from `old_css_modifiers`/`new_css_modifiers`, and compares
+/// the normalized resolved override keys. If zero overlap, the modifiers
+/// affect completely different CSS properties → false rename.
+fn check_css_resolved_value_mismatch(
+    sd: &crate::sd_types::SdPipelineResult,
+    old_profile: &crate::sd_types::ComponentSourceProfile,
+    old_prop: &str,
+    new_prop: &str,
+) -> CssRenameVerdict {
+    // Derive modifier names from prop names
+    let (old_modifier, new_modifier) = match (prop_to_bem_modifier(old_prop), prop_to_bem_modifier(new_prop)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    // Get the component's BEM block name for CSS modifier lookup
+    let bem_block = match old_profile.bem_block.as_deref() {
+        Some(b) if !b.is_empty() => b,
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    // Look up CSS modifier effects
+    let (old_css_mods, new_css_mods) = match (sd.old_css_modifiers.get(bem_block), sd.new_css_modifiers.get(bem_block)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    let old_css_class = modifier_to_css_class(&old_modifier);
+    let new_css_class = modifier_to_css_class(&new_modifier);
+
+    let (old_effect, new_effect) = match (old_css_mods.get(&old_css_class), new_css_mods.get(&new_css_class)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    // Normalize resolved override keys: strip --pf-v5-c-{block} / --pf-v6-c-{block}
+    // prefix to get the essence (e.g., `__content--PaddingLeft`).
+    let strip_prefix = |key: &str| -> String {
+        // Pattern: --pf-v{N}-c-{block-name}--{rest} or --pf-v{N}-c-{block}__...
+        // We want to strip everything up to and including the block name.
+        if let Some(idx) = key.find("--c-") {
+            let after_c = &key[idx + 4..]; // skip "--c-"
+            // Find the next "--" or "__" after the block name
+            if let Some(sep) = after_c.find("--").or_else(|| after_c.find("__")) {
+                return after_c[sep..].to_string();
+            }
+        }
+        key.to_string()
+    };
+
+    let old_keys: HashSet<String> = old_effect
+        .resolved_overrides
+        .keys()
+        .map(|k| strip_prefix(k))
+        .collect();
+    let new_keys: HashSet<String> = new_effect
+        .resolved_overrides
+        .keys()
+        .map(|k| strip_prefix(k))
+        .collect();
+
+    // If either has no resolved overrides, check direct properties
+    if old_keys.is_empty() && new_keys.is_empty() {
+        let old_direct: HashSet<&str> = old_effect.direct_properties.keys().map(|s| s.as_str()).collect();
+        let new_direct: HashSet<&str> = new_effect.direct_properties.keys().map(|s| s.as_str()).collect();
+        if old_direct.is_empty() || new_direct.is_empty() {
+            return CssRenameVerdict::Inconclusive;
+        }
+        let overlap = old_direct.intersection(&new_direct).count();
+        if overlap == 0 {
+            return CssRenameVerdict::Invalidate(format!(
+                "CSS modifiers {} and {} affect completely different CSS properties \
+                 (old: {:?}, new: {:?})",
+                old_css_class, new_css_class, old_direct, new_direct
+            ));
+        }
+        return CssRenameVerdict::Validate;
+    }
+
+    if old_keys.is_empty() || new_keys.is_empty() {
+        return CssRenameVerdict::Inconclusive;
+    }
+
+    let overlap = old_keys.intersection(&new_keys).count();
+    if overlap == 0 {
+        CssRenameVerdict::Invalidate(format!(
+            "CSS modifiers {} and {} affect completely different CSS properties \
+             (old: {:?}, new: {:?})",
+            old_css_class, new_css_class, old_keys, new_keys
+        ))
+    } else {
+        CssRenameVerdict::Validate
+    }
 }
 
 /// Strip a component-derived prefix from a prop name if it matches.
@@ -6734,5 +6929,222 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// TC082: usePageInsets → hasNoPadding is a false rename. Both are boolean
+    /// props on Toolbar, but they control completely different CSS modifiers:
+    /// - usePageInsets → pf-m-page-insets (horizontal content padding)
+    /// - hasNoPadding → pf-m-no-padding (vertical root padding)
+    ///
+    /// The CSS resolved-value comparison should detect zero overlap in
+    /// normalized CSS property keys and invalidate the rename.
+    #[test]
+    fn step0_css_resolved_value_invalidates_false_boolean_rename() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        // Build a Renamed change: Toolbar.usePageInsets → hasNoPadding
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Toolbar.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Toolbar.usePageInsets".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("usePageInsets".into()),
+                after: Some("hasNoPadding".into()),
+                description: "property `usePageInsets` was renamed to `hasNoPadding`".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+
+        // Old profile: Toolbar has BEM block "toolbar", usePageInsets is in BEM modifiers
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Toolbar".into();
+        old_profile.bem_block = Some("toolbar".into());
+        old_profile.bem_modifiers = ["fullHeight", "pageInsets", "static", "sticky"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.old_profiles.insert("Toolbar".into(), old_profile);
+
+        // New profile: Toolbar's BEM modifiers replaced pageInsets with noPadding
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Toolbar".into();
+        new_profile.bem_block = Some("toolbar".into());
+        new_profile.bem_modifiers = ["fullHeight", "noPadding", "static", "sticky"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.new_profiles.insert("Toolbar".into(), new_profile);
+
+        // Old CSS modifiers: pf-m-page-insets controls horizontal content padding
+        let mut old_page_insets = CssModifierEffect::default();
+        old_page_insets.resolved_overrides.insert(
+            "--pf-v5-c-toolbar__content--PaddingLeft".into(),
+            "1rem".into(),
+        );
+        old_page_insets.resolved_overrides.insert(
+            "--pf-v5-c-toolbar__content--PaddingRight".into(),
+            "1rem".into(),
+        );
+        let mut old_toolbar_mods = CssModifierMap::new();
+        old_toolbar_mods.insert("pf-m-page-insets".into(), old_page_insets);
+
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("toolbar".into(), old_toolbar_mods);
+        sd.old_css_modifiers = old_css;
+
+        // New CSS modifiers: pf-m-no-padding controls vertical root padding
+        let mut new_no_padding = CssModifierEffect::default();
+        new_no_padding.resolved_overrides.insert(
+            "--pf-v6-c-toolbar--PaddingBlockEnd".into(),
+            "0".into(),
+        );
+        new_no_padding.resolved_overrides.insert(
+            "--pf-v6-c-toolbar--m-sticky--PaddingBlockEnd".into(),
+            "0".into(),
+        );
+        new_no_padding.resolved_overrides.insert(
+            "--pf-v6-c-toolbar--m-sticky--PaddingBlockStart".into(),
+            "0".into(),
+        );
+        let mut new_toolbar_mods = CssModifierMap::new();
+        new_toolbar_mods.insert("pf-m-no-padding".into(), new_no_padding);
+
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("toolbar".into(), new_toolbar_mods);
+        sd.new_css_modifiers = new_css;
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Removed,
+            "TC082: usePageInsets → hasNoPadding should be invalidated (reclassified as Removed) \
+             because CSS modifiers pf-m-page-insets and pf-m-no-padding affect completely \
+             different CSS properties. Got: {:?}",
+            change.change
+        );
+        assert!(
+            change.after.is_none(),
+            "TC082: after field should be cleared when rename is invalidated"
+        );
+    }
+
+    /// Tabs.isSecondary → isSubtab is a TRUE rename. Both modifiers affect
+    /// the same CSS properties (font sizes for tab sub-elements).
+    /// The CSS resolved-value check should NOT invalidate this rename.
+    #[test]
+    fn step0_css_resolved_value_preserves_true_boolean_rename() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Tabs.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Tabs.isSecondary".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("isSecondary".into()),
+                after: Some("isSubtab".into()),
+                description: "property `isSecondary` was renamed to `isSubtab`".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+
+        // Old profile: secondary is in BEM modifiers
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Tabs".into();
+        old_profile.bem_block = Some("tabs".into());
+        old_profile.bem_modifiers = ["secondary", "box"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.old_profiles.insert("Tabs".into(), old_profile);
+
+        // New profile: secondary still exists (different purpose), subtab added
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Tabs".into();
+        new_profile.bem_block = Some("tabs".into());
+        new_profile.bem_modifiers = ["secondary", "subtab", "box"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.new_profiles.insert("Tabs".into(), new_profile);
+
+        // Old CSS: pf-m-secondary overrides font sizes
+        let mut old_secondary = CssModifierEffect::default();
+        old_secondary.resolved_overrides.insert(
+            "--pf-v5-c-tabs__add--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        old_secondary.resolved_overrides.insert(
+            "--pf-v5-c-tabs__item-action--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        old_secondary.resolved_overrides.insert(
+            "--pf-v5-c-tabs__link--FontSize".into(),
+            ".875rem".into(),
+        );
+        let mut old_tabs_mods = CssModifierMap::new();
+        old_tabs_mods.insert("pf-m-secondary".into(), old_secondary);
+
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("tabs".into(), old_tabs_mods);
+        sd.old_css_modifiers = old_css;
+
+        // New CSS: pf-m-subtab overrides the SAME font size properties
+        let mut new_subtab = CssModifierEffect::default();
+        new_subtab.resolved_overrides.insert(
+            "--pf-v6-c-tabs__add--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        new_subtab.resolved_overrides.insert(
+            "--pf-v6-c-tabs__item-action--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        new_subtab.resolved_overrides.insert(
+            "--pf-v6-c-tabs__link--FontSize".into(),
+            ".75rem".into(),
+        );
+        let mut new_tabs_mods = CssModifierMap::new();
+        new_tabs_mods.insert("pf-m-subtab".into(), new_subtab);
+
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("tabs".into(), new_tabs_mods);
+        sd.new_css_modifiers = new_css;
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Tabs.isSecondary → isSubtab should remain Renamed because CSS modifiers \
+             pf-m-secondary and pf-m-subtab affect the same CSS properties (font sizes). \
+             Got: {:?}",
+            change.change
+        );
     }
 }
