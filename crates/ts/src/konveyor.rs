@@ -781,12 +781,27 @@ pub fn generate_rules(
             // fix engine consolidate them with the replacement family's strategy
             // entry (target_structure, retained_props, unmapped_removed_props),
             // giving the LLM full context about the target component's v6 API.
+            //
+            // IMPORTANT: Only remap components whose v6 package is /deprecated.
+            // Components that were promoted from /next to main (e.g.,
+            // DualListSelector) share the same name as their deprecated
+            // counterpart but should NOT be remapped to the replacement family
+            // (e.g., DragDrop). Without this guard, the blanket remapping
+            // contaminates /next and main rules with wrong family labels.
             for dr in &sd.deprecated_replacements {
                 if let Some(new_family) = map.get(&dr.new_component).cloned() {
                     let old_family = dr.old_component.clone();
-                    for value in map.values_mut() {
+                    for (comp, value) in map.iter_mut() {
                         if *value == old_family {
-                            *value = new_family.clone();
+                            // Only remap if this component's v6 package is deprecated.
+                            let comp_pkg = sd
+                                .component_packages
+                                .get(comp.as_str())
+                                .map(|p| p.as_str())
+                                .unwrap_or("");
+                            if comp_pkg.contains("/deprecated") {
+                                *value = new_family.clone();
+                            }
                         }
                     }
                 }
@@ -10076,6 +10091,18 @@ mod tests {
                 evidence_hosts: vec![],
                 evidence_source: ReplacementEvidence::CommitCoChange,
             }],
+            // v6 package mapping: Tile is now in /deprecated, Card is in main.
+            // This is needed for the scoped family remapping guard which only
+            // remaps components whose v6 package is /deprecated.
+            component_packages: {
+                let mut pkgs = HashMap::new();
+                pkgs.insert("Tile".into(), "@patternfly/react-core/deprecated".into());
+                pkgs.insert("Card".into(), "@patternfly/react-core".into());
+                pkgs.insert("CardHeader".into(), "@patternfly/react-core".into());
+                pkgs.insert("CardBody".into(), "@patternfly/react-core".into());
+                pkgs.insert("CardTitle".into(), "@patternfly/react-core".into());
+                pkgs
+            },
             ..SdPipelineResult::default()
         });
 

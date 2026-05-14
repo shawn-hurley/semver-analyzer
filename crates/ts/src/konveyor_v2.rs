@@ -1902,6 +1902,7 @@ fn generate_deprecated_migration_rules(
         let new_pkg = sd.component_packages.get(component);
 
         let old_is_deprecated = old_pkg.contains("/deprecated");
+        let old_is_next = old_pkg.contains("/next");
         let new_pkg_val = new_pkg.cloned().unwrap_or_default();
         let new_is_deprecated = new_pkg_val.contains("/deprecated");
         let new_is_main = !new_pkg_val.is_empty()
@@ -2048,6 +2049,57 @@ fn generate_deprecated_migration_rules(
                     from: Some(deprecated_pkg),
                     to: Some(base_pkg),
                     component: Some(component.clone()),
+                    ..Default::default()
+                }),
+            });
+        }
+
+        // Case 3: Was in /next (preview), now in main → import path changed.
+        // Consumer must change import from @pkg/next to @pkg.
+        // This is a simple path change, not a deprecation or API migration.
+        if old_is_next && new_is_main {
+            let rule_id = format!("sd-next-promoted-{}", sanitize(component));
+            let message = format!(
+                "`{component}` was promoted from preview (`{old_pkg}`) to main exports.\n\
+                 Change import from `{old_pkg}` to `{new_pkg_val}`.\n",
+            );
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=import-path-change".into(),
+                    format!("package={}", old_pkg),
+                    format!("target-package={}", new_pkg_val),
+                ],
+                effort: 1,
+                category: "mandatory".into(),
+                description: format!(
+                    "{} promoted from /next to main — update import path",
+                    component
+                ),
+                message,
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", component),
+                        location: "IMPORT".into(),
+                        component: None,
+                        parent: None,
+                        parent_from: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        value: None,
+                        from: Some(old_pkg.clone()),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "ImportPathChange".into(),
+                    from: Some(old_pkg.clone()),
+                    to: Some(new_pkg_val.clone()),
                     ..Default::default()
                 }),
             });
@@ -2649,6 +2701,7 @@ fn build_deprecated_migration_context(
         matching_props,
         new_props,
         removed_props,
+        appearance_notes: Vec::new(), // MigrationTarget path has no CSS data access
     })
 }
 
@@ -2787,13 +2840,159 @@ fn build_deprecated_migration_from_replacement(
         return None;
     }
 
+    // ── Appearance notes from CSS modifier comparison ──────────────────
+    //
+    // Generic: when the new component has a variant-like prop with union
+    // string values that the old component didn't have, compare CSS
+    // modifier inventories to detect potential appearance mismatches.
+    //
+    // Algorithm:
+    //   1. Find props on the new component that (a) are union string types
+    //      AND (b) don't exist on the old component
+    //   2. For each variant value, check if pf-m-{value} exists as a CSS
+    //      modifier on the old vs new component
+    //   3. Variant values where the NEW has the modifier but the OLD doesn't
+    //      are "appearance options the old component had as its default"
+    //   4. If only ONE such candidate survives after filtering out shared
+    //      modifiers, recommend it as the default
+    let appearance_notes = infer_appearance_defaults(
+        old_component,
+        family_root,
+        &old_types,
+        &new_types,
+        &sd.old_css_modifiers,
+        &sd.new_css_modifiers,
+    );
+
     Some(semver_analyzer_konveyor_core::DeprecatedMigrationContext {
         old_package,
         new_package,
         matching_props,
         new_props,
         removed_props,
+        appearance_notes,
     })
+}
+
+/// Infer default appearance props when a deprecated component is replaced.
+///
+/// Compares CSS modifier inventories between old and new components to detect
+/// when the old component's fixed appearance corresponds to a specific variant
+/// value on the new component.
+///
+/// Example: Chip has no `pf-m-outline` modifier (outline IS its default).
+/// Label has `pf-m-outline` as an explicit variant. The algorithm detects
+/// that `outline` is a variant value only on the new component, suggesting
+/// `variant='outline'` should be added to preserve visual parity.
+fn infer_appearance_defaults(
+    old_component: &str,
+    new_component: &str,
+    old_types: &BTreeMap<String, String>,
+    new_types: &BTreeMap<String, String>,
+    old_css_modifiers: &crate::sd_types::ComponentCssModifiers,
+    new_css_modifiers: &crate::sd_types::ComponentCssModifiers,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+
+    // Find variant-like props: new-only props with union string types
+    let variant_props: Vec<(&String, Vec<String>)> = new_types
+        .iter()
+        .filter(|(name, _)| !old_types.contains_key(name.as_str()))
+        .filter_map(|(name, typ)| {
+            let values = parse_union_string_values(typ);
+            if values.len() >= 2 {
+                let sorted: Vec<String> = values.into_iter().collect();
+                Some((name, sorted))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if variant_props.is_empty() {
+        return notes;
+    }
+
+    // Look up CSS modifier data for both components by BEM block.
+    // Try camelCase block name, lowercase, and prefix matching.
+    let old_block = old_component
+        .chars()
+        .next()
+        .map(|c| c.to_lowercase().to_string())
+        .unwrap_or_default()
+        + &old_component[1..];
+    let new_block = new_component
+        .chars()
+        .next()
+        .map(|c| c.to_lowercase().to_string())
+        .unwrap_or_default()
+        + &new_component[1..];
+
+    let old_mods = old_css_modifiers
+        .get(&old_block)
+        .or_else(|| old_css_modifiers.get(&old_component.to_lowercase()));
+    let new_mods = new_css_modifiers
+        .get(&new_block)
+        .or_else(|| new_css_modifiers.get(&new_component.to_lowercase()));
+
+    // Need at least the new component's modifier data
+    let new_mods = match new_mods {
+        Some(m) => m,
+        None => return notes,
+    };
+
+    let old_modifier_names: std::collections::HashSet<&str> = old_mods
+        .map(|m| m.keys().map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+
+    for (prop_name, values) in &variant_props {
+        // For each variant value, check if the corresponding CSS modifier
+        // exists on the old vs new component
+        let mut candidates: Vec<&str> = Vec::new();
+        let mut shared: Vec<&str> = Vec::new();
+
+        for value in values {
+            let modifier_class = format!("pf-m-{}", value);
+            let on_new = new_mods.contains_key(&modifier_class);
+            let on_old = old_modifier_names.contains(modifier_class.as_str());
+
+            if on_new && !on_old {
+                // This variant is explicit on the new component but the old
+                // component didn't have it as an option — it may have been
+                // the old component's default appearance.
+                candidates.push(value);
+            } else if on_new && on_old {
+                // Both components have this modifier — it's a non-default
+                // option on both.
+                shared.push(value);
+            }
+        }
+
+        if candidates.is_empty() {
+            continue;
+        }
+
+        // If only ONE candidate remains, it's the likely default appearance
+        // for the old component. If multiple remain, list them all and let
+        // the LLM choose.
+        if candidates.len() == 1 {
+            let value = candidates[0];
+            notes.push(format!(
+                "{old_component} has no pf-m-{value} CSS modifier — {value} is its \
+                 default appearance. Add {prop_name}='{value}' to {new_component} \
+                 to preserve visual parity.",
+            ));
+        } else {
+            notes.push(format!(
+                "{old_component} did not have a {prop_name} prop. \
+                 {new_component} defaults to a different appearance. \
+                 Consider which {prop_name} value matches {old_component}'s look: {}.",
+                candidates.join(", "),
+            ));
+        }
+    }
+
+    notes
 }
 
 /// Render a family's target JSX structure with prop names on each component.
@@ -2904,6 +3103,8 @@ fn compute_css_modifier_bridge(
     added_values: &[&String],
     old_css_modifiers: &crate::sd_types::ComponentCssModifiers,
     new_css_modifiers: &crate::sd_types::ComponentCssModifiers,
+    old_css_property_targets: &crate::sd_types::CssPropertyTargetMap,
+    new_css_property_targets: &crate::sd_types::CssPropertyTargetMap,
 ) -> HashMap<String, String> {
     let mut hints = HashMap::new();
 
@@ -2921,13 +3122,35 @@ fn compute_css_modifier_bridge(
         + &component[1..];
 
     // Look up modifier data for this component's BEM block.
-    // Try: exact camelCase, lowercase, with common prefixes stripped.
+    // Try: exact camelCase, lowercase, then prefix matching.
+    //
+    // Prefix matching handles sub-components that share a parent BEM block:
+    // "DrawerContent" (camelCase "drawerContent") → BEM block "drawer"
+    // "DrawerPanelContent" → BEM block "drawer"
+    // "PageSection" → BEM block "page"
+    //
+    // We check if any existing key is a camelCase prefix of the component
+    // name (e.g., "drawer" is a prefix of "drawerContent").
     let old_mods = old_css_modifiers
         .get(&block_lower)
-        .or_else(|| old_css_modifiers.get(&component.to_lowercase()));
+        .or_else(|| old_css_modifiers.get(&component.to_lowercase()))
+        .or_else(|| {
+            old_css_modifiers
+                .iter()
+                .filter(|(k, _)| block_lower.starts_with(k.as_str()) && k.len() < block_lower.len())
+                .max_by_key(|(k, _)| k.len()) // longest matching prefix
+                .map(|(_, v)| v)
+        });
     let new_mods = new_css_modifiers
         .get(&block_lower)
-        .or_else(|| new_css_modifiers.get(&component.to_lowercase()));
+        .or_else(|| new_css_modifiers.get(&component.to_lowercase()))
+        .or_else(|| {
+            new_css_modifiers
+                .iter()
+                .filter(|(k, _)| block_lower.starts_with(k.as_str()) && k.len() < block_lower.len())
+                .max_by_key(|(k, _)| k.len()) // longest matching prefix
+                .map(|(_, v)| v)
+        });
 
     let (old_mods, new_mods) = match (old_mods, new_mods) {
         (Some(o), Some(n)) => (o, n),
@@ -2960,7 +3183,7 @@ fn compute_css_modifier_bridge(
     let mut candidates: Vec<(&str, &str, f64)> = Vec::new();
     for (old_val, old_effect) in &old_pairs {
         for (new_val, new_effect) in &new_pairs {
-            let sim = modifier_similarity(old_effect, new_effect);
+            let sim = modifier_similarity(old_effect, new_effect, old_css_property_targets, new_css_property_targets);
             candidates.push((old_val, new_val, sim));
         }
     }
@@ -3093,92 +3316,142 @@ fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
     }
 }
 
-/// Compute color similarity between two hex colors as a value in [0.0, 1.0].
+/// Compute color similarity between two RGB colors as a value in [0.0, 1.0].
 ///
-/// Uses Euclidean distance in RGB space, normalized to [0, 1]:
-///   distance = sqrt((r1-r2)^2 + (g1-g2)^2 + (b1-b2)^2)
-///   max_distance = sqrt(255^2 + 255^2 + 255^2) ≈ 441.67
-///   similarity = 1.0 - (distance / max_distance)
+/// Uses hue-weighted comparison in HSL space. Hue is the primary signal
+/// for color identity (gold and yellow have the same hue ~45°, while
+/// orangered has hue ~16°). Saturation and lightness contribute less.
 ///
-/// This gives:
-///   - identical colors → 1.0
-///   - similar colors (e.g., cyan #e0f5f5 vs teal #daf2f2) → ~0.98
-///   - different colors (e.g., cyan #e0f5f5 vs yellow #fff4cc) → ~0.87
-///   - opposite colors (black vs white) → 0.0
+/// For achromatic colors (saturation near 0, i.e., greys and near-blacks),
+/// falls back to lightness comparison only since hue is undefined.
+///
+/// Weights: hue 60%, saturation 20%, lightness 20%.
 fn color_similarity(c1: (u8, u8, u8), c2: (u8, u8, u8)) -> f64 {
-    let dr = c1.0 as f64 - c2.0 as f64;
-    let dg = c1.1 as f64 - c2.1 as f64;
-    let db = c1.2 as f64 - c2.2 as f64;
-    let distance = (dr * dr + dg * dg + db * db).sqrt();
-    let max_distance = (255.0_f64 * 255.0 * 3.0).sqrt(); // ~441.67
-    1.0 - (distance / max_distance)
+    let (h1, s1, l1) = rgb_to_hsl(c1.0, c1.1, c1.2);
+    let (h2, s2, l2) = rgb_to_hsl(c2.0, c2.1, c2.2);
+
+    let achromatic_threshold = 0.1;
+    let both_achromatic = s1 < achromatic_threshold && s2 < achromatic_threshold;
+
+    if both_achromatic {
+        // Both are greys/blacks/whites — compare by lightness only
+        return 1.0 - (l1 - l2).abs();
+    }
+
+    // Hue distance on the circular scale [0, 360)
+    let hue_diff = (h1 - h2).abs();
+    let hue_dist = hue_diff.min(360.0 - hue_diff); // shortest arc
+    let hue_sim = 1.0 - (hue_dist / 180.0); // 0° diff → 1.0, 180° → 0.0
+
+    let sat_sim = 1.0 - (s1 - s2).abs();
+    let light_sim = 1.0 - (l1 - l2).abs();
+
+    0.6 * hue_sim + 0.2 * sat_sim + 0.2 * light_sim
+}
+
+/// Convert RGB (0-255) to HSL (hue: 0-360, saturation: 0-1, lightness: 0-1).
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    let r = r as f64 / 255.0;
+    let g = g as f64 / 255.0;
+    let b = b as f64 / 255.0;
+
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+
+    if (max - min).abs() < f64::EPSILON {
+        // Achromatic
+        return (0.0, 0.0, l);
+    }
+
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+
+    let h = if (max - r).abs() < f64::EPSILON {
+        let mut h = (g - b) / d;
+        if g < b {
+            h += 6.0;
+        }
+        h
+    } else if (max - g).abs() < f64::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+
+    (h * 60.0, s, l)
 }
 
 /// Compute resolved-value similarity between two CSS modifier effects
-/// using a "bag of colors" approach.
+/// by comparing the actual CSS properties each modifier targets.
 ///
-/// Ignores token slot names entirely — v5 and v6 Label modifiers have
-/// completely different token structures (v5 has 13 slots with `editable`,
-/// `outline`, `content` sub-patterns; v6 has 8 slots with `clickable`,
-/// `outline` patterns). Comparing by slot name gives near-zero overlap.
+/// Uses `CssPropertyTargetMap` to trace each custom property override to
+/// the actual CSS property it sets on the DOM (e.g., `--pf-v6-c-label--BackgroundColor`
+/// → `background-color`). Then compares resolved hex colors at matching
+/// CSS properties: `background-color` to `background-color`, `color` to
+/// `color`, etc.
 ///
-/// Instead, extracts all resolved hex color values from each side and
-/// computes symmetric nearest-neighbor color distance: for each old color,
-/// find the closest new color; for each new color, find the closest old
-/// color. Average all best-match similarities.
-///
-/// This produces high similarity when both modifiers use the same color
-/// palette (cyan blues ↔ teal blues) and low similarity when they don't
-/// (cyan blues ↔ yellow golds).
+/// Only shared CSS properties contribute — non-shared properties don't
+/// penalize the score. This correctly handles v5→v6 where the custom
+/// property token structures changed completely but the underlying CSS
+/// properties (background-color, color, border-color) are the same.
 fn modifier_resolved_similarity(
     old: &crate::sd_types::CssModifierEffect,
     new: &crate::sd_types::CssModifierEffect,
+    old_targets: &crate::sd_types::CssPropertyTargetMap,
+    new_targets: &crate::sd_types::CssPropertyTargetMap,
 ) -> f64 {
-    // Collect all parseable hex colors from each side
-    let old_colors: Vec<(u8, u8, u8)> = old
-        .resolved_overrides
-        .values()
-        .chain(old.direct_properties.values())
-        .filter_map(|v| parse_hex_color(v))
-        .collect();
+    // Resolve each custom property override to its target CSS property + hex color.
+    // Multiple custom properties may target the same CSS property (e.g., the base
+    // --label--BackgroundColor and the outline --label--m-outline--BackgroundColor
+    // both target `background-color`). Prefer the SHORTEST custom property name
+    // as it's the primary/base token, not a modifier-specific variant.
+    let mut old_css: HashMap<&str, (&str, (u8, u8, u8))> = HashMap::new();
+    for (custom_prop, resolved_value) in &old.resolved_overrides {
+        if let Some(css_prop) = old_targets.get(custom_prop.as_str()) {
+            if let Some(color) = parse_hex_color(resolved_value) {
+                let entry = old_css.entry(css_prop.as_str()).or_insert((custom_prop.as_str(), color));
+                // Prefer shorter custom property name (primary token)
+                if custom_prop.len() < entry.0.len() {
+                    *entry = (custom_prop.as_str(), color);
+                }
+            }
+        }
+    }
 
-    let new_colors: Vec<(u8, u8, u8)> = new
-        .resolved_overrides
-        .values()
-        .chain(new.direct_properties.values())
-        .filter_map(|v| parse_hex_color(v))
-        .collect();
+    let mut new_css: HashMap<&str, (&str, (u8, u8, u8))> = HashMap::new();
+    for (custom_prop, resolved_value) in &new.resolved_overrides {
+        if let Some(css_prop) = new_targets.get(custom_prop.as_str()) {
+            if let Some(color) = parse_hex_color(resolved_value) {
+                let entry = new_css.entry(css_prop.as_str()).or_insert((custom_prop.as_str(), color));
+                if custom_prop.len() < entry.0.len() {
+                    *entry = (custom_prop.as_str(), color);
+                }
+            }
+        }
+    }
 
-    if old_colors.is_empty() || new_colors.is_empty() {
+    // Find shared CSS properties
+    let shared: Vec<&&str> = old_css.keys().filter(|k| new_css.contains_key(**k)).collect();
+    if shared.is_empty() {
         return 0.0;
     }
 
-    // For each old color, find the best-matching new color
-    let old_to_new: f64 = old_colors
+    // Compare colors at matching CSS properties
+    let total_sim: f64 = shared
         .iter()
-        .map(|oc| {
-            new_colors
-                .iter()
-                .map(|nc| color_similarity(*oc, *nc))
-                .fold(0.0_f64, f64::max)
+        .map(|css_prop| {
+            let old_color = old_css[**css_prop].1;
+            let new_color = new_css[**css_prop].1;
+            color_similarity(old_color, new_color)
         })
-        .sum::<f64>()
-        / old_colors.len() as f64;
+        .sum();
 
-    // For each new color, find the best-matching old color
-    let new_to_old: f64 = new_colors
-        .iter()
-        .map(|nc| {
-            old_colors
-                .iter()
-                .map(|oc| color_similarity(*oc, *nc))
-                .fold(0.0_f64, f64::max)
-        })
-        .sum::<f64>()
-        / new_colors.len() as f64;
-
-    // Symmetric average
-    (old_to_new + new_to_old) / 2.0
+    total_sim / shared.len() as f64
 }
 
 /// Combined similarity: blends structural and resolved signals.
@@ -3197,6 +3470,8 @@ fn modifier_resolved_similarity(
 fn modifier_similarity(
     old: &crate::sd_types::CssModifierEffect,
     new: &crate::sd_types::CssModifierEffect,
+    old_targets: &crate::sd_types::CssPropertyTargetMap,
+    new_targets: &crate::sd_types::CssPropertyTargetMap,
 ) -> f64 {
     let structural = modifier_structural_similarity(old, new);
 
@@ -3205,7 +3480,7 @@ fn modifier_similarity(
     // for all color modifiers (same token slots), and only the actual rendered
     // values disambiguate them.
     if !old.resolved_overrides.is_empty() && !new.resolved_overrides.is_empty() {
-        let resolved = modifier_resolved_similarity(old, new);
+        let resolved = modifier_resolved_similarity(old, new, old_targets, new_targets);
         return structural * 0.3 + resolved * 0.7;
     }
 
@@ -3372,19 +3647,38 @@ fn generate_prop_value_conformance_rules(
 
             // ── CSS modifier bridge ──────────────────────────────
             // Before falling back to string similarity, try matching
-            // removed values to added values by comparing what CSS
+            // removed values to candidate values by comparing what CSS
             // each modifier class actually declares. This produces
             // evidence-based mappings like cyan→teal (both override
             // the same set of component tokens) instead of relying
             // on name similarity which fails for semantic renames.
+            //
+            // Candidates include BOTH added values and surviving values.
+            // A surviving value (one that exists in both old and new) can
+            // be a valid replacement when a removed value's functionality
+            // was merged into it. The CSS bridge provides evidence-based
+            // matching regardless of whether the candidate is new or
+            // pre-existing, avoiding the false matches that string
+            // similarity produces on surviving values (e.g., Nav.variant
+            // "tertiary" → "horizontal" was wrong; CSS bridge correctly
+            // returns no match because they affect different properties).
             let added_for_bridge: Vec<&String> =
                 new_values.difference(&old_values).collect();
+            let surviving_for_bridge: Vec<&String> =
+                old_values.intersection(&new_values).collect();
+            let all_candidates_for_bridge: Vec<&String> = added_for_bridge
+                .iter()
+                .chain(surviving_for_bridge.iter())
+                .cloned()
+                .collect();
             let css_bridge_hints = compute_css_modifier_bridge(
                 &component,
                 &removed,
-                &added_for_bridge,
+                &all_candidates_for_bridge,
                 &sd.old_css_modifiers,
                 &sd.new_css_modifiers,
+                &sd.old_css_property_targets,
+                &sd.new_css_property_targets,
             );
             if !css_bridge_hints.is_empty() {
                 tracing::debug!(
@@ -3455,15 +3749,24 @@ fn generate_prop_value_conformance_rules(
                         }
                     } else {
                         // Partial replacement: each removed value independently
-                        // picks its best match. Unlike prop renames, multiple
+                        // picks its best match among ADDED values only. Multiple
                         // removed values CAN map to the same new value (e.g.,
                         // 'dark' and 'darker' both → 'secondary').
                         //
-                        // Priority: added values first (threshold 0.3), then
-                        // surviving values as fallback (threshold 0.2).
-                        // (TC021: light-200→secondary, TC067: light→default)
+                        // Surviving values are NOT matched via string similarity.
+                        // A surviving value that existed in both v5 and v6 is a
+                        // distinct concept, not a rename target. Using string
+                        // similarity on survivors produced false matches:
+                        //   Nav.variant: tertiary → horizontal (wrong, should be horizontal-subnav)
+                        //   PageSection.type: nav → subnav (wrong, should be removed)
+                        //   Label.color: cyan → orange (wrong, should be teal)
+                        //
+                        // Surviving values CAN still be matched via the CSS
+                        // modifier bridge (computed above), which compares actual
+                        // CSS property effects — a much stronger signal than
+                        // name similarity.
                         for rem in &removed {
-                            // Try added values first (with directional boost)
+                            // Try added values (with directional boost)
                             let best_added = added_values
                                 .iter()
                                 .filter(|a| {
@@ -3476,35 +3779,23 @@ fn generate_prop_value_conformance_rules(
                                         + directional_similarity_boost(rem, a);
                                     let sb = semver_analyzer_core::diff::name_similarity(rem, b)
                                         + directional_similarity_boost(rem, b);
+                                    let da = directional_similarity_boost(rem, a) > 0.0;
+                                    let db = directional_similarity_boost(rem, b) > 0.0;
                                     sa.partial_cmp(&sb)
                                         .unwrap_or(std::cmp::Ordering::Equal)
+                                        .then(da.cmp(&db)) // tiebreaker: prefer directional match
                                 });
 
                             if let Some(add) = best_added {
                                 hints.insert(rem.to_string(), add.to_string());
-                            } else {
-                                // Fallback: surviving values (lower threshold, no
-                                // directional boost — survivors kept their names)
-                                let best_surv = surviving
-                                    .iter()
-                                    .filter(|s| {
-                                        semver_analyzer_core::diff::name_similarity(rem, s)
-                                            >= 0.2
-                                    })
-                                    .max_by(|a, b| {
-                                        let sa = semver_analyzer_core::diff::name_similarity(
-                                            rem, a,
-                                        );
-                                        let sb = semver_analyzer_core::diff::name_similarity(
-                                            rem, b,
-                                        );
-                                        sa.partial_cmp(&sb)
-                                            .unwrap_or(std::cmp::Ordering::Equal)
-                                    });
-                                if let Some(surv) = best_surv {
-                                    hints.insert(rem.to_string(), surv.to_string());
-                                }
                             }
+                            // No surviving-value string similarity fallback.
+                            // The CSS bridge (computed above with both added and
+                            // surviving candidates) provides evidence-based
+                            // surviving-value matching where CSS data is available.
+                            // When neither CSS bridge nor added-value string
+                            // matching produces a hint, the rule emits
+                            // "Valid values: ..." and the LLM handles the mapping.
                         }
                     }
 
@@ -9469,6 +9760,11 @@ mod tests {
     // Each test corresponds to a failing TC from the PF6 migration bench.
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Helper: empty CssPropertyTargetMap for tests that don't need CSS targets.
+    fn empty_targets() -> crate::sd_types::CssPropertyTargetMap {
+        HashMap::new()
+    }
+
     /// Helper: build a minimal AnalysisReport for testing rule generators
     /// that need a report (like generate_prop_value_conformance_rules).
     fn build_test_report(
@@ -9574,9 +9870,11 @@ mod tests {
             "TC021: no-background should map to secondary (sim=0.308)"
         );
 
-        // Find the rule for "light-200" → maps to "default" (surviving value
-        // fallback, since light-200 has 0.0 similarity to all added values).
-        // This is better than the old behavior of no suggestion at all.
+        // Find the rule for "light-200" → no replacement from string similarity.
+        // The surviving-value fallback was removed because it produced false
+        // matches. Without CSS modifier data in this test, light-200 has no
+        // hint. The CSS bridge (when populated with real data) or the LLM
+        // will handle this mapping correctly.
         let light200_rule = rules
             .iter()
             .find(|r| r.rule_id.contains("light-200"))
@@ -9586,8 +9884,10 @@ mod tests {
             .as_ref()
             .and_then(|s| s.replacement.as_ref());
         assert!(
-            light200_repl.is_some(),
-            "TC021: light-200 should have a replacement suggestion"
+            light200_repl.is_none(),
+            "TC021: light-200 should NOT have a replacement from string similarity \
+             (surviving-value fallback removed). Got: {:?}",
+            light200_repl,
         );
     }
 
@@ -9663,21 +9963,24 @@ mod tests {
             );
         }
 
-        // Find the rule for "light" — should NOT map to "secondary"
+        // Find the rule for "light" — should have NO replacement (no string
+        // similarity fallback to surviving values). Without CSS modifier data,
+        // the rule emits "Valid values: ..." and the LLM handles the mapping.
+        // In PF5 'light' was the standard appearance → PF6 'default', but this
+        // semantic relationship can only be established via CSS evidence or LLM
+        // reasoning, not string similarity ("light" vs "default" = 0.29).
         let light_rule = rules.iter().find(|r| r.rule_id.contains("light"));
         if let Some(rule) = light_rule {
             let replacement = rule
                 .fix_strategy
                 .as_ref()
                 .and_then(|s| s.replacement.as_ref());
-            // Light should map to "default" (the surviving neutral value).
-            // "light" was the standard/neutral appearance in v5, which is
-            // what "default" means in v6.
             assert_eq!(
                 replacement.map(|s| s.as_str()),
-                Some("default"),
-                "TC067: light should map to surviving value 'default', not 'secondary'. \
-                 In PF5, 'light' was the standard appearance; in PF6, 'default' is."
+                None,
+                "TC067: light should NOT have a replacement from string similarity \
+                 (surviving-value fallback removed). The LLM will infer \
+                 light→default from the 'Valid values' list."
             );
         }
     }
@@ -10007,10 +10310,16 @@ mod tests {
         let darker_repl = darker_rule.fix_strategy.as_ref().and_then(|s| s.replacement.as_ref());
         assert_eq!(darker_repl.map(|s| s.as_str()), Some("secondary"));
 
-        // light → default (surviving fallback, 0.286≥0.2)
+        // light → no replacement (surviving-value fallback removed).
+        // Without CSS modifier data, light has no mapping. The LLM will
+        // infer light→default from the "Valid values" list.
         let light_rule = ps_rules.iter().find(|r| r.rule_id.ends_with("-light")).unwrap();
         let light_repl = light_rule.fix_strategy.as_ref().and_then(|s| s.replacement.as_ref());
-        assert_eq!(light_repl.map(|s| s.as_str()), Some("default"));
+        assert_eq!(
+            light_repl.map(|s| s.as_str()),
+            None,
+            "light should have no replacement (surviving-value fallback removed)"
+        );
     }
 
     /// ToolbarGroup.variant: partial replacement (action-group etc. survive).
@@ -10303,6 +10612,7 @@ mod tests {
         let hints = compute_css_modifier_bridge(
             "Nav", &removed_refs, &added_refs,
             &old_mods, &new_mods,
+            &empty_targets(), &empty_targets(),
         );
 
         // Bridge correctly returns empty when structures are too different.
@@ -10381,6 +10691,7 @@ mod tests {
         let hints = compute_css_modifier_bridge(
             "Label", &removed_refs, &added_refs,
             &old_mods, &new_mods,
+            &empty_targets(), &empty_targets(),
         );
 
         // NOTE: With Phase 1 structural matching, ALL v6 color modifiers have
@@ -10556,15 +10867,16 @@ mod tests {
         ] {
             yellow.custom_property_overrides.insert(k.into(), v.into());
         }
+        // Real PF v6 resolved values from pipeline report (exact hex values)
         for (k, v) in [
-            ("--pf-v6-c-label--BackgroundColor", "#f9e0a2"),       // warm yellow
+            ("--pf-v6-c-label--BackgroundColor", "#ffe072"),       // yellow bg (H≈47°)
             ("--pf-v6-c-label--Color", "#151515"),
             ("--pf-v6-c-label__icon--Color", "#1f1f1f"),
-            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#f4c145"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#ffcc17"),
             ("--pf-v6-c-label--m-clickable--hover--Color", "#151515"),
             ("--pf-v6-c-label--m-clickable--hover__icon--Color", "#1f1f1f"),
-            ("--pf-v6-c-label--m-outline--BorderColor", "#f4c145"),
-            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#c58c00"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#ffcc17"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#dca614"),
         ] {
             yellow.resolved_overrides.insert(k.into(), v.into());
         }
@@ -10584,15 +10896,16 @@ mod tests {
         ] {
             orangered.custom_property_overrides.insert(k.into(), v.into());
         }
+        // Real PF v6 resolved values from pipeline report (exact hex values)
         for (k, v) in [
-            ("--pf-v6-c-label--BackgroundColor", "#f4b678"),       // warm orange
+            ("--pf-v6-c-label--BackgroundColor", "#fbbea8"),       // orangered bg (H≈16°)
             ("--pf-v6-c-label--Color", "#151515"),
             ("--pf-v6-c-label__icon--Color", "#1f1f1f"),
-            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#ef9234"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#f89b78"),
             ("--pf-v6-c-label--m-clickable--hover--Color", "#151515"),
             ("--pf-v6-c-label--m-clickable--hover__icon--Color", "#1f1f1f"),
-            ("--pf-v6-c-label--m-outline--BorderColor", "#ef9234"),
-            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#8f4700"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#f89b78"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#f4784a"),
         ] {
             orangered.resolved_overrides.insert(k.into(), v.into());
         }
@@ -10605,15 +10918,49 @@ mod tests {
         let removed_refs: Vec<&String> = removed.iter().collect();
         let added_refs: Vec<&String> = added.iter().collect();
 
+        // Target maps: trace custom properties to actual CSS properties.
+        // In real PF CSS, the base .pf-c-label rule has:
+        //   background-color: var(--pf-c-label--BackgroundColor)
+        //   color: var(--pf-c-label--Color) or var(--pf-c-label__content--Color)
+        //   .icon { color: var(--pf-c-label__icon--Color) }
+        //   border-color: var(--pf-c-label__content--before--BorderColor) etc.
+        let mut old_targets = crate::sd_types::CssPropertyTargetMap::new();
+        old_targets.insert("--pf-v5-c-label--BackgroundColor".into(), "background-color".into());
+        old_targets.insert("--pf-v5-c-label__content--Color".into(), "color".into());
+        old_targets.insert("--pf-v5-c-label__icon--Color".into(), "color".into());
+        old_targets.insert("--pf-v5-c-label__content--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label--m-outline__content--Color".into(), "color".into());
+        old_targets.insert("--pf-v5-c-label--m-outline__content--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label__content--link--hover--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label__content--link--focus--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label--m-editable__content--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label--m-editable__content--hover--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label--m-editable__content--focus--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label--m-outline__content--link--hover--before--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label--m-outline__content--link--focus--before--BorderColor".into(), "border-color".into());
+
+        let mut new_targets = crate::sd_types::CssPropertyTargetMap::new();
+        new_targets.insert("--pf-v6-c-label--BackgroundColor".into(), "background-color".into());
+        new_targets.insert("--pf-v6-c-label--Color".into(), "color".into());
+        new_targets.insert("--pf-v6-c-label__icon--Color".into(), "color".into());
+        new_targets.insert("--pf-v6-c-label--m-clickable--hover--BackgroundColor".into(), "background-color".into());
+        new_targets.insert("--pf-v6-c-label--m-clickable--hover--Color".into(), "color".into());
+        new_targets.insert("--pf-v6-c-label--m-clickable--hover__icon--Color".into(), "color".into());
+        new_targets.insert("--pf-v6-c-label--m-outline--BorderColor".into(), "border-color".into());
+        new_targets.insert("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor".into(), "border-color".into());
+
         let hints = compute_css_modifier_bridge(
             "Label", &removed_refs, &added_refs,
             &old_mods, &new_mods,
+            &old_targets, &new_targets,
         );
 
-        // Bag-of-colors: cyan's blue-green palette (#f2f9f9, #a2d9d9, #009596)
-        // is closest to teal's blue-green palette (#b9e5e5, #9ad8d8, #63bdbd).
-        // Gold's warm palette (#fdf7e7, #f9e0a2, #f0ab00) is closest to
-        // yellow's warm palette (#f9e0a2, #f4c145, #c58c00).
+        // CSS property comparison: both sides set background-color, color,
+        // and border-color. Comparing at matching CSS properties:
+        //   cyan bg #f2f9f9 vs teal bg #b9e5e5 → both blue-green → high similarity
+        //   cyan bg #f2f9f9 vs yellow bg #ffe072 → different hue → lower similarity
+        //   gold bg #fdf7e7 vs yellow bg #f9e0a2 → both warm → higher similarity
+        //   gold bg #fdf7e7 vs orangered bg #fbbea8 → warm vs salmon → lower similarity
         assert_eq!(
             hints.len(), 2,
             "Should produce 2 mappings. Got: {:?}", hints
@@ -10643,6 +10990,7 @@ mod tests {
         let hints = compute_css_modifier_bridge(
             "PageSection", &removed_refs, &added_refs,
             &empty, &empty,
+            &empty_targets(), &empty_targets(),
         );
 
         assert!(
@@ -10681,6 +11029,7 @@ mod tests {
         let hints = compute_css_modifier_bridge(
             "Comp", &removed_refs, &added_refs,
             &old_mods, &new_mods,
+            &empty_targets(), &empty_targets(),
         );
 
         assert!(
@@ -10835,22 +11184,32 @@ mod tests {
             "#7d1007".into(), // dark red text
         );
 
-        let sim_teal = modifier_resolved_similarity(&old, &new_teal);
-        let sim_red = modifier_resolved_similarity(&old, &new_red);
+        // Build target maps so resolved similarity can trace custom props → CSS props
+        let mut old_targets = crate::sd_types::CssPropertyTargetMap::new();
+        old_targets.insert("--pf-v5-c-label--BackgroundColor".into(), "background-color".into());
+        old_targets.insert("--pf-v5-c-label__icon--Color".into(), "color".into());
+        old_targets.insert("--pf-v5-c-label__content--Color".into(), "color".into());
+
+        let mut new_targets = crate::sd_types::CssPropertyTargetMap::new();
+        new_targets.insert("--pf-v6-c-label--BackgroundColor".into(), "background-color".into());
+        new_targets.insert("--pf-v6-c-label__icon--Color".into(), "color".into());
+        new_targets.insert("--pf-v6-c-label__content--Color".into(), "color".into());
+
+        let sim_teal = modifier_resolved_similarity(&old, &new_teal, &old_targets, &new_targets);
+        let sim_red = modifier_resolved_similarity(&old, &new_red, &old_targets, &new_targets);
 
         assert!(
             sim_teal > sim_red,
             "Multi-slot: cyan modifier should be closer to teal ({:.4}) than red ({:.4})",
             sim_teal, sim_red
         );
-        // Both should be > 0.0 since they share the same slots
+        // Both should be > 0.0 since they share CSS properties
         assert!(sim_teal > 0.5, "teal similarity should be high: {:.4}", sim_teal);
-        assert!(sim_red > 0.0, "red similarity should be > 0 (shared slots): {:.4}", sim_red);
+        assert!(sim_red > 0.0, "red similarity should be > 0 (shared CSS props): {:.4}", sim_red);
     }
 
-    /// Non-color resolved values (sizes, keywords) are ignored by the
-    /// bag-of-colors approach — only hex colors contribute to similarity.
-    /// Modifiers with only non-color values return 0.0 (no signal).
+    /// Non-color resolved values (sizes, keywords) don't produce hex colors,
+    /// so the CSS-property-based comparison returns 0.0 for them.
     #[test]
     fn test_resolved_similarity_non_color_values_ignored() {
         use crate::sd_types::CssModifierEffect;
@@ -10867,7 +11226,13 @@ mod tests {
             "16px".into(),
         );
 
-        let sim = modifier_resolved_similarity(&old, &new_same);
+        // Target maps exist but values aren't hex colors
+        let mut old_targets = crate::sd_types::CssPropertyTargetMap::new();
+        old_targets.insert("--pf-v5-c-comp--FontSize".into(), "font-size".into());
+        let mut new_targets = crate::sd_types::CssPropertyTargetMap::new();
+        new_targets.insert("--pf-v6-c-comp--FontSize".into(), "font-size".into());
+
+        let sim = modifier_resolved_similarity(&old, &new_same, &old_targets, &new_targets);
         assert!(
             sim.abs() < f64::EPSILON,
             "Non-color values should give 0.0 (no parseable hex colors): {:.4}", sim
@@ -11722,5 +12087,1036 @@ mod tests {
         let change = &report.changes[0].breaking_api_changes[0];
         assert_eq!(change.change, ApiChangeType::Removed);
         assert!(change.symbol.contains("hasNavLinkWrapper"));
+    }
+
+    // ── Integration tests: surviving-value fallback removal ──────────
+
+    /// TC051/TC060: Nav.variant "tertiary" should NOT map to "horizontal".
+    /// Old: 'default' | 'horizontal' | 'tertiary' | 'horizontal-subnav'
+    /// New: 'default' | 'horizontal' | 'horizontal-subnav'
+    /// Removed: tertiary. Added: none. Surviving: default, horizontal, horizontal-subnav.
+    ///
+    /// With the surviving-value fallback removed, "tertiary" should have
+    /// NO replacement (previously mapped to "horizontal" via string similarity
+    /// 0.30 >= 0.2 threshold). The rule should say "Valid values: ..." and
+    /// the LLM will correctly choose "horizontal-subnav".
+    #[test]
+    fn test_nav_variant_tertiary_no_surviving_fallback() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Nav.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'horizontal' | 'tertiary' | 'horizontal-subnav'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Nav".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have exactly 1 rule for "tertiary"
+        let tertiary_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("tertiary"))
+            .expect("TC051: Should have a rule for removed value 'tertiary'");
+
+        let replacement = tertiary_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            None,
+            "TC051: tertiary should NOT map to any surviving value. \
+             Previously mapped to 'horizontal' (sim=0.30), but the correct \
+             replacement is 'horizontal-subnav' which requires LLM reasoning. \
+             Got: {:?}",
+            replacement
+        );
+
+        // Verify the rule message lists valid values
+        assert!(
+            tertiary_rule.message.contains("horizontal-subnav"),
+            "TC051: Rule message should list 'horizontal-subnav' as a valid value"
+        );
+    }
+
+    /// TC051/TC060: Nav.variant "tertiary" should NOT map to "horizontal"
+    /// even when real CSS modifier data is available.
+    ///
+    /// Uses real PF v5/v6 CSS data: tertiary (29 custom property overrides)
+    /// vs surviving candidates horizontal-subnav (9 overrides, restructured
+    /// token naming). The CSS bridge should return no match because the
+    /// structures are too different between v5 and v6.
+    #[test]
+    fn test_nav_variant_tertiary_no_match_with_real_css_data() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+        use semver_analyzer_core::*;
+
+        // Build CSS data from real PF data
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_nav = CssModifierMap::new();
+
+        // Real PF v5 pf-m-tertiary data (key properties only - representative subset)
+        let mut tertiary = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v5-c-nav__link--BackgroundColor",
+            "--pf-v5-c-nav__link--Color",
+            "--pf-v5-c-nav__link--PaddingBottom",
+            "--pf-v5-c-nav__link--PaddingLeft",
+            "--pf-v5-c-nav__link--PaddingRight",
+            "--pf-v5-c-nav__link--PaddingTop",
+            "--pf-v5-c-nav__link--Left",
+            "--pf-v5-c-nav__link--Right",
+            "--pf-v5-c-nav__link--hover--BackgroundColor",
+            "--pf-v5-c-nav__link--hover--Color",
+            "--pf-v5-c-nav__link--active--BackgroundColor",
+            "--pf-v5-c-nav__link--active--Color",
+            "--pf-v5-c-nav__link--before--BorderColor",
+            "--pf-v5-c-nav__link--before--BorderBottomWidth",
+            "--pf-v5-c-nav__scroll-button--Color",
+        ] {
+            tertiary
+                .custom_property_overrides
+                .insert(prop.to_string(), format!("var(--pf-v5-c-nav--m-tertiary-override)"));
+        }
+        tertiary
+            .direct_properties
+            .insert("display".into(), "flex".into());
+        tertiary
+            .direct_properties
+            .insert("overflow".into(), "hidden".into());
+        old_nav.insert("pf-m-tertiary".into(), tertiary);
+
+        // Real PF v5 pf-m-horizontal data
+        let mut horizontal = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v5-c-nav__link--BackgroundColor",
+            "--pf-v5-c-nav__link--Color",
+            "--pf-v5-c-nav__link--PaddingBottom",
+            "--pf-v5-c-nav__link--PaddingLeft",
+            "--pf-v5-c-nav__link--PaddingRight",
+            "--pf-v5-c-nav__link--PaddingTop",
+            "--pf-v5-c-nav__link--Left",
+            "--pf-v5-c-nav__link--Right",
+        ] {
+            horizontal
+                .custom_property_overrides
+                .insert(prop.to_string(), format!("var(--pf-v5-c-nav--m-horizontal-override)"));
+        }
+        horizontal
+            .direct_properties
+            .insert("display".into(), "flex".into());
+        old_nav.insert("pf-m-horizontal".into(), horizontal);
+
+        // Real PF v5 pf-m-horizontal-subnav data (similar to tertiary)
+        let mut h_subnav_old = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v5-c-nav__link--BackgroundColor",
+            "--pf-v5-c-nav__link--Color",
+            "--pf-v5-c-nav__link--FontSize",
+            "--pf-v5-c-nav__link--PaddingBottom",
+            "--pf-v5-c-nav__link--PaddingLeft",
+            "--pf-v5-c-nav__link--PaddingRight",
+            "--pf-v5-c-nav__link--PaddingTop",
+            "--pf-v5-c-nav__link--Left",
+            "--pf-v5-c-nav__link--Right",
+        ] {
+            h_subnav_old
+                .custom_property_overrides
+                .insert(prop.to_string(), format!("var(--pf-v5-c-nav--m-horizontal-subnav-override)"));
+        }
+        old_nav.insert("pf-m-horizontal-subnav".into(), h_subnav_old);
+        old_mods.insert("nav".into(), old_nav);
+
+        // v6 CSS data: completely restructured token naming
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_nav = CssModifierMap::new();
+
+        // Real PF v6 pf-m-subnav data (replaces tertiary/horizontal-subnav)
+        let mut subnav = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v6-c-nav--BackgroundColor",
+            "--pf-v6-c-nav--m-horizontal--m-scrollable__list--PaddingInlineEnd",
+            "--pf-v6-c-nav--m-horizontal--m-scrollable__list--PaddingInlineStart",
+            "--pf-v6-c-nav--m-horizontal__list--PaddingBlockEnd",
+            "--pf-v6-c-nav--m-horizontal__list--PaddingBlockStart",
+            "--pf-v6-c-nav--m-horizontal__list--PaddingInlineEnd",
+            "--pf-v6-c-nav--m-horizontal__list--PaddingInlineStart",
+            "--pf-v6-c-nav__link--PaddingBlockEnd",
+            "--pf-v6-c-nav__link--PaddingBlockStart",
+        ] {
+            subnav
+                .custom_property_overrides
+                .insert(prop.to_string(), format!("var(--pf-v6-c-nav-subnav-override)"));
+        }
+        subnav
+            .direct_properties
+            .insert("border".into(), "var(--pf-v6-c-nav--m-horizontal--m-subnav--BorderWidth) solid var(--pf-v6-c-nav--m-horizontal--m-subnav--BorderColor)".into());
+        new_nav.insert("pf-m-subnav".into(), subnav);
+        new_mods.insert("nav".into(), new_nav);
+
+        // Build report
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Nav.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'horizontal' | 'tertiary' | 'horizontal-subnav'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Nav".into(), "@patternfly/react-core".into());
+        sd.old_css_modifiers = old_mods;
+        sd.new_css_modifiers = new_mods;
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        let tertiary_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("tertiary"))
+            .expect("Should have a rule for 'tertiary'");
+
+        let replacement = tertiary_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+
+        // Even with CSS data, tertiary should NOT match any surviving value
+        // because the v5→v6 CSS restructuring made the structures incomparable.
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            None,
+            "TC051: tertiary should have no replacement even with CSS data. \
+             The v5→v6 token restructuring makes structural comparison fail. \
+             Got: {:?}",
+            replacement
+        );
+    }
+
+    /// TC065: PageSection.type "nav" should NOT map to "subnav".
+    /// Old: 'default' | 'nav' | 'subnav' | 'wizard' | 'breadcrumb' | 'tabs'
+    /// New: 'default' | 'subnav' | 'wizard' | 'breadcrumb' | 'tabs'
+    /// Removed: nav. Added: none. Surviving includes subnav.
+    ///
+    /// The surviving-value fallback previously mapped "nav" → "subnav"
+    /// (name_similarity 0.50 >= 0.2). The correct fix is to remove the
+    /// type prop entirely, not rename its value.
+    #[test]
+    fn test_pagesection_type_nav_no_surviving_fallback() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/PageSection.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "PageSectionProps.type".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: type: 'default' | 'nav' | 'subnav' | 'wizard' | 'breadcrumb' | 'tabs'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: type: 'default' | 'subnav' | 'wizard' | 'breadcrumb' | 'tabs'"
+                        .into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        let nav_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("-nav"))
+            .expect("TC065: Should have a rule for removed value 'nav'");
+
+        let replacement = nav_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            None,
+            "TC065: 'nav' should NOT map to 'subnav' (a surviving value). \
+             The correct fix is to remove the type prop entirely. \
+             Got: {:?}",
+            replacement
+        );
+
+        // Verify the rule message lists valid values for LLM guidance
+        assert!(
+            nav_rule.message.contains("subnav"),
+            "TC065: Rule message should list 'subnav' among valid values"
+        );
+    }
+
+    /// TC014: Label.color "cyan" should map to "teal" and "gold" to "yellow"
+    /// via the CSS modifier bridge with real PF data.
+    ///
+    /// Old: blue | cyan | green | grey | gold | orange | purple | red
+    /// New: blue | green | grey | orange | purple | red | teal | yellow
+    /// Removed: cyan, gold. Added: teal, yellow (+ orangered).
+    ///
+    /// The CSS bridge compares modifier effects and should produce:
+    ///   cyan → teal (similar background colors: #e0f5f5 → #daf2f2)
+    ///   gold → yellow (similar background colors: #fdf7e7 → #fff4cc)
+    ///
+    /// Previously these fell through to surviving-value fallback and got
+    /// wrong mappings: cyan→orange, gold→red.
+    #[test]
+    fn test_label_color_css_bridge_with_real_data() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+        use semver_analyzer_core::*;
+
+        // ── Build real PF CSS modifier data ──
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_label = CssModifierMap::new();
+
+        // Real PF v5 pf-m-cyan (13 overrides with resolved hex values)
+        let mut cyan = CssModifierEffect::default();
+        let cyan_overrides = vec![
+            ("--pf-v5-c-label--BackgroundColor", "#f2f9f9"),
+            ("--pf-v5-c-label--BorderColor", "#009596"),
+            ("--pf-v5-c-label__icon--Color", "#009596"),
+            ("--pf-v5-c-label__content--Color", "#003737"),
+            ("--pf-v5-c-label__content--link--Color", "#003737"),
+            ("--pf-v5-c-label__content--link--hover--Color", "#003737"),
+            ("--pf-v5-c-label__content--link--focus--Color", "#003737"),
+            ("--pf-v5-c-label--m-outline--BorderColor", "#009596"),
+            ("--pf-v5-c-label--m-outline__content--Color", "#005f60"),
+            ("--pf-v5-c-label--m-outline__content--link--hover--Color", "#005f60"),
+            ("--pf-v5-c-label--m-outline__content--link--focus--Color", "#005f60"),
+            ("--pf-v5-c-label--m-outline--m-editable__content--before--BorderColor", "#009596"),
+            ("--pf-v5-c-label--m-editable-active__content--before--BorderColor", "#d2d2d2"),
+        ];
+        for (k, v) in &cyan_overrides {
+            cyan.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v5-c-label--m-cyan-val)"));
+            cyan.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        old_label.insert("pf-m-cyan".into(), cyan);
+
+        // Real PF v5 pf-m-gold
+        let mut gold = CssModifierEffect::default();
+        let gold_overrides = vec![
+            ("--pf-v5-c-label--BackgroundColor", "#fdf7e7"),
+            ("--pf-v5-c-label--BorderColor", "#f0ab00"),
+            ("--pf-v5-c-label__icon--Color", "#f0ab00"),
+            ("--pf-v5-c-label__content--Color", "#795600"),
+            ("--pf-v5-c-label__content--link--Color", "#795600"),
+            ("--pf-v5-c-label__content--link--hover--Color", "#795600"),
+            ("--pf-v5-c-label__content--link--focus--Color", "#795600"),
+            ("--pf-v5-c-label--m-outline--BorderColor", "#f0ab00"),
+            ("--pf-v5-c-label--m-outline__content--Color", "#c58c00"),
+            ("--pf-v5-c-label--m-outline__content--link--hover--Color", "#c58c00"),
+            ("--pf-v5-c-label--m-outline__content--link--focus--Color", "#c58c00"),
+            ("--pf-v5-c-label--m-outline--m-editable__content--before--BorderColor", "#f0ab00"),
+            ("--pf-v5-c-label--m-editable-active__content--before--BorderColor", "#d2d2d2"),
+        ];
+        for (k, v) in &gold_overrides {
+            gold.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v5-c-label--m-gold-val)"));
+            gold.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        old_label.insert("pf-m-gold".into(), gold);
+        old_mods.insert("label".into(), old_label);
+
+        // Real PF v6 data
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_label = CssModifierMap::new();
+
+        // Real PF v6 pf-m-teal (8 overrides)
+        let mut teal = CssModifierEffect::default();
+        let teal_overrides = vec![
+            ("--pf-v6-c-label--BackgroundColor", "#daf2f2"),
+            ("--pf-v6-c-label--BorderColor", "#63bdbd"),
+            ("--pf-v6-c-label__icon--Color", "#63bdbd"),
+            ("--pf-v6-c-label__content--Color", "#151515"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#9ad8d8"),
+            ("--pf-v6-c-label--m-outline__content--Color", "#151515"),
+            ("--pf-v6-c-label--m-outline--BackgroundColor", "#b9e5e5"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#1f1f1f"),
+        ];
+        for (k, v) in &teal_overrides {
+            teal.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v6-c-label--m-teal-val)"));
+            teal.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        new_label.insert("pf-m-teal".into(), teal);
+
+        // Real PF v6 pf-m-yellow (8 overrides)
+        let mut yellow = CssModifierEffect::default();
+        let yellow_overrides = vec![
+            ("--pf-v6-c-label--BackgroundColor", "#fff4cc"),
+            ("--pf-v6-c-label--BorderColor", "#dca614"),
+            ("--pf-v6-c-label__icon--Color", "#dca614"),
+            ("--pf-v6-c-label__content--Color", "#151515"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#ffcc17"),
+            ("--pf-v6-c-label--m-outline__content--Color", "#151515"),
+            ("--pf-v6-c-label--m-outline--BackgroundColor", "#ffe072"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#1f1f1f"),
+        ];
+        for (k, v) in &yellow_overrides {
+            yellow.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v6-c-label--m-yellow-val)"));
+            yellow.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        new_label.insert("pf-m-yellow".into(), yellow);
+
+        // Real PF v6 pf-m-orangered (8 overrides, for disambiguation)
+        let mut orangered = CssModifierEffect::default();
+        let orangered_overrides = vec![
+            ("--pf-v6-c-label--BackgroundColor", "#fce8e8"),
+            ("--pf-v6-c-label--BorderColor", "#f4784a"),
+            ("--pf-v6-c-label__icon--Color", "#f4784a"),
+            ("--pf-v6-c-label__content--Color", "#151515"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#f89b78"),
+            ("--pf-v6-c-label--m-outline__content--Color", "#151515"),
+            ("--pf-v6-c-label--m-outline--BackgroundColor", "#fbbea8"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#1f1f1f"),
+        ];
+        for (k, v) in &orangered_overrides {
+            orangered.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v6-c-label--m-orangered-val)"));
+            orangered.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        new_label.insert("pf-m-orangered".into(), orangered);
+
+        // Also need surviving colors that exist in both v5 and v6 (orange, red)
+        // to verify they are NOT incorrectly matched
+        let mut orange_new = CssModifierEffect::default();
+        let orange_new_overrides = vec![
+            ("--pf-v6-c-label--BackgroundColor", "#fff3e8"),
+            ("--pf-v6-c-label--BorderColor", "#ef6518"),
+            ("--pf-v6-c-label__icon--Color", "#ef6518"),
+            ("--pf-v6-c-label__content--Color", "#151515"),
+        ];
+        for (k, v) in &orange_new_overrides {
+            orange_new.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v6-c-label--m-orange-val)"));
+            orange_new.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        new_label.insert("pf-m-orange".into(), orange_new);
+
+        let mut red_new = CssModifierEffect::default();
+        let red_new_overrides = vec![
+            ("--pf-v6-c-label--BackgroundColor", "#fce8e8"),
+            ("--pf-v6-c-label--BorderColor", "#c9190b"),
+            ("--pf-v6-c-label__icon--Color", "#c9190b"),
+            ("--pf-v6-c-label__content--Color", "#151515"),
+        ];
+        for (k, v) in &red_new_overrides {
+            red_new.custom_property_overrides.insert(k.to_string(), format!("var(--pf-v6-c-label--m-red-val)"));
+            red_new.resolved_overrides.insert(k.to_string(), v.to_string());
+        }
+        new_label.insert("pf-m-red".into(), red_new);
+
+        new_mods.insert("label".into(), new_label);
+
+        // CssPropertyTargetMap: map custom property tokens to CSS properties
+        let mut old_targets = crate::sd_types::CssPropertyTargetMap::new();
+        old_targets.insert("--pf-v5-c-label--BackgroundColor".into(), "background-color".into());
+        old_targets.insert("--pf-v5-c-label--BorderColor".into(), "border-color".into());
+        old_targets.insert("--pf-v5-c-label__icon--Color".into(), "color".into());
+        old_targets.insert("--pf-v5-c-label__content--Color".into(), "color".into());
+
+        let mut new_targets = crate::sd_types::CssPropertyTargetMap::new();
+        new_targets.insert("--pf-v6-c-label--BackgroundColor".into(), "background-color".into());
+        new_targets.insert("--pf-v6-c-label--BorderColor".into(), "border-color".into());
+        new_targets.insert("--pf-v6-c-label__icon--Color".into(), "color".into());
+        new_targets.insert("--pf-v6-c-label__content--Color".into(), "color".into());
+
+        // Build report
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Label.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "LabelProps.color".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: color: 'blue' | 'cyan' | 'green' | 'grey' | 'gold' | 'orange' | 'purple' | 'red'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: color: 'blue' | 'green' | 'grey' | 'orange' | 'purple' | 'red' | 'teal' | 'yellow' | 'orangered'"
+                        .into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Label".into(), "@patternfly/react-core".into());
+        sd.old_css_modifiers = old_mods;
+        sd.new_css_modifiers = new_mods;
+        sd.old_css_property_targets = old_targets;
+        sd.new_css_property_targets = new_targets;
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Find cyan rule
+        let cyan_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("cyan"))
+            .expect("TC014: Should have a rule for removed value 'cyan'");
+        let cyan_repl = cyan_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            cyan_repl.map(|s| s.as_str()),
+            Some("teal"),
+            "TC014: cyan should map to teal via CSS bridge (similar background colors). \
+             Previously mapped to orange (surviving-value fallback). Got: {:?}",
+            cyan_repl
+        );
+
+        // Find gold rule
+        let gold_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("gold"))
+            .expect("TC014: Should have a rule for removed value 'gold'");
+        let gold_repl = gold_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            gold_repl.map(|s| s.as_str()),
+            Some("yellow"),
+            "TC014: gold should map to yellow via CSS bridge (similar background colors). \
+             Previously mapped to red (surviving-value fallback). Got: {:?}",
+            gold_repl
+        );
+    }
+
+    /// TC020: DrawerContent.colorVariant "light-200" should map to "secondary"
+    /// (not "default") via the CSS modifier bridge with real PF data.
+    ///
+    /// Real data: both light-200 and secondary override the same 3 token
+    /// slots (content, panel, section BackgroundColor) with similar colors
+    /// (#f0f0f0 → #f2f2f2). "primary" only overrides content (#fff).
+    ///
+    /// Previously mapped to "default" via surviving-value string similarity
+    /// (0.22 >= 0.2). Now uses CSS bridge with surviving values included.
+    #[test]
+    fn test_drawer_colorvariant_css_bridge_with_real_data() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+        use semver_analyzer_core::*;
+
+        // Real PF CSS modifier data for Drawer
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_drawer = CssModifierMap::new();
+
+        // pf-m-light-200 (v5): 3 BackgroundColor overrides, all #f0f0f0
+        let mut light200 = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v5-c-drawer__content--BackgroundColor",
+            "--pf-v5-c-drawer__panel--BackgroundColor",
+            "--pf-v5-c-drawer__section--BackgroundColor",
+        ] {
+            light200.custom_property_overrides.insert(
+                prop.to_string(),
+                format!("var(--pf-v5-c-drawer--m-light-200-val)"),
+            );
+            light200
+                .resolved_overrides
+                .insert(prop.to_string(), "#f0f0f0".into());
+        }
+        old_drawer.insert("pf-m-light-200".into(), light200);
+
+        // pf-m-no-background (v5): 3 BackgroundColor overrides, all transparent
+        let mut nobg = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v5-c-drawer__content--BackgroundColor",
+            "--pf-v5-c-drawer__panel--BackgroundColor",
+            "--pf-v5-c-drawer__section--BackgroundColor",
+        ] {
+            nobg.custom_property_overrides
+                .insert(prop.to_string(), "transparent".into());
+            nobg.resolved_overrides
+                .insert(prop.to_string(), "transparent".into());
+        }
+        old_drawer.insert("pf-m-no-background".into(), nobg);
+        old_mods.insert("drawer".into(), old_drawer);
+
+        // v6 CSS data
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_drawer = CssModifierMap::new();
+
+        // pf-m-primary (v6): 1 BackgroundColor override, #fff
+        let mut primary = CssModifierEffect::default();
+        primary.custom_property_overrides.insert(
+            "--pf-v6-c-drawer__content--BackgroundColor".into(),
+            "var(--pf-v6-c-drawer__content--m-primary--BackgroundColor)".into(),
+        );
+        primary
+            .resolved_overrides
+            .insert("--pf-v6-c-drawer__content--BackgroundColor".into(), "#fff".into());
+        new_drawer.insert("pf-m-primary".into(), primary);
+
+        // pf-m-secondary (v6): 3 BackgroundColor overrides, all #f2f2f2
+        let mut secondary = CssModifierEffect::default();
+        for prop in &[
+            "--pf-v6-c-drawer__content--BackgroundColor",
+            "--pf-v6-c-drawer__panel--BackgroundColor",
+            "--pf-v6-c-drawer__section--BackgroundColor",
+        ] {
+            secondary.custom_property_overrides.insert(
+                prop.to_string(),
+                format!("var(--pf-v6-c-drawer--m-secondary-val)"),
+            );
+            secondary
+                .resolved_overrides
+                .insert(prop.to_string(), "#f2f2f2".into());
+        }
+        new_drawer.insert("pf-m-secondary".into(), secondary);
+        new_mods.insert("drawer".into(), new_drawer);
+
+        // Build report
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/DrawerContent.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "DrawerContentProps.colorVariant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: colorVariant: 'default' | 'light-200' | 'no-background'".into(),
+                ),
+                after: Some(
+                    "property: colorVariant: 'default' | 'primary' | 'secondary'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("DrawerContent".into(), "@patternfly/react-core".into());
+        sd.old_css_modifiers = old_mods;
+        sd.new_css_modifiers = new_mods;
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // no-background should still map to an added value (primary or secondary)
+        // via string similarity: no-background → secondary (0.308 >= 0.3)
+        let nobg_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("no-background") || r.rule_id.contains("no_background"))
+            .expect("TC020: Should have a rule for 'no-background'");
+        let nobg_repl = nobg_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            nobg_repl.map(|s| s.as_str()),
+            Some("secondary"),
+            "TC020: no-background should map to secondary (added value, sim=0.308)"
+        );
+
+        // light-200 should map to secondary via CSS bridge:
+        // Both override the same 3 token slots with similar hex colors
+        // (#f0f0f0 → #f2f2f2). CSS structural similarity is high.
+        // Previously mapped to "default" (surviving-value string sim 0.22).
+        let light200_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("light-200"))
+            .expect("TC020: Should have a rule for 'light-200'");
+        let light200_repl = light200_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            light200_repl.map(|s| s.as_str()),
+            Some("secondary"),
+             "TC020: light-200 should map to secondary via CSS bridge \
+             (same 3 BackgroundColor slots, #f0f0f0 → #f2f2f2). \
+             Previously mapped to 'default' via surviving-value string sim. \
+             Got: {:?}",
+            light200_repl
+        );
+    }
+
+    // ── Appearance default inference tests ────────────────────────────
+
+    /// TC012: Generic appearance inference for Chip → Label.
+    ///
+    /// Chip has CSS modifiers: pf-m-overflow, pf-m-draggable (no pf-m-outline).
+    /// Label has CSS modifiers: pf-m-outline, pf-m-overflow, pf-m-add, etc.
+    /// Label's `variant` prop has values: 'outline' | 'filled' | 'overflow' | 'add'
+    ///
+    /// The algorithm should detect:
+    /// - pf-m-overflow exists on BOTH → not the default
+    /// - pf-m-outline exists on Label only → candidate default for Chip
+    /// - pf-m-filled: no CSS modifier for "filled" on either → not detectable
+    /// - pf-m-add exists on Label only → candidate, but "outline" is more likely
+    ///
+    /// Since pf-m-outline and pf-m-add are both candidates, the algorithm
+    /// should list them. In practice, the LLM picks "outline" because Chip
+    /// visually looks like an outlined label.
+    #[test]
+    fn test_appearance_inference_chip_to_label() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        // Old component: Chip (BEM block "chip")
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_chip = CssModifierMap::new();
+        // Real PF v5 Chip modifiers (only 2)
+        old_chip.insert("pf-m-overflow".into(), CssModifierEffect::default());
+        old_chip.insert("pf-m-draggable".into(), CssModifierEffect::default());
+        old_mods.insert("chip".into(), old_chip);
+
+        // New component: Label (BEM block "label")
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_label = CssModifierMap::new();
+        // Real PF v6 Label modifiers (subset relevant to variant prop)
+        new_label.insert("pf-m-outline".into(), CssModifierEffect::default());
+        new_label.insert("pf-m-overflow".into(), CssModifierEffect::default());
+        new_label.insert("pf-m-add".into(), CssModifierEffect::default());
+        new_label.insert("pf-m-compact".into(), CssModifierEffect::default());
+        new_label.insert("pf-m-editable".into(), CssModifierEffect::default());
+        new_mods.insert("label".into(), new_label);
+
+        // Old types (Chip props): no variant prop
+        let old_types: BTreeMap<String, String> = [
+            ("closeBtnAriaLabel".to_string(), "string".to_string()),
+            ("onClick".to_string(), "(e: React.MouseEvent) => void".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        // New types (Label props): has variant prop with union string type
+        let new_types: BTreeMap<String, String> = [
+            ("closeBtnAriaLabel".to_string(), "string".to_string()),
+            ("onClick".to_string(), "(e: React.MouseEvent) => void".to_string()),
+            (
+                "variant".to_string(),
+                "'outline' | 'filled' | 'overflow' | 'add'".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let notes = infer_appearance_defaults(
+            "Chip",
+            "Label",
+            &old_types,
+            &new_types,
+            &old_mods,
+            &new_mods,
+        );
+
+        assert!(
+            !notes.is_empty(),
+            "TC012: Should produce appearance notes for Chip → Label"
+        );
+
+        // The note should mention "outline" as a candidate
+        let note = &notes[0];
+        assert!(
+            note.contains("outline"),
+            "TC012: Appearance note should mention 'outline'. Got: {}",
+            note
+        );
+
+        // The note should mention the prop name "variant"
+        assert!(
+            note.contains("variant"),
+            "TC012: Appearance note should mention 'variant' prop. Got: {}",
+            note
+        );
+    }
+
+    /// Appearance inference produces NO notes when the old component already
+    /// has the same variant prop (no appearance divergence).
+    #[test]
+    fn test_appearance_inference_no_notes_when_shared_prop() {
+        let old_types: BTreeMap<String, String> = [
+            ("variant".to_string(), "'default' | 'secondary'".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let new_types: BTreeMap<String, String> = [
+            ("variant".to_string(), "'default' | 'secondary'".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let notes = infer_appearance_defaults(
+            "OldComp",
+            "NewComp",
+            &old_types,
+            &new_types,
+            &crate::sd_types::ComponentCssModifiers::new(),
+            &crate::sd_types::ComponentCssModifiers::new(),
+        );
+
+        assert!(
+            notes.is_empty(),
+            "Should produce no notes when both components have the same variant prop"
+        );
+    }
+
+    /// Appearance inference produces NO notes when no variant-like props exist.
+    #[test]
+    fn test_appearance_inference_no_variant_props() {
+        let old_types: BTreeMap<String, String> = [
+            ("title".to_string(), "string".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let new_types: BTreeMap<String, String> = [
+            ("title".to_string(), "string".to_string()),
+            ("subtitle".to_string(), "string".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let notes = infer_appearance_defaults(
+            "OldComp",
+            "NewComp",
+            &old_types,
+            &new_types,
+            &crate::sd_types::ComponentCssModifiers::new(),
+            &crate::sd_types::ComponentCssModifiers::new(),
+        );
+
+        assert!(
+            notes.is_empty(),
+            "Should produce no notes when no variant-like union string props exist"
+        );
+    }
+
+    /// Appearance inference with single-candidate produces specific
+    /// recommendation (not a list of candidates).
+    #[test]
+    fn test_appearance_inference_single_candidate() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        // Old component has pf-m-bar but not pf-m-foo
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_comp = CssModifierMap::new();
+        old_comp.insert("pf-m-bar".into(), CssModifierEffect::default());
+        old_mods.insert("oldComp".into(), old_comp);
+
+        // New component has both pf-m-foo and pf-m-bar
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_comp = CssModifierMap::new();
+        new_comp.insert("pf-m-foo".into(), CssModifierEffect::default());
+        new_comp.insert("pf-m-bar".into(), CssModifierEffect::default());
+        new_mods.insert("newComp".into(), new_comp);
+
+        let old_types: BTreeMap<String, String> = BTreeMap::new();
+        let new_types: BTreeMap<String, String> = [(
+            "variant".to_string(),
+            "'foo' | 'bar'".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let notes = infer_appearance_defaults(
+            "OldComp",
+            "NewComp",
+            &old_types,
+            &new_types,
+            &old_mods,
+            &new_mods,
+        );
+
+        assert_eq!(notes.len(), 1, "Should produce exactly one note");
+        // Single candidate "foo" → specific recommendation
+        assert!(
+            notes[0].contains("variant='foo'"),
+            "Single candidate should produce specific recommendation. Got: {}",
+            notes[0]
+        );
+    }
+
+    // ── /next promotion rule tests ───────────────────────────────────
+
+    /// TC024: Component promoted from /next to main should generate an
+    /// ImportPathChange rule.
+    #[test]
+    fn test_next_to_main_promotion_generates_import_path_change() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_packages.insert(
+            "DualListSelector".into(),
+            "@patternfly/react-core/next".into(),
+        );
+        sd.component_packages.insert(
+            "DualListSelector".into(),
+            "@patternfly/react-core".into(),
+        );
+
+        let component_packages = sd.component_packages.clone();
+        let rules = generate_deprecated_migration_rules(&sd, &component_packages);
+
+        let promotion_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("next-promoted"))
+            .expect("TC024: Should generate a /next promotion rule");
+
+        // Verify rule ID
+        assert!(
+            promotion_rule.rule_id.contains("duallistselector"),
+            "TC024: Rule ID should contain component name. Got: {}",
+            promotion_rule.rule_id
+        );
+
+        // Verify fix strategy is ImportPathChange
+        let strategy = promotion_rule
+            .fix_strategy
+            .as_ref()
+            .expect("TC024: Should have a fix strategy");
+        assert_eq!(
+            strategy.strategy, "ImportPathChange",
+            "TC024: Strategy should be ImportPathChange"
+        );
+        assert_eq!(
+            strategy.from.as_deref(),
+            Some("@patternfly/react-core/next"),
+            "TC024: from should be the /next package"
+        );
+        assert_eq!(
+            strategy.to.as_deref(),
+            Some("@patternfly/react-core"),
+            "TC024: to should be the main package"
+        );
+
+        // Verify the rule targets IMPORT location from /next
+        if let KonveyorCondition::FrontendReferenced { ref referenced } = promotion_rule.when {
+            assert_eq!(referenced.location, "IMPORT");
+            assert_eq!(
+                referenced.from.as_deref(),
+                Some("@patternfly/react-core/next")
+            );
+        } else {
+            panic!("TC024: Expected FrontendReferenced condition");
+        }
+
+        // Verify message mentions promotion
+        assert!(
+            promotion_rule.message.contains("promoted"),
+            "TC024: Message should mention promotion. Got: {}",
+            promotion_rule.message
+        );
+    }
+
+    /// Component that moves from /next to /deprecated should NOT generate
+    /// a promotion rule (it's a regression, not a promotion).
+    #[test]
+    fn test_next_to_deprecated_no_promotion_rule() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_packages.insert(
+            "Foo".into(),
+            "@patternfly/react-core/next".into(),
+        );
+        sd.component_packages.insert(
+            "Foo".into(),
+            "@patternfly/react-core/deprecated".into(),
+        );
+
+        let component_packages = sd.component_packages.clone();
+        let rules = generate_deprecated_migration_rules(&sd, &component_packages);
+
+        let promotion_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("next-promoted"))
+            .collect();
+        assert!(
+            promotion_rules.is_empty(),
+            "/next → /deprecated should NOT generate a promotion rule"
+        );
+    }
+
+    /// Component in main in both v5 and v6 should NOT generate any
+    /// promotion rule.
+    #[test]
+    fn test_main_to_main_no_promotion_rule() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_packages.insert(
+            "Button".into(),
+            "@patternfly/react-core".into(),
+        );
+        sd.component_packages.insert(
+            "Button".into(),
+            "@patternfly/react-core".into(),
+        );
+
+        let component_packages = sd.component_packages.clone();
+        let rules = generate_deprecated_migration_rules(&sd, &component_packages);
+
+        let promotion_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("next-promoted"))
+            .collect();
+        assert!(
+            promotion_rules.is_empty(),
+            "main → main should NOT generate a promotion rule"
+        );
     }
 }

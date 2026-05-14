@@ -980,7 +980,23 @@ pub struct SdPipelineResult {
     /// CSS modifier declarations per component, new version.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub new_css_modifiers: ComponentCssModifiers,
+
+    /// Reverse map: CSS custom property → actual CSS property it targets (old version).
+    /// Built by tracing `var()` usage in base component rules.
+    /// e.g., `"--pf-v5-c-label--BackgroundColor"` → `"background-color"`
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub old_css_property_targets: CssPropertyTargetMap,
+
+    /// Reverse map: CSS custom property → actual CSS property it targets (new version).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub new_css_property_targets: CssPropertyTargetMap,
 }
+
+/// Map from CSS custom property name to the actual CSS property it targets.
+///
+/// Built by tracing `var()` usage in non-modifier (base) component rules.
+/// e.g., `"--pf-v6-c-label--BackgroundColor"` → `"background-color"`
+pub type CssPropertyTargetMap = HashMap<String, String>;
 
 // ── CSS Modifier Effects ─────────────────────────────────────────────────
 

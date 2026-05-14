@@ -798,8 +798,10 @@ pub fn run_sd(
         deprecated_replacements: Vec::new(),     // populated by orchestrator from rendering swaps
         old_profiles,
         new_profiles,
-        old_css_modifiers: HashMap::new(),         // populated by orchestrator from dep-repo CSS
-        new_css_modifiers: HashMap::new(),         // populated by orchestrator from dep-repo CSS
+        old_css_modifiers: HashMap::new(),           // populated by orchestrator from dep-repo CSS
+        new_css_modifiers: HashMap::new(),           // populated by orchestrator from dep-repo CSS
+        old_css_property_targets: HashMap::new(),    // populated by orchestrator from dep-repo CSS
+        new_css_property_targets: HashMap::new(),    // populated by orchestrator from dep-repo CSS
     })
 }
 
