@@ -568,6 +568,13 @@ pub struct ExtendedAnalysisParams {
     /// Used together with `old_css_class_inventory` to determine which
     /// classes have a direct 1:1 rename (prefix swap) vs which were removed.
     pub new_css_class_inventory: HashSet<String>,
+
+    /// Filesystem path to the old (from) version of the dependency repo,
+    /// already built with compiled assets (e.g., SCSS → CSS). Used by
+    /// language implementations to extract version-specific data like
+    /// CSS modifier declarations. None if the old dep worktree couldn't
+    /// be created.
+    pub dep_from_dir: Option<PathBuf>,
 }
 
 // ── LLM category definitions ────────────────────────────────────────────

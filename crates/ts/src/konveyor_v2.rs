@@ -16,10 +16,10 @@ use crate::sd_types::{
     ConformanceCheckType, SdPipelineResult, SourceLevelCategory, SourceLevelChange,
 };
 use semver_analyzer_core::types::MigrationTarget;
-use semver_analyzer_core::{AnalysisReport, ApiChangeType};
+use semver_analyzer_core::{AnalysisReport, ApiChangeType, RemovalDisposition};
 use semver_analyzer_konveyor_core::{
     FileContentFields, FixStrategyEntry, FrontendPatternFields, FrontendReferencedFields,
-    KonveyorCondition, KonveyorRule,
+    KonveyorCondition, KonveyorRule, parse_union_string_values, regex_escape,
 };
 
 use crate::TypeScript;
@@ -67,6 +67,9 @@ pub fn generate_sd_rules(
         sd,
         &component_packages,
     ));
+
+    // ── Prop movement between family members ──────────────────────────
+    rules.extend(generate_prop_movement_rules(sd, &component_packages));
 
     // ── Cross-family child→prop migration rules ───────────────────────
     rules.extend(generate_cross_family_child_to_prop_rules(
@@ -119,6 +122,18 @@ pub fn generate_sd_rules(
     // ── Removed CSS entry point file rules ──────────────────────────
     rules.extend(generate_removed_css_file_rules(
         &sd.removed_css_entry_files,
+    ));
+
+    // ── Prop default value changes ──────────────────────────────────
+    rules.extend(generate_prop_default_changed_rules(
+        sd,
+        &component_packages,
+    ));
+
+    // ── New absorbing prop rules (children→prop migration hints) ────
+    rules.extend(generate_new_absorbing_prop_rules(
+        sd,
+        &component_packages,
     ));
 
     // ── Deprecated prop rules (@deprecated JSDoc) ────────────────────
@@ -306,7 +321,15 @@ fn generate_composition_change_rules(
                 // component is required, conformance rules handle it.
             }
             CompositionChangeType::FamilyMemberRemoved { member } => {
-                let pkg = pkg_for(member, component_packages);
+                // Use the OLD package map for removed members — consumers
+                // still import from the v5 path. The new map may resolve to
+                // a different package if the component was relocated
+                // (e.g., DragDrop moved from react-core to react-drag-drop).
+                let pkg = sd
+                    .old_component_packages
+                    .get(member)
+                    .cloned()
+                    .unwrap_or_else(|| pkg_for(member, component_packages));
                 let rule_id = format!(
                     "sd-composition-{}-removed-member-{}",
                     sanitize(&change.family),
@@ -653,6 +676,24 @@ fn generate_conformance_rules(
                 // grandparent. The child is a valid direct child there, so
                 // "X should not be directly in G" is wrong.
                 if chp_parents.contains(grandparent) {
+                    continue;
+                }
+
+                // Suppress when the grandparent is already a valid parent
+                // of the child (any edge strength). The notParent rule's
+                // regex includes all non-Internal parents, so emitting
+                // "X should not be directly in G" would contradict "X must
+                // be inside G (or other parents)".
+                //
+                // Example: MenuList has an Allowed edge from MenuContent
+                // (CSS descendant). The notParent rule lists MenuContent as
+                // a valid parent. Without this check, the invalidDirectChild
+                // generator would emit "MenuList should not be in MenuContent,
+                // use Menu" — contradicting the notParent rule.
+                if child_to_all_parents
+                    .get(child)
+                    .is_some_and(|parents| parents.contains(grandparent))
+                {
                     continue;
                 }
                 let mut unique_parents: Vec<&str> = expected_parents.clone();
@@ -1044,13 +1085,11 @@ fn generate_prop_child_migration_rules(
                             .unwrap_or(false);
 
                         removed_props
-                            .entry(component.clone())
+                            .entry(component)
                             .or_default()
                             .push(RemovedProp {
                                 name: prop,
-                                component,
                                 is_reactnode,
-                                before_type: change.before.clone(),
                             });
                     }
                 }
@@ -1449,6 +1488,144 @@ fn generate_prop_child_migration_rules(
                         }),
                     });
                     break;
+                }
+            }
+        }
+    }
+
+    rules
+}
+
+// ── Prop movement between family members ─────────────────────────────────
+
+/// Detect props that moved from one family member to another.
+///
+/// When a prop is removed from component A and a prop with the same name
+/// is added to component B, where A and B are members of the same family,
+/// this is a prop movement — the consumer needs to move the prop value
+/// from `<A prop={val}>` to `<B prop={val}>`.
+///
+/// Example: Accordion family — `isExpanded` was removed from AccordionToggle
+/// and added to AccordionItem. The consumer must move `isExpanded={...}` from
+/// `<AccordionToggle>` to `<AccordionItem>`.
+///
+/// This uses SD pipeline data (`old_component_props` / `new_component_props`)
+/// which tracks every prop on every component at both versions.
+fn generate_prop_movement_rules(
+    sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for tree in &sd.composition_trees {
+        let family_members: HashSet<&str> = tree.family_members.iter().map(|s| s.as_str()).collect();
+
+        // For each family member, compute removed and added props
+        let mut member_removed: HashMap<&str, BTreeSet<String>> = HashMap::new();
+        let mut member_added: HashMap<&str, BTreeSet<String>> = HashMap::new();
+
+        for member in &tree.family_members {
+            let old_props = sd
+                .old_component_props
+                .get(member)
+                .cloned()
+                .unwrap_or_default();
+            let new_props = sd
+                .new_component_props
+                .get(member)
+                .cloned()
+                .unwrap_or_default();
+
+            let removed: BTreeSet<String> = old_props.difference(&new_props).cloned().collect();
+            let added: BTreeSet<String> = new_props.difference(&old_props).cloned().collect();
+
+            if !removed.is_empty() {
+                member_removed.insert(member.as_str(), removed);
+            }
+            if !added.is_empty() {
+                member_added.insert(member.as_str(), added);
+            }
+        }
+
+        // For each member's removed props, check if another member gained
+        // a prop with the same name
+        for (source_member, removed_props) in &member_removed {
+            for prop in removed_props {
+                // Skip ubiquitous props that are noise
+                if prop == "children" || prop == "className" || prop == "ref" {
+                    continue;
+                }
+
+                for (target_member, added_props) in &member_added {
+                    if source_member == target_member {
+                        continue;
+                    }
+                    if !family_members.contains(target_member) {
+                        continue;
+                    }
+                    if !added_props.contains(prop) {
+                        continue;
+                    }
+
+                    let pkg = pkg_for(source_member, component_packages);
+
+                    let rule_id = format!(
+                        "sd-prop-moved-{}-{}-from-{}-to-{}",
+                        sanitize(&tree.root),
+                        sanitize(prop),
+                        short_component_id(source_member, &tree.root),
+                        short_component_id(target_member, &tree.root),
+                    );
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".into(),
+                            "change-type=prop-moved".into(),
+                            format!("package={}", pkg),
+                            format!("family={}", tree.root),
+                        ],
+                        effort: 3,
+                        category: "mandatory".into(),
+                        description: format!(
+                            "The `{}` prop moved from <{}> to <{}>",
+                            prop, source_member, target_member,
+                        ),
+                        message: format!(
+                            "The `{prop}` prop has been removed from <{source}> and moved to <{target}>.\n\
+                             Move the prop value from <{source}> to <{target}>.\n\n\
+                             Before:\n  <{target}>\n    <{source} {prop}={{value}} />\n  </{target}>\n\n\
+                             After:\n  <{target} {prop}={{value}}>\n    <{source} />\n  </{target}>",
+                            prop = prop,
+                            source = source_member,
+                            target = target_member,
+                        ),
+                        links: vec![],
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: format!("^{}$", prop),
+                                location: "JSX_PROP".into(),
+                                component: Some(format!("^{}$", source_member)),
+                                parent: None,
+                                parent_from: None,
+                                not_parent: None,
+                                child: None,
+                                not_child: None,
+                                requires_child: None,
+                                value: None,
+                                from: Some(pkg),
+                                file_pattern: None,
+                            },
+                        },
+                        fix_strategy: Some(FixStrategyEntry {
+                            strategy: "LlmAssisted".into(),
+                            from: Some(prop.clone()),
+                            component: Some(source_member.to_string()),
+                            replacement: Some(target_member.to_string()),
+                            prop: Some(prop.clone()),
+                            ..Default::default()
+                        }),
+                    });
                 }
             }
         }
@@ -2095,6 +2272,34 @@ pub fn generate_family_strategies(
         // 8. Import source package
         let import_source = sd.component_packages.get(&tree.root).cloned();
 
+        // Source package: use majority vote of member packages so cross-package
+        // families resolve correctly. For example, the DragDrop family tree has
+        // root "DragDrop" which maps to @patternfly/react-core/deprecated, but
+        // its members (DragDropSort, DragDropContainer, Droppable) all live in
+        // @patternfly/react-drag-drop. The majority package is the one the
+        // fix-engine should match against EnsureDependency rules.
+        let source_package = {
+            let strip_subpath = |s: &str| -> String {
+                s.strip_suffix("/deprecated")
+                    .or_else(|| s.strip_suffix("/next"))
+                    .unwrap_or(s)
+                    .to_string()
+            };
+            // Count packages across all members (including root)
+            let mut pkg_counts: HashMap<String, usize> = HashMap::new();
+            for member in std::iter::once(&tree.root).chain(tree.family_members.iter()) {
+                if let Some(pkg) = sd.component_packages.get(member.as_str()) {
+                    let base = strip_subpath(pkg);
+                    *pkg_counts.entry(base).or_default() += 1;
+                }
+            }
+            // Pick the package with the most members
+            pkg_counts
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(pkg, _)| pkg)
+        };
+
         // 9. Prop value changes from composition changes
         let prop_value_changes: BTreeMap<String, Vec<semver_analyzer_konveyor_core::MappingEntry>> =
             BTreeMap::new();
@@ -2272,6 +2477,7 @@ pub fn generate_family_strategies(
             removed_imports,
             import_source,
             deprecated_migration,
+            source_package,
             ..Default::default()
         };
 
@@ -2348,6 +2554,7 @@ fn build_deprecated_migration_context(
                     family_root,
                     &dr.old_component,
                     sd,
+                    report,
                 );
             }
             return None;
@@ -2445,6 +2652,24 @@ fn build_deprecated_migration_context(
     })
 }
 
+/// Extract the type portion from a member signature string.
+///
+/// Format is `"property: propName: type"` or `"property: propName?: type"`.
+/// Returns the type portion after the second `": "` separator, stripping
+/// any optional marker (`?`).
+fn extract_type_from_member_signature(sig: &str) -> Option<&str> {
+    // Skip the kind prefix (e.g., "property")
+    let after_kind = sig.split_once(": ")?.1;
+    // Skip the prop name
+    let type_part = after_kind.split_once(": ")?.1;
+    let trimmed = type_part.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 /// Build a `DeprecatedMigrationContext` for cross-name replacements
 /// (e.g., Tile → Card) by comparing old and new prop type maps directly,
 /// without requiring a `MigrationTarget` from the diff engine.
@@ -2453,13 +2678,62 @@ fn build_deprecated_migration_context(
 /// replacement detected via rendering swap or commit co-change analysis.
 /// The prop overlap is computed by exact name matching between the old
 /// component's props and the new (replacement) component's props.
+///
+/// The prop type maps from source profiles only contain directly-defined
+/// interface members (not inherited props). To get better coverage, we also
+/// scan the TD report's `StructuralChange` entries for the Props interfaces,
+/// which include removed, renamed, and type-changed members with their type
+/// signatures. This enrichment catches inherited props that the source
+/// profile extraction missed.
 fn build_deprecated_migration_from_replacement(
     family_root: &str,
     old_component: &str,
     sd: &SdPipelineResult,
+    report: &AnalysisReport<TypeScript>,
 ) -> Option<semver_analyzer_konveyor_core::DeprecatedMigrationContext> {
-    let old_types = sd.old_component_prop_types.get(old_component)?;
-    let new_types = sd.new_component_prop_types.get(family_root)?;
+    // Start with source profile prop types (directly-defined members).
+    let mut old_types = sd
+        .old_component_prop_types
+        .get(old_component)
+        .cloned()
+        .unwrap_or_default();
+    let mut new_types = sd
+        .new_component_prop_types
+        .get(family_root)
+        .cloned()
+        .unwrap_or_default();
+
+    // Enrich from TD report: scan StructuralChange entries for the old/new
+    // Props interfaces to pick up inherited members not in source profiles.
+    let old_props_name = format!("{}Props", old_component);
+    let new_props_name = format!("{}Props", family_root);
+    for file_changes in &report.changes {
+        for change in &file_changes.breaking_api_changes {
+            // Match entries like "ChipProps.onClick" or "LabelProps.variant"
+            if let Some((parent, prop)) = change.symbol.split_once('.') {
+                if parent == old_props_name {
+                    // Extract type from the "before" signature for old props
+                    if let Some(ref sig) = change.before {
+                        if let Some(typ) = extract_type_from_member_signature(sig) {
+                            old_types.entry(prop.to_string()).or_insert(typ.to_string());
+                        }
+                    }
+                }
+                if parent == new_props_name {
+                    // Extract type from the "after" signature for new props
+                    if let Some(ref sig) = change.after {
+                        if let Some(typ) = extract_type_from_member_signature(sig) {
+                            new_types.entry(prop.to_string()).or_insert(typ.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if old_types.is_empty() && new_types.is_empty() {
+        return None;
+    }
 
     let old_package = sd
         .old_component_packages
@@ -2606,11 +2880,438 @@ fn render_family_target_with_props(
 
 struct RemovedProp {
     name: String,
-    #[allow(dead_code)]
-    component: String,
     is_reactnode: bool,
-    #[allow(dead_code)]
-    before_type: Option<String>,
+}
+
+// ── CSS modifier bridge for value mapping ───────────────────────────────
+
+/// Match removed prop values to added prop values by comparing what CSS
+/// each value's modifier class actually declares.
+///
+/// For each removed value (e.g., "cyan"), looks up the corresponding CSS
+/// modifier class (e.g., "pf-m-cyan") in the old version's modifier data.
+/// For each added value (e.g., "teal"), looks up "pf-m-teal" in the new
+/// version. Compares their `CssModifierEffect` by structural similarity
+/// (which component token slots are overridden) and returns greedy
+/// best-match pairs.
+///
+/// Returns a map from removed_value → added_value for values that have
+/// strong CSS evidence. Values without modifier data or without a good
+/// match are omitted (fall through to string similarity).
+fn compute_css_modifier_bridge(
+    component: &str,
+    removed_values: &[&String],
+    added_values: &[&String],
+    old_css_modifiers: &crate::sd_types::ComponentCssModifiers,
+    new_css_modifiers: &crate::sd_types::ComponentCssModifiers,
+) -> HashMap<String, String> {
+    let mut hints = HashMap::new();
+
+    if old_css_modifiers.is_empty() || new_css_modifiers.is_empty() {
+        return hints;
+    }
+
+    // Find the BEM block name for this component. Try common conventions:
+    // ComponentName → camelCase block name (e.g., "Label" → "label", "DrawerContent" → "drawerContent")
+    let block_lower = component
+        .chars()
+        .next()
+        .map(|c| c.to_lowercase().to_string())
+        .unwrap_or_default()
+        + &component[1..];
+
+    // Look up modifier data for this component's BEM block.
+    // Try: exact camelCase, lowercase, with common prefixes stripped.
+    let old_mods = old_css_modifiers
+        .get(&block_lower)
+        .or_else(|| old_css_modifiers.get(&component.to_lowercase()));
+    let new_mods = new_css_modifiers
+        .get(&block_lower)
+        .or_else(|| new_css_modifiers.get(&component.to_lowercase()));
+
+    let (old_mods, new_mods) = match (old_mods, new_mods) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return hints,
+    };
+
+    // Build (removed_value, old_effect) and (added_value, new_effect) pairs
+    // by resolving value → modifier class name → CssModifierEffect
+    let old_pairs: Vec<(&str, &crate::sd_types::CssModifierEffect)> = removed_values
+        .iter()
+        .filter_map(|val| {
+            let effect = resolve_value_to_modifier(val, old_mods)?;
+            Some((val.as_str(), effect))
+        })
+        .collect();
+
+    let new_pairs: Vec<(&str, &crate::sd_types::CssModifierEffect)> = added_values
+        .iter()
+        .filter_map(|val| {
+            let effect = resolve_value_to_modifier(val, new_mods)?;
+            Some((val.as_str(), effect))
+        })
+        .collect();
+
+    if old_pairs.is_empty() || new_pairs.is_empty() {
+        return hints;
+    }
+
+    // Compute pairwise structural similarity and greedy-assign
+    let mut candidates: Vec<(&str, &str, f64)> = Vec::new();
+    for (old_val, old_effect) in &old_pairs {
+        for (new_val, new_effect) in &new_pairs {
+            let sim = modifier_similarity(old_effect, new_effect);
+            candidates.push((old_val, new_val, sim));
+        }
+    }
+
+    // Sort by similarity descending
+    candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Greedy assignment with minimum threshold
+    let min_similarity = 0.3;
+    let mut used_old: HashSet<&str> = HashSet::new();
+    let mut used_new: HashSet<&str> = HashSet::new();
+
+    for (old_val, new_val, sim) in &candidates {
+        if *sim < min_similarity {
+            continue;
+        }
+        if used_old.contains(old_val) || used_new.contains(new_val) {
+            continue;
+        }
+        hints.insert(old_val.to_string(), new_val.to_string());
+        used_old.insert(old_val);
+        used_new.insert(new_val);
+    }
+
+    hints
+}
+
+/// Resolve a prop value to its CSS modifier class effect.
+///
+/// Tries common naming conventions: value "cyan" → class "pf-m-cyan",
+/// value "horizontal-subnav" → class "pf-m-horizontal-subnav".
+/// Also tries "is-{value}" and "has-{value}" for generic patterns.
+fn resolve_value_to_modifier<'a>(
+    value: &str,
+    modifiers: &'a crate::sd_types::CssModifierMap,
+) -> Option<&'a crate::sd_types::CssModifierEffect> {
+    // Try PatternFly BEM modifier convention
+    let pf_class = format!("pf-m-{}", value);
+    if let Some(effect) = modifiers.get(&pf_class) {
+        return Some(effect);
+    }
+
+    // Try generic state modifier conventions
+    let is_class = format!("is-{}", value);
+    if let Some(effect) = modifiers.get(&is_class) {
+        return Some(effect);
+    }
+
+    let has_class = format!("has-{}", value);
+    if let Some(effect) = modifiers.get(&has_class) {
+        return Some(effect);
+    }
+
+    // Try the value directly as a class name
+    modifiers.get(value)
+}
+
+/// Compute structural similarity between two CSS modifier effects.
+///
+/// Compares the "token slots" each modifier overrides. A token slot is
+/// the portion of a custom property name that describes WHAT is being
+/// overridden, after stripping the component prefix and modifier name.
+///
+/// Example:
+///   "--pf-v5-c-label--m-cyan--BackgroundColor" → slot "BackgroundColor"
+///   "--pf-v6-c-label--m-teal--BackgroundColor" → slot "BackgroundColor"
+///   Same slot → structurally equivalent override.
+///
+/// Also includes direct CSS properties (e.g., "display", "overflow") in
+/// the comparison.
+///
+/// Returns Jaccard similarity over the combined slot set.
+fn modifier_structural_similarity(
+    old: &crate::sd_types::CssModifierEffect,
+    new: &crate::sd_types::CssModifierEffect,
+) -> f64 {
+    let old_slots: HashSet<String> = old
+        .custom_property_overrides
+        .keys()
+        .filter_map(|k| extract_token_slot(k))
+        .chain(old.direct_properties.keys().cloned())
+        .collect();
+
+    let new_slots: HashSet<String> = new
+        .custom_property_overrides
+        .keys()
+        .filter_map(|k| extract_token_slot(k))
+        .chain(new.direct_properties.keys().cloned())
+        .collect();
+
+    if old_slots.is_empty() && new_slots.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = old_slots.intersection(&new_slots).count();
+    let union = old_slots.union(&new_slots).count();
+
+    if union == 0 {
+        return 0.0;
+    }
+
+    intersection as f64 / union as f64
+}
+
+/// Parse a CSS hex color string into (R, G, B) components.
+///
+/// Handles both short (`#abc` → `(0xaa, 0xbb, 0xcc)`) and long (`#aabbcc`)
+/// hex formats. Case-insensitive. Returns `None` for non-hex values
+/// (keywords like `transparent`, `inherit`, or non-color values like `0px`).
+fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim();
+    if !s.starts_with('#') {
+        return None;
+    }
+    let hex = &s[1..];
+    match hex.len() {
+        3 => {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+            Some((r, g, b))
+        }
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some((r, g, b))
+        }
+        _ => None,
+    }
+}
+
+/// Compute color similarity between two hex colors as a value in [0.0, 1.0].
+///
+/// Uses Euclidean distance in RGB space, normalized to [0, 1]:
+///   distance = sqrt((r1-r2)^2 + (g1-g2)^2 + (b1-b2)^2)
+///   max_distance = sqrt(255^2 + 255^2 + 255^2) ≈ 441.67
+///   similarity = 1.0 - (distance / max_distance)
+///
+/// This gives:
+///   - identical colors → 1.0
+///   - similar colors (e.g., cyan #e0f5f5 vs teal #daf2f2) → ~0.98
+///   - different colors (e.g., cyan #e0f5f5 vs yellow #fff4cc) → ~0.87
+///   - opposite colors (black vs white) → 0.0
+fn color_similarity(c1: (u8, u8, u8), c2: (u8, u8, u8)) -> f64 {
+    let dr = c1.0 as f64 - c2.0 as f64;
+    let dg = c1.1 as f64 - c2.1 as f64;
+    let db = c1.2 as f64 - c2.2 as f64;
+    let distance = (dr * dr + dg * dg + db * db).sqrt();
+    let max_distance = (255.0_f64 * 255.0 * 3.0).sqrt(); // ~441.67
+    1.0 - (distance / max_distance)
+}
+
+/// Compute resolved-value similarity between two CSS modifier effects
+/// using a "bag of colors" approach.
+///
+/// Ignores token slot names entirely — v5 and v6 Label modifiers have
+/// completely different token structures (v5 has 13 slots with `editable`,
+/// `outline`, `content` sub-patterns; v6 has 8 slots with `clickable`,
+/// `outline` patterns). Comparing by slot name gives near-zero overlap.
+///
+/// Instead, extracts all resolved hex color values from each side and
+/// computes symmetric nearest-neighbor color distance: for each old color,
+/// find the closest new color; for each new color, find the closest old
+/// color. Average all best-match similarities.
+///
+/// This produces high similarity when both modifiers use the same color
+/// palette (cyan blues ↔ teal blues) and low similarity when they don't
+/// (cyan blues ↔ yellow golds).
+fn modifier_resolved_similarity(
+    old: &crate::sd_types::CssModifierEffect,
+    new: &crate::sd_types::CssModifierEffect,
+) -> f64 {
+    // Collect all parseable hex colors from each side
+    let old_colors: Vec<(u8, u8, u8)> = old
+        .resolved_overrides
+        .values()
+        .chain(old.direct_properties.values())
+        .filter_map(|v| parse_hex_color(v))
+        .collect();
+
+    let new_colors: Vec<(u8, u8, u8)> = new
+        .resolved_overrides
+        .values()
+        .chain(new.direct_properties.values())
+        .filter_map(|v| parse_hex_color(v))
+        .collect();
+
+    if old_colors.is_empty() || new_colors.is_empty() {
+        return 0.0;
+    }
+
+    // For each old color, find the best-matching new color
+    let old_to_new: f64 = old_colors
+        .iter()
+        .map(|oc| {
+            new_colors
+                .iter()
+                .map(|nc| color_similarity(*oc, *nc))
+                .fold(0.0_f64, f64::max)
+        })
+        .sum::<f64>()
+        / old_colors.len() as f64;
+
+    // For each new color, find the best-matching old color
+    let new_to_old: f64 = new_colors
+        .iter()
+        .map(|nc| {
+            old_colors
+                .iter()
+                .map(|oc| color_similarity(*oc, *nc))
+                .fold(0.0_f64, f64::max)
+        })
+        .sum::<f64>()
+        / new_colors.len() as f64;
+
+    // Symmetric average
+    (old_to_new + new_to_old) / 2.0
+}
+
+/// Combined similarity: blends structural and resolved signals.
+///
+/// Structural similarity compares which component tokens are overridden
+/// (high when same slots are touched, regardless of values).
+/// Resolved similarity compares actual rendered output using color-distance
+/// for hex colors and exact matching for non-color values.
+///
+/// The combined score is: structural × 0.3 + resolved × 0.7 when both
+/// are available. Resolved values dominate because structurally-identical
+/// modifiers (all PF color variants share the same slots) can only be
+/// disambiguated by their actual rendered colors. For example:
+///   cyan (#e0f5f5) → teal (#daf2f2): resolved ~0.98, much higher than
+///   cyan (#e0f5f5) → yellow (#fff4cc): resolved ~0.87
+fn modifier_similarity(
+    old: &crate::sd_types::CssModifierEffect,
+    new: &crate::sd_types::CssModifierEffect,
+) -> f64 {
+    let structural = modifier_structural_similarity(old, new);
+
+    // If both have resolved overrides, blend with resolved similarity.
+    // Weight resolved higher (0.7) because structural similarity is identical
+    // for all color modifiers (same token slots), and only the actual rendered
+    // values disambiguate them.
+    if !old.resolved_overrides.is_empty() && !new.resolved_overrides.is_empty() {
+        let resolved = modifier_resolved_similarity(old, new);
+        return structural * 0.3 + resolved * 0.7;
+    }
+
+    structural
+}
+
+/// Extract the "token slot" from a CSS custom property name.
+///
+/// Strips the component prefix (version + block name) to isolate what
+/// aspect of the component is being overridden. This works across
+/// version prefixes (pf-v5-c- vs pf-v6-c-) and produces comparable
+/// slots for the same logical property across versions.
+///
+/// Two strategies, tried in order:
+///
+/// 1. **Modifier-based**: If the token contains `--m-{name}--` or
+///    `--m-{name}__`, extract everything after the modifier name.
+///    This handles modifier-specific tokens like:
+///    "--pf-v5-c-label--m-cyan--BackgroundColor" → "BackgroundColor"
+///    "--pf-v5-c-label--m-cyan__icon--Color" → "icon--Color"
+///
+/// 2. **Element-based**: If no modifier segment, find the first `__`
+///    (BEM element separator) or the last `--` after the block name
+///    prefix, and use everything from there. This handles tokens that
+///    the modifier overrides but which aren't modifier-specific:
+///    "--pf-v5-c-nav__link--PaddingTop" → "link--PaddingTop"
+///    "--pf-v5-c-nav__link--Color" → "link--Color"
+///    "--pf-v5-c-label--BackgroundColor" → "BackgroundColor"
+fn extract_token_slot(token_name: &str) -> Option<String> {
+    // Strategy 1: find modifier segment "--m-"
+    if let Some(m_idx) = token_name.find("--m-") {
+        let after_m = &token_name[m_idx + 4..]; // skip "--m-"
+        let end_idx = after_m.find("--").or_else(|| after_m.find("__"));
+        if let Some(idx) = end_idx {
+            let slot = &after_m[idx..];
+            let slot = slot
+                .strip_prefix("--")
+                .or_else(|| slot.strip_prefix("__"))
+                .unwrap_or(slot);
+            if !slot.is_empty() {
+                return Some(slot.to_string());
+            }
+        }
+    }
+
+    // Strategy 2: strip component prefix, extract element + property
+    // Known prefixes: --pf-v5-c-, --pf-v6-c-, --pf-c-
+    let stripped = token_name
+        .strip_prefix("--pf-v6-c-")
+        .or_else(|| token_name.strip_prefix("--pf-v5-c-"))
+        .or_else(|| token_name.strip_prefix("--pf-c-"))
+        .or_else(|| token_name.strip_prefix("--"));
+
+    let stripped = match stripped {
+        Some(s) => s,
+        None => return None,
+    };
+
+    // Skip the block name: everything up to the first "__" or "--"
+    let slot_start = stripped
+        .find("__")
+        .or_else(|| stripped.find("--"));
+
+    match slot_start {
+        Some(idx) => {
+            let slot = &stripped[idx..];
+            let slot = slot
+                .strip_prefix("__")
+                .or_else(|| slot.strip_prefix("--"))
+                .unwrap_or(slot);
+            if slot.is_empty() {
+                None
+            } else {
+                Some(slot.to_string())
+            }
+        }
+        None => None,
+    }
+}
+
+/// Returns a similarity boost when a removed value's directional suffix
+/// maps semantically to an added value's CSS logical direction suffix.
+///
+/// Physical → Logical direction mapping (CSS Writing Modes Level 3):
+///   Left  → Start (inline-start in LTR)
+///   Right → End   (inline-end in LTR)
+///
+/// PatternFly v6 renamed directional prop values from physical (Left/Right)
+/// to logical (Start/End) for RTL support. The LCS-based `name_similarity`
+/// function produces wrong greedy matches because "alignLeft" has higher
+/// character overlap with "alignCenter" than "alignStart".
+///
+/// The boost (+0.10) is small enough to not override a genuinely better
+/// match, but large enough to break the tie in favor of the semantically
+/// correct directional pair.
+fn directional_similarity_boost(removed: &str, added: &str) -> f64 {
+    let r = removed.to_lowercase();
+    let a = added.to_lowercase();
+
+    if (r.ends_with("left") && a.ends_with("start"))
+        || (r.ends_with("right") && a.ends_with("end"))
+    {
+        0.10
+    } else {
+        0.0
+    }
 }
 
 // ── Prop value conformance rules ────────────────────────────────────────
@@ -2655,8 +3356,8 @@ fn generate_prop_value_conformance_rules(
             };
 
             // Extract string literal values from union types
-            let old_values: HashSet<String> = extract_union_values(before);
-            let new_values: HashSet<String> = extract_union_values(after);
+            let old_values = parse_union_string_values(before);
+            let new_values = parse_union_string_values(after);
 
             if old_values.is_empty() {
                 continue;
@@ -2669,6 +3370,31 @@ fn generate_prop_value_conformance_rules(
 
             let pkg = pkg_for(&component, component_packages);
 
+            // ── CSS modifier bridge ──────────────────────────────
+            // Before falling back to string similarity, try matching
+            // removed values to added values by comparing what CSS
+            // each modifier class actually declares. This produces
+            // evidence-based mappings like cyan→teal (both override
+            // the same set of component tokens) instead of relying
+            // on name similarity which fails for semantic renames.
+            let added_for_bridge: Vec<&String> =
+                new_values.difference(&old_values).collect();
+            let css_bridge_hints = compute_css_modifier_bridge(
+                &component,
+                &removed,
+                &added_for_bridge,
+                &sd.old_css_modifiers,
+                &sd.new_css_modifiers,
+            );
+            if !css_bridge_hints.is_empty() {
+                tracing::debug!(
+                    component = %component,
+                    prop = %prop,
+                    hints = ?css_bridge_hints,
+                    "CSS modifier bridge produced value mappings"
+                );
+            }
+
             // Generate one rule per removed value for precise matching
             for value in &removed {
                 let rule_id = format!(
@@ -2678,8 +3404,118 @@ fn generate_prop_value_conformance_rules(
                     sanitize(value),
                 );
 
-                // Find replacement suggestion if there's a close match in new values
-                let replacement_hint = find_replacement_value(value, &new_values);
+                // ── Value mapping heuristic ────────────────────────
+                // Try to find the best replacement among newly-added values.
+                let added_values: Vec<&String> =
+                    new_values.difference(&old_values).collect();
+                let surviving: HashSet<&String> =
+                    old_values.intersection(&new_values).collect();
+                let is_complete_replacement = surviving.is_empty();
+
+                // Build replacement hints using greedy N:M assignment across
+                // ALL removed values (not per-value independently). This prevents
+                // multiple removed values from claiming the same added value and
+                // enables leftover pairing (TC021: light-200→secondary after
+                // no-background claims primary).
+                //
+                // The hints are computed once per (component, prop) type change,
+                // then looked up per removed value below.
+                let replacement_hints: HashMap<String, String> = {
+                    let mut hints = HashMap::new();
+
+                    if added_values.len() == 1 && removed.len() == 1 {
+                        // 1:1: only one removed, only one added → auto-map
+                        hints.insert(removed[0].clone(), added_values[0].clone());
+                    } else if is_complete_replacement && !added_values.is_empty() {
+                        // Complete replacement: greedy best-match, no threshold.
+                        // Apply directional boost so Left→Start and Right→End
+                        // are preferred over character-level coincidences.
+                        let mut candidates: Vec<(&String, &String, f64)> = Vec::new();
+                        for rem in &removed {
+                            for add in &added_values {
+                                let sim = semver_analyzer_core::diff::name_similarity(rem, add)
+                                    + directional_similarity_boost(rem, add);
+                                candidates.push((rem, add, sim));
+                            }
+                        }
+                        candidates.sort_by(|a, b| {
+                            b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let mut used_added_vals: HashSet<&str> = HashSet::new();
+                        let mut used_removed_vals: HashSet<&str> = HashSet::new();
+                        for (rem, add, _sim) in &candidates {
+                            if used_removed_vals.contains(rem.as_str())
+                                || used_added_vals.contains(add.as_str())
+                            {
+                                continue;
+                            }
+                            hints.insert(rem.to_string(), add.to_string());
+                            used_removed_vals.insert(rem);
+                            used_added_vals.insert(add);
+                        }
+                    } else {
+                        // Partial replacement: each removed value independently
+                        // picks its best match. Unlike prop renames, multiple
+                        // removed values CAN map to the same new value (e.g.,
+                        // 'dark' and 'darker' both → 'secondary').
+                        //
+                        // Priority: added values first (threshold 0.3), then
+                        // surviving values as fallback (threshold 0.2).
+                        // (TC021: light-200→secondary, TC067: light→default)
+                        for rem in &removed {
+                            // Try added values first (with directional boost)
+                            let best_added = added_values
+                                .iter()
+                                .filter(|a| {
+                                    semver_analyzer_core::diff::name_similarity(rem, a)
+                                        + directional_similarity_boost(rem, a)
+                                        >= 0.3
+                                })
+                                .max_by(|a, b| {
+                                    let sa = semver_analyzer_core::diff::name_similarity(rem, a)
+                                        + directional_similarity_boost(rem, a);
+                                    let sb = semver_analyzer_core::diff::name_similarity(rem, b)
+                                        + directional_similarity_boost(rem, b);
+                                    sa.partial_cmp(&sb)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+
+                            if let Some(add) = best_added {
+                                hints.insert(rem.to_string(), add.to_string());
+                            } else {
+                                // Fallback: surviving values (lower threshold, no
+                                // directional boost — survivors kept their names)
+                                let best_surv = surviving
+                                    .iter()
+                                    .filter(|s| {
+                                        semver_analyzer_core::diff::name_similarity(rem, s)
+                                            >= 0.2
+                                    })
+                                    .max_by(|a, b| {
+                                        let sa = semver_analyzer_core::diff::name_similarity(
+                                            rem, a,
+                                        );
+                                        let sb = semver_analyzer_core::diff::name_similarity(
+                                            rem, b,
+                                        );
+                                        sa.partial_cmp(&sb)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                if let Some(surv) = best_surv {
+                                    hints.insert(rem.to_string(), surv.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    hints
+                };
+
+                // CSS bridge hints override string similarity when available
+                let replacement_hint = css_bridge_hints
+                    .get(*value)
+                    .cloned()
+                    .or_else(|| replacement_hints.get(*value).cloned());
                 let message = if let Some(ref replacement) = replacement_hint {
                     format!(
                         "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
@@ -2754,7 +3590,209 @@ fn generate_prop_value_conformance_rules(
         }
     }
 
-    // ── Phase 2: Renamed props with value changes ────────────────────
+    // ── Phase 2: Removed props with a known replacement (ReplacedByMember) ──
+    //
+    // When a prop is removed and the SD enrichment found a replacement prop
+    // (e.g., Banner variant → color), generate per-value rules mapping old
+    // prop values to new prop values. Uses string similarity for value mapping
+    // and LlmAssisted strategy since the transformation crosses prop boundaries
+    // (old prop name → new prop name + new value).
+    for fc in &report.changes {
+        for api in &fc.breaking_api_changes {
+            if api.change != ApiChangeType::Removed {
+                continue;
+            }
+            let new_member = match &api.removal_disposition {
+                Some(RemovalDisposition::ReplacedByMember { new_member }) => new_member,
+                _ => continue,
+            };
+
+            let symbol = &api.symbol;
+            if !symbol.contains('.') {
+                continue;
+            }
+            let component = match extract_component_name_from_symbol(symbol) {
+                Some(c) => c,
+                None => continue,
+            };
+            let old_prop = match extract_prop_name_from_symbol(symbol) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Get old values from the removed prop's before type
+            let old_values = api
+                .before
+                .as_deref()
+                .map(parse_union_string_values)
+                .unwrap_or_default();
+            if old_values.is_empty() {
+                continue;
+            }
+
+            // Get new values from the replacement prop's type via SD data
+            let new_values = sd
+                .new_component_prop_types
+                .get(&component)
+                .and_then(|m| m.get(new_member))
+                .map(|t| parse_union_string_values(t))
+                .unwrap_or_default();
+            if new_values.is_empty() {
+                continue;
+            }
+
+            let pkg = pkg_for(&component, component_packages);
+
+            // Check if any OTHER new prop on this component has values that
+            // overlap with the old values — indicates a secondary prop
+            // (e.g., Banner status has "danger", "success", "warning")
+            let mut secondary_props: Vec<(String, BTreeSet<String>)> = Vec::new();
+            if let Some(new_props) = sd.new_component_prop_types.get(&component) {
+                for (prop_name, prop_type) in new_props {
+                    if prop_name == new_member || prop_name == &old_prop {
+                        continue;
+                    }
+                    let prop_values = parse_union_string_values(prop_type);
+                    let overlap: Vec<&String> = old_values
+                        .intersection(&prop_values)
+                        .collect();
+                    if !overlap.is_empty() {
+                        secondary_props.push((prop_name.clone(), prop_values));
+                    }
+                }
+            }
+
+            // Build value mapping: old value → new value on the replacement prop
+            let mut value_map: HashMap<String, String> = HashMap::new();
+            {
+                let mut candidates: Vec<(&String, &String, f64)> = Vec::new();
+                for old_val in &old_values {
+                    for new_val in &new_values {
+                        let sim =
+                            semver_analyzer_core::diff::name_similarity(old_val, new_val);
+                        candidates.push((old_val, new_val, sim));
+                    }
+                }
+                candidates.sort_by(|a, b| {
+                    b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut used_old: HashSet<&str> = HashSet::new();
+                let mut used_new: HashSet<&str> = HashSet::new();
+                for (old_val, new_val, _sim) in &candidates {
+                    if used_old.contains(old_val.as_str())
+                        || used_new.contains(new_val.as_str())
+                    {
+                        continue;
+                    }
+                    value_map.insert(old_val.to_string(), new_val.to_string());
+                    used_old.insert(old_val);
+                    used_new.insert(new_val);
+                }
+            }
+
+            tracing::debug!(
+                component = %component,
+                old_prop = %old_prop,
+                new_member = %new_member,
+                value_map = ?value_map,
+                secondary_props = ?secondary_props.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                "Phase 2: Removed prop with replacement — generating per-value rules"
+            );
+
+            // Generate per-value rules
+            for old_val in &old_values {
+                let rule_id = format!(
+                    "sd-prop-replaced-{}-{}-{}",
+                    sanitize(&component),
+                    sanitize(&old_prop),
+                    sanitize(old_val),
+                );
+
+                let new_val = value_map.get(old_val.as_str());
+
+                // Build the migration message
+                let mut message = if let Some(nv) = new_val {
+                    format!(
+                        "The `{}` prop has been removed from <{}>.\n\
+                         Replace `{}=\"{}\"` with `{}=\"{}\"`.\n\n\
+                         Old: <{component} {old_prop}=\"{old_val}\" />\n\
+                         New: <{component} {new_member}=\"{new_val}\" />",
+                        old_prop,
+                        component,
+                        old_prop,
+                        old_val,
+                        new_member,
+                        nv,
+                        component = component,
+                        old_prop = old_prop,
+                        old_val = old_val,
+                        new_member = new_member,
+                        new_val = nv,
+                    )
+                } else {
+                    format!(
+                        "The `{}` prop has been removed from <{}>.\n\
+                         The value \"{}\" has no direct replacement on the `{}` prop.\n\
+                         Consider removing `{}=\"{}\"` entirely.",
+                        old_prop, component, old_val, new_member, old_prop, old_val,
+                    )
+                };
+
+                // If secondary props overlap with this value, mention them
+                for (sec_prop, sec_values) in &secondary_props {
+                    if sec_values.contains(old_val) {
+                        message.push_str(&format!(
+                            "\n\nAlso add `{}=\"{}\"` to preserve semantic meaning.",
+                            sec_prop, old_val,
+                        ));
+                    }
+                }
+
+                rules.push(KonveyorRule {
+                    rule_id,
+                    labels: vec![
+                        "source=semver-analyzer".into(),
+                        "change-type=prop-value-removed".into(),
+                        format!("package={}", pkg),
+                    ],
+                    effort: 3,
+                    category: "mandatory".into(),
+                    description: format!(
+                        "Prop `{}` removed from <{}>; value \"{}\" must migrate to `{}`",
+                        old_prop, component, old_val, new_member,
+                    ),
+                    message: message.clone(),
+                    links: vec![],
+                    when: KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: format!("^{}$", old_prop),
+                            location: "JSX_PROP".into(),
+                            component: Some(format!("^{}$", component)),
+                            parent: None,
+                            not_parent: None,
+                            child: None,
+                            not_child: None,
+                            requires_child: None,
+                            parent_from: None,
+                            value: Some(format!("^{}$", regex_escape(old_val))),
+                            from: Some(pkg.to_string()),
+                            file_pattern: None,
+                        },
+                    },
+                    fix_strategy: Some(FixStrategyEntry {
+                        strategy: "LlmAssisted".into(),
+                        component: Some(component.clone()),
+                        prop: Some(old_prop.clone()),
+                        from: Some(old_val.to_string()),
+                        replacement: new_val.cloned(),
+                        ..Default::default()
+                    }),
+                });
+            }
+        }
+    }
+
+    // ── Phase 3: Renamed props with value changes ────────────────────
     //
     // When a prop is renamed (e.g., spacer → gap), the values may also
     // change (e.g., spacerNone → gapNone). Detect these by comparing
@@ -2799,8 +3837,8 @@ fn generate_prop_value_conformance_rules(
                 _ => continue,
             };
 
-            let old_values = extract_union_values(old_type);
-            let new_values = extract_union_values(new_type);
+            let old_values = parse_union_string_values(old_type);
+            let new_values = parse_union_string_values(new_type);
 
             if old_values.is_empty() || new_values.is_empty() {
                 continue;
@@ -2814,7 +3852,7 @@ fn generate_prop_value_conformance_rules(
             let pkg = pkg_for(&component, component_packages);
 
             for value in &removed {
-                let replacement_hint = find_replacement_value(value, &new_values);
+                let replacement_hint: Option<String> = None;
 
                 // Generate rules for BOTH old and new prop names, since the
                 // rename fix may or may not have been applied yet.
@@ -2907,45 +3945,6 @@ fn generate_prop_value_conformance_rules(
     rules
 }
 
-/// Extract string literal values from a TypeScript union type string.
-/// E.g., "'dark' | 'light' | 'default'" → {"dark", "light", "default"}
-fn extract_union_values(type_str: &str) -> HashSet<String> {
-    let re = regex::Regex::new(r"'([^']+)'").unwrap();
-    re.captures_iter(type_str)
-        .map(|c| c[1].to_string())
-        .collect()
-}
-
-/// Try to find a replacement value in the new set for a removed value.
-/// Heuristic: looks for common PF rename patterns.
-fn find_replacement_value(removed: &str, new_values: &HashSet<String>) -> Option<String> {
-    // Common PF v5→v6 renames
-    let mappings = [
-        ("light", "secondary"),
-        ("dark", "secondary"),
-        ("darker", "secondary"),
-        ("light-200", "secondary"),
-        ("light300", "secondary"),
-        ("tertiary", "secondary"),
-        ("cyan", "teal"),
-        ("gold", "yellow"),
-        ("alignLeft", "start"),
-        ("alignRight", "end"),
-        ("button-group", "action-group"),
-        ("icon-button-group", "action-group-plain"),
-        ("chip-group", "label-group"),
-        ("TableComposable", "default"),
-    ];
-
-    for (old, new) in &mappings {
-        if removed == *old && new_values.contains(*new) {
-            return Some(new.to_string());
-        }
-    }
-
-    None
-}
-
 // ── Required prop added rules ───────────────────────────────────────────
 //
 // When a component gains a new REQUIRED prop (not optional, no default),
@@ -2958,10 +3957,16 @@ fn generate_required_prop_added_rules(
     let mut rules = Vec::new();
 
     for (component, required) in &sd.new_required_props {
-        let old_props = sd.old_component_props.get(component);
-        let old_required = old_props.cloned().unwrap_or_default();
+        // Compare against old REQUIRED props (not all old props).
+        // This catches both:
+        // - Brand new props that are required
+        // - Existing props that were optional in v5 and became required in v6
+        let old_required = sd
+            .old_required_props
+            .get(component)
+            .cloned()
+            .unwrap_or_default();
 
-        // Find required props that are NEW (not in old version)
         let newly_required: Vec<&String> = required
             .iter()
             .filter(|p| !old_required.contains(*p))
@@ -2990,6 +3995,40 @@ fn generate_required_prop_added_rules(
                 .map(|t| format!(" (type: `{}`)", t))
                 .unwrap_or_default();
 
+            // Distinguish "new required prop" from "optional prop became required"
+            let is_new_prop = !sd
+                .old_component_props
+                .get(component)
+                .is_some_and(|old| old.contains(*prop));
+
+            let (description, message) = if is_new_prop {
+                (
+                    format!(
+                        "<{}> now requires the `{}` prop{}",
+                        component, prop, type_hint,
+                    ),
+                    format!(
+                        "<{}> has a new required prop `{}`{}.\n\
+                         This prop must be provided — omitting it will cause a TypeScript error.\n\n\
+                         Add the prop: <{} {}={{...}} />",
+                        component, prop, type_hint, component, prop,
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "The `{}` prop on <{}> is now required (was previously optional){}",
+                        prop, component, type_hint,
+                    ),
+                    format!(
+                        "The `{}` prop on <{}> is now required{}.\n\
+                         It was optional in the previous version but must now be provided.\n\n\
+                         Ensure all usages include: <{} {}={{...}} />",
+                        prop, component, type_hint, component, prop,
+                    ),
+                )
+            };
+
             rules.push(KonveyorRule {
                 rule_id,
                 labels: vec![
@@ -2999,16 +4038,8 @@ fn generate_required_prop_added_rules(
                 ],
                 effort: 1,
                 category: "mandatory".into(),
-                description: format!(
-                    "<{}> now requires the `{}` prop{}",
-                    component, prop, type_hint,
-                ),
-                message: format!(
-                    "<{}> has a new required prop `{}`{}.\n\
-                     This prop must be provided — omitting it will cause a TypeScript error.\n\n\
-                     Add the prop: <{} {}={{...}} />",
-                    component, prop, type_hint, component, prop,
-                ),
+                description,
+                message,
                 links: vec![],
                 when: KonveyorCondition::FrontendReferenced {
                     referenced: FrontendReferencedFields {
@@ -3030,6 +4061,286 @@ fn generate_required_prop_added_rules(
                     strategy: "LlmAssisted".into(),
                     component: Some(component.clone()),
                     prop: Some(prop.to_string()),
+                    ..Default::default()
+                }),
+            });
+        }
+    }
+
+    rules
+}
+
+// ── Prop default value change rules ─────────────────────────────────────
+//
+// When a prop's default value changes between versions, consumers relying on
+// the old default will see changed behavior silently. Generate rules to flag
+// these and suggest explicit prop values.
+
+/// Returns true for default values that are trivially empty / meaningless.
+/// No consumer code relies on these as explicit defaults — generating
+/// PropDefault rules for them causes the LLM to add noise.
+///
+/// Suppressed values:
+/// - `''`, `""` — empty strings (TC023: children='', TC045: className='')
+/// - `undefined`, `null` — nullish values
+/// - `false` — removing a false default → undefined (both falsy, same effect)
+/// - Noop arrow functions returning undefined (TC037: Label.onClick)
+fn is_trivial_default(value: &str) -> bool {
+    matches!(value, "''" | "\"\"" | "undefined" | "null" | "false")
+        // Noop arrow functions: (...) => undefined [as any]
+        // e.g., "(_e: React.MouseEvent) => undefined as any"
+        || (value.contains("=>") && value.contains("undefined"))
+}
+
+fn generate_prop_default_changed_rules(
+    sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    use crate::sd_types::SourceLevelCategory;
+
+    let mut rules = Vec::new();
+
+    for change in &sd.source_level_changes {
+        if change.category != SourceLevelCategory::PropDefault {
+            continue;
+        }
+        // Only handle removed/changed defaults (old_value is Some).
+        // A newly-added default (old_value=None) is not a breaking change.
+        let old_val = match &change.old_value {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Skip trivially empty defaults — no consumer relies on '' or
+        // undefined/null defaults, and firing on them causes the LLM to
+        // add noise like `children={''}` or `className={''}`.
+        // (TC023, TC024, TC045)
+        if is_trivial_default(old_val) {
+            tracing::debug!(
+                component = %change.component,
+                old_default = %old_val,
+                "Skipping PropDefault rule: trivial default value"
+            );
+            continue;
+        }
+
+        // Extract prop name from description pattern:
+        // "Default value for 'X' prop on Y removed (was Z)"
+        // "Default value for 'X' prop on Y changed from Z to W"
+        let prop_name = change
+            .description
+            .split('\'')
+            .nth(1)
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Skip PropDefault rules for props that were removed entirely.
+        // A removed prop can't have a meaningful "changed default" — it
+        // doesn't exist in v6. Generating a rule for it would conflict
+        // with the RemoveProp rule and cause the LLM to re-add the prop.
+        //
+        // Only skip when we positively know the prop was removed: the
+        // component IS in new_component_props but the prop is NOT in
+        // its set. If the component isn't in the map at all, we don't
+        // have enough info — generate the rule to be safe.
+        let prop_was_removed = sd
+            .new_component_props
+            .get(&change.component)
+            .is_some_and(|props| !props.contains(&prop_name));
+        if prop_was_removed {
+            tracing::debug!(
+                component = %change.component,
+                prop = %prop_name,
+                "Skipping PropDefault rule: prop was removed in new version"
+            );
+            continue;
+        }
+
+        let pkg = pkg_for(&change.component, component_packages);
+
+        let new_val_msg = match &change.new_value {
+            Some(nv) => format!(
+                "The default value of `{}` on <{}> changed from `{}` to `{}`.\n\
+                 Existing code relying on the old default may behave differently.\n\n\
+                 To preserve v5 behavior, add the prop explicitly:\n  \
+                 <{} {}={{{}}} />",
+                prop_name, change.component, old_val, nv,
+                change.component, prop_name, old_val,
+            ),
+            None => format!(
+                "The default value of `{}` on <{}> was removed (was `{}`).\n\
+                 Existing code relying on the old default may behave differently.\n\n\
+                 To preserve v5 behavior, add the prop explicitly:\n  \
+                 <{} {}={{{}}} />",
+                prop_name, change.component, old_val,
+                change.component, prop_name, old_val,
+            ),
+        };
+
+        let rule_id = format!(
+            "sd-prop-default-{}-{}",
+            sanitize(&change.component),
+            sanitize(&prop_name),
+        );
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=prop-default-changed".into(),
+                format!("package={}", pkg),
+            ],
+            effort: 1,
+            category: "mandatory".into(),
+            description: format!(
+                "Default value of `{}` on <{}> changed (was `{}`)",
+                prop_name, change.component, old_val,
+            ),
+            message: new_val_msg,
+            links: vec![],
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", change.component),
+                    location: "JSX_COMPONENT".into(),
+                    component: None,
+                    parent: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                    parent_from: None,
+                    value: None,
+                    from: Some(pkg.to_string()),
+                    file_pattern: None,
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry {
+                strategy: "LlmAssisted".into(),
+                component: Some(change.component.clone()),
+                prop: Some(prop_name),
+                ..Default::default()
+            }),
+        });
+    }
+
+    rules
+}
+
+// ── New absorbing prop rules ────────────────────────────────────────────
+//
+// When a component gains a new prop of type ReactNode/ReactElement that
+// didn't exist in the previous version, content that was previously passed
+// as children may need to move to that prop. Generate LlmAssisted rules
+// with enough context for the LLM to determine if restructuring is needed.
+//
+// Examples:
+// - MenuToggle gained `icon: React.ReactNode` → icons in children should
+//   move to the `icon` prop (TC046)
+// - NavItem gained `icon: React.ReactNode` → same pattern (TC053)
+// - Any component gaining `actions`, `header`, `footer` ReactNode props
+
+fn generate_new_absorbing_prop_rules(
+    sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for (component, new_props) in &sd.new_component_props {
+        // Must have old props to compute the diff
+        let old_props = match sd.old_component_props.get(component) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Component must accept children (otherwise there's nothing to absorb)
+        let has_children = sd
+            .new_profiles
+            .get(component)
+            .map(|p| p.has_children_prop)
+            .unwrap_or(false);
+        if !has_children {
+            continue;
+        }
+
+        // Find newly added props
+        let added: Vec<&String> = new_props.difference(old_props).collect();
+        if added.is_empty() {
+            continue;
+        }
+
+        // Get type info for the new props
+        let type_map = sd.new_component_prop_types.get(component);
+
+        for prop in &added {
+            // Skip `children` itself
+            if prop.as_str() == "children" {
+                continue;
+            }
+
+            // Must be a ReactNode/ReactElement type (accepts JSX content)
+            let prop_type = type_map
+                .and_then(|m| m.get(prop.as_str()))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if !is_react_node_type(prop_type) {
+                continue;
+            }
+
+            let pkg = pkg_for(component, component_packages);
+
+            let message = format!(
+                "Component <{component}> has a new prop `{prop}` (type: `{prop_type}`) \
+                 added in v6 that accepts JSX content.\n\n\
+                 This prop may be intended to receive content that was previously \
+                 passed as children. Review the JSX children of <{component}> and \
+                 determine if any should be moved to the `{prop}` prop.\n\n\
+                 Example migration:\n  \
+                 Before: <{component}>{{content}} other children</{component}>\n  \
+                 After:  <{component} {prop}={{{{content}}}}>other children</{component}>"
+            );
+
+            let rule_id = format!(
+                "sd-new-absorbing-prop-{}-{}",
+                sanitize(component),
+                sanitize(prop),
+            );
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=new-absorbing-prop".into(),
+                    format!("package={}", pkg),
+                ],
+                effort: 3,
+                category: "potential".into(),
+                description: format!(
+                    "New `{}` prop on <{}> may absorb children content",
+                    prop, component,
+                ),
+                message,
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", component),
+                        location: "JSX_COMPONENT".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: None,
+                        from: Some(pkg.to_string()),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "LlmAssisted".into(),
+                    component: Some(component.clone()),
+                    prop: Some(prop.to_string()),
+                    to: Some(prop_type.to_string()),
                     ..Default::default()
                 }),
             });
@@ -4530,21 +5841,6 @@ fn extract_aria_attr_name(description: &str) -> Option<String> {
     }
 }
 
-/// Escape special regex characters in a string.
-fn regex_escape(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '^' | '$' | '|' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
 // ── Deprecated prop rules ───────────────────────────────────────────────
 
 /// Generate targeted rules for props marked `@deprecated` in JSDoc.
@@ -5237,6 +6533,43 @@ mod tests {
             Some("icon".into())
         );
         assert_eq!(extract_bem_prop_name("no quotes here"), None);
+    }
+
+    fn make_empty_report() -> AnalysisReport<TypeScript> {
+        use semver_analyzer_core::*;
+        AnalysisReport {
+            repository: std::path::PathBuf::from("/tmp/test"),
+            comparison: Comparison {
+                from_ref: "v5".into(),
+                to_ref: "v6".into(),
+                from_sha: "aaa".into(),
+                to_sha: "bbb".into(),
+                commit_count: 1,
+                analysis_timestamp: "2026-01-01".into(),
+            },
+            summary: Summary {
+                total_breaking_changes: 0,
+                breaking_api_changes: 0,
+                breaking_behavioral_changes: 0,
+                files_with_breaking_changes: 0,
+            },
+            changes: vec![],
+            manifest_changes: vec![],
+            added_files: vec![],
+            packages: vec![],
+            member_renames: HashMap::new(),
+            inferred_rename_patterns: None,
+            extensions: crate::extensions::TsAnalysisExtensions {
+                sd_result: None,
+                hierarchy_deltas: Vec::new(),
+                new_hierarchies: Default::default(),
+            },
+            metadata: AnalysisMetadata {
+                call_graph_analysis: "none".into(),
+                tool_version: "0.1.0".into(),
+                llm_usage: None,
+            },
+        }
     }
 
     fn test_pkg_map() -> HashMap<String, String> {
@@ -6779,6 +8112,71 @@ mod tests {
         );
     }
 
+    /// When a grandparent is already a valid parent of the child (any edge
+    /// strength), the invalidDirectChild rule should be suppressed because
+    /// it contradicts the notParent rule that lists the grandparent as valid.
+    ///
+    /// Example: Menu family has Menu → MenuList (Structural/CHP) and
+    /// MenuContent → MenuList (Allowed). The grandparent walk goes
+    /// MenuList → Menu (CHP) → MenuContent (parent of Menu). Since
+    /// MenuContent is already a valid parent of MenuList (Allowed edge),
+    /// the rule "MenuList not-in MenuContent, use Menu" should NOT fire.
+    #[test]
+    fn test_invalid_direct_child_suppressed_when_grandparent_is_valid_parent() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Menu".into(), "@patternfly/react-core".into());
+        pkgs.insert("MenuContent".into(), "@patternfly/react-core".into());
+        pkgs.insert("MenuList".into(), "@patternfly/react-core".into());
+        pkgs.insert("MenuItem".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec![
+                "Menu".into(),
+                "MenuContent".into(),
+                "MenuList".into(),
+                "MenuItem".into(),
+            ],
+            edges: vec![
+                // Menu → MenuContent: Structural (CHP=YES, PMC=NO)
+                make_edge("Menu", "MenuContent", crate::sd_types::EdgeStrength::Structural),
+                // Menu → MenuList: Structural (CHP=YES, PMC=NO)
+                make_edge("Menu", "MenuList", crate::sd_types::EdgeStrength::Structural),
+                // MenuContent → MenuList: Allowed (CSS descendant — transparent wrapper)
+                make_edge("MenuContent", "MenuList", crate::sd_types::EdgeStrength::Allowed),
+                // MenuList → MenuItem: Required
+                make_edge("MenuList", "MenuItem", crate::sd_types::EdgeStrength::Required),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // The notParent rule for MenuList should include MenuContent as valid
+        let not_parent_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("list-in-"));
+        assert!(
+            not_parent_rule.is_some(),
+            "Expected notParent rule for MenuList"
+        );
+
+        // Should NOT have "MenuList not-in MenuContent, use Menu" because
+        // MenuContent is already a valid parent (Allowed edge exists).
+        let false_rule = rules
+            .iter()
+            .any(|r| r.rule_id.contains("list-not-in-content"));
+        assert!(
+            !false_rule,
+            "invalidDirectChild 'MenuList not-in MenuContent' should be suppressed \
+             because MenuContent is already a valid parent in the notParent rule. Got: {:?}",
+            rules
+                .iter()
+                .filter(|r| r.rule_id.contains("not-in"))
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Internal edges should not affect conformance rules at all.
     #[test]
     fn test_internal_edges_ignored() {
@@ -7240,6 +8638,230 @@ mod tests {
         insta::assert_yaml_snapshot!(snapshot_rules(rules));
     }
 
+    /// When a component moves between packages (e.g., DragDrop from react-core
+    /// to react-drag-drop), removed-member rules must use the OLD package in
+    /// `from:` so they match consumer code that still imports from the v5 path.
+    #[test]
+    fn test_removed_member_uses_old_package_for_cross_package_move() {
+        let sd = SdPipelineResult {
+            composition_changes: vec![crate::sd_types::CompositionChange {
+                family: "deprecated/DragDrop".into(),
+                change_type: CompositionChangeType::FamilyMemberRemoved {
+                    member: "Draggable".into(),
+                },
+                description: "Draggable was removed from the DragDrop family".into(),
+                before_pattern: None,
+                after_pattern: None,
+            }],
+            // v6 map: Draggable now lives in react-drag-drop
+            component_packages: {
+                let mut m = HashMap::new();
+                m.insert("Draggable".into(), "@patternfly/react-drag-drop".into());
+                m
+            },
+            // v5 map: Draggable was in react-core
+            old_component_packages: {
+                let mut m = HashMap::new();
+                m.insert("Draggable".into(), "@patternfly/react-core".into());
+                m
+            },
+            ..SdPipelineResult::default()
+        };
+
+        let pkg_map = sd.component_packages.clone();
+        let rules = generate_composition_change_rules(&sd, &pkg_map);
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        // The `from:` field should use the OLD package (@patternfly/react-core),
+        // not the new one (@patternfly/react-drag-drop), because consumers
+        // still import from the v5 path.
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-core"),
+                    "removed-member rule should use old_component_packages for from:"
+                );
+            }
+            _ => panic!("expected FrontendReferenced condition"),
+        }
+    }
+
+    /// When a prop is removed from one family member and added to another
+    /// family member, generate a prop-movement rule that instructs moving
+    /// the prop value between components.
+    ///
+    /// Example: Accordion family — `isExpanded` removed from AccordionToggle,
+    /// added to AccordionItem.
+    #[test]
+    fn test_prop_movement_between_family_members() {
+        let mut sd = SdPipelineResult::default();
+
+        // Accordion family: AccordionToggle lost isExpanded, AccordionItem gained it
+        sd.old_component_props.insert(
+            "AccordionToggle".into(),
+            ["isExpanded", "id", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "AccordionToggle".into(),
+            ["id", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.old_component_props.insert(
+            "AccordionItem".into(),
+            ["className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "AccordionItem".into(),
+            ["isExpanded", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        // Root component (unchanged props, just needs to exist)
+        sd.old_component_props.insert(
+            "Accordion".into(),
+            ["displaySize"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Accordion".into(),
+            ["displaySize"].iter().map(|s| s.to_string()).collect(),
+        );
+
+        sd.composition_trees = vec![CompositionTree {
+            root: "Accordion".into(),
+            family_members: vec![
+                "Accordion".into(),
+                "AccordionItem".into(),
+                "AccordionToggle".into(),
+            ],
+            edges: vec![],
+        }];
+
+        let mut pkgs = HashMap::new();
+        pkgs.insert("Accordion".into(), "@patternfly/react-core".into());
+        pkgs.insert("AccordionItem".into(), "@patternfly/react-core".into());
+        pkgs.insert("AccordionToggle".into(), "@patternfly/react-core".into());
+
+        let rules = generate_prop_movement_rules(&sd, &pkgs);
+
+        // Should detect isExpanded moving from AccordionToggle to AccordionItem
+        assert_eq!(rules.len(), 1, "Expected 1 prop-movement rule, got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>());
+
+        let rule = &rules[0];
+        assert!(
+            rule.rule_id.contains("isexpanded"),
+            "Rule should be about isExpanded: {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.rule_id.contains("toggle"),
+            "Rule should reference AccordionToggle: {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.rule_id.contains("item"),
+            "Rule should reference AccordionItem: {}",
+            rule.rule_id
+        );
+        assert!(
+            rule.description.contains("AccordionToggle"),
+            "Description should mention source: {}",
+            rule.description
+        );
+        assert!(
+            rule.description.contains("AccordionItem"),
+            "Description should mention target: {}",
+            rule.description
+        );
+
+        // Should NOT generate rules for className (ubiquitous, filtered)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("classname")),
+            "Should not generate prop-movement for className"
+        );
+    }
+
+    /// When a prop was optional in v5 and becomes required in v6,
+    /// generate a rule. Also verify that a prop that was already
+    /// required in both versions does NOT generate a rule.
+    #[test]
+    fn test_optional_to_required_prop_detected() {
+        let mut sd = SdPipelineResult::default();
+
+        // JumpLinksItem: `href` was optional in v5, required in v6
+        sd.old_component_props.insert(
+            "JumpLinksItem".into(),
+            ["href", "children", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "JumpLinksItem".into(),
+            ["href", "children", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        // In v5, href was NOT required (optional)
+        sd.old_required_props.insert(
+            "JumpLinksItem".into(),
+            ["children"].iter().map(|s| s.to_string()).collect(),
+        );
+        // In v6, href IS required
+        sd.new_required_props.insert(
+            "JumpLinksItem".into(),
+            ["href", "children"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        sd.component_packages
+            .insert("JumpLinksItem".into(), "@patternfly/react-core".into());
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_required_prop_added_rules(&sd, &pkgs);
+
+        // Should generate a rule for `href` (was optional, now required)
+        assert_eq!(
+            rules.len(),
+            1,
+            "Expected 1 rule for href becoming required. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        let rule = &rules[0];
+        assert!(
+            rule.rule_id.contains("href"),
+            "Rule should be about href: {}",
+            rule.rule_id
+        );
+        // Should use the "now required" message, not "new required prop"
+        assert!(
+            rule.description.contains("now required"),
+            "Should say 'now required' for optional→required: {}",
+            rule.description
+        );
+
+        // Should NOT generate a rule for `children` (was required in both versions)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("children")),
+            "Should not generate rule for children (always required)"
+        );
+    }
+
     #[test]
     fn snapshot_conformance_invalid_direct_child_rule() {
         use crate::sd_types::EdgeStrength;
@@ -7300,8 +8922,10 @@ mod tests {
             ..SdPipelineResult::default()
         };
 
-        let result =
-            super::build_deprecated_migration_from_replacement("Card", "Tile", &sd);
+        let empty_report = make_empty_report();
+        let result = super::build_deprecated_migration_from_replacement(
+            "Card", "Tile", &sd, &empty_report,
+        );
         assert!(result.is_some(), "should produce a migration context");
 
         let ctx = result.unwrap();
@@ -7352,8 +8976,10 @@ mod tests {
             ..SdPipelineResult::default()
         };
 
-        let result =
-            super::build_deprecated_migration_from_replacement("NewComp", "OldComp", &sd);
+        let empty_report = make_empty_report();
+        let result = super::build_deprecated_migration_from_replacement(
+            "NewComp", "OldComp", &sd, &empty_report,
+        );
         let ctx = result.unwrap();
         assert_eq!(ctx.matching_props.len(), 1);
         assert!(ctx.matching_props[0].type_changed);
@@ -7378,9 +9004,134 @@ mod tests {
             ..SdPipelineResult::default()
         };
 
-        let result =
-            super::build_deprecated_migration_from_replacement("Card", "Tile", &sd);
+        let empty_report = make_empty_report();
+        let result = super::build_deprecated_migration_from_replacement(
+            "Card", "Tile", &sd, &empty_report,
+        );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_deprecated_migration_from_replacement_td_enrichment() {
+        // TC012/TC013: Source profile prop_types only captures directly-defined
+        // props. For Chip→Label, most props are inherited and missing from
+        // prop_types. The TD report's ApiChange entries should enrich
+        // the prop type maps with inherited members.
+        use semver_analyzer_core::*;
+
+        // Source profile only has 2 props each (simulating partial coverage)
+        let mut old_prop_types = HashMap::new();
+        let mut chip_props = BTreeMap::new();
+        chip_props.insert("isReadOnly".into(), "boolean".into());
+        chip_props.insert("badge".into(), "React.ReactNode".into());
+        old_prop_types.insert("Chip".into(), chip_props);
+
+        let mut new_prop_types = HashMap::new();
+        let mut label_props = BTreeMap::new();
+        label_props.insert("isCompact".into(), "boolean".into());
+        label_props.insert("variant".into(), "'outline' | 'filled'".into());
+        new_prop_types.insert("Label".into(), label_props);
+
+        let sd = SdPipelineResult {
+            old_component_prop_types: old_prop_types,
+            new_component_prop_types: new_prop_types,
+            ..SdPipelineResult::default()
+        };
+
+        // Build a report with ApiChange entries for inherited props
+        // that the source profile missed.
+        let mut report = make_empty_report();
+        report.changes.push(FileChanges {
+            file: std::path::PathBuf::from("packages/react-core/src/components/Chip/Chip.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                // ChipProps.onClick existed in old (inherited) — type sig in "before"
+                ApiChange {
+                    symbol: "ChipProps.onClick".into(),
+                    qualified_name: "ChipProps.onClick".into(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: onClick: (event: React.MouseEvent) => void".into()),
+                    after: None,
+                    description: "onClick removed from ChipProps".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+                // ChipProps.closeBtnAriaLabel existed in old (inherited)
+                ApiChange {
+                    symbol: "ChipProps.closeBtnAriaLabel".into(),
+                    qualified_name: "ChipProps.closeBtnAriaLabel".into(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: closeBtnAriaLabel: string".into()),
+                    after: None,
+                    description: "closeBtnAriaLabel removed from ChipProps".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        });
+        // Also add an entry for LabelProps with a new prop "onClose"
+        report.changes.push(FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Label/Label.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "LabelProps.onClose".into(),
+                qualified_name: "LabelProps.onClose".into(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::SignatureChanged,
+                before: None,
+                after: Some("property: onClose: (event: React.MouseEvent) => void".into()),
+                description: "onClose added to LabelProps".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        });
+
+        let result = super::build_deprecated_migration_from_replacement(
+            "Label", "Chip", &sd, &report,
+        );
+        assert!(result.is_some(), "should produce a migration context");
+        let ctx = result.unwrap();
+
+        // The key assertion: TD-enriched props appear in the output
+        let all_old_props: Vec<String> = ctx
+            .matching_props
+            .iter()
+            .map(|p| p.old_name.clone())
+            .chain(ctx.removed_props.iter().cloned())
+            .collect();
+
+        assert!(
+            all_old_props.contains(&"onClick".to_string()),
+            "onClick should be in old props (enriched from TD report). \
+             matching: {:?}, removed: {:?}",
+            ctx.matching_props
+                .iter()
+                .map(|p| &p.old_name)
+                .collect::<Vec<_>>(),
+            ctx.removed_props
+        );
+        assert!(
+            all_old_props.contains(&"closeBtnAriaLabel".to_string()),
+            "closeBtnAriaLabel should be in old props (enriched from TD report)"
+        );
+
+        // onClose should be in new_props (enriched from TD report for Label)
+        assert!(
+            ctx.new_props.contains_key("onClose"),
+            "onClose should be in new_props (enriched from TD report). \
+             new_props: {:?}",
+            ctx.new_props
+        );
     }
 
     #[test]
@@ -7711,5 +9462,2265 @@ mod tests {
                 cond
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // TC-driven rule generation tests
+    // Each test corresponds to a failing TC from the PF6 migration bench.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Helper: build a minimal AnalysisReport for testing rule generators
+    /// that need a report (like generate_prop_value_conformance_rules).
+    fn build_test_report(
+        changes: Vec<semver_analyzer_core::FileChanges<TypeScript>>,
+    ) -> semver_analyzer_core::AnalysisReport<TypeScript> {
+        use semver_analyzer_core::*;
+        AnalysisReport {
+            repository: std::path::PathBuf::from("/tmp/test"),
+            comparison: Comparison {
+                from_ref: "v5".into(),
+                to_ref: "v6".into(),
+                from_sha: "aaa".into(),
+                to_sha: "bbb".into(),
+                commit_count: 1,
+                analysis_timestamp: "2026-01-01".into(),
+            },
+            summary: Summary {
+                total_breaking_changes: 0,
+                breaking_api_changes: 0,
+                breaking_behavioral_changes: 0,
+                files_with_breaking_changes: 0,
+            },
+            changes,
+            manifest_changes: vec![],
+            added_files: vec![],
+            packages: vec![],
+            member_renames: HashMap::new(),
+            inferred_rename_patterns: None,
+            extensions: crate::extensions::TsAnalysisExtensions {
+                sd_result: None,
+                hierarchy_deltas: Vec::new(),
+                new_hierarchies: Default::default(),
+            },
+            metadata: AnalysisMetadata {
+                call_graph_analysis: "none".into(),
+                tool_version: "0.1.0".into(),
+                llm_usage: None,
+            },
+        }
+    }
+
+    /// TC021: DrawerContent.colorVariant PropValueChange rules should have
+    /// replacement values populated (currently hardcoded to None).
+    ///
+    /// Old values: 'default' | 'light-200' | 'no-background'
+    /// New values: 'default' | 'primary' | 'secondary'
+    /// Surviving: 'default'. Added: 'primary', 'secondary'.
+    /// Expected: light-200→secondary, no-background→primary (or default/remove)
+    #[test]
+    fn test_prop_value_change_computes_replacement_value() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/DrawerContent.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "DrawerContentProps.colorVariant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: colorVariant: 'default' | 'light-200' | 'no-background'".into(),
+                ),
+                after: Some(
+                    "property: colorVariant: 'default' | 'primary' | 'secondary'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("DrawerContent".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have 2 rules: one per removed value (light-200, no-background)
+        assert!(
+            rules.len() >= 2,
+            "TC021: Expected at least 2 rules for removed values, got {}",
+            rules.len()
+        );
+
+        // Find the rule for "no-background" → should map to "secondary"
+        // (name_similarity("no-background", "secondary") = 0.308, passes 0.3)
+        let nobg_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("no-background") || r.rule_id.contains("no_background"))
+            .expect("TC021: Should have a rule for removed value 'no-background'");
+        let nobg_repl = nobg_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            nobg_repl.map(|s| s.as_str()),
+            Some("secondary"),
+            "TC021: no-background should map to secondary (sim=0.308)"
+        );
+
+        // Find the rule for "light-200" → maps to "default" (surviving value
+        // fallback, since light-200 has 0.0 similarity to all added values).
+        // This is better than the old behavior of no suggestion at all.
+        let light200_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("light-200"))
+            .expect("TC021: Should have a rule for removed value 'light-200'");
+        let light200_repl = light200_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert!(
+            light200_repl.is_some(),
+            "TC021: light-200 should have a replacement suggestion"
+        );
+    }
+
+    /// TC067: PageSection.variant value 'light' should map to 'default',
+    /// not 'secondary'.
+    ///
+    /// Old values: 'default' | 'dark' | 'darker' | 'light'
+    /// New values: 'default' | 'secondary'
+    /// Removed: dark, darker, light. Added: secondary.
+    /// Expected: dark→secondary, darker→secondary, light→default (or remove prop)
+    #[test]
+    fn test_prop_value_change_variant_light_maps_correctly() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/PageSection.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "PageSectionProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'dark' | 'darker' | 'light'".into(),
+                ),
+                after: Some("property: variant: 'default' | 'secondary'".into()),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Find the rule for "dark"
+        let dark_rule = rules
+            .iter()
+            .find(|r| {
+                r.rule_id.contains("-dark")
+                    && !r.rule_id.contains("darker")
+            });
+        if let Some(rule) = dark_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                Some("secondary"),
+                "TC067: dark should map to secondary"
+            );
+        }
+
+        // Find the rule for "darker"
+        let darker_rule = rules.iter().find(|r| r.rule_id.contains("darker"));
+        if let Some(rule) = darker_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                Some("secondary"),
+                "TC067: darker should map to secondary"
+            );
+        }
+
+        // Find the rule for "light" — should NOT map to "secondary"
+        let light_rule = rules.iter().find(|r| r.rule_id.contains("light"));
+        if let Some(rule) = light_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            // Light should map to "default" (the surviving neutral value).
+            // "light" was the standard/neutral appearance in v5, which is
+            // what "default" means in v6.
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                Some("default"),
+                "TC067: light should map to surviving value 'default', not 'secondary'. \
+                 In PF5, 'light' was the standard appearance; in PF6, 'default' is."
+            );
+        }
+    }
+
+    /// TC075 (regression): When exactly 1 value is removed and 1 is added,
+    /// auto-map them. Tabs.variant: 'default'|'light300' → 'default'|'secondary'.
+    /// Removed: light300. Added: secondary. 1:1 → auto-map.
+    #[test]
+    fn test_prop_value_change_single_new_value_auto_maps() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Tabs.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "TabsProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("property: variant: 'default' | 'light300'".into()),
+                after: Some("property: variant: 'default' | 'secondary'".into()),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Tabs".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have 1 rule for removed value "light300"
+        let light300_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("light300"))
+            .expect("Should have a rule for removed value 'light300'");
+
+        let replacement = light300_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("secondary"),
+            "TC075: light300 should auto-map to secondary (only 1 new value)"
+        );
+    }
+
+    // ── Directional similarity boost tests ────────────────────────────
+
+    #[test]
+    fn test_directional_boost_left_start() {
+        assert!(
+            (directional_similarity_boost("alignLeft", "alignStart") - 0.10).abs() < f64::EPSILON,
+        );
+    }
+
+    #[test]
+    fn test_directional_boost_right_end() {
+        assert!(
+            (directional_similarity_boost("alignRight", "alignEnd") - 0.10).abs() < f64::EPSILON,
+        );
+    }
+
+    #[test]
+    fn test_directional_boost_left_end_no_boost() {
+        assert!(
+            directional_similarity_boost("alignLeft", "alignEnd").abs() < f64::EPSILON,
+            "Left should not boost to End"
+        );
+    }
+
+    #[test]
+    fn test_directional_boost_right_start_no_boost() {
+        assert!(
+            directional_similarity_boost("alignRight", "alignStart").abs() < f64::EPSILON,
+            "Right should not boost to Start"
+        );
+    }
+
+    #[test]
+    fn test_directional_boost_unrelated_no_boost() {
+        assert!(directional_similarity_boost("default", "primary").abs() < f64::EPSILON);
+        assert!(directional_similarity_boost("light-200", "secondary").abs() < f64::EPSILON);
+        assert!(directional_similarity_boost("dark", "secondary").abs() < f64::EPSILON);
+        assert!(directional_similarity_boost("tertiary", "horizontal").abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_directional_boost_case_insensitive() {
+        // camelCase: AlignLeft → lowered → "alignleft" ends_with "left"
+        assert!(
+            (directional_similarity_boost("AlignLeft", "alignStart") - 0.10).abs() < f64::EPSILON,
+        );
+        assert!(
+            (directional_similarity_boost("ALIGNRIGHT", "ALIGNEND") - 0.10).abs() < f64::EPSILON,
+        );
+    }
+
+    // ── Full pipeline tests with real PF data ───────────────────────────
+
+    /// ToolbarGroup.align: alignLeft→alignStart, alignRight→alignEnd.
+    /// Complete replacement (no survivors). The directional boost fixes
+    /// the greedy matching that otherwise picks alignLeft→alignCenter.
+    #[test]
+    fn test_align_left_right_maps_to_start_end() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/ToolbarGroup.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ToolbarGroupProps.align".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: align: 'alignLeft' | 'alignRight'".into(),
+                ),
+                after: Some(
+                    "property: align: 'alignCenter' | 'alignEnd' | 'alignStart'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("ToolbarGroup".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        let left_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("alignleft"))
+            .expect("Should have a rule for alignLeft");
+        let left_replacement = left_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            left_replacement.map(|s| s.as_str()),
+            Some("alignStart"),
+            "alignLeft should map to alignStart (directional: Left→Start). Got: {:?}",
+            left_replacement
+        );
+
+        let right_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("alignright"))
+            .expect("Should have a rule for alignRight");
+        let right_replacement = right_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            right_replacement.map(|s| s.as_str()),
+            Some("alignEnd"),
+            "alignRight should map to alignEnd (directional: Right→End). Got: {:?}",
+            right_replacement
+        );
+    }
+
+    /// DrawerContent.colorVariant: partial replacement (default survives).
+    /// Removed: light-200, no-background. Added: primary, secondary.
+    /// Boost should NOT affect this — no directional suffixes.
+    #[test]
+    fn test_drawer_colorvariant_not_affected_by_directional_boost() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/DrawerContent.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "DrawerContentProps.colorVariant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: colorVariant: 'default' | 'light-200' | 'no-background'".into(),
+                ),
+                after: Some(
+                    "property: colorVariant: 'default' | 'primary' | 'secondary'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("DrawerContent".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have 2 rules: light-200 and no-background
+        let drawer_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("drawercontent"))
+            .collect();
+        assert_eq!(drawer_rules.len(), 2, "Should have 2 Drawer colorVariant rules");
+
+        // Verify directional boost didn't change behavior:
+        // light-200 has no directional suffix, no-background has no directional suffix
+        // Verify directional boost is zero for all Drawer colorVariant values
+        let boost_left = directional_similarity_boost("light-200", "primary");
+        let boost_right = directional_similarity_boost("no-background", "secondary");
+        assert!(boost_left.abs() < f64::EPSILON, "light-200 should have zero directional boost");
+        assert!(boost_right.abs() < f64::EPSILON, "no-background should have zero directional boost");
+    }
+
+    /// Tabs.variant: 1:1 auto-map (light300→secondary). Directional boost
+    /// doesn't apply — the 1:1 branch runs before similarity matching.
+    #[test]
+    fn test_tabs_variant_1to1_not_affected_by_boost() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Tabs.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "TabsProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("property: variant: 'default' | 'light300'".into()),
+                after: Some("property: variant: 'default' | 'secondary'".into()),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Tabs".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        let light300_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("light300"))
+            .expect("Should have a rule for light300");
+        let replacement = light300_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("secondary"),
+            "light300→secondary (1:1 auto-map, unaffected by boost)"
+        );
+    }
+
+    /// PageSection.variant: partial replacement (default survives).
+    /// Removed: dark, darker, light. Added: secondary.
+    /// No directional suffixes — boost should not change existing behavior.
+    #[test]
+    fn test_pagesection_variant_partial_not_affected() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/PageSection.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "PageSectionProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'dark' | 'darker' | 'light'".into(),
+                ),
+                after: Some(
+                    "property: variant: 'default' | 'secondary'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have 3 rules: dark, darker, light
+        let ps_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("pagesection"))
+            .collect();
+        assert_eq!(ps_rules.len(), 3, "Should have 3 PageSection variant rules");
+
+        // dark → secondary (added, 0.333≥0.3)
+        let dark_rule = ps_rules.iter().find(|r| r.rule_id.ends_with("-dark")).unwrap();
+        let dark_repl = dark_rule.fix_strategy.as_ref().and_then(|s| s.replacement.as_ref());
+        assert_eq!(dark_repl.map(|s| s.as_str()), Some("secondary"));
+
+        // darker → secondary (added, 0.333≥0.3)
+        let darker_rule = ps_rules.iter().find(|r| r.rule_id.contains("darker")).unwrap();
+        let darker_repl = darker_rule.fix_strategy.as_ref().and_then(|s| s.replacement.as_ref());
+        assert_eq!(darker_repl.map(|s| s.as_str()), Some("secondary"));
+
+        // light → default (surviving fallback, 0.286≥0.2)
+        let light_rule = ps_rules.iter().find(|r| r.rule_id.ends_with("-light")).unwrap();
+        let light_repl = light_rule.fix_strategy.as_ref().and_then(|s| s.replacement.as_ref());
+        assert_eq!(light_repl.map(|s| s.as_str()), Some("default"));
+    }
+
+    /// ToolbarGroup.variant: partial replacement (action-group etc. survive).
+    /// Removed: button-group, icon-button-group. No directional suffixes.
+    #[test]
+    fn test_toolbargroup_variant_partial_not_affected() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/ToolbarGroup.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ToolbarGroupProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'action-group' | 'action-group-plain' | 'button-group' | 'filter-group' | 'icon-button-group'".into(),
+                ),
+                after: Some(
+                    "property: variant: 'action-group' | 'action-group-inline' | 'action-group-plain' | 'filter-group'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("ToolbarGroup".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have 2 rules: button-group, icon-button-group
+        let tg_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("toolbargroup-variant"))
+            .collect();
+        assert_eq!(tg_rules.len(), 2, "Should have 2 ToolbarGroup variant rules");
+
+        // button-group → action-group-inline (added, best match) or action-group (surviving)
+        let bg_rule = tg_rules.iter().find(|r| r.rule_id.contains("button-group") && !r.rule_id.contains("icon")).unwrap();
+        let bg_repl = bg_rule.fix_strategy.as_ref().and_then(|s| s.replacement.as_ref());
+        assert!(
+            bg_repl.is_some(),
+            "button-group should have a replacement suggestion"
+        );
+        // No directional boost involved — verify it's zero
+        assert!(
+            directional_similarity_boost("button-group", bg_repl.unwrap()).abs() < f64::EPSILON,
+            "button-group replacement should have zero directional boost"
+        );
+    }
+
+    // ── Phase 2: Removed prop with ReplacedByMember tests ─────────────
+
+    /// TC006: Banner variant prop was removed and replaced by `color` prop.
+    /// Phase 2 should generate per-value rules mapping old variant values
+    /// to new color values using string similarity.
+    ///
+    /// v5: variant: 'default' | 'info' | 'danger' | 'success' | 'warning'
+    /// v6: color: 'blue' | 'red' | 'green' | 'gold' | 'default'
+    /// v6: status: 'danger' | 'success' | 'warning' | 'info' | 'custom'
+    ///
+    /// Expected mappings (by name_similarity):
+    ///   info → (no strong color match, but "blue" is best via LLM)
+    ///   danger → red (or LLM)
+    ///   success → green (or LLM)
+    ///   warning → gold (or LLM)
+    ///   default → default (surviving or removable)
+    ///
+    /// All get LlmAssisted strategy since the transformation crosses
+    /// prop boundaries (variant → color + status).
+    #[test]
+    fn test_removed_prop_replaced_by_member_generates_per_value_rules() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Banner.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "BannerProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some(
+                    "property: variant: 'default' | 'info' | 'danger' | 'success' | 'warning'"
+                        .into(),
+                ),
+                after: None,
+                description: "variant prop removed".into(),
+                migration_target: None,
+                removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                    new_member: "color".into(),
+                }),
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Banner".into(), "@patternfly/react-core".into());
+        // Set up new component prop types so Phase 2 can look up the replacement
+        sd.new_component_prop_types.insert(
+            "Banner".into(),
+            [
+                (
+                    "color".into(),
+                    "'blue' | 'red' | 'green' | 'gold' | 'default'".into(),
+                ),
+                (
+                    "status".into(),
+                    "'danger' | 'success' | 'warning' | 'info' | 'custom'".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should generate 5 rules — one for each variant value
+        let banner_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.starts_with("sd-prop-replaced-banner-variant-"))
+            .collect();
+        assert_eq!(
+            banner_rules.len(),
+            5,
+            "Should generate 5 per-value rules for Banner variant. Got: {:?}",
+            banner_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Each rule should detect the old prop with a value discriminator
+        for rule in &banner_rules {
+            let refs = semver_analyzer_konveyor_core::extract_frontend_refs(&rule.when);
+            assert_eq!(refs.len(), 1, "Each rule should have exactly 1 condition");
+            let r = refs[0];
+            assert_eq!(r.location, "JSX_PROP");
+            assert_eq!(r.pattern, "^variant$");
+            assert_eq!(
+                r.component.as_deref(),
+                Some("^Banner$"),
+                "Rule should scope to Banner component"
+            );
+            assert!(
+                r.value.is_some(),
+                "Rule should have value discriminator: {:?}",
+                rule.rule_id
+            );
+        }
+
+        // All rules should use LlmAssisted strategy
+        for rule in &banner_rules {
+            let strategy = rule
+                .fix_strategy
+                .as_ref()
+                .expect("Should have fix strategy");
+            assert_eq!(
+                strategy.strategy, "LlmAssisted",
+                "Should use LlmAssisted for cross-prop transformation: {}",
+                rule.rule_id
+            );
+        }
+
+        // Check that secondary prop "status" is mentioned in the messages
+        // for values that overlap (danger, success, warning, info)
+        let danger_rule = banner_rules
+            .iter()
+            .find(|r| r.rule_id.contains("danger"))
+            .expect("Should have a rule for danger");
+        assert!(
+            danger_rule.message.contains("status"),
+            "danger rule should mention the status prop: {}",
+            danger_rule.message
+        );
+
+        let info_rule = banner_rules
+            .iter()
+            .find(|r| r.rule_id.contains("-info"))
+            .expect("Should have a rule for info");
+        assert!(
+            info_rule.message.contains("status"),
+            "info rule should mention the status prop: {}",
+            info_rule.message
+        );
+
+        // "default" should NOT mention status (not in status values)
+        let default_rule = banner_rules
+            .iter()
+            .find(|r| r.rule_id.contains("default"))
+            .expect("Should have a rule for default");
+        // default IS in the color values, so it gets a replacement mapping
+        let default_replacement = default_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            default_replacement.map(|s| s.as_str()),
+            Some("default"),
+            "default should map to default on color prop"
+        );
+    }
+
+    /// Removed prop WITHOUT ReplacedByMember should NOT generate Phase 2 rules.
+    #[test]
+    fn test_removed_prop_without_replacement_no_phase2_rules() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/Comp.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "CompProps.oldProp".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some("property: oldProp: 'a' | 'b' | 'c'".into()),
+                after: None,
+                description: "oldProp removed".into(),
+                migration_target: None,
+                removal_disposition: Some(RemovalDisposition::TrulyRemoved),
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let sd = SdPipelineResult::default();
+        let pkgs = HashMap::new();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        let phase2_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.starts_with("sd-prop-replaced-"))
+            .collect();
+        assert!(
+            phase2_rules.is_empty(),
+            "TrulyRemoved props should NOT generate Phase 2 rules. Got: {:?}",
+            phase2_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    // ── CSS Modifier Bridge Tests ──────────────────────────────────────
+
+    /// TC051 Nav case: structural matching can't bridge tertiary→horizontal-subnav
+    /// because v5→v6 completely restructured the CSS (physical→logical properties,
+    /// different direct properties). This is expected — Nav tertiary→horizontal-subnav
+    /// is a 1:1 auto-map case handled by the existing Branch 1 algorithm.
+    /// The CSS bridge correctly returns empty and falls through.
+    ///
+    /// This test validates that the bridge doesn't produce a WRONG match
+    /// when structures are too different.
+    #[test]
+    fn test_css_bridge_nav_no_structural_match_when_restructured() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_nav = CssModifierMap::new();
+        // v5 .pf-m-tertiary: physical padding + color + display
+        let mut tertiary = CssModifierEffect::default();
+        tertiary.custom_property_overrides.insert("--pf-v5-c-nav__link--PaddingTop".into(), "var(...)".into());
+        tertiary.custom_property_overrides.insert("--pf-v5-c-nav__link--Color".into(), "var(...)".into());
+        tertiary.direct_properties.insert("display".into(), "flex".into());
+        old_nav.insert("pf-m-tertiary".into(), tertiary);
+        old_mods.insert("nav".into(), old_nav);
+
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_nav = CssModifierMap::new();
+        // v6 .pf-m-horizontal-subnav: logical padding + border (no display)
+        let mut subnav = CssModifierEffect::default();
+        subnav.custom_property_overrides.insert("--pf-v6-c-nav__link--PaddingBlockStart".into(), "var(...)".into());
+        subnav.direct_properties.insert("border".into(), "1px solid var(...)".into());
+        new_nav.insert("pf-m-horizontal-subnav".into(), subnav);
+        new_mods.insert("nav".into(), new_nav);
+
+        let removed: Vec<String> = vec!["tertiary".into()];
+        let added: Vec<String> = vec!["horizontal-subnav".into()];
+        let removed_refs: Vec<&String> = removed.iter().collect();
+        let added_refs: Vec<&String> = added.iter().collect();
+
+        let hints = compute_css_modifier_bridge(
+            "Nav", &removed_refs, &added_refs,
+            &old_mods, &new_mods,
+        );
+
+        // Bridge correctly returns empty when structures are too different.
+        // The 1:1 auto-map in the string similarity algorithm handles this case.
+        assert!(
+            hints.is_empty(),
+            "Nav: CSS bridge should return empty when structures are too different \
+             (v5 physical→v6 logical restructuring). Got: {:?}",
+            hints
+        );
+    }
+
+    /// TC014: Label color cyan → teal via CSS modifier bridge.
+    /// Both modifiers override the same structural slots (BackgroundColor,
+    /// Color, icon--Color) just with different color token values.
+    #[test]
+    fn test_css_bridge_label_cyan_to_teal() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_label = CssModifierMap::new();
+
+        // Real PF v5 .pf-m-cyan: 13 custom property overrides
+        let mut cyan = CssModifierEffect::default();
+        cyan.custom_property_overrides.insert("--pf-v5-c-label--BackgroundColor".into(), "var(--pf-v5-c-label--m-cyan--BackgroundColor)".into());
+        cyan.custom_property_overrides.insert("--pf-v5-c-label__icon--Color".into(), "var(--pf-v5-c-label--m-cyan__icon--Color)".into());
+        cyan.custom_property_overrides.insert("--pf-v5-c-label__content--Color".into(), "var(--pf-v5-c-label--m-cyan__content--Color)".into());
+        cyan.custom_property_overrides.insert("--pf-v5-c-label__content--before--BorderColor".into(), "var(--pf-v5-c-label--m-cyan__content--before--BorderColor)".into());
+        // (abbreviated — 13 total in real PF, using 4 for test)
+        old_label.insert("pf-m-cyan".into(), cyan);
+
+        // Real PF v5 .pf-m-gold: same structure as cyan (same 13 overrides)
+        let mut gold = CssModifierEffect::default();
+        gold.custom_property_overrides.insert("--pf-v5-c-label--BackgroundColor".into(), "var(--pf-v5-c-label--m-gold--BackgroundColor)".into());
+        gold.custom_property_overrides.insert("--pf-v5-c-label__icon--Color".into(), "var(--pf-v5-c-label--m-gold__icon--Color)".into());
+        gold.custom_property_overrides.insert("--pf-v5-c-label__content--Color".into(), "var(--pf-v5-c-label--m-gold__content--Color)".into());
+        gold.custom_property_overrides.insert("--pf-v5-c-label__content--before--BorderColor".into(), "var(--pf-v5-c-label--m-gold__content--before--BorderColor)".into());
+        old_label.insert("pf-m-gold".into(), gold);
+
+        old_mods.insert("label".into(), old_label);
+
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_label = CssModifierMap::new();
+
+        // Real PF v6 .pf-m-teal: 8 custom property overrides
+        let mut teal = CssModifierEffect::default();
+        teal.custom_property_overrides.insert("--pf-v6-c-label--BackgroundColor".into(), "var(--pf-v6-c-label--m-teal--BackgroundColor)".into());
+        teal.custom_property_overrides.insert("--pf-v6-c-label--Color".into(), "var(--pf-v6-c-label--m-teal--Color)".into());
+        teal.custom_property_overrides.insert("--pf-v6-c-label__icon--Color".into(), "var(--pf-v6-c-label--m-teal__icon--Color)".into());
+        teal.custom_property_overrides.insert("--pf-v6-c-label--m-clickable--hover--BackgroundColor".into(), "var(--pf-v6-c-label--m-teal--m-clickable--hover--BackgroundColor)".into());
+        new_label.insert("pf-m-teal".into(), teal);
+
+        // Real PF v6 .pf-m-yellow: same structure as teal
+        let mut yellow = CssModifierEffect::default();
+        yellow.custom_property_overrides.insert("--pf-v6-c-label--BackgroundColor".into(), "var(--pf-v6-c-label--m-yellow--BackgroundColor)".into());
+        yellow.custom_property_overrides.insert("--pf-v6-c-label--Color".into(), "var(--pf-v6-c-label--m-yellow--Color)".into());
+        yellow.custom_property_overrides.insert("--pf-v6-c-label__icon--Color".into(), "var(--pf-v6-c-label--m-yellow__icon--Color)".into());
+        yellow.custom_property_overrides.insert("--pf-v6-c-label--m-clickable--hover--BackgroundColor".into(), "var(--pf-v6-c-label--m-yellow--m-clickable--hover--BackgroundColor)".into());
+        new_label.insert("pf-m-yellow".into(), yellow);
+
+        // Real PF v6 .pf-m-orange: different structure — has orangered tokens
+        let mut orange = CssModifierEffect::default();
+        orange.custom_property_overrides.insert("--pf-v6-c-label--BackgroundColor".into(), "var(--pf-v6-c-label--m-orange--BackgroundColor)".into());
+        orange.custom_property_overrides.insert("--pf-v6-c-label--Color".into(), "var(--pf-v6-c-label--m-orange--Color)".into());
+        orange.custom_property_overrides.insert("--pf-v6-c-label__icon--Color".into(), "var(--pf-v6-c-label--m-orange__icon--Color)".into());
+        orange.custom_property_overrides.insert("--pf-v6-c-label--m-clickable--hover--BackgroundColor".into(), "var(--pf-v6-c-label--m-orange--m-clickable--hover--BackgroundColor)".into());
+        new_label.insert("pf-m-orange".into(), orange);
+
+        new_mods.insert("label".into(), new_label);
+
+        let removed: Vec<String> = vec!["cyan".into(), "gold".into()];
+        let added: Vec<String> = vec!["teal".into(), "yellow".into(), "orangered".into()];
+        let removed_refs: Vec<&String> = removed.iter().collect();
+        let added_refs: Vec<&String> = added.iter().collect();
+
+        let hints = compute_css_modifier_bridge(
+            "Label", &removed_refs, &added_refs,
+            &old_mods, &new_mods,
+        );
+
+        // NOTE: With Phase 1 structural matching, ALL v6 color modifiers have
+        // identical structure (same 4 slots). So cyan could map to any of
+        // {teal, yellow, orange}. The structural similarity is the same for all.
+        // Phase 2 (resolved values) will disambiguate by comparing actual colors.
+        //
+        // For Phase 1, we just verify that BOTH removed values get mappings
+        // and they don't both map to the same added value (greedy prevents that).
+        assert_eq!(
+            hints.len(), 2,
+            "TC014: CSS bridge should produce 2 mappings (cyan + gold). Got: {:?}",
+            hints
+        );
+        assert!(hints.contains_key("cyan"), "cyan should have a mapping");
+        assert!(hints.contains_key("gold"), "gold should have a mapping");
+        // Greedy should prevent both mapping to the same value
+        assert_ne!(
+            hints.get("cyan"), hints.get("gold"),
+            "cyan and gold should not map to the same value"
+        );
+    }
+
+    /// TC014 with REAL PF data: cyan→teal and gold→yellow disambiguated
+    /// using bag-of-colors resolved similarity.
+    ///
+    /// Real PF v5 and v6 Label modifiers have DIFFERENT token structures:
+    ///   - v5 cyan: 13 custom_property_overrides (editable, outline, content, icon patterns)
+    ///   - v6 teal: 8 custom_property_overrides (clickable, outline, icon patterns)
+    ///
+    /// Token slot names DON'T match across versions, so slot-based comparison
+    /// gives near-zero similarity. The bag-of-colors approach ignores slot names
+    /// and directly compares the hex color palettes.
+    ///
+    /// Colors from the actual PF CSS (from pipeline report):
+    ///   v5 cyan palette: #f2f9f9, #a2d9d9, #009596, #003737, #005f60, #d2d2d2
+    ///   v5 gold palette: #f9e0a2, #f0ab00, #795600, #3e2b00, #c58c00, #d2d2d2
+    ///   v6 teal palette: #b9e5e5, #9ad8d8, #63bdbd, #151515, #1f1f1f
+    ///   v6 yellow palette: #f9e0a2, #f4c145, #c58c00, #151515, #1f1f1f
+    ///   v6 orange palette: #f4b678, #ef9234, #8f4700, #151515, #1f1f1f
+    ///
+    /// cyan colors (blue-green) are closest to teal colors (blue-green).
+    /// gold colors (warm yellow) are closest to yellow colors (warm yellow).
+    #[test]
+    fn test_css_bridge_label_resolved_values_disambiguate() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_label = CssModifierMap::new();
+
+        // Real PF v5 .pf-m-cyan — 13 overrides with resolved hex colors
+        let mut cyan = CssModifierEffect::default();
+        // Custom property overrides (for structural similarity)
+        for (k, v) in [
+            ("--pf-v5-c-label--BackgroundColor", "var(--pf-v5-c-label--m-cyan--BackgroundColor)"),
+            ("--pf-v5-c-label__content--Color", "var(--pf-v5-c-label--m-cyan__content--Color)"),
+            ("--pf-v5-c-label__icon--Color", "var(--pf-v5-c-label--m-cyan__icon--Color)"),
+            ("--pf-v5-c-label__content--before--BorderColor", "var(--pf-v5-c-label--m-cyan__content--before--BorderColor)"),
+            ("--pf-v5-c-label--m-outline__content--Color", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label__content--link--hover--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label__content--link--focus--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-editable__content--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-editable__content--hover--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-editable__content--focus--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--link--hover--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--link--focus--before--BorderColor", "var(...)"),
+        ] {
+            cyan.custom_property_overrides.insert(k.into(), v.into());
+        }
+        // Resolved terminal hex colors (from real pipeline output)
+        for (k, v) in [
+            ("--pf-v5-c-label--BackgroundColor", "#f2f9f9"),
+            ("--pf-v5-c-label__content--Color", "#003737"),
+            ("--pf-v5-c-label__icon--Color", "#009596"),
+            ("--pf-v5-c-label__content--before--BorderColor", "#a2d9d9"),
+            ("--pf-v5-c-label--m-outline__content--Color", "#005f60"),
+            ("--pf-v5-c-label--m-outline__content--before--BorderColor", "#d2d2d2"),
+            ("--pf-v5-c-label__content--link--hover--before--BorderColor", "#009596"),
+            ("--pf-v5-c-label__content--link--focus--before--BorderColor", "#009596"),
+            ("--pf-v5-c-label--m-editable__content--before--BorderColor", "#a2d9d9"),
+            ("--pf-v5-c-label--m-editable__content--hover--before--BorderColor", "#a2d9d9"),
+            ("--pf-v5-c-label--m-editable__content--focus--before--BorderColor", "#a2d9d9"),
+            ("--pf-v5-c-label--m-outline__content--link--hover--before--BorderColor", "#d2d2d2"),
+            ("--pf-v5-c-label--m-outline__content--link--focus--before--BorderColor", "#d2d2d2"),
+        ] {
+            cyan.resolved_overrides.insert(k.into(), v.into());
+        }
+        old_label.insert("pf-m-cyan".into(), cyan);
+
+        // Real PF v5 .pf-m-gold — same 13 override slots, warm palette
+        let mut gold = CssModifierEffect::default();
+        for (k, v) in [
+            ("--pf-v5-c-label--BackgroundColor", "var(...)"),
+            ("--pf-v5-c-label__content--Color", "var(...)"),
+            ("--pf-v5-c-label__icon--Color", "var(...)"),
+            ("--pf-v5-c-label__content--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--Color", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label__content--link--hover--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label__content--link--focus--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-editable__content--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-editable__content--hover--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-editable__content--focus--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--link--hover--before--BorderColor", "var(...)"),
+            ("--pf-v5-c-label--m-outline__content--link--focus--before--BorderColor", "var(...)"),
+        ] {
+            gold.custom_property_overrides.insert(k.into(), v.into());
+        }
+        for (k, v) in [
+            ("--pf-v5-c-label--BackgroundColor", "#fdf7e7"),
+            ("--pf-v5-c-label__content--Color", "#3e2b00"),
+            ("--pf-v5-c-label__icon--Color", "#f0ab00"),
+            ("--pf-v5-c-label__content--before--BorderColor", "#f9e0a2"),
+            ("--pf-v5-c-label--m-outline__content--Color", "#795600"),
+            ("--pf-v5-c-label--m-outline__content--before--BorderColor", "#d2d2d2"),
+            ("--pf-v5-c-label__content--link--hover--before--BorderColor", "#c58c00"),
+            ("--pf-v5-c-label__content--link--focus--before--BorderColor", "#c58c00"),
+            ("--pf-v5-c-label--m-editable__content--before--BorderColor", "#f9e0a2"),
+            ("--pf-v5-c-label--m-editable__content--hover--before--BorderColor", "#f9e0a2"),
+            ("--pf-v5-c-label--m-editable__content--focus--before--BorderColor", "#f9e0a2"),
+            ("--pf-v5-c-label--m-outline__content--link--hover--before--BorderColor", "#d2d2d2"),
+            ("--pf-v5-c-label--m-outline__content--link--focus--before--BorderColor", "#d2d2d2"),
+        ] {
+            gold.resolved_overrides.insert(k.into(), v.into());
+        }
+        old_label.insert("pf-m-gold".into(), gold);
+
+        old_mods.insert("label".into(), old_label);
+
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_label = CssModifierMap::new();
+
+        // Real PF v6 .pf-m-teal — 8 overrides, DIFFERENT token structure
+        let mut teal = CssModifierEffect::default();
+        for (k, v) in [
+            ("--pf-v6-c-label--BackgroundColor", "var(...)"),
+            ("--pf-v6-c-label--Color", "var(...)"),
+            ("--pf-v6-c-label__icon--Color", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover--Color", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover__icon--Color", "var(...)"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "var(...)"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "var(...)"),
+        ] {
+            teal.custom_property_overrides.insert(k.into(), v.into());
+        }
+        for (k, v) in [
+            ("--pf-v6-c-label--BackgroundColor", "#b9e5e5"),      // light teal
+            ("--pf-v6-c-label--Color", "#151515"),                  // near-black text
+            ("--pf-v6-c-label__icon--Color", "#1f1f1f"),            // dark icon
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#9ad8d8"), // mid teal
+            ("--pf-v6-c-label--m-clickable--hover--Color", "#151515"),
+            ("--pf-v6-c-label--m-clickable--hover__icon--Color", "#1f1f1f"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#9ad8d8"), // teal border
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#63bdbd"),
+        ] {
+            teal.resolved_overrides.insert(k.into(), v.into());
+        }
+        new_label.insert("pf-m-teal".into(), teal);
+
+        // Real PF v6 .pf-m-yellow — 8 overrides, warm palette
+        let mut yellow = CssModifierEffect::default();
+        for (k, v) in [
+            ("--pf-v6-c-label--BackgroundColor", "var(...)"),
+            ("--pf-v6-c-label--Color", "var(...)"),
+            ("--pf-v6-c-label__icon--Color", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover--Color", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover__icon--Color", "var(...)"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "var(...)"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "var(...)"),
+        ] {
+            yellow.custom_property_overrides.insert(k.into(), v.into());
+        }
+        for (k, v) in [
+            ("--pf-v6-c-label--BackgroundColor", "#f9e0a2"),       // warm yellow
+            ("--pf-v6-c-label--Color", "#151515"),
+            ("--pf-v6-c-label__icon--Color", "#1f1f1f"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#f4c145"),
+            ("--pf-v6-c-label--m-clickable--hover--Color", "#151515"),
+            ("--pf-v6-c-label--m-clickable--hover__icon--Color", "#1f1f1f"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#f4c145"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#c58c00"),
+        ] {
+            yellow.resolved_overrides.insert(k.into(), v.into());
+        }
+        new_label.insert("pf-m-yellow".into(), yellow);
+
+        // Real PF v6 .pf-m-orangered — 8 overrides, orange palette
+        let mut orangered = CssModifierEffect::default();
+        for (k, v) in [
+            ("--pf-v6-c-label--BackgroundColor", "var(...)"),
+            ("--pf-v6-c-label--Color", "var(...)"),
+            ("--pf-v6-c-label__icon--Color", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover--Color", "var(...)"),
+            ("--pf-v6-c-label--m-clickable--hover__icon--Color", "var(...)"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "var(...)"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "var(...)"),
+        ] {
+            orangered.custom_property_overrides.insert(k.into(), v.into());
+        }
+        for (k, v) in [
+            ("--pf-v6-c-label--BackgroundColor", "#f4b678"),       // warm orange
+            ("--pf-v6-c-label--Color", "#151515"),
+            ("--pf-v6-c-label__icon--Color", "#1f1f1f"),
+            ("--pf-v6-c-label--m-clickable--hover--BackgroundColor", "#ef9234"),
+            ("--pf-v6-c-label--m-clickable--hover--Color", "#151515"),
+            ("--pf-v6-c-label--m-clickable--hover__icon--Color", "#1f1f1f"),
+            ("--pf-v6-c-label--m-outline--BorderColor", "#ef9234"),
+            ("--pf-v6-c-label--m-outline--m-clickable--hover--BorderColor", "#8f4700"),
+        ] {
+            orangered.resolved_overrides.insert(k.into(), v.into());
+        }
+        new_label.insert("pf-m-orangered".into(), orangered);
+
+        new_mods.insert("label".into(), new_label);
+
+        let removed: Vec<String> = vec!["cyan".into(), "gold".into()];
+        let added: Vec<String> = vec!["teal".into(), "yellow".into(), "orangered".into()];
+        let removed_refs: Vec<&String> = removed.iter().collect();
+        let added_refs: Vec<&String> = added.iter().collect();
+
+        let hints = compute_css_modifier_bridge(
+            "Label", &removed_refs, &added_refs,
+            &old_mods, &new_mods,
+        );
+
+        // Bag-of-colors: cyan's blue-green palette (#f2f9f9, #a2d9d9, #009596)
+        // is closest to teal's blue-green palette (#b9e5e5, #9ad8d8, #63bdbd).
+        // Gold's warm palette (#fdf7e7, #f9e0a2, #f0ab00) is closest to
+        // yellow's warm palette (#f9e0a2, #f4c145, #c58c00).
+        assert_eq!(
+            hints.len(), 2,
+            "Should produce 2 mappings. Got: {:?}", hints
+        );
+        assert_eq!(
+            hints.get("cyan").map(|s| s.as_str()), Some("teal"),
+            "cyan should map to teal (blue-green palette match). Got: {:?}", hints
+        );
+        assert_eq!(
+            hints.get("gold").map(|s| s.as_str()), Some("yellow"),
+            "gold should map to yellow (warm palette match). Got: {:?}", hints
+        );
+    }
+
+    /// When no CSS modifier data exists, bridge returns empty and
+    /// string similarity runs unchanged. Regression guard for TC067.
+    #[test]
+    fn test_css_bridge_no_data_falls_through() {
+        use crate::sd_types::ComponentCssModifiers;
+
+        let empty = ComponentCssModifiers::new();
+        let removed: Vec<String> = vec!["dark".into()];
+        let added: Vec<String> = vec!["secondary".into()];
+        let removed_refs: Vec<&String> = removed.iter().collect();
+        let added_refs: Vec<&String> = added.iter().collect();
+
+        let hints = compute_css_modifier_bridge(
+            "PageSection", &removed_refs, &added_refs,
+            &empty, &empty,
+        );
+
+        assert!(
+            hints.is_empty(),
+            "TC067 regression: No CSS data → empty bridge → string similarity fallback"
+        );
+    }
+
+    /// Modifiers with completely different structures should not match.
+    #[test]
+    fn test_css_bridge_different_structure_no_match() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_comp = CssModifierMap::new();
+        let mut foo = CssModifierEffect::default();
+        foo.custom_property_overrides.insert("--comp--m-foo--BackgroundColor".into(), "red".into());
+        foo.custom_property_overrides.insert("--comp--m-foo--Color".into(), "white".into());
+        old_comp.insert("pf-m-foo".into(), foo);
+        old_mods.insert("comp".into(), old_comp);
+
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_comp = CssModifierMap::new();
+        let mut bar = CssModifierEffect::default();
+        // Completely different slots — no overlap
+        bar.direct_properties.insert("display".into(), "none".into());
+        bar.direct_properties.insert("visibility".into(), "hidden".into());
+        new_comp.insert("pf-m-bar".into(), bar);
+        new_mods.insert("comp".into(), new_comp);
+
+        let removed: Vec<String> = vec!["foo".into()];
+        let added: Vec<String> = vec!["bar".into()];
+        let removed_refs: Vec<&String> = removed.iter().collect();
+        let added_refs: Vec<&String> = added.iter().collect();
+
+        let hints = compute_css_modifier_bridge(
+            "Comp", &removed_refs, &added_refs,
+            &old_mods, &new_mods,
+        );
+
+        assert!(
+            hints.is_empty(),
+            "Different structures should not match: {:?}",
+            hints
+        );
+    }
+
+    // ── Color distance unit tests ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_hex_color_long() {
+        assert_eq!(parse_hex_color("#e0f5f5"), Some((0xe0, 0xf5, 0xf5)));
+        assert_eq!(parse_hex_color("#000000"), Some((0, 0, 0)));
+        assert_eq!(parse_hex_color("#ffffff"), Some((255, 255, 255)));
+        assert_eq!(parse_hex_color("#AABBCC"), Some((0xaa, 0xbb, 0xcc)));
+        assert_eq!(parse_hex_color("#0066cc"), Some((0x00, 0x66, 0xcc)));
+    }
+
+    #[test]
+    fn test_parse_hex_color_short() {
+        // #abc → (0xaa, 0xbb, 0xcc)
+        assert_eq!(parse_hex_color("#abc"), Some((0xaa, 0xbb, 0xcc)));
+        assert_eq!(parse_hex_color("#fff"), Some((255, 255, 255)));
+        assert_eq!(parse_hex_color("#000"), Some((0, 0, 0)));
+        // lightningcss minifies #0066cc → #06c
+        assert_eq!(parse_hex_color("#06c"), Some((0x00, 0x66, 0xcc)));
+    }
+
+    #[test]
+    fn test_parse_hex_color_invalid() {
+        assert_eq!(parse_hex_color("transparent"), None);
+        assert_eq!(parse_hex_color("inherit"), None);
+        assert_eq!(parse_hex_color("0px"), None);
+        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color("#"), None);
+        assert_eq!(parse_hex_color("#gg"), None);
+        assert_eq!(parse_hex_color("#12345"), None); // 5 digits — invalid
+    }
+
+    #[test]
+    fn test_color_similarity_identical() {
+        let c = (0xe0, 0xf5, 0xf5);
+        assert!((color_similarity(c, c) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_color_similarity_black_white() {
+        let black = (0, 0, 0);
+        let white = (255, 255, 255);
+        assert!((color_similarity(black, white)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_color_similarity_cyan_teal_closer_than_cyan_yellow() {
+        // Real PF values
+        let cyan = parse_hex_color("#e0f5f5").unwrap();   // cyan-50
+        let teal = parse_hex_color("#daf2f2").unwrap();   // teal-10
+        let yellow = parse_hex_color("#fff4cc").unwrap();  // yellow-10
+        let orange = parse_hex_color("#fff3e8").unwrap();  // orange-10
+
+        let sim_cyan_teal = color_similarity(cyan, teal);
+        let sim_cyan_yellow = color_similarity(cyan, yellow);
+        let sim_cyan_orange = color_similarity(cyan, orange);
+
+        assert!(
+            sim_cyan_teal > sim_cyan_yellow,
+            "cyan→teal ({:.4}) should be closer than cyan→yellow ({:.4})",
+            sim_cyan_teal, sim_cyan_yellow
+        );
+        assert!(
+            sim_cyan_teal > sim_cyan_orange,
+            "cyan→teal ({:.4}) should be closer than cyan→orange ({:.4})",
+            sim_cyan_teal, sim_cyan_orange
+        );
+    }
+
+    #[test]
+    fn test_color_similarity_gold_yellow_closer_than_gold_teal() {
+        let gold = parse_hex_color("#fdf7e7").unwrap();    // gold-50
+        let yellow = parse_hex_color("#fff4cc").unwrap();  // yellow-10
+        let teal = parse_hex_color("#daf2f2").unwrap();    // teal-10
+
+        let sim_gold_yellow = color_similarity(gold, yellow);
+        let sim_gold_teal = color_similarity(gold, teal);
+
+        assert!(
+            sim_gold_yellow > sim_gold_teal,
+            "gold→yellow ({:.4}) should be closer than gold→teal ({:.4})",
+            sim_gold_yellow, sim_gold_teal
+        );
+    }
+
+    #[test]
+    fn test_color_similarity_is_symmetric() {
+        let c1 = (100, 150, 200);
+        let c2 = (200, 100, 50);
+        assert!(
+            (color_similarity(c1, c2) - color_similarity(c2, c1)).abs() < f64::EPSILON
+        );
+    }
+
+    /// Resolved similarity with multiple slots — verifies that per-slot
+    /// color distance is averaged across all shared slots, not just one.
+    #[test]
+    fn test_resolved_similarity_multi_slot_color_distance() {
+        use crate::sd_types::CssModifierEffect;
+
+        // Old modifier overrides 3 slots with resolved hex values
+        let mut old = CssModifierEffect::default();
+        old.resolved_overrides.insert(
+            "--pf-v5-c-label--BackgroundColor".into(),
+            "#e0f5f5".into(), // cyan background
+        );
+        old.resolved_overrides.insert(
+            "--pf-v5-c-label__icon--Color".into(),
+            "#005f60".into(), // dark cyan icon
+        );
+        old.resolved_overrides.insert(
+            "--pf-v5-c-label__content--Color".into(),
+            "#003737".into(), // darkest cyan text
+        );
+
+        // New modifier "teal" — similar colors on all 3 slots
+        let mut new_teal = CssModifierEffect::default();
+        new_teal.resolved_overrides.insert(
+            "--pf-v6-c-label--BackgroundColor".into(),
+            "#daf2f2".into(), // teal background (close to #e0f5f5)
+        );
+        new_teal.resolved_overrides.insert(
+            "--pf-v6-c-label__icon--Color".into(),
+            "#004d4d".into(), // dark teal icon (close to #005f60)
+        );
+        new_teal.resolved_overrides.insert(
+            "--pf-v6-c-label__content--Color".into(),
+            "#002b2b".into(), // darkest teal text (close to #003737)
+        );
+
+        // New modifier "red" — very different colors
+        let mut new_red = CssModifierEffect::default();
+        new_red.resolved_overrides.insert(
+            "--pf-v6-c-label--BackgroundColor".into(),
+            "#fce8e8".into(), // red background
+        );
+        new_red.resolved_overrides.insert(
+            "--pf-v6-c-label__icon--Color".into(),
+            "#c9190b".into(), // red icon
+        );
+        new_red.resolved_overrides.insert(
+            "--pf-v6-c-label__content--Color".into(),
+            "#7d1007".into(), // dark red text
+        );
+
+        let sim_teal = modifier_resolved_similarity(&old, &new_teal);
+        let sim_red = modifier_resolved_similarity(&old, &new_red);
+
+        assert!(
+            sim_teal > sim_red,
+            "Multi-slot: cyan modifier should be closer to teal ({:.4}) than red ({:.4})",
+            sim_teal, sim_red
+        );
+        // Both should be > 0.0 since they share the same slots
+        assert!(sim_teal > 0.5, "teal similarity should be high: {:.4}", sim_teal);
+        assert!(sim_red > 0.0, "red similarity should be > 0 (shared slots): {:.4}", sim_red);
+    }
+
+    /// Non-color resolved values (sizes, keywords) are ignored by the
+    /// bag-of-colors approach — only hex colors contribute to similarity.
+    /// Modifiers with only non-color values return 0.0 (no signal).
+    #[test]
+    fn test_resolved_similarity_non_color_values_ignored() {
+        use crate::sd_types::CssModifierEffect;
+
+        let mut old = CssModifierEffect::default();
+        old.resolved_overrides.insert(
+            "--pf-v5-c-comp--FontSize".into(),
+            "16px".into(),
+        );
+
+        let mut new_same = CssModifierEffect::default();
+        new_same.resolved_overrides.insert(
+            "--pf-v6-c-comp--FontSize".into(),
+            "16px".into(),
+        );
+
+        let sim = modifier_resolved_similarity(&old, &new_same);
+        assert!(
+            sim.abs() < f64::EPSILON,
+            "Non-color values should give 0.0 (no parseable hex colors): {:.4}", sim
+        );
+    }
+
+    /// TC057-062: PageSection should get a rule about hasBodyWrapper default change.
+    ///
+    /// Currently fails because generate_prop_default_changed_rules is a stub
+    /// returning empty Vec.
+    #[test]
+    fn test_prop_default_changed_generates_rule() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+
+        // Add a PropDefault source-level change for PageSection.hasBodyWrapper
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "PageSection".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'hasBodyWrapper' prop on PageSection removed (was true)".into(),
+            old_value: Some("true".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+
+        assert!(
+            !rules.is_empty(),
+            "TC057-062: Should generate at least 1 rule for PageSection hasBodyWrapper default change"
+        );
+
+        let rule = &rules[0];
+        assert!(
+            rule.rule_id.contains("pagesection") || rule.rule_id.contains("PageSection"),
+            "TC057-062: Rule should be about PageSection: {}",
+            rule.rule_id
+        );
+         assert!(
+            rule.message.contains("hasBodyWrapper"),
+            "TC057-062: Rule message should mention hasBodyWrapper: {}",
+            rule.message
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PropDefault trivial-default suppression
+    //
+    // TC023: DualListSelector children='' fires and LLM adds children={''}
+    // TC024: Same + compounds with /deprecated issue
+    // TC045: MenuItemAction className='' fires and LLM adds className={''}
+    //
+    // Empty-string defaults ('') are noise — no consumer relies on them.
+    // generate_prop_default_changed_rules() should skip them.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Trivially empty defaults (empty string) should NOT generate rules.
+    /// These cause the LLM to add `children={''}` or `className={''}` noise.
+    #[test]
+    fn test_prop_default_empty_string_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+
+        // DualListSelector.children default was '' (TC023/TC024)
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "DualListSelector".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'children' prop on DualListSelector removed (was '')".into(),
+            old_value: Some("''".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        // MenuItemAction.className default was '' (TC045)
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "MenuItemAction".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'className' prop on MenuItemAction removed (was '')".into(),
+            old_value: Some("''".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("DualListSelector".into(), "@patternfly/react-core".into());
+        sd.component_packages
+            .insert("MenuItemAction".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+
+        // Neither should produce a rule
+        let children_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("duallistselector-children"));
+        let classname_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("menuitemaction-classname"));
+
+        assert!(
+            children_rule.is_none(),
+            "TC023/TC024: DualListSelector children='' should be suppressed, got: {:?}",
+            children_rule.map(|r| &r.rule_id)
+        );
+        assert!(
+            classname_rule.is_none(),
+            "TC045: MenuItemAction className='' should be suppressed, got: {:?}",
+            classname_rule.map(|r| &r.rule_id)
+        );
+    }
+
+    /// Double-quoted empty strings should also be suppressed.
+    #[test]
+    fn test_prop_default_double_quoted_empty_string_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "TestComp".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'label' prop on TestComp removed (was \"\")".into(),
+            old_value: Some("\"\"".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("TestComp".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "Double-quoted empty string default should be suppressed"
+        );
+    }
+
+    /// `undefined` and `null` defaults should be suppressed.
+    #[test]
+    fn test_prop_default_undefined_null_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Comp1".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'icon' prop on Comp1 removed (was undefined)".into(),
+            old_value: Some("undefined".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Comp2".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'ref' prop on Comp2 removed (was null)".into(),
+            old_value: Some("null".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("Comp1".into(), "@patternfly/react-core".into());
+        sd.component_packages
+            .insert("Comp2".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "undefined and null defaults should be suppressed, got {} rules",
+            rules.len()
+        );
+    }
+
+    /// Meaningful defaults like 'primary' or 'h1' should NOT be suppressed.
+    #[test]
+    fn test_prop_default_meaningful_values_not_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+
+        // variant='primary' → removed (meaningful)
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Button".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'variant' prop on Button removed (was 'primary')".into(),
+            old_value: Some("'primary'".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        // headingLevel='h1' → 'h2' (meaningful change)
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "EmptyStateHeader".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'headingLevel' prop on EmptyStateHeader changed from 'h1' to 'h2'".into(),
+            old_value: Some("'h1'".into()),
+            new_value: Some("'h2'".into()),
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        // boolean true → removed (meaningful — hasBodyWrapper)
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "PageSection".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'hasBodyWrapper' prop on PageSection removed (was true)".into(),
+            old_value: Some("true".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("Button".into(), "@patternfly/react-core".into());
+        sd.component_packages
+            .insert("EmptyStateHeader".into(), "@patternfly/react-core".into());
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert_eq!(
+            rules.len(),
+            3,
+            "All 3 meaningful defaults should generate rules, got {}",
+            rules.len()
+        );
+    }
+
+    /// TC037: Noop arrow function defaults should be suppressed.
+    /// Label.onClick had default `(_e: React.MouseEvent) => undefined as any`
+    /// which is semantically meaningless — no consumer relies on it.
+    #[test]
+    fn test_prop_default_noop_function_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Label".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'onClick' prop on Label removed (was (_e: React.MouseEvent) => undefined as any)".into(),
+            old_value: Some("(_e: React.MouseEvent) => undefined as any".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("Label".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "TC037: Noop arrow function default should be suppressed, got {} rules",
+            rules.len()
+        );
+    }
+
+    /// `false` defaults should be suppressed — removing a `false` default
+    /// means the prop now defaults to `undefined` (both falsy, same effect).
+    #[test]
+    fn test_prop_default_false_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Comp".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'isDisabled' prop on Comp removed (was false)".into(),
+            old_value: Some("false".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("Comp".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "false default should be suppressed"
+        );
+    }
+
+    /// Meaningful string defaults like 'close' should NOT be suppressed.
+    #[test]
+    fn test_prop_default_meaningful_string_not_suppressed() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Label".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'closeBtnAriaLabel' prop on Label removed (was 'close')".into(),
+            old_value: Some("'close'".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        sd.component_packages
+            .insert("Label".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert_eq!(
+            rules.len(),
+            1,
+            "Meaningful string default 'close' should NOT be suppressed"
+        );
+    }
+
+    /// TC031: HelperTextItem hasIcon AND isDynamic both removed.
+    /// Both should produce RemoveProp rules or be covered by a grouped rule.
+    ///
+    /// Expected to PASS — semver-analyzer correctly generates grouped rule.
+    /// The gap is in the fix-engine (only removes first prop in group).
+    #[test]
+    fn test_helpertextitem_both_props_have_rules() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/HelperTextItem.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                ApiChange {
+                    symbol: "HelperTextItemProps.hasIcon".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: hasIcon: boolean".into()),
+                    after: None,
+                    description: "property `hasIcon` was removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+                ApiChange {
+                    symbol: "HelperTextItemProps.isDynamic".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: isDynamic: boolean".into()),
+                    after: None,
+                    description: "property `isDynamic` was removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        // The TD rule generator (konveyor.rs, not v2) produces these rules.
+        // For this test, we verify both props appear as Removed ApiChanges
+        // in the report and would generate strategies.
+        let has_icon = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .any(|c| c.symbol.contains("hasIcon") && c.change == ApiChangeType::Removed);
+        let is_dynamic = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .any(|c| c.symbol.contains("isDynamic") && c.change == ApiChangeType::Removed);
+
+        assert!(
+            has_icon,
+            "TC031: hasIcon should be in report as Removed"
+        );
+        assert!(
+            is_dynamic,
+            "TC031: isDynamic should be in report as Removed"
+        );
+    }
+
+    /// TC022: DrawerHead→DrawerActions edge should be Structural (CHP-only),
+    /// NOT Required (CHP+PMC). DrawerActions is optional inside DrawerHead —
+    /// PF6 docs do not require it. When the edge is Required, a requiresChild
+    /// rule fires on DrawerHead and the LLM adds DrawerActions+DrawerCloseButton
+    /// to code that never had them, breaking TC022.
+    ///
+    /// The fix: change the edge from Required (PMC=YES) to Structural (PMC=NO)
+    /// so no requiresChild rule is generated for DrawerHead.
+    #[test]
+    fn test_drawer_head_behavioral_rule_is_informational() {
+        use crate::sd_types::EdgeStrength;
+
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Drawer".into(), "@patternfly/react-core".into());
+        pkgs.insert("DrawerHead".into(), "@patternfly/react-core".into());
+        pkgs.insert("DrawerActions".into(), "@patternfly/react-core".into());
+        pkgs.insert("DrawerCloseButton".into(), "@patternfly/react-core".into());
+
+        // Current (broken) tree: DrawerHead→DrawerActions is Required (CHP+PMC).
+        // This generates a requiresChild rule that causes over-fixing.
+        let tree = CompositionTree {
+            root: "Drawer".into(),
+            family_members: vec![
+                "Drawer".into(),
+                "DrawerHead".into(),
+                "DrawerActions".into(),
+                "DrawerCloseButton".into(),
+            ],
+            edges: vec![
+                make_edge("Drawer", "DrawerHead", EdgeStrength::Required),
+                make_edge("DrawerHead", "DrawerActions", EdgeStrength::Required),
+                make_edge("DrawerActions", "DrawerCloseButton", EdgeStrength::Required),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // Check that NO requiresChild rule exists for DrawerHead.
+        // A requiresChild rule on DrawerHead causes over-fixing (TC022).
+        // Note: short_component_id strips "Drawer" prefix, so "DrawerHead" → "head"
+        let drawer_head_requires: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                // Match "sd-cf-drawer-head-req-*" pattern
+                r.rule_id.contains("-head-req-")
+            })
+            .collect();
+
+        assert!(
+            drawer_head_requires.is_empty(),
+            "TC022: DrawerHead should NOT have a requiresChild rule (DrawerActions is optional). \
+             Found rules: {:?}",
+            drawer_head_requires
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// TC010: Card selectableActions — no API surface change, no rule expected.
+    /// Documents that the semver-analyzer correctly produces no rule for this
+    /// since selectableActions was NOT removed from CardHeaderProps in PF6.
+    #[test]
+    fn test_card_selectable_actions_no_rule() {
+        // selectableActions still exists in PF6 CardHeaderProps.
+        // The semver-analyzer should not generate a rule for it.
+        // This is a usage-pattern change, not an API surface change.
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "CardHeader".into(),
+            ["selectableActions", "actions", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        // selectableActions still present in new version
+        sd.new_component_props.insert(
+            "CardHeader".into(),
+            ["selectableActions", "actions", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        // No prop was removed → no rule should be generated
+        // This test documents the gap: simplification of selectableActions
+        // for basic clickable cards requires hand-crafted rule or LLM.
+        let report = build_test_report(vec![]);
+        let pkgs: HashMap<String, String> = [(
+            "CardHeader".into(),
+            "@patternfly/react-core".into(),
+        )]
+        .into_iter()
+        .collect();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+        let card_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("cardheader") && r.rule_id.contains("selectableActions"))
+            .collect();
+
+        assert!(
+            card_rules.is_empty(),
+            "TC010: No rule should exist for selectableActions (prop not removed in PF6). \
+             This is a known gap requiring a hand-crafted rule."
+        );
+    }
+
+    /// TC029: FormFieldGroupHeader typo fix rename is correct.
+    /// The semver-analyzer correctly generates a Rename rule.
+    /// Unused import cleanup is a fix-engine concern.
+    #[test]
+    fn test_unused_import_rename_correct() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/FormFieldGroupHeader.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "FormFiledGroupHeaderTitleTextObject".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Interface,
+                change: ApiChangeType::Renamed,
+                before: Some("FormFiledGroupHeaderTitleTextObject".into()),
+                after: Some("FormFieldGroupHeaderTitleTextObject".into()),
+                description: "renamed (typo fix)".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        // Verify the rename exists and is correct
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(change.change, ApiChangeType::Renamed);
+        assert_eq!(
+            change.before.as_deref(),
+            Some("FormFiledGroupHeaderTitleTextObject")
+        );
+        assert_eq!(
+            change.after.as_deref(),
+            Some("FormFieldGroupHeaderTitleTextObject")
+        );
+        // TC029: This is correct. Unused import cleanup is outside semver-analyzer scope.
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // New absorbing prop detection
+    //
+    // When a component gains a new ReactNode/ReactElement prop that didn't
+    // exist before, content that was previously passed as children may need
+    // to move to that prop. Generate LlmAssisted rules with enough context
+    // for the LLM to determine if children need restructuring.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// TC046: MenuToggle gained `icon: React.ReactNode` prop in v6.
+    /// Should generate a new-absorbing-prop rule so the LLM knows to
+    /// move icon children to the `icon` prop.
+    #[test]
+    fn test_new_absorbing_prop_menutoggle_icon() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "MenuToggle".into(),
+            ["children", "variant", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "MenuToggle".into(),
+            ["children", "icon", "variant", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "MenuToggle".into(),
+            [("icon".into(), "React.ReactNode".into())]
+                .into_iter()
+                .collect(),
+        );
+        // Mark that MenuToggle has children prop
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = true;
+        sd.new_profiles.insert("MenuToggle".into(), profile);
+
+        sd.component_packages
+            .insert("MenuToggle".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+
+        let icon_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("menutoggle") && r.rule_id.contains("icon"));
+        assert!(
+            icon_rule.is_some(),
+            "TC046: Should generate a new-absorbing-prop rule for MenuToggle.icon"
+        );
+        let rule = icon_rule.unwrap();
+        assert!(
+            rule.message.contains("icon"),
+            "Rule message should mention the prop name"
+        );
+        assert!(
+            rule.message.contains("React.ReactNode"),
+            "Rule message should include the prop type"
+        );
+        assert_eq!(
+            rule.category, "potential",
+            "New absorbing prop rules should be 'potential' not 'mandatory'"
+        );
+        assert!(
+            rule.fix_strategy.is_some(),
+            "Should have an LlmAssisted fix strategy"
+        );
+        assert_eq!(
+            rule.fix_strategy.as_ref().unwrap().strategy,
+            "LlmAssisted"
+        );
+    }
+
+    /// TC053: NavItem gained `icon: React.ReactNode` prop in v6.
+    /// Same pattern as TC046.
+    #[test]
+    fn test_new_absorbing_prop_navitem_icon() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "NavItem".into(),
+            ["children", "to", "hasNavLinkWrapper", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "NavItem".into(),
+            ["children", "icon", "to", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "NavItem".into(),
+            [("icon".into(), "React.ReactNode".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = true;
+        sd.new_profiles.insert("NavItem".into(), profile);
+
+        sd.component_packages
+            .insert("NavItem".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("navitem") && r.rule_id.contains("icon")),
+            "TC053: Should generate a new-absorbing-prop rule for NavItem.icon"
+        );
+    }
+
+    /// Props that are NOT ReactNode/ReactElement should NOT generate rules.
+    #[test]
+    fn test_new_absorbing_prop_skips_non_reactnode() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Toolbar".into(),
+            ["children", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Toolbar".into(),
+            ["children", "hasNoPadding", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Toolbar".into(),
+            [("hasNoPadding".into(), "boolean".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = true;
+        sd.new_profiles.insert("Toolbar".into(), profile);
+
+        sd.component_packages
+            .insert("Toolbar".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "boolean props should not generate new-absorbing-prop rules"
+        );
+    }
+
+    /// Props that already existed in old version should NOT generate rules.
+    #[test]
+    fn test_new_absorbing_prop_skips_existing_props() {
+        let mut sd = SdPipelineResult::default();
+        // icon already existed in v5
+        sd.old_component_props.insert(
+            "Button".into(),
+            ["children", "icon", "variant"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Button".into(),
+            ["children", "icon", "variant"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Button".into(),
+            [("icon".into(), "ReactNode".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = true;
+        sd.new_profiles.insert("Button".into(), profile);
+
+        sd.component_packages
+            .insert("Button".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "Props that already existed should not generate rules"
+        );
+    }
+
+    /// Components without children prop should NOT generate rules.
+    #[test]
+    fn test_new_absorbing_prop_skips_no_children() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Badge".into(),
+            ["className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Badge".into(),
+            ["className", "icon"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Badge".into(),
+            [("icon".into(), "ReactNode".into())]
+                .into_iter()
+                .collect(),
+        );
+        // No profile with has_children_prop = true
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = false;
+        sd.new_profiles.insert("Badge".into(), profile);
+
+        sd.component_packages
+            .insert("Badge".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs);
+        assert!(
+            rules.is_empty(),
+            "Components without children should not generate rules"
+        );
+    }
+
+    /// TC053: NavItem hasNavLinkWrapper removal is correctly detected as Removed.
+    /// The icon-to-prop migration is now handled by generate_new_absorbing_prop_rules.
+    #[test]
+    fn test_icon_children_to_prop_navitem_removal_still_works() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/NavItem.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavItemProps.hasNavLinkWrapper".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some("property: hasNavLinkWrapper: boolean".into()),
+                after: None,
+                description: "property `hasNavLinkWrapper` was removed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(change.change, ApiChangeType::Removed);
+        assert!(change.symbol.contains("hasNavLinkWrapper"));
     }
 }

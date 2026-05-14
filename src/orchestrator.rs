@@ -669,6 +669,7 @@ impl<L: Language> Analyzer<L> {
                             dead_classes_after_swap: Vec::new(),
                             old_inventory: std::collections::HashSet::new(),
                             new_inventory: std::collections::HashSet::new(),
+                            from_dep_worktree: None,
                         }
                     };
 
@@ -710,6 +711,11 @@ impl<L: Language> Analyzer<L> {
                         );
                     }
 
+                    let dep_from_dir = css_inventory
+                        .from_dep_worktree
+                        .as_ref()
+                        .map(|g| g.path().to_path_buf());
+
                     let params = semver_analyzer_core::ExtendedAnalysisParams {
                         repo: repo_sd.clone(),
                         from_ref: from_sd.clone(),
@@ -723,12 +729,15 @@ impl<L: Language> Analyzer<L> {
                         dead_css_classes_after_swap: css_inventory.dead_classes_after_swap,
                         old_css_class_inventory: css_inventory.old_inventory,
                         new_css_class_inventory: css_inventory.new_inventory,
+                        dep_from_dir,
                     };
 
                     // Keep worktree handles alive until analysis completes.
                     let result = lang_sd.run_extended_analysis(&params);
                     drop(from_wt);
                     drop(to_wt);
+                    // Drop the old dep worktree after analysis is done
+                    drop(css_inventory.from_dep_worktree);
                     result
                 })
                 .await
@@ -2562,6 +2571,10 @@ struct CssInventoryResult {
     old_inventory: std::collections::HashSet<String>,
     /// Full CSS class inventory from the new version (compiled CSS).
     new_inventory: std::collections::HashSet<String>,
+    /// The old dep-repo worktree guard. Kept alive so the language impl
+    /// can extract additional data (e.g., CSS modifier declarations) from
+    /// the built old-version CSS. Dropped after `run_extended_analysis`.
+    from_dep_worktree: Option<semver_analyzer_ts::WorktreeGuard>,
 }
 
 /// Extract CSS class inventories from both dep-repo versions and detect dead classes.
@@ -2588,6 +2601,7 @@ fn analyze_css_class_inventories(
         dead_classes_after_swap: Vec::new(),
         old_inventory: std::collections::HashSet::new(),
         new_inventory: std::collections::HashSet::new(),
+        from_dep_worktree: None,
     };
 
     // Extract old class inventory.
@@ -2700,6 +2714,7 @@ fn analyze_css_class_inventories(
                             dead_classes_after_swap: Vec::new(),
                             old_inventory: old_classes,
                             new_inventory: std::collections::HashSet::new(),
+                            from_dep_worktree: from_worktree,
                         };
                     }
                 }
@@ -2714,6 +2729,7 @@ fn analyze_css_class_inventories(
                     dead_classes_after_swap: Vec::new(),
                     old_inventory: old_classes,
                     new_inventory: std::collections::HashSet::new(),
+                    from_dep_worktree: from_worktree,
                 };
             }
         }
@@ -2764,13 +2780,14 @@ fn analyze_css_class_inventories(
         }
     };
 
-    // Drop the from_worktree guard before returning (cleanup)
-    drop(from_worktree);
-
+    // Return the from_worktree guard instead of dropping it. The language
+    // impl needs it to extract additional CSS data (e.g., modifier declarations)
+    // during run_extended_analysis. The guard is dropped after analysis completes.
     CssInventoryResult {
         dead_classes_after_swap,
         old_inventory: old_classes,
         new_inventory: new_classes,
+        from_dep_worktree: from_worktree,
     }
 }
 

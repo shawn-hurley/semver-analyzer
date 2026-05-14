@@ -78,7 +78,6 @@ Generates [Konveyor](https://www.konveyor.io/) migration rules from analysis rep
 - `generate_rules()` -- main rule generation from breaking API and behavioral changes
 - `generate_dependency_update_rules()` -- `builtin.json` rules for package dependency detection
 - `generate_conformance_rules()` -- rules for expected child component composition patterns
-- `generate_fix_guidance()` -- per-rule fix strategies with confidence levels
 - `write_ruleset_dir()` -- writes `ruleset.yaml` and `breaking-changes.yaml` output
 
 Re-exports all shared types from `semver-analyzer-konveyor-core`.

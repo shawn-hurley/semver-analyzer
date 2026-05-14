@@ -798,6 +798,65 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             }
             strategies.extend(family_strategies);
 
+            // Suppress TD prop-value-change rules when SD prop-value-removed
+            // rules cover the same (component, prop, value). The SD rules have
+            // better replacement guidance (CSS modifier bridge, greedy N:M
+            // matching) so they should take priority over the TD rules.
+            {
+                // Collect (prop_pattern, value_pattern) keys from SD rules
+                let sd_value_keys: std::collections::HashSet<(String, String)> = sd_rules
+                    .iter()
+                    .filter(|r| {
+                        r.labels
+                            .iter()
+                            .any(|l| l == "change-type=prop-value-removed")
+                    })
+                    .flat_map(|r| {
+                        semver_analyzer_konveyor_core::extract_frontend_refs(&r.when)
+                            .into_iter()
+                            .filter(|f| f.location == "JSX_PROP")
+                            .filter_map(|f| {
+                                let value = f.value.as_ref()?;
+                                Some((f.pattern.clone(), value.clone()))
+                            })
+                    })
+                    .collect();
+
+                if !sd_value_keys.is_empty() {
+                    let before = all_rules.len();
+                    all_rules.retain(|r| {
+                        let is_td_prop_value = r
+                            .labels
+                            .iter()
+                            .any(|l| l == "change-type=prop-value-change");
+                        if !is_td_prop_value {
+                            return true;
+                        }
+                        // Check if any SD rule covers this same prop+value
+                        let dominated = semver_analyzer_konveyor_core::extract_frontend_refs(
+                            &r.when,
+                        )
+                        .iter()
+                        .filter(|f| f.location == "JSX_PROP")
+                        .any(|f| {
+                            if let Some(ref value) = f.value {
+                                sd_value_keys.contains(&(f.pattern.clone(), value.clone()))
+                            } else {
+                                false
+                            }
+                        });
+                        !dominated
+                    });
+                    let suppressed = before - all_rules.len();
+                    if suppressed > 0 {
+                        info!(
+                            suppressed,
+                            "Suppressed TD prop-value-change rules covered by SD prop-value-removed rules"
+                        );
+                    }
+                }
+            }
+
             all_rules.extend(sd_rules);
 
             // Suppress the v1 catch-all CSS class prefix rule when
@@ -828,7 +887,31 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         }
     }
 
-    let fix_guidance = konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
+    // Tag each fix strategy with its source package.
+    // Rules carry `package=<npm-name>` labels; propagate to the strategy so the
+    // fix-engine can group entries by originating package at merge time.
+    for rule in &all_rules {
+        let pkg_label = rule
+            .labels
+            .iter()
+            .find_map(|l| l.strip_prefix("package="));
+        if let Some(pkg) = pkg_label {
+            if let Some(entry) = strategies.get_mut(&rule.rule_id) {
+                if entry.source_package.is_none() {
+                    entry.source_package = Some(pkg.to_string());
+                }
+            }
+        }
+    }
+
+    let fix_guidance = konveyor::FixGuidanceDoc {
+        migration: konveyor::MigrationInfo {
+            from_ref: report.comparison.from_ref.clone(),
+            to_ref: report.comparison.to_ref.clone(),
+            generated_by: format!("semver-analyzer v{}", report.metadata.tool_version),
+        },
+        summary: konveyor::compute_fix_summary(&strategies),
+    };
     let rule_count = all_rules.len();
     rule_phase.finish_with_detail("Rules generated", &format!("{} rules", rule_count));
 

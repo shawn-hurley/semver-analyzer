@@ -150,48 +150,7 @@ pub enum StyleToken {
     Modifier(String),
 }
 
-/// Extract the BEM block name from the `styles` import path.
-///
-/// Pattern: `import styles from '@patternfly/react-styles/css/components/Menu/menu'`
-/// → block = `"menu"` (last path segment)
-///
-/// Returns `None` if no matching import is found.
-pub fn extract_bem_block_from_import(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let trimmed = line.trim();
 
-        // Match: import styles from '...' or import styles from "..."
-        // Also matches: import xxxStyles from '...'
-        if !trimmed.starts_with("import ") {
-            continue;
-        }
-
-        // Must import from @patternfly/react-styles/css/
-        if !trimmed.contains("@patternfly/react-styles/css/") {
-            continue;
-        }
-
-        // Must be the main `styles` binding (not e.g., `type` imports)
-        // Check for `import styles from` or `import xxxStyles from`
-        let after_import = trimmed.strip_prefix("import ")?;
-        let binding = after_import.split_whitespace().next()?;
-
-        // Accept `styles` or anything ending in `Styles` (e.g., `breadcrumbStyles`)
-        // but only use the primary `styles` binding for the block name
-        if binding != "styles" {
-            continue;
-        }
-
-        // Extract the path: last segment before the quote
-        let quote_start = trimmed.rfind('\'')?;
-        let path = &trimmed[..quote_start];
-        let block = path.rsplit('/').next()?;
-
-        return Some(block.to_string());
-    }
-
-    None
-}
 
 /// Parse BEM structure from a set of style tokens.
 ///

@@ -35,6 +35,8 @@ use migration::detect_migrations;
 use relocate::{detect_relocations, RelocationType};
 use rename::detect_renames;
 
+pub use rename::name_similarity;
+
 /// Compare two API surfaces using language-specific semantic rules.
 ///
 /// This is the core of the TD (Top-Down) pipeline. It matches symbols by

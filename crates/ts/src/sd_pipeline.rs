@@ -753,6 +753,11 @@ pub fn run_sd(
         .filter(|(_, profile)| !profile.required_props.is_empty())
         .map(|(name, profile)| (name.clone(), profile.required_props.clone()))
         .collect();
+    let old_required_props: HashMap<String, BTreeSet<String>> = old_profiles
+        .iter()
+        .filter(|(_, profile)| !profile.required_props.is_empty())
+        .map(|(name, profile)| (name.clone(), profile.required_props.clone()))
+        .collect();
 
     // Build component→package maps for both versions.
     // Used for detecting deprecated↔main migrations.
@@ -783,6 +788,7 @@ pub fn run_sd(
         old_component_prop_types,
         new_component_prop_types,
         new_required_props,
+        old_required_props,
         dep_repo_packages: HashMap::new(), // populated by orchestrator from --dep-repo
         removed_css_blocks: Vec::new(),       // populated by orchestrator from dep-repo diff
         removed_css_entry_files: Vec::new(), // populated by orchestrator from dep-repo diff
@@ -792,6 +798,8 @@ pub fn run_sd(
         deprecated_replacements: Vec::new(),     // populated by orchestrator from rendering swaps
         old_profiles,
         new_profiles,
+        old_css_modifiers: HashMap::new(),         // populated by orchestrator from dep-repo CSS
+        new_css_modifiers: HashMap::new(),         // populated by orchestrator from dep-repo CSS
     })
 }
 
@@ -1124,35 +1132,6 @@ fn extract_from_path(line: &str) -> Option<String> {
 }
 
 // ── CSS grid nesting enrichment ─────────────────────────────────────────
-
-/// Enrich composition trees with CSS grid layout nesting.
-///
-/// For each tree, find the matching CSS profile (by block name) and use
-/// grid layout signals to move edges from flat (root → all) to nested
-/// (root → grid-items, grid-items → non-grid-items).
-///
-/// Algorithm:
-/// 1. Match CSS profile to tree via the BEM block name
-/// 2. Identify grid items (elements with `grid-column`) → direct children of root
-///    Convert a camelCase suffix to kebab-case for CSS element matching.
-///    "ContentSection" → "content-section"
-///    "item" → "item"
-///    "expandableContent" → "expandable-content"
-#[allow(dead_code)]
-fn camel_to_kebab(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() {
-            if i > 0 {
-                result.push('-');
-            }
-            result.push(ch.to_ascii_lowercase());
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
 
 // ── Internal node collapsing ────────────────────────────────────────────
 

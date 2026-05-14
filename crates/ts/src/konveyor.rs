@@ -3209,14 +3209,6 @@ pub fn apply_suffix_renames(
 // NOTE: v1 generate_conformance_rules was removed — superseded by
 // sd-cf-* conformance rules in konveyor_v2.rs (generate_conformance_rules).
 
-pub fn build_package_name_cache(report: &AnalysisReport<TypeScript>) -> HashMap<String, String> {
-    let full_cache = build_package_info_cache(report);
-    full_cache
-        .into_iter()
-        .map(|(dir, info)| (dir, info.name))
-        .collect()
-}
-
 /// Build a cache of package directory name -> PackageInfo (name + version).
 ///
 /// Reads package.json from both `from_ref` (old version) and `to_ref` (new version)
@@ -3501,72 +3493,7 @@ fn detect_css_prefix_changes(report: &AnalysisReport<TypeScript>) -> Vec<(String
         .collect()
 }
 
-pub fn generate_fix_guidance(
-    report: &AnalysisReport<TypeScript>,
-    rules: &[KonveyorRule],
-    file_pattern: &str,
-) -> FixGuidanceDoc {
-    let mut fixes = Vec::new();
-    let mut rule_idx = 0;
 
-    // API + behavioral changes (per-file, in same order as generate_rules)
-    for file_changes in &report.changes {
-        for api_change in &file_changes.breaking_api_changes {
-            if rule_idx < rules.len() {
-                let fix = api_change_to_fix(
-                    api_change,
-                    file_changes,
-                    &rules[rule_idx].rule_id,
-                    file_pattern,
-                );
-                fixes.push(fix);
-                rule_idx += 1;
-            }
-        }
-        for behavioral in &file_changes.breaking_behavioral_changes {
-            if rule_idx < rules.len() {
-                let fix =
-                    behavioral_change_to_fix(behavioral, file_changes, &rules[rule_idx].rule_id);
-                fixes.push(fix);
-                rule_idx += 1;
-            }
-        }
-    }
-
-    // Manifest changes
-    for manifest in &report.manifest_changes {
-        if rule_idx < rules.len() {
-            let fix = manifest_change_to_fix(manifest, &rules[rule_idx].rule_id);
-            fixes.push(fix);
-            rule_idx += 1;
-        }
-    }
-
-    let auto_fixable = fixes
-        .iter()
-        .filter(|f| matches!(f.confidence, FixConfidence::Exact | FixConfidence::High))
-        .count();
-    let manual_only = fixes
-        .iter()
-        .filter(|f| matches!(f.source, FixSource::Manual))
-        .count();
-    let needs_review = fixes.len() - auto_fixable - manual_only;
-
-    FixGuidanceDoc {
-        migration: MigrationInfo {
-            from_ref: report.comparison.from_ref.clone(),
-            to_ref: report.comparison.to_ref.clone(),
-            generated_by: format!("semver-analyzer v{}", report.metadata.tool_version),
-        },
-        summary: FixSummary {
-            total_fixes: fixes.len(),
-            auto_fixable,
-            needs_review,
-            manual_only,
-        },
-        fixes,
-    }
-}
 
 /// CSS-related change-type labels used for partitioning rules into the CSS file.
 const CSS_CHANGE_TYPES: &[&str] = &[
@@ -3689,6 +3616,23 @@ fn api_change_to_rules(
     component_to_family: &HashMap<String, String>,
     old_component_prop_types: &HashMap<String, BTreeMap<String, String>>,
 ) -> Vec<KonveyorRule> {
+    // Skip union-value-removed entries — the SD pipeline generates precise
+    // sd-prop-value-* rules with correct PropValueChange strategy and
+    // replacement mappings. Emitting these as Removed rules produces
+    // RemoveProp strategy (via consolidation into group rules) that
+    // incorrectly deletes the entire prop instead of changing its value.
+    //
+    // Detection: Removed(UnionValue{..}) entries have before="'value'" (a
+    // single-quoted literal) and after=None. Whole-property removals have
+    // before as a full type signature (e.g., "property: variant: ...").
+    if change.change == ApiChangeType::Removed
+        && matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field)
+        && change.before.as_deref().map_or(false, is_single_quoted_value)
+        && change.after.is_none()
+    {
+        return vec![];
+    }
+
     let file_path = file_changes.file.display().to_string();
     let leaf_symbol = extract_leaf_symbol(&change.symbol);
     let effort = effort_for_api_change(&change.change);
@@ -3869,6 +3813,8 @@ fn api_change_to_rules(
             || matches!(
                 change.removal_disposition,
                 Some(RemovalDisposition::ReplacedByMember { .. })
+                    | Some(RemovalDisposition::TrulyRemoved)
+                    | Some(RemovalDisposition::MadeAutomatic)
             )
     };
     labels.push(format!("has-codemod={}", has_codemod));
@@ -3984,6 +3930,17 @@ fn api_change_to_rules(
     // will cover it. Skip the main rule. If no union values can be parsed
     // (structural type change, nullability, etc.), the main rule is emitted
     // as a catch-all since no per-value discrimination is possible.
+    // Skip no-op "X replaced by X" signature-changed rules where the
+    // component name didn't change (e.g., Chart relocated but not renamed).
+    // These produce useless guidance like "Migrate from <Chart> to <Chart>".
+    if change.change == ApiChangeType::SignatureChanged {
+        if let (Some(before), Some(after)) = (&change.before, &change.after) {
+            if before == after {
+                return vec![];
+            }
+        }
+    }
+
     let per_value_covered = matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field)
         && change.change == ApiChangeType::TypeChanged
         && !extract_removed_union_values(change).is_empty();
@@ -4339,398 +4296,6 @@ fn manifest_change_to_rule(
         links: Vec::new(),
         when: condition,
         fix_strategy,
-    }
-}
-
-// ── Fix guidance generators ─────────────────────────────────────────────
-
-fn api_change_to_fix(
-    change: &ApiChange,
-    file_changes: &FileChanges<TypeScript>,
-    rule_id: &str,
-    file_pattern: &str,
-) -> FixGuidanceEntry {
-    let file_path = file_changes.file.display().to_string();
-    let leaf_symbol = extract_leaf_symbol(&change.symbol);
-    let search_pattern = build_pattern(&change.kind, &change.change, leaf_symbol, &change.before);
-
-    let (strategy, confidence, source, fix_description, replacement) = match change.change {
-        ApiChangeType::Renamed => {
-            let old_name = change
-                .before
-                .as_deref()
-                .map(|b| extract_leaf_symbol(b).to_string())
-                .unwrap_or_else(|| change.symbol.clone());
-            let new_name = change
-                .after
-                .as_deref()
-                .map(|a| extract_leaf_symbol(a).to_string())
-                .unwrap_or_else(|| change.symbol.clone());
-
-            let desc = format!(
-                "Rename all occurrences of '{}' to '{}'.\n\
-                 This is a mechanical find-and-replace that can be auto-applied.\n\
-                 Search pattern: {} (in {} files)",
-                old_name, new_name, search_pattern, file_pattern,
-            );
-            (
-                FixStrategy::Rename,
-                FixConfidence::Exact,
-                FixSource::Pattern,
-                desc,
-                Some(new_name),
-            )
-        }
-
-        ApiChangeType::SignatureChanged => {
-            let desc = if let (Some(ref before), Some(ref after)) = (&change.before, &change.after)
-            {
-                format!(
-                    "Update all call sites of '{}' to match the new signature.\n\n\
-                     Old signature: {}\n\
-                     New signature: {}\n\n\
-                     Review each call site and adjust arguments accordingly.\n\
-                     {}",
-                    change.symbol, before, after, change.description,
-                )
-            } else {
-                format!(
-                    "Update all call sites of '{}' to match the new signature.\n\
-                     {}\n\n\
-                     Review each usage and adjust arguments, type parameters, or \
-                     modifiers as described above.",
-                    change.symbol, change.description,
-                )
-            };
-
-            (
-                FixStrategy::UpdateSignature,
-                FixConfidence::High,
-                FixSource::Pattern,
-                desc,
-                None,
-            )
-        }
-
-        ApiChangeType::TypeChanged => {
-            let desc = if let (Some(ref before), Some(ref after)) = (&change.before, &change.after)
-            {
-                format!(
-                    "Update type annotations from '{}' to '{}'.\n\n\
-                     Old type: {}\n\
-                     New type: {}\n\n\
-                     Check all locations where this type is used in assignments, \
-                     function parameters, return types, and generic type arguments.\n\
-                     {}",
-                    change.symbol, change.symbol, before, after, change.description,
-                )
-            } else {
-                format!(
-                    "Update type references for '{}'.\n\
-                     {}\n\n\
-                     Check all locations where this type is used and update accordingly.",
-                    change.symbol, change.description,
-                )
-            };
-
-            (
-                FixStrategy::UpdateType,
-                FixConfidence::High,
-                FixSource::Pattern,
-                desc,
-                None,
-            )
-        }
-
-        ApiChangeType::Removed => {
-            let kind_label = api_kind_label(&change.kind);
-            let desc = format!(
-                "The {} '{}' has been removed.\n\n\
-                 Action required:\n\
-                 1. Find all usages of '{}' in your codebase\n\
-                 2. Identify an appropriate replacement (check the library's \
-                    migration guide or changelog)\n\
-                 3. Update each usage to use the replacement\n\
-                 4. Remove any imports of '{}'\n\n\
-                 {}",
-                kind_label, change.symbol, change.symbol, change.symbol, change.description,
-            );
-
-            (
-                FixStrategy::FindAlternative,
-                FixConfidence::Low,
-                FixSource::Manual,
-                desc,
-                None,
-            )
-        }
-
-        ApiChangeType::VisibilityChanged => {
-            let desc = format!(
-                "The visibility of '{}' has been reduced.\n\n\
-                 If you are importing or using '{}' from outside its module, \
-                 you need to find a public alternative.\n\
-                 {}\n\n\
-                 Check if there is a new public API that exposes the same functionality, \
-                 or refactor your code to avoid depending on this internal symbol.",
-                change.symbol, change.symbol, change.description,
-            );
-
-            (
-                FixStrategy::FindAlternative,
-                FixConfidence::Medium,
-                FixSource::Pattern,
-                desc,
-                None,
-            )
-        }
-    };
-
-    FixGuidanceEntry {
-        rule_id: rule_id.to_string(),
-        strategy,
-        confidence,
-        source,
-        symbol: change.symbol.clone(),
-        file: file_path,
-        fix_description,
-        before: change.before.clone(),
-        after: change.after.clone(),
-        search_pattern,
-        replacement,
-    }
-}
-
-fn behavioral_change_to_fix(
-    change: &BehavioralChange<TypeScript>,
-    file_changes: &FileChanges<TypeScript>,
-    rule_id: &str,
-) -> FixGuidanceEntry {
-    let file_path = file_changes.file.display().to_string();
-    let leaf_symbol = extract_leaf_symbol(&change.symbol);
-    let search_pattern = format!(r"\b{}\b", regex_escape(leaf_symbol));
-
-    let fix_description = format!(
-        "Behavioral change detected in '{}' (AI-generated finding).\n\n\
-         What changed: {}\n\n\
-         Action required:\n\
-         1. Review all usages of '{}' in your codebase\n\
-         2. Verify that your code handles the new behavior correctly\n\
-         3. Update tests that depend on the old behavior\n\
-         4. Pay special attention to edge cases and error handling\n\n\
-         This finding was generated by LLM analysis and should be \
-         verified by a developer.",
-        change.symbol, change.description, change.symbol,
-    );
-
-    FixGuidanceEntry {
-        rule_id: rule_id.to_string(),
-        strategy: FixStrategy::ManualReview,
-        confidence: FixConfidence::Medium,
-        source: FixSource::Llm,
-        symbol: change.symbol.clone(),
-        file: file_path,
-        fix_description,
-        before: None,
-        after: None,
-        search_pattern,
-        replacement: None,
-    }
-}
-
-fn manifest_change_to_fix(change: &ManifestChange<TypeScript>, rule_id: &str) -> FixGuidanceEntry {
-    let (strategy, confidence, source, fix_description, search, replacement) = match change
-        .change_type
-    {
-        TsManifestChangeType::ModuleSystemChanged => {
-            let is_cjs_to_esm = change
-                .after
-                .as_deref()
-                .map(|a| a == "module")
-                .unwrap_or(false);
-
-            if is_cjs_to_esm {
-                (
-                    FixStrategy::UpdateImport,
-                    FixConfidence::High,
-                    FixSource::Pattern,
-                    format!(
-                        "The package has changed from CommonJS to ESM.\n\n\
-                             Action required:\n\
-                             1. Convert all require() calls to import statements:\n\
-                             \n\
-                             Before: const {{ foo }} = require('package')\n\
-                             After:  import {{ foo }} from 'package'\n\
-                             \n\
-                             2. Convert module.exports to export statements:\n\
-                             \n\
-                             Before: module.exports = {{ foo }}\n\
-                             After:  export {{ foo }}\n\
-                             \n\
-                             3. Update your package.json \"type\" field if needed\n\
-                             4. Rename .js files to .mjs if mixing module systems\n\n\
-                             {}",
-                        change.description,
-                    ),
-                    r"\brequire\s*\(".to_string(),
-                    Some("import".to_string()),
-                )
-            } else {
-                (
-                    FixStrategy::UpdateImport,
-                    FixConfidence::High,
-                    FixSource::Pattern,
-                    format!(
-                        "The package has changed from ESM to CommonJS.\n\n\
-                             Action required:\n\
-                             1. Convert all import statements to require() calls:\n\
-                             \n\
-                             Before: import {{ foo }} from 'package'\n\
-                             After:  const {{ foo }} = require('package')\n\
-                             \n\
-                             2. Convert export statements to module.exports\n\
-                             3. Update your package.json \"type\" field if needed\n\n\
-                             {}",
-                        change.description,
-                    ),
-                    r"\bimport\s+".to_string(),
-                    Some("require".to_string()),
-                )
-            }
-        }
-
-        TsManifestChangeType::PeerDependencyAdded => {
-            // change.field is "peerDependencies.victory" — strip prefix to get bare package name
-            let dep_name = change
-                .field
-                .strip_prefix("peerDependencies.")
-                .unwrap_or(&change.field);
-            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
-            (
-                FixStrategy::EnsureDependency,
-                FixConfidence::Exact,
-                FixSource::Pattern,
-                format!(
-                    "Package `{}` now requires `{}` as a peer dependency.\n\n\
-                         Action required:\n\
-                         1. Install the peer dependency: npm install {}\n\
-                         2. Verify version compatibility with your existing dependencies\n\n\
-                         {}",
-                    source_pkg, dep_name, dep_name, change.description,
-                ),
-                dep_name.to_string(),
-                change.after.clone(),
-            )
-        }
-
-        TsManifestChangeType::PeerDependencyRemoved => {
-            let dep_name = change
-                .field
-                .strip_prefix("peerDependencies.")
-                .unwrap_or(&change.field);
-            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
-            (
-                FixStrategy::EnsureDependency,
-                FixConfidence::High,
-                FixSource::Pattern,
-                format!(
-                    "Package `{}` no longer requires `{}` as a peer dependency.\n\n\
-                         Action required:\n\
-                         1. Check if you still need '{}' as a direct dependency\n\
-                         2. If it was only required by this package, you may be able \
-                            to remove it\n\
-                         3. Verify that removing it doesn't break other dependencies\n\n\
-                         {}",
-                    source_pkg, dep_name, dep_name, change.description,
-                ),
-                dep_name.to_string(),
-                None,
-            )
-        }
-
-        TsManifestChangeType::PeerDependencyRangeChanged => {
-            let dep_name = change
-                .field
-                .strip_prefix("peerDependencies.")
-                .unwrap_or(&change.field);
-            let source_pkg = change.source_package.as_deref().unwrap_or("the library");
-            (
-                FixStrategy::EnsureDependency,
-                FixConfidence::High,
-                FixSource::Pattern,
-                format!(
-                    "Package `{}` changed peer dependency `{}` version range.\n\n\
-                         Before: {}\n\
-                         After:  {}\n\n\
-                         Action required:\n\
-                         1. Update '{}' to a version that satisfies the new range\n\
-                         2. Test for compatibility with the new version\n\n\
-                         {}",
-                    source_pkg,
-                    dep_name,
-                    change.before.as_deref().unwrap_or("(none)"),
-                    change.after.as_deref().unwrap_or("(none)"),
-                    dep_name,
-                    change.description,
-                ),
-                dep_name.to_string(),
-                change.after.clone(),
-            )
-        }
-
-        TsManifestChangeType::EntryPointChanged | TsManifestChangeType::ExportsEntryRemoved => (
-            FixStrategy::UpdateImport,
-            FixConfidence::Medium,
-            FixSource::Pattern,
-            format!(
-                "Package entry point or export map changed for '{}'.\n\n\
-                     Before: {}\n\
-                     After:  {}\n\n\
-                     Action required:\n\
-                     1. Update all import paths that reference the old entry point\n\
-                     2. Check the package's export map for the new path\n\n\
-                     {}",
-                change.field,
-                change.before.as_deref().unwrap_or("(none)"),
-                change.after.as_deref().unwrap_or("(none)"),
-                change.description,
-            ),
-            change.field.clone(),
-            change.after.clone(),
-        ),
-
-        _ => (
-            FixStrategy::ManualReview,
-            FixConfidence::Medium,
-            FixSource::Pattern,
-            format!(
-                "Package manifest field '{}' changed.\n\n\
-                     Before: {}\n\
-                     After:  {}\n\n\
-                     Review the change and update your configuration accordingly.\n\n\
-                     {}",
-                change.field,
-                change.before.as_deref().unwrap_or("(none)"),
-                change.after.as_deref().unwrap_or("(none)"),
-                change.description,
-            ),
-            change.field.clone(),
-            None,
-        ),
-    };
-
-    FixGuidanceEntry {
-        rule_id: rule_id.to_string(),
-        strategy,
-        confidence,
-        source,
-        symbol: change.field.clone(),
-        file: "package.json".to_string(),
-        fix_description,
-        before: change.before.clone(),
-        after: change.after.clone(),
-        search_pattern: search,
-        replacement,
     }
 }
 
@@ -5246,7 +4811,15 @@ mod tests {
             &RenamePatterns::empty(),
             &HashMap::new(),
         );
-        let fix_guidance = generate_fix_guidance(&report, &rules, "*.ts");
+        let strategies = extract_fix_strategies(&rules);
+        let fix_guidance = FixGuidanceDoc {
+            migration: MigrationInfo {
+                from_ref: report.comparison.from_ref.clone(),
+                to_ref: report.comparison.to_ref.clone(),
+                generated_by: "test".to_string(),
+            },
+            summary: compute_fix_summary(&strategies),
+        };
 
         write_ruleset_dir(&dir, "test-ruleset", &report, &rules).unwrap();
         let fix_dir = write_fix_guidance_dir(&dir, &fix_guidance).unwrap();
@@ -5315,341 +4888,6 @@ mod tests {
         assert!(yaml.contains("ruleID"));
         assert!(yaml.contains("frontend.referenced"));
         assert!(yaml.contains("variant"));
-    }
-
-    // ── Fix guidance tests ──────────────────────────────────────────────
-
-    #[test]
-    fn test_fix_guidance_renamed_is_exact() {
-        let changes = vec![FileChanges {
-            file: PathBuf::from("src/lib.d.ts"),
-            status: FileStatus::Modified,
-            renamed_from: None,
-            breaking_api_changes: vec![ApiChange {
-                symbol: "Chip".to_string(),
-                qualified_name: String::new(),
-                kind: ApiChangeKind::Class,
-                change: ApiChangeType::Renamed,
-                before: Some("Chip".to_string()),
-                after: Some("Label".to_string()),
-                description: "Chip renamed to Label".to_string(),
-                migration_target: None,
-                removal_disposition: None,
-            }],
-            breaking_behavioral_changes: vec![],
-            container_changes: vec![],
-        }];
-
-        let report = make_report(changes, vec![]);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.{ts,tsx}",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.{ts,tsx}");
-
-        assert_eq!(guidance.fixes.len(), 1);
-        let fix = &guidance.fixes[0];
-        assert!(matches!(fix.strategy, FixStrategy::Rename));
-        assert!(matches!(fix.confidence, FixConfidence::Exact));
-        assert!(matches!(fix.source, FixSource::Pattern));
-        assert_eq!(fix.replacement.as_deref(), Some("Label"));
-        assert!(fix.fix_description.contains("Rename all occurrences"));
-        assert!(fix.fix_description.contains("'Chip'"));
-        assert!(fix.fix_description.contains("'Label'"));
-    }
-
-    #[test]
-    fn test_fix_guidance_removed_is_manual() {
-        let changes = vec![FileChanges {
-            file: PathBuf::from("src/api.d.ts"),
-            status: FileStatus::Deleted,
-            renamed_from: None,
-            breaking_api_changes: vec![ApiChange {
-                symbol: "createUser".to_string(),
-                qualified_name: String::new(),
-                kind: ApiChangeKind::Function,
-                change: ApiChangeType::Removed,
-                before: None,
-                after: None,
-                description: "Function createUser was removed".to_string(),
-                migration_target: None,
-                removal_disposition: None,
-            }],
-            breaking_behavioral_changes: vec![],
-            container_changes: vec![],
-        }];
-
-        let report = make_report(changes, vec![]);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.ts",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
-
-        assert_eq!(guidance.fixes.len(), 1);
-        let fix = &guidance.fixes[0];
-        assert!(matches!(fix.strategy, FixStrategy::FindAlternative));
-        assert!(matches!(fix.confidence, FixConfidence::Low));
-        assert!(matches!(fix.source, FixSource::Manual));
-        assert!(fix.replacement.is_none());
-        assert!(fix.fix_description.contains("has been removed"));
-    }
-
-    #[test]
-    fn test_fix_guidance_signature_changed() {
-        let changes = vec![FileChanges {
-            file: PathBuf::from("src/utils.d.ts"),
-            status: FileStatus::Modified,
-            renamed_from: None,
-            breaking_api_changes: vec![ApiChange {
-                symbol: "formatDate".to_string(),
-                qualified_name: String::new(),
-                kind: ApiChangeKind::Function,
-                change: ApiChangeType::SignatureChanged,
-                before: Some("formatDate(d: Date): string".to_string()),
-                after: Some("formatDate(d: Date, locale: string): string".to_string()),
-                description: "Added required 'locale' parameter".to_string(),
-                migration_target: None,
-                removal_disposition: None,
-            }],
-            breaking_behavioral_changes: vec![],
-            container_changes: vec![],
-        }];
-
-        let report = make_report(changes, vec![]);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.ts",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
-
-        assert_eq!(guidance.fixes.len(), 1);
-        let fix = &guidance.fixes[0];
-        assert!(matches!(fix.strategy, FixStrategy::UpdateSignature));
-        assert!(matches!(fix.confidence, FixConfidence::High));
-        assert!(fix.fix_description.contains("Old signature:"));
-        assert!(fix.fix_description.contains("New signature:"));
-        assert_eq!(fix.before.as_deref(), Some("formatDate(d: Date): string"));
-        assert_eq!(
-            fix.after.as_deref(),
-            Some("formatDate(d: Date, locale: string): string")
-        );
-    }
-
-    #[test]
-    fn test_fix_guidance_behavioral_is_llm_source() {
-        let changes = vec![FileChanges {
-            file: PathBuf::from("src/auth.ts"),
-            status: FileStatus::Modified,
-            renamed_from: None,
-            breaking_api_changes: vec![],
-            breaking_behavioral_changes: vec![BehavioralChange {
-                symbol: "validateToken".to_string(),
-                kind: BehavioralChangeKind::Function,
-                category: None,
-                description: "Now throws on expired tokens instead of returning null".to_string(),
-                source_file: Some("src/auth.ts".to_string()),
-                confidence: None,
-                evidence_type: None,
-                referenced_symbols: vec![],
-                is_internal_only: None,
-            }],
-            container_changes: vec![],
-        }];
-
-        let report = make_report(changes, vec![]);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.ts",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
-
-        assert_eq!(guidance.fixes.len(), 1);
-        let fix = &guidance.fixes[0];
-        assert!(matches!(fix.strategy, FixStrategy::ManualReview));
-        assert!(matches!(fix.confidence, FixConfidence::Medium));
-        assert!(matches!(fix.source, FixSource::Llm));
-        assert!(fix.fix_description.contains("AI-generated"));
-        assert!(fix.fix_description.contains("throws on expired tokens"));
-    }
-
-    #[test]
-    fn test_fix_guidance_manifest_cjs_to_esm() {
-        let manifest = vec![ManifestChange {
-            field: "type".to_string(),
-            change_type: TsManifestChangeType::ModuleSystemChanged,
-            before: Some("commonjs".to_string()),
-            after: Some("module".to_string()),
-            description: "CJS to ESM migration".to_string(),
-            is_breaking: true,
-            source_package: None,
-        }];
-
-        let report = make_report(vec![], manifest);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.ts",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
-
-        assert_eq!(guidance.fixes.len(), 1);
-        let fix = &guidance.fixes[0];
-        assert!(matches!(fix.strategy, FixStrategy::UpdateImport));
-        assert!(matches!(fix.confidence, FixConfidence::High));
-        assert!(fix.fix_description.contains("require()"));
-        assert!(fix.fix_description.contains("import"));
-        assert_eq!(fix.replacement.as_deref(), Some("import"));
-    }
-
-    #[test]
-    fn test_fix_guidance_summary_counts() {
-        let changes = vec![FileChanges {
-            file: PathBuf::from("src/lib.d.ts"),
-            status: FileStatus::Modified,
-            renamed_from: None,
-            breaking_api_changes: vec![
-                ApiChange {
-                    symbol: "Chip".to_string(),
-                    qualified_name: String::new(),
-                    kind: ApiChangeKind::Class,
-                    change: ApiChangeType::Renamed,
-                    before: Some("Chip".to_string()),
-                    after: Some("Label".to_string()),
-                    description: "Renamed".to_string(),
-                    migration_target: None,
-                    removal_disposition: None,
-                },
-                ApiChange {
-                    symbol: "oldFn".to_string(),
-                    qualified_name: String::new(),
-                    kind: ApiChangeKind::Function,
-                    change: ApiChangeType::Removed,
-                    before: None,
-                    after: None,
-                    description: "Removed".to_string(),
-                    migration_target: None,
-                    removal_disposition: None,
-                },
-            ],
-            breaking_behavioral_changes: vec![BehavioralChange {
-                symbol: "process".to_string(),
-                kind: BehavioralChangeKind::Function,
-                category: None,
-                description: "Changed behavior".to_string(),
-                source_file: Some("src/lib.ts".to_string()),
-                confidence: None,
-                evidence_type: None,
-                referenced_symbols: vec![],
-                is_internal_only: None,
-            }],
-            container_changes: vec![],
-        }];
-
-        let report = make_report(changes, vec![]);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.ts",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.ts");
-
-        assert_eq!(guidance.summary.total_fixes, 3);
-        // Rename=Exact (auto), Removed=Low/Manual, Behavioral=Medium/LLM
-        assert_eq!(guidance.summary.auto_fixable, 1); // only Rename
-        assert_eq!(guidance.summary.manual_only, 1); // Removed
-        assert_eq!(guidance.summary.needs_review, 1); // Behavioral
-    }
-
-    #[test]
-    fn test_fix_guidance_yaml_roundtrip() {
-        let changes = vec![FileChanges {
-            file: PathBuf::from("src/index.d.ts"),
-            status: FileStatus::Modified,
-            renamed_from: None,
-            breaking_api_changes: vec![
-                ApiChange {
-                    symbol: "Foo".to_string(),
-                    qualified_name: String::new(),
-                    kind: ApiChangeKind::Class,
-                    change: ApiChangeType::Renamed,
-                    before: Some("Foo".to_string()),
-                    after: Some("Bar".to_string()),
-                    description: "Renamed Foo to Bar".to_string(),
-                    migration_target: None,
-                    removal_disposition: None,
-                },
-                ApiChange {
-                    symbol: "baz".to_string(),
-                    qualified_name: String::new(),
-                    kind: ApiChangeKind::Function,
-                    change: ApiChangeType::SignatureChanged,
-                    before: Some("baz(): void".to_string()),
-                    after: Some("baz(x: number): void".to_string()),
-                    description: "Added required param".to_string(),
-                    migration_target: None,
-                    removal_disposition: None,
-                },
-            ],
-            breaking_behavioral_changes: vec![],
-            container_changes: vec![],
-        }];
-
-        let manifest = vec![ManifestChange {
-            field: "type".to_string(),
-            change_type: TsManifestChangeType::ModuleSystemChanged,
-            before: Some("commonjs".to_string()),
-            after: Some("module".to_string()),
-            description: "CJS to ESM".to_string(),
-            is_breaking: true,
-            source_package: None,
-        }];
-
-        let report = make_report(changes, manifest);
-        let empty_cache = HashMap::new();
-        let rules = generate_rules(
-            &report,
-            "*.{ts,tsx}",
-            &empty_cache,
-            &RenamePatterns::empty(),
-            &HashMap::new(),
-        );
-        let guidance = generate_fix_guidance(&report, &rules, "*.{ts,tsx}");
-
-        let yaml = serde_yaml::to_string(&guidance).unwrap();
-        assert!(yaml.contains("strategy"));
-        assert!(yaml.contains("confidence"));
-        assert!(yaml.contains("fix_description"));
-        assert!(yaml.contains("search_pattern"));
-        assert!(yaml.contains("replacement"));
-        assert!(yaml.contains("rename"));
-        assert!(yaml.contains("update_signature"));
-        assert!(yaml.contains("update_import"));
-        assert!(yaml.contains("auto_fixable"));
-        assert!(yaml.contains("needs_review"));
-        assert!(yaml.contains("manual_only"));
     }
 
     // ── Frontend provider tests ─────────────────────────────────────
@@ -6915,7 +6153,11 @@ mod tests {
 
     // Regular API rules (removed, type-changed) from the same file SHOULD still consolidate
     #[test]
-    fn test_consolidation_regular_api_rules_still_merge() {
+    fn test_consolidation_removed_properties_are_singletons() {
+        // TC031: Removed properties must NOT consolidate — each needs its own
+        // rule so the scanner generates a separate incident per prop. When
+        // grouped into one `or` rule, only the first matching condition fires
+        // per JSX element, leaving other removed props unfixed.
         let mut rule_a = make_rule_with_labels(
             "semver-modal-title-removed",
             vec![
@@ -6943,10 +6185,13 @@ mod tests {
         let key_a = consolidation_key(&rule_a, &extract_package_from_path);
         let key_b = consolidation_key(&rule_b, &extract_package_from_path);
 
-        assert_eq!(
+        assert_ne!(
             key_a, key_b,
-            "Regular API rules from the same file should still consolidate"
+            "Removed property rules must be singletons (TC031: hasIcon + isDynamic)"
         );
+        // Each returns its own rule_id
+        assert_eq!(key_a, "semver-modal-title-removed");
+        assert_eq!(key_b, "semver-modal-actions-removed");
     }
 
     // End-to-end: consolidate_rules() should keep P0-C, CSS, and sibling rules intact
@@ -9998,6 +9243,118 @@ mod tests {
         );
     }
 
+    // ── Union value removals must NOT produce rules (SD pipeline covers them) ──
+
+    /// When a property has a union type and one value was removed (e.g.,
+    /// `variant: 'default' | 'tertiary'` → `variant: 'default'`), the diff
+    /// engine emits `Removed(UnionValue{value: "tertiary"})` with
+    /// `before="'tertiary'"` and `after=None`. These must NOT produce
+    /// `change-type=removed` rules because the fix-engine assigns
+    /// `RemoveProp` strategy to them, which deletes the entire prop.
+    /// The SD pipeline generates correct `sd-prop-value-*` rules with
+    /// `PropValueChange` strategy instead.
+    #[test]
+    fn test_removed_union_value_produces_no_td_rule() {
+        // Simulate what the diff engine produces for a removed union value
+        let changes = vec![FileChanges {
+            file: PathBuf::from(
+                "packages/react-core/src/components/Nav/Nav.NavProps.variant.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavProps.variant".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some("'tertiary'".to_string()),
+                after: None,
+                description: "Value 'tertiary' was removed from the `variant` prop".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should produce NO rules — the SD pipeline handles these
+        let removed_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=removed")
+            })
+            .collect();
+        assert!(
+            removed_rules.is_empty(),
+            "Removed union value should NOT produce a change-type=removed rule. \
+             Got: {:?}",
+            removed_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Whole-property removals (before is a full type signature or None)
+    /// should still produce rules — only single-quoted-value removals
+    /// (union value removals) are suppressed.
+    #[test]
+    fn test_whole_prop_removal_still_produces_rule() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from(
+                "packages/react-core/src/components/Accordion/AccordionContent.AccordionContentProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "AccordionContentProps.isHidden".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some("property: isHidden: boolean".to_string()),
+                after: None,
+                description: "property `isHidden` was removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let removed_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=removed")
+            })
+            .collect();
+        assert!(
+            !removed_rules.is_empty(),
+            "Whole-property removal should still produce a change-type=removed rule"
+        );
+    }
+
     // NOTE: Full integration test for token rename pipeline lives in
     // crates/konveyor-core/tests/token_rename_pipeline.rs using real
     // fixture data (4028 token renames from PF v5→v6).
@@ -10743,6 +10100,253 @@ mod tests {
         assert!(
             !tile_rule.labels.contains(&"family=Tile".to_string()),
             "Tile rule should NOT have family=Tile label"
+        );
+    }
+
+    // ── Fix 3: No-op signature-changed suppression tests ────────────────
+
+    /// Helper to call api_change_to_rules with minimal boilerplate.
+    fn call_api_change_to_rules(change: &ApiChange) -> Vec<KonveyorRule> {
+        let file_changes = FileChanges {
+            file: PathBuf::from("src/Test.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![change.clone()],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        };
+        let mut id_counts = HashMap::new();
+        let rename_patterns = empty_rename_patterns();
+        let member_renames = HashMap::new();
+        let component_to_family = HashMap::new();
+        let old_prop_types = HashMap::new();
+        api_change_to_rules(
+            change,
+            &file_changes,
+            Some("@patternfly/react-core"),
+            &mut id_counts,
+            &rename_patterns,
+            &member_renames,
+            &component_to_family,
+            &old_prop_types,
+        )
+    }
+
+    /// No-op: "Chart replaced by Chart" should produce zero rules.
+    #[test]
+    fn test_signature_changed_noop_chart_suppressed() {
+        let change = ApiChange {
+            symbol: "Chart".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("Chart".into()),
+            after: Some("Chart".into()),
+            description: "Component `Chart` was deprecated and replaced by `Chart`. \
+                          Migrate from `<Chart>` to `<Chart>`."
+                .into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert!(
+            rules.is_empty(),
+            "No-op Chart→Chart should produce zero rules. Got {} rules: {:?}",
+            rules.len(),
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// No-op: "DragDrop replaced by DragDrop" should also be suppressed.
+    #[test]
+    fn test_signature_changed_noop_dragdrop_suppressed() {
+        let change = ApiChange {
+            symbol: "DragDrop".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("DragDrop".into()),
+            after: Some("DragDrop".into()),
+            description: "Component `DragDrop` was deprecated and replaced by `DragDrop`."
+                .into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert!(
+            rules.is_empty(),
+            "No-op DragDrop→DragDrop should produce zero rules"
+        );
+    }
+
+    /// Legitimate rename: "Chip replaced by Label" should still produce a rule.
+    #[test]
+    fn test_signature_changed_chip_to_label_preserved() {
+        let change = ApiChange {
+            symbol: "Chip".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("Chip".into()),
+            after: Some("Label".into()),
+            description: "Component `Chip` was deprecated and replaced by `Label`. \
+                          Migrate from `<Chip>` to `<Label>`."
+                .into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert_eq!(
+            rules.len(),
+            1,
+            "Chip→Label rename should produce 1 rule. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        assert!(
+            rules[0].description.contains("Chip"),
+            "Rule description should mention Chip"
+        );
+        assert!(
+            rules[0].description.contains("Label"),
+            "Rule description should mention Label"
+        );
+    }
+
+    /// Legitimate rename: "Tile replaced by Card" should still produce a rule.
+    #[test]
+    fn test_signature_changed_tile_to_card_preserved() {
+        let change = ApiChange {
+            symbol: "Tile".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("Tile".into()),
+            after: Some("Card".into()),
+            description: "Component `Tile` was deprecated and replaced by `Card`."
+                .into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert_eq!(
+            rules.len(),
+            1,
+            "Tile→Card rename should produce 1 rule"
+        );
+    }
+
+    /// Base class change should still produce a rule (before != after as type sigs).
+    #[test]
+    fn test_signature_changed_base_class_change_preserved() {
+        let change = ApiChange {
+            symbol: "ModalProps".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Interface,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("React.Component".into()),
+            after: Some("Component".into()),
+            description: "ModalProps base class changed".into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert_eq!(
+            rules.len(),
+            1,
+            "Base class change should produce 1 rule"
+        );
+    }
+
+    /// Property addition (before=None) should still produce a rule.
+    #[test]
+    fn test_signature_changed_before_none_preserved() {
+        let change = ApiChange {
+            symbol: "ButtonProps.icon".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::SignatureChanged,
+            before: None,
+            after: Some("property: icon: ReactNode".into()),
+            description: "icon prop was added".into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert_eq!(
+            rules.len(),
+            1,
+            "Property with before=None should produce 1 rule"
+        );
+    }
+
+    /// Property removal (after=None) should still produce a rule.
+    #[test]
+    fn test_signature_changed_after_none_preserved() {
+        let change = ApiChange {
+            symbol: "ButtonProps.isActive".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("property: isActive: boolean".into()),
+            after: None,
+            description: "isActive prop was removed".into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert_eq!(
+            rules.len(),
+            1,
+            "Property with after=None should produce 1 rule"
+        );
+    }
+
+    /// Props interface no-op: "ModalProps replaced by ModalProps" suppressed.
+    #[test]
+    fn test_signature_changed_noop_props_interface_suppressed() {
+        let change = ApiChange {
+            symbol: "ModalProps".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Interface,
+            change: ApiChangeType::SignatureChanged,
+            before: Some("ModalProps".into()),
+            after: Some("ModalProps".into()),
+            description: "Component `ModalProps` was deprecated and replaced by `ModalProps`."
+                .into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        assert!(
+            rules.is_empty(),
+            "No-op ModalProps→ModalProps should produce zero rules"
+        );
+    }
+
+    /// TypeChanged is NOT affected by the no-op filter (different change type).
+    #[test]
+    fn test_type_changed_with_same_before_after_not_affected() {
+        // Hypothetical: a TypeChanged entry where before == after
+        // (shouldn't happen in practice but verifies the guard is scoped
+        // to SignatureChanged only)
+        let change = ApiChange {
+            symbol: "CompProps.variant".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::TypeChanged,
+            before: Some("'a' | 'b'".into()),
+            after: Some("'a' | 'b'".into()),
+            description: "type not actually changed".into(),
+            migration_target: None,
+            removal_disposition: None,
+        };
+        let rules = call_api_change_to_rules(&change);
+        // TypeChanged with before == after should still produce a rule
+        // (the no-op guard only applies to SignatureChanged)
+        assert_eq!(
+            rules.len(),
+            1,
+            "TypeChanged should not be affected by the no-op SignatureChanged filter"
         );
     }
 }

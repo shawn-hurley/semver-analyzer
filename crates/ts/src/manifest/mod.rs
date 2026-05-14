@@ -9,7 +9,7 @@ use crate::language::{TsManifestChangeType, TypeScript};
 use semver_analyzer_core::ManifestChange;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
+
 
 /// Compare two `package.json` files and produce manifest changes.
 pub fn diff_manifests(old: &Value, new: &Value) -> Vec<ManifestChange<TypeScript>> {
@@ -23,18 +23,6 @@ pub fn diff_manifests(old: &Value, new: &Value) -> Vec<ManifestChange<TypeScript
     diff_bin(old, new, &mut changes);
 
     changes
-}
-
-/// Parse a `package.json` file and diff it against another.
-pub fn diff_manifest_files(
-    old_path: &Path,
-    new_path: &Path,
-) -> anyhow::Result<Vec<ManifestChange<TypeScript>>> {
-    let old_content = std::fs::read_to_string(old_path)?;
-    let new_content = std::fs::read_to_string(new_path)?;
-    let old: Value = serde_json::from_str(&old_content)?;
-    let new: Value = serde_json::from_str(&new_content)?;
-    Ok(diff_manifests(&old, &new))
 }
 
 // ─── Entry points ────────────────────────────────────────────────────────

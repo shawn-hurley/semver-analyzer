@@ -1196,6 +1196,558 @@ fn kebab_to_camel(s: &str) -> String {
 }
 
 use crate::git_utils::read_git_file;
+use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+// ── CSS Modifier Extraction ─────────────────────────────────────────────
+
+/// Extract CSS modifier declarations for all components in a CSS directory.
+///
+/// For each component CSS file, finds all `.pf-m-*` modifier rules and
+/// captures their declarations: custom property overrides (e.g.,
+/// `--pf-v6-c-label--BackgroundColor: var(...)`) and direct CSS properties
+/// (e.g., `display: flex`). Shorthand properties are expanded to longhands.
+///
+/// Returns: BEM block name → { modifier class → CssModifierEffect }
+pub fn extract_component_css_modifiers_from_dir(
+    dir: &Path,
+) -> Result<ComponentCssModifiers> {
+    let mut all_modifiers = ComponentCssModifiers::new();
+
+    // Same directory resolution as extract_css_profiles_from_dir
+    let components_dir = if dir.join("components").exists() {
+        dir.join("components")
+    } else if dir.join("dist/components").exists() {
+        dir.join("dist/components")
+    } else if dir.join("src/patternfly/components").exists() {
+        dir.join("src/patternfly/components")
+    } else {
+        dir.to_path_buf()
+    };
+
+    if !components_dir.exists() {
+        warn!(path = %components_dir.display(), "CSS components directory not found for modifier extraction");
+        return Ok(all_modifiers);
+    }
+
+    for entry in std::fs::read_dir(&components_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        for css_entry in std::fs::read_dir(entry.path())? {
+            let css_entry = css_entry?;
+            let css_path = css_entry.path();
+            if css_path.extension().is_none_or(|e| e != "css") {
+                continue;
+            }
+            let fname = css_path.file_name().unwrap_or_default().to_string_lossy();
+            if fname.contains(".min.") || fname.contains(".map") {
+                continue;
+            }
+
+            match std::fs::read_to_string(&css_path) {
+                Ok(source) => {
+                    match extract_css_modifier_declarations(&source) {
+                        Ok(modifiers) => {
+                            for (block, modifier_map) in modifiers {
+                                let existing = all_modifiers.entry(block).or_default();
+                                for (class, effect) in modifier_map {
+                                    let entry = existing.entry(class).or_default();
+                                    // Merge: later declarations override earlier ones
+                                    entry.custom_property_overrides.extend(
+                                        effect.custom_property_overrides,
+                                    );
+                                    entry.direct_properties.extend(effect.direct_properties);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(file = %css_path.display(), %e, "failed to parse CSS for modifiers");
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(file = %css_path.display(), %e, "failed to read CSS file for modifiers");
+                }
+            }
+        }
+    }
+
+    info!(
+        blocks = all_modifiers.len(),
+        total_modifiers = all_modifiers.values().map(|m| m.len()).sum::<usize>(),
+        "CSS modifier declarations extracted"
+    );
+    Ok(all_modifiers)
+}
+
+/// Extract modifier declarations from a single CSS source string.
+///
+/// Finds the block class, then walks all rules looking for selectors
+/// containing `.pf-m-*` classes. For each modifier rule, captures
+/// custom property overrides and direct CSS property declarations.
+fn extract_css_modifier_declarations(
+    source: &str,
+) -> Result<ComponentCssModifiers> {
+    let stylesheet = StyleSheet::parse(source, ParserOptions::default())
+        .map_err(|e| anyhow::anyhow!("CSS parse error: {}", e))?;
+
+    let block_class = match detect_block_class(&stylesheet) {
+        Some(b) => b,
+        None => return Ok(ComponentCssModifiers::new()),
+    };
+
+    let block_name = derive_block_name(&block_class);
+    let mut modifier_map = CssModifierMap::new();
+
+    for rule in &stylesheet.rules.0 {
+        extract_modifiers_from_rule(rule, &mut modifier_map);
+    }
+
+    if modifier_map.is_empty() {
+        return Ok(ComponentCssModifiers::new());
+    }
+
+    let mut result = ComponentCssModifiers::new();
+    result.insert(block_name, modifier_map);
+    Ok(result)
+}
+
+/// Recursively walk CSS rules, extracting modifier declarations.
+fn extract_modifiers_from_rule(
+    rule: &CssRule,
+    modifiers: &mut CssModifierMap,
+) {
+    match rule {
+        CssRule::Style(style_rule) => {
+            // Check if any selector contains a modifier class
+            let mut found_modifiers = Vec::new();
+            for selector in style_rule.selectors.0.iter() {
+                for class_name in extract_modifier_classes(selector) {
+                    found_modifiers.push(class_name);
+                }
+            }
+
+            if found_modifiers.is_empty() {
+                return;
+            }
+
+            // Collect all declarations from this rule
+            let mut effect = CssModifierEffect::default();
+            for property in style_rule
+                .declarations
+                .declarations
+                .iter()
+                .chain(style_rule.declarations.important_declarations.iter())
+            {
+                collect_declaration(property, &mut effect);
+            }
+
+            if effect.custom_property_overrides.is_empty()
+                && effect.direct_properties.is_empty()
+            {
+                return;
+            }
+
+            // Attribute to each modifier found in the selectors
+            for modifier_class in found_modifiers {
+                let entry = modifiers.entry(modifier_class).or_default();
+                entry
+                    .custom_property_overrides
+                    .extend(effect.custom_property_overrides.clone());
+                entry
+                    .direct_properties
+                    .extend(effect.direct_properties.clone());
+            }
+        }
+        CssRule::Media(media_rule) => {
+            for inner in &media_rule.rules.0 {
+                extract_modifiers_from_rule(inner, modifiers);
+            }
+        }
+        CssRule::Supports(supports_rule) => {
+            for inner in &supports_rule.rules.0 {
+                extract_modifiers_from_rule(inner, modifiers);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract all modifier class names from a selector.
+///
+/// A modifier class is any class matching common modifier patterns:
+/// - `pf-m-*` (PatternFly BEM modifier)
+/// - `is-*` (generic state modifier)
+/// - `has-*` (generic state modifier)
+///
+/// Returns all matching class names from the selector.
+fn extract_modifier_classes(selector: &Selector) -> Vec<String> {
+    let mut classes = Vec::new();
+    for component in selector.iter() {
+        if let Component::Class(class_name) = component {
+            let name = class_name.as_ref();
+            if name.starts_with("pf-m-") || name.starts_with("is-") || name.starts_with("has-") {
+                classes.push(name.to_string());
+            }
+        }
+    }
+    classes
+}
+
+/// Collect a single CSS property declaration into a CssModifierEffect.
+fn collect_declaration(property: &Property, effect: &mut CssModifierEffect) {
+    use lightningcss::printer::PrinterOptions;
+
+    let prop_name = property.property_id().name().to_string();
+
+    // Serialize the value using lightningcss's public API
+    let value_str = match property.value_to_css_string(PrinterOptions::default()) {
+        Ok(v) => v.trim().to_string(),
+        Err(_) => return,
+    };
+
+    if prop_name.starts_with("--") {
+        // CSS custom property override (e.g., --pf-v6-c-label--BackgroundColor)
+        effect
+            .custom_property_overrides
+            .insert(prop_name, value_str);
+    } else {
+        // Direct CSS property (e.g., display, overflow, border)
+        effect.direct_properties.insert(prop_name, value_str);
+    }
+}
+
+// ── CSS Variable Resolution ─────────────────────────────────────────────
+
+/// A map from CSS custom property name to its resolved terminal value.
+/// Terminal values are concrete (hex colors, pixels, etc.) — no `var()`.
+pub type CssVariableResolutionMap = HashMap<String, String>;
+
+/// Build a resolution map from CSS custom property names to their terminal
+/// values by collecting all custom property definitions from CSS files and
+/// iteratively resolving `var()` chains.
+///
+/// Parses ALL CSS files in the directory (including global token files like
+/// `patternfly-base.css` which contain `:root` definitions with palette and
+/// semantic tokens). Component CSS files contribute component-level tokens.
+///
+/// Returns: variable name (with `--` prefix) → resolved terminal value.
+pub fn build_css_variable_resolution_map_from_dir(
+    dir: &Path,
+) -> Result<CssVariableResolutionMap> {
+    let mut definitions: HashMap<String, String> = HashMap::new();
+
+    // Walk ALL CSS files recursively to find custom property definitions
+    collect_css_definitions_recursive(dir, &mut definitions)?;
+
+    info!(
+        raw_definitions = definitions.len(),
+        "Collected CSS custom property definitions for resolution"
+    );
+
+    // Iteratively resolve var() references
+    resolve_var_chains(&mut definitions);
+
+    // Keep only entries with terminal values (no remaining var() references)
+    let resolved: CssVariableResolutionMap = definitions
+        .into_iter()
+        .filter(|(_, v)| !v.contains("var("))
+        .collect();
+
+    info!(
+        resolved = resolved.len(),
+        "CSS variable resolution map built"
+    );
+
+    Ok(resolved)
+}
+
+/// Recursively walk a directory and collect all CSS custom property definitions.
+fn collect_css_definitions_recursive(
+    dir: &Path,
+    definitions: &mut HashMap<String, String>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_css_definitions_recursive(&path, definitions)?;
+        } else if path.extension().is_some_and(|e| e == "css") {
+            let fname = path.file_name().unwrap_or_default().to_string_lossy();
+            if fname.contains(".min.") || fname.contains(".map") {
+                continue;
+            }
+
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                collect_definitions_from_css(&source, definitions);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a CSS source string and collect all custom property definitions.
+///
+/// Extracts `--name: value` declarations from all rule blocks (including
+/// `:root`, component rules, modifier rules, etc.).
+fn collect_definitions_from_css(
+    source: &str,
+    definitions: &mut HashMap<String, String>,
+) {
+    let stylesheet = match StyleSheet::parse(source, ParserOptions::default()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    for rule in &stylesheet.rules.0 {
+        collect_definitions_from_rule(rule, definitions);
+    }
+}
+
+/// Recursively walk CSS rules collecting custom property definitions.
+fn collect_definitions_from_rule(
+    rule: &CssRule,
+    definitions: &mut HashMap<String, String>,
+) {
+    match rule {
+        CssRule::Style(style_rule) => {
+            for property in style_rule
+                .declarations
+                .declarations
+                .iter()
+                .chain(style_rule.declarations.important_declarations.iter())
+            {
+                let prop_name = property.property_id().name().to_string();
+                if prop_name.starts_with("--") {
+                    if let Ok(value_str) = property.value_to_css_string(
+                        lightningcss::printer::PrinterOptions::default(),
+                    ) {
+                        let value = value_str.trim().to_string();
+                        // Only insert if not already defined (first definition wins —
+                        // `:root` definitions come before component overrides)
+                        definitions.entry(prop_name).or_insert(value);
+                    }
+                }
+            }
+        }
+        CssRule::Media(media_rule) => {
+            for inner in &media_rule.rules.0 {
+                collect_definitions_from_rule(inner, definitions);
+            }
+        }
+        CssRule::Supports(supports_rule) => {
+            for inner in &supports_rule.rules.0 {
+                collect_definitions_from_rule(inner, definitions);
+            }
+        }
+        CssRule::LayerBlock(layer_rule) => {
+            for inner in &layer_rule.rules.0 {
+                collect_definitions_from_rule(inner, definitions);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Iteratively resolve `var()` references in a definitions map.
+///
+/// For each definition whose value is `var(--name)` or `var(--name, fallback)`,
+/// replaces it with the referenced definition's value. Repeats until no more
+/// resolutions are possible (handles multi-level chains).
+///
+/// Max 10 iterations to prevent infinite loops from circular references.
+fn resolve_var_chains(definitions: &mut HashMap<String, String>) {
+    for iteration in 0..10 {
+        let mut resolved_count = 0;
+
+        let snapshot: Vec<(String, String)> = definitions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (name, value) in &snapshot {
+            if !value.contains("var(") {
+                continue;
+            }
+
+            // Try to resolve the var() reference
+            if let Some(resolved) = resolve_single_var(value, definitions) {
+                if resolved != *value {
+                    definitions.insert(name.clone(), resolved);
+                    resolved_count += 1;
+                }
+            }
+        }
+
+        if resolved_count == 0 {
+            debug!(
+                iterations = iteration + 1,
+                "CSS variable resolution converged"
+            );
+            break;
+        }
+    }
+}
+
+/// Resolve a single value that may contain `var()` references.
+///
+/// Handles:
+/// - `var(--name)` → looks up `--name` in definitions
+/// - `var(--name, fallback)` → uses fallback if `--name` not found
+/// - Multiple `var()` references in one value (e.g., border shorthand)
+/// - Nested `var()` (var inside fallback)
+fn resolve_single_var(
+    value: &str,
+    definitions: &HashMap<String, String>,
+) -> Option<String> {
+    // Simple case: value is exactly `var(--name)` or `var(--name, fallback)`
+    let trimmed = value.trim();
+
+    if !trimmed.contains("var(") {
+        return Some(trimmed.to_string());
+    }
+
+    // Find all var() references and try to resolve them
+    let mut result = trimmed.to_string();
+    let mut changed = false;
+
+    // Iteratively replace var() references (innermost first)
+    for _ in 0..5 {
+        let mut new_result = String::new();
+        let mut remaining = result.as_str();
+        let mut round_changed = false;
+
+        while let Some(var_start) = remaining.find("var(") {
+            new_result.push_str(&remaining[..var_start]);
+            let after_var = &remaining[var_start + 4..];
+
+            // Find matching closing paren (handle nested parens)
+            if let Some(content_end) = find_matching_paren(after_var) {
+                let content = &after_var[..content_end];
+
+                // Parse var name and optional fallback
+                let (var_name, fallback) = if let Some(comma_pos) = find_comma_outside_parens(content) {
+                    let name = content[..comma_pos].trim();
+                    let fb = content[comma_pos + 1..].trim();
+                    (name, Some(fb))
+                } else {
+                    (content.trim(), None)
+                };
+
+                // Try to resolve
+                if let Some(resolved_value) = definitions.get(var_name) {
+                    if !resolved_value.contains("var(") {
+                        // Fully resolved — inline the terminal value
+                        new_result.push_str(resolved_value);
+                        round_changed = true;
+                    } else {
+                        // Partially resolved — keep var() for next iteration
+                        new_result.push_str(&format!("var({}", content));
+                        new_result.push(')');
+                    }
+                } else if let Some(fb) = fallback {
+                    // Name not found, use fallback
+                    new_result.push_str(fb);
+                    round_changed = true;
+                } else {
+                    // Unresolvable — keep as-is
+                    new_result.push_str(&format!("var({}", content));
+                    new_result.push(')');
+                }
+
+                remaining = &after_var[content_end + 1..];
+            } else {
+                // Malformed var() — keep as-is
+                new_result.push_str("var(");
+                remaining = after_var;
+            }
+        }
+        new_result.push_str(remaining);
+
+        if !round_changed {
+            break;
+        }
+        changed = true;
+        result = new_result;
+    }
+
+    if changed {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Find the position of the matching closing parenthesis.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Find the first comma that's not inside parentheses.
+fn find_comma_outside_parens(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve the `CssModifierEffect.custom_property_overrides` values using
+/// a variable resolution map, populating `resolved_overrides`.
+///
+/// For each override `--token: var(--ref)`, looks up `--ref` in the
+/// resolution map. If resolved, stores the terminal value in
+/// `resolved_overrides` under the same key.
+pub fn resolve_modifier_effects(
+    modifiers: &mut crate::sd_types::ComponentCssModifiers,
+    resolution_map: &CssVariableResolutionMap,
+) {
+    for (_block, modifier_map) in modifiers.iter_mut() {
+        for (_class, effect) in modifier_map.iter_mut() {
+            for (token_name, raw_value) in &effect.custom_property_overrides {
+                // Try to resolve the raw value (which is typically var(--something))
+                if let Some(resolved) = resolve_single_var(raw_value, resolution_map) {
+                    if !resolved.contains("var(") {
+                        effect
+                            .resolved_overrides
+                            .insert(token_name.clone(), resolved);
+                    }
+                } else if !raw_value.contains("var(") {
+                    // Already a terminal value (e.g., "transparent", "0")
+                    effect
+                        .resolved_overrides
+                        .insert(token_name.clone(), raw_value.clone());
+                }
+            }
+        }
+    }
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
@@ -1708,6 +2260,542 @@ mod selector_relationship_tests {
             root.has_grid_template,
             "Should detect grid-template from unparsed var(). Got: {:?}",
             root
+        );
+    }
+
+    // ── CSS Modifier Extraction Tests ────────────────────────────────────
+
+    fn modifiers_from_css(css: &str) -> ComponentCssModifiers {
+        extract_css_modifier_declarations(css).unwrap()
+    }
+
+    /// Real PF v5 Label .pf-m-cyan modifier (compiled CSS equivalent).
+    /// From v5.4.0:src/patternfly/components/Label/label.scss, .pf-m-cyan block.
+    /// The SCSS #{$label} resolves to pf-v5-c-label after compilation.
+    #[test]
+    fn test_modifier_extraction_label_v5_cyan() {
+        let css = r#"
+            .pf-v5-c-label {
+                background-color: var(--pf-v5-c-label--BackgroundColor);
+            }
+            .pf-v5-c-label.pf-m-cyan {
+                --pf-v5-c-label--BackgroundColor: var(--pf-v5-c-label--m-cyan--BackgroundColor);
+                --pf-v5-c-label__icon--Color: var(--pf-v5-c-label--m-cyan__icon--Color);
+                --pf-v5-c-label__content--Color: var(--pf-v5-c-label--m-cyan__content--Color);
+                --pf-v5-c-label__content--before--BorderColor: var(--pf-v5-c-label--m-cyan__content--before--BorderColor);
+                --pf-v5-c-label__content--link--hover--before--BorderColor: var(--pf-v5-c-label--m-cyan__content--link--hover--before--BorderColor);
+                --pf-v5-c-label__content--link--focus--before--BorderColor: var(--pf-v5-c-label--m-cyan__content--link--focus--before--BorderColor);
+                --pf-v5-c-label--m-outline__content--Color: var(--pf-v5-c-label--m-outline--m-cyan__content--Color);
+                --pf-v5-c-label--m-outline__content--before--BorderColor: var(--pf-v5-c-label--m-outline--m-cyan__content--before--BorderColor);
+                --pf-v5-c-label--m-outline__content--link--hover--before--BorderColor: var(--pf-v5-c-label--m-outline--m-cyan__content--link--hover--before--BorderColor);
+                --pf-v5-c-label--m-outline__content--link--focus--before--BorderColor: var(--pf-v5-c-label--m-outline--m-cyan__content--link--focus--before--BorderColor);
+                --pf-v5-c-label--m-editable__content--before--BorderColor: var(--pf-v5-c-label--m-cyan__content--before--BorderColor);
+                --pf-v5-c-label--m-editable__content--hover--before--BorderColor: var(--pf-v5-c-label--m-cyan__content--before--BorderColor);
+                --pf-v5-c-label--m-editable__content--focus--before--BorderColor: var(--pf-v5-c-label--m-cyan__content--before--BorderColor);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        let label_mods = all.get("label").expect("should have 'label' block");
+        let cyan = label_mods.get("pf-m-cyan").expect("should have pf-m-cyan");
+
+        // v5 cyan has 13 custom property overrides
+        assert_eq!(
+            cyan.custom_property_overrides.len(),
+            13,
+            "v5 pf-m-cyan should have 13 custom property overrides. Got: {:?}",
+            cyan.custom_property_overrides.keys().collect::<Vec<_>>()
+        );
+
+        // Verify specific override keys
+        assert!(cyan.custom_property_overrides.contains_key("--pf-v5-c-label--BackgroundColor"));
+        assert!(cyan.custom_property_overrides.contains_key("--pf-v5-c-label__icon--Color"));
+        assert!(cyan
+            .custom_property_overrides
+            .contains_key("--pf-v5-c-label__content--Color"));
+
+        // No direct properties — modifier only overrides custom properties
+        assert!(
+            cyan.direct_properties.is_empty(),
+            "pf-m-cyan should have no direct properties"
+        );
+    }
+
+    /// Real PF v6 Label .pf-m-teal modifier (compiled CSS equivalent).
+    /// From v6.4.0:src/patternfly/components/Label/label.scss, .pf-m-teal block.
+    #[test]
+    fn test_modifier_extraction_label_v6_teal() {
+        let css = r#"
+            .pf-v6-c-label {
+                background-color: var(--pf-v6-c-label--BackgroundColor);
+            }
+            .pf-v6-c-label.pf-m-teal {
+                --pf-v6-c-label--BackgroundColor: var(--pf-v6-c-label--m-teal--BackgroundColor);
+                --pf-v6-c-label--Color: var(--pf-v6-c-label--m-teal--Color);
+                --pf-v6-c-label__icon--Color: var(--pf-v6-c-label--m-teal__icon--Color);
+                --pf-v6-c-label--m-clickable--hover--BackgroundColor: var(--pf-v6-c-label--m-teal--m-clickable--hover--BackgroundColor);
+                --pf-v6-c-label--m-clickable--hover--Color: var(--pf-v6-c-label--m-teal--m-clickable--hover--Color);
+                --pf-v6-c-label--m-clickable--hover__icon--Color: var(--pf-v6-c-label--m-teal--m-clickable--hover__icon--Color);
+                --pf-v6-c-label--m-outline--BorderColor: var(--pf-v6-c-label--m-teal--m-outline--BorderColor);
+                --pf-v6-c-label--m-outline--m-clickable--hover--BorderColor: var(--pf-v6-c-label--m-teal--m-outline--m-clickable--hover--BorderColor);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        let label_mods = all.get("label").expect("should have 'label' block");
+        let teal = label_mods.get("pf-m-teal").expect("should have pf-m-teal");
+
+        // v6 teal has 8 custom property overrides (simplified from v5's 13)
+        assert_eq!(
+            teal.custom_property_overrides.len(),
+            8,
+            "v6 pf-m-teal should have 8 custom property overrides. Got: {:?}",
+            teal.custom_property_overrides.keys().collect::<Vec<_>>()
+        );
+
+        assert!(teal
+            .custom_property_overrides
+            .contains_key("--pf-v6-c-label--BackgroundColor"));
+        assert!(teal
+            .custom_property_overrides
+            .contains_key("--pf-v6-c-label--Color"));
+    }
+
+    /// Real PF v5 Nav with tertiary modifier — includes direct CSS properties
+    /// (display, position, overflow) from the shared horizontal layout block.
+    /// From v5.4.0:src/patternfly/components/Nav/nav.scss.
+    #[test]
+    fn test_modifier_extraction_nav_v5_tertiary_with_direct_props() {
+        let css = r#"
+            .pf-v5-c-nav {
+                display: block;
+            }
+            .pf-v5-c-nav.pf-m-horizontal,
+            .pf-v5-c-nav.pf-m-tertiary,
+            .pf-v5-c-nav.pf-m-horizontal-subnav {
+                display: flex;
+                overflow: hidden;
+            }
+            .pf-v5-c-nav.pf-m-tertiary {
+                --pf-v5-c-nav__link--PaddingTop: var(--pf-v5-c-nav--m-tertiary__link--PaddingTop);
+                --pf-v5-c-nav__link--PaddingRight: var(--pf-v5-c-nav--m-tertiary__link--PaddingRight);
+                --pf-v5-c-nav__link--PaddingBottom: var(--pf-v5-c-nav--m-tertiary__link--PaddingBottom);
+                --pf-v5-c-nav__link--PaddingLeft: var(--pf-v5-c-nav--m-tertiary__link--PaddingLeft);
+                --pf-v5-c-nav__link--Color: var(--pf-v5-c-nav--m-tertiary__link--Color);
+                --pf-v5-c-nav__link--BackgroundColor: transparent;
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        let nav_mods = all.get("nav").expect("should have 'nav' block");
+        let tertiary = nav_mods.get("pf-m-tertiary").expect("should have pf-m-tertiary");
+
+        // Should have custom property overrides from the tertiary-specific block
+        assert!(
+            tertiary.custom_property_overrides.len() >= 6,
+            "tertiary should have at least 6 custom property overrides. Got: {:?}",
+            tertiary.custom_property_overrides
+        );
+
+        // Should have direct properties from the shared horizontal block
+        assert!(
+            tertiary.direct_properties.contains_key("display"),
+            "tertiary should have 'display' from shared horizontal rule. Got: {:?}",
+            tertiary.direct_properties
+        );
+        assert!(
+            tertiary.direct_properties.contains_key("overflow"),
+            "tertiary should have 'overflow' from shared horizontal rule"
+        );
+
+        // horizontal-subnav should also have the same direct properties
+        let hs = nav_mods
+            .get("pf-m-horizontal-subnav")
+            .expect("should have pf-m-horizontal-subnav");
+        assert!(
+            hs.direct_properties.contains_key("display"),
+            "horizontal-subnav should share display from combined selector"
+        );
+    }
+
+    /// Real PF v5 Drawer .pf-m-light-200 and .pf-m-no-background modifiers.
+    /// Each overrides only one custom property (BackgroundColor).
+    /// From v5.4.0:src/patternfly/components/Drawer/drawer.scss.
+    #[test]
+    fn test_modifier_extraction_drawer_v5_variants() {
+        let css = r#"
+            .pf-v5-c-drawer__content {
+                background-color: var(--pf-v5-c-drawer__content--BackgroundColor);
+            }
+            .pf-v5-c-drawer__content.pf-m-no-background {
+                --pf-v5-c-drawer__content--BackgroundColor: transparent;
+            }
+            .pf-v5-c-drawer__content.pf-m-light-200 {
+                --pf-v5-c-drawer__content--BackgroundColor: var(--pf-v5-c-drawer__content--m-light-200--BackgroundColor);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        // Without the parent .pf-v5-c-drawer block class in the CSS,
+        // detect_block_class can't find the block (it skips classes with "__").
+        // In real compiled CSS, the drawer.css starts with .pf-v5-c-drawer {},
+        // so the block is always detectable. This test verifies that when the
+        // block class is missing, extraction degrades gracefully.
+        assert!(
+            all.is_empty(),
+            "Without block class, no modifiers should be extracted"
+        );
+    }
+
+    /// Drawer test with proper block class included.
+    #[test]
+    fn test_modifier_extraction_drawer_with_block() {
+        let css = r#"
+            .pf-v5-c-drawer {
+                display: flex;
+            }
+            .pf-v5-c-drawer__content {
+                background-color: var(--pf-v5-c-drawer__content--BackgroundColor);
+            }
+            .pf-v5-c-drawer__content.pf-m-no-background {
+                --pf-v5-c-drawer__content--BackgroundColor: transparent;
+            }
+            .pf-v5-c-drawer__content.pf-m-light-200 {
+                --pf-v5-c-drawer__content--BackgroundColor: var(--pf-v5-c-drawer__content--m-light-200--BackgroundColor);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        let drawer_mods = all.get("drawer").expect("should have 'drawer' block");
+
+        let nobg = drawer_mods
+            .get("pf-m-no-background")
+            .expect("should have pf-m-no-background");
+        assert_eq!(
+            nobg.custom_property_overrides.len(),
+            1,
+            "no-background should override 1 custom property"
+        );
+        // Value should be "transparent" (a terminal value, not var())
+        assert_eq!(
+            nobg.custom_property_overrides
+                .get("--pf-v5-c-drawer__content--BackgroundColor")
+                .map(|v| v.as_str()),
+            Some("transparent"),
+            "no-background should set BackgroundColor to transparent"
+        );
+
+        let light200 = drawer_mods
+            .get("pf-m-light-200")
+            .expect("should have pf-m-light-200");
+        assert_eq!(
+            light200.custom_property_overrides.len(),
+            1,
+            "light-200 should override 1 custom property"
+        );
+    }
+
+    /// Modifier inside @media query should still be extracted.
+    #[test]
+    fn test_modifier_extraction_inside_media_query() {
+        let css = r#"
+            .pf-v6-c-nav {
+                display: block;
+            }
+            @media (min-width: 768px) {
+                .pf-v6-c-nav.pf-m-horizontal {
+                    --pf-v6-c-nav--BackgroundColor: var(--pf-v6-c-nav--m-horizontal--BackgroundColor);
+                    display: flex;
+                }
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        let nav_mods = all.get("nav").expect("should have 'nav' block");
+        let horizontal = nav_mods
+            .get("pf-m-horizontal")
+            .expect("should have pf-m-horizontal");
+
+        assert!(
+            horizontal
+                .custom_property_overrides
+                .contains_key("--pf-v6-c-nav--BackgroundColor"),
+            "Should extract custom property from inside @media"
+        );
+        assert!(
+            horizontal.direct_properties.contains_key("display"),
+            "Should extract display from inside @media"
+        );
+    }
+
+    /// Non-modifier rules should not appear in the modifier map.
+    #[test]
+    fn test_modifier_extraction_non_modifier_ignored() {
+        let css = r#"
+            .pf-v6-c-label {
+                background-color: var(--pf-v6-c-label--BackgroundColor);
+                color: var(--pf-v6-c-label--Color);
+            }
+            .pf-v6-c-label__icon {
+                color: var(--pf-v6-c-label__icon--Color);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        // Should have a label block but NO modifiers
+        if let Some(label_mods) = all.get("label") {
+            assert!(
+                label_mods.is_empty(),
+                "Should have no modifiers for base/element rules only"
+            );
+        }
+    }
+
+    /// Multiple modifiers on the same component should each have their
+    /// own entry with correct declarations.
+    #[test]
+    fn test_modifier_extraction_multiple_colors() {
+        let css = r#"
+            .pf-v6-c-label {
+                background-color: var(--pf-v6-c-label--BackgroundColor);
+            }
+            .pf-v6-c-label.pf-m-blue {
+                --pf-v6-c-label--BackgroundColor: var(--pf-v6-c-label--m-blue--BackgroundColor);
+                --pf-v6-c-label--Color: var(--pf-v6-c-label--m-blue--Color);
+                --pf-v6-c-label__icon--Color: var(--pf-v6-c-label--m-blue__icon--Color);
+            }
+            .pf-v6-c-label.pf-m-teal {
+                --pf-v6-c-label--BackgroundColor: var(--pf-v6-c-label--m-teal--BackgroundColor);
+                --pf-v6-c-label--Color: var(--pf-v6-c-label--m-teal--Color);
+                --pf-v6-c-label__icon--Color: var(--pf-v6-c-label--m-teal__icon--Color);
+            }
+            .pf-v6-c-label.pf-m-yellow {
+                --pf-v6-c-label--BackgroundColor: var(--pf-v6-c-label--m-yellow--BackgroundColor);
+                --pf-v6-c-label--Color: var(--pf-v6-c-label--m-yellow--Color);
+                --pf-v6-c-label__icon--Color: var(--pf-v6-c-label--m-yellow__icon--Color);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        let label_mods = all.get("label").expect("should have 'label' block");
+
+        assert_eq!(
+            label_mods.len(),
+            3,
+            "Should have 3 color modifiers. Got: {:?}",
+            label_mods.keys().collect::<Vec<_>>()
+        );
+
+        // All three should have the same structure (3 overrides each)
+        for (name, effect) in label_mods {
+            assert_eq!(
+                effect.custom_property_overrides.len(),
+                3,
+                "{} should have 3 custom property overrides",
+                name
+            );
+        }
+    }
+
+    /// Generic modifier patterns (is-*, has-*) should also be extracted.
+    #[test]
+    fn test_modifier_extraction_generic_patterns() {
+        let css = r#"
+            .my-component {
+                color: var(--my-component--Color);
+            }
+            .my-component.is-active {
+                --my-component--Color: var(--my-component--is-active--Color);
+            }
+            .my-component.has-icon {
+                --my-component--PaddingLeft: var(--my-component--has-icon--PaddingLeft);
+            }
+        "#;
+
+        let all = modifiers_from_css(css);
+        // Block name derived from "my-component" → "myComponent"
+        let comp_mods = all.get("myComponent").expect("should have 'myComponent' block");
+
+        assert!(
+            comp_mods.contains_key("is-active"),
+            "Should extract is-active modifier"
+        );
+        assert!(
+            comp_mods.contains_key("has-icon"),
+            "Should extract has-icon modifier"
+        );
+    }
+
+    // ── CSS Variable Resolution Tests ────────────────────────────────
+
+    /// Terminal values (no var()) are preserved as-is.
+    #[test]
+    fn test_resolution_terminal_values() {
+        let css = r#"
+            :root {
+                --pf-t--color--teal--10: #daf2f2;
+                --pf-t--color--teal--20: #b9e5e5;
+                --pf-t--color--blue--50: #0066cc;
+            }
+        "#;
+        let mut defs = HashMap::new();
+        collect_definitions_from_css(css, &mut defs);
+        resolve_var_chains(&mut defs);
+
+        // lightningcss may minify hex colors (e.g., #0066cc → #06c)
+        // so we compare case-insensitively and accept both forms
+        let teal10 = defs.get("--pf-t--color--teal--10").unwrap();
+        assert!(teal10 == "#daf2f2" || teal10 == "#DAF2F2", "teal-10: {}", teal10);
+        let teal20 = defs.get("--pf-t--color--teal--20").unwrap();
+        assert!(teal20 == "#b9e5e5" || teal20 == "#B9E5E5", "teal-20: {}", teal20);
+        let blue50 = defs.get("--pf-t--color--blue--50").unwrap();
+        assert!(blue50 == "#0066cc" || blue50 == "#06c", "blue-50: {}", blue50);
+    }
+
+    /// One level of var() indirection: semantic → palette.
+    /// Real PF v6: --pf-t--global--color--nonstatus--teal--100: var(--pf-t--color--teal--20)
+    #[test]
+    fn test_resolution_one_level_chain() {
+        let css = r#"
+            :root {
+                --pf-t--color--teal--20: #b9e5e5;
+                --pf-t--global--color--nonstatus--teal--100: var(--pf-t--color--teal--20);
+            }
+        "#;
+        let mut defs = HashMap::new();
+        collect_definitions_from_css(css, &mut defs);
+        resolve_var_chains(&mut defs);
+
+        assert_eq!(
+            defs.get("--pf-t--global--color--nonstatus--teal--100").map(|s| s.as_str()),
+            Some("#b9e5e5"),
+            "Semantic token should resolve to palette hex"
+        );
+    }
+
+    /// Multi-level chain matching real PF v6 architecture:
+    /// palette → semantic numbered → semantic default → component modifier token.
+    #[test]
+    fn test_resolution_multi_level_chain() {
+        let css = r#"
+            :root {
+                --pf-t--color--teal--20: #b9e5e5;
+                --pf-t--global--color--nonstatus--teal--100: var(--pf-t--color--teal--20);
+                --pf-t--global--color--nonstatus--teal--default: var(--pf-t--global--color--nonstatus--teal--100);
+            }
+            .pf-v6-c-label {
+                --pf-v6-c-label--m-teal--BackgroundColor: var(--pf-t--global--color--nonstatus--teal--default);
+            }
+        "#;
+        let mut defs = HashMap::new();
+        collect_definitions_from_css(css, &mut defs);
+        resolve_var_chains(&mut defs);
+
+        // Full chain: label modifier token → semantic default → semantic 100 → palette → hex
+        assert_eq!(
+            defs.get("--pf-v6-c-label--m-teal--BackgroundColor").map(|s| s.as_str()),
+            Some("#b9e5e5"),
+            "Label modifier token should resolve through 3 levels to palette hex"
+        );
+    }
+
+    /// Fallback value used when referenced variable doesn't exist.
+    #[test]
+    fn test_resolution_with_fallback() {
+        let css = r#"
+            :root {
+                --my-color: var(--missing-var, red);
+            }
+        "#;
+        let mut defs = HashMap::new();
+        collect_definitions_from_css(css, &mut defs);
+        resolve_var_chains(&mut defs);
+
+        assert_eq!(
+            defs.get("--my-color").map(|s| s.as_str()),
+            Some("red"),
+            "Should use fallback when referenced var doesn't exist"
+        );
+    }
+
+    /// Terminal values like "transparent" and "0" pass through unchanged.
+    #[test]
+    fn test_resolution_transparent_terminal() {
+        let css = r#"
+            .pf-v5-c-drawer__content.pf-m-no-background {
+                --pf-v5-c-drawer__content--BackgroundColor: transparent;
+            }
+        "#;
+        let mut defs = HashMap::new();
+        collect_definitions_from_css(css, &mut defs);
+        resolve_var_chains(&mut defs);
+
+        assert_eq!(
+            defs.get("--pf-v5-c-drawer__content--BackgroundColor").map(|s| s.as_str()),
+            Some("transparent"),
+            "Terminal 'transparent' should pass through unchanged"
+        );
+    }
+
+    /// resolve_modifier_effects enriches CssModifierEffect with resolved values.
+    #[test]
+    fn test_resolve_modifier_effects_enrichment() {
+        use crate::sd_types::{CssModifierEffect, ComponentCssModifiers};
+
+        // Build a resolution map (simulating the global token chain)
+        let mut resolution_map = CssVariableResolutionMap::new();
+        resolution_map.insert("--pf-v6-c-label--m-teal--BackgroundColor".into(), "#b9e5e5".into());
+        resolution_map.insert("--pf-v6-c-label--m-teal--Color".into(), "#003333".into());
+        resolution_map.insert("--pf-v6-c-label--m-yellow--BackgroundColor".into(), "#fff4cc".into());
+        resolution_map.insert("--pf-v6-c-label--m-yellow--Color".into(), "#54330b".into());
+
+        let mut modifiers = ComponentCssModifiers::new();
+        let mut label_mods = HashMap::new();
+
+        let mut teal = CssModifierEffect::default();
+        teal.custom_property_overrides.insert(
+            "--pf-v6-c-label--BackgroundColor".into(),
+            "var(--pf-v6-c-label--m-teal--BackgroundColor)".into(),
+        );
+        teal.custom_property_overrides.insert(
+            "--pf-v6-c-label--Color".into(),
+            "var(--pf-v6-c-label--m-teal--Color)".into(),
+        );
+        label_mods.insert("pf-m-teal".into(), teal);
+
+        let mut yellow = CssModifierEffect::default();
+        yellow.custom_property_overrides.insert(
+            "--pf-v6-c-label--BackgroundColor".into(),
+            "var(--pf-v6-c-label--m-yellow--BackgroundColor)".into(),
+        );
+        yellow.custom_property_overrides.insert(
+            "--pf-v6-c-label--Color".into(),
+            "var(--pf-v6-c-label--m-yellow--Color)".into(),
+        );
+        label_mods.insert("pf-m-yellow".into(), yellow);
+
+        modifiers.insert("label".into(), label_mods);
+
+        // Resolve
+        resolve_modifier_effects(&mut modifiers, &resolution_map);
+
+        let teal = &modifiers["label"]["pf-m-teal"];
+        assert_eq!(
+            teal.resolved_overrides.get("--pf-v6-c-label--BackgroundColor").map(|s| s.as_str()),
+            Some("#b9e5e5"),
+            "teal BackgroundColor should resolve to #b9e5e5"
+        );
+        assert_eq!(
+            teal.resolved_overrides.get("--pf-v6-c-label--Color").map(|s| s.as_str()),
+            Some("#003333"),
+            "teal Color should resolve to #003333"
+        );
+
+        let yellow = &modifiers["label"]["pf-m-yellow"];
+        assert_eq!(
+            yellow.resolved_overrides.get("--pf-v6-c-label--BackgroundColor").map(|s| s.as_str()),
+            Some("#fff4cc"),
+            "yellow BackgroundColor should resolve to #fff4cc"
         );
     }
 }

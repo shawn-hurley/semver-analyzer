@@ -1583,14 +1583,13 @@ fn extract_keys_from_stmt<'a>(
                 }
             }
         }
-        Statement::ExportDefaultDeclaration(export) => {
+        Statement::ExportDefaultDeclaration(export)
             // Only match if function_name is "default"
-            if function_name == "default" {
+            if function_name == "default" => {
                 if let Some(expr) = export.declaration.as_expression() {
                     extract_keys_from_arrow_or_function(expr, keys);
                 }
             }
-        }
         _ => {}
     }
 }

@@ -340,6 +340,204 @@ fn extract_family_from_components_path(path: &str) -> Option<String> {
     None
 }
 
+// ── Git-based component rename detection ─────────────────────────────
+
+/// A component-level rename detected from git file renames.
+#[derive(Debug, Clone)]
+pub struct GitComponentRename {
+    /// Component directory in the old version (e.g., "NotAuthorized").
+    pub old_component: String,
+    /// Component directory in the new version (e.g., "UnauthorizedAccess").
+    pub new_component: String,
+    /// The git rename similarity percentage (0-100).
+    pub similarity: u32,
+}
+
+/// Detect component-level renames by scanning per-commit git rename
+/// detection from `to_ref` back to `from_ref`.
+///
+/// Per-commit scanning produces much higher similarity scores than
+/// cumulative `git diff` because each commit changes fewer files.
+/// For example, `NotAuthorized → UnauthorizedAccess` shows R061 in
+/// cumulative diff but R090 in the specific rename commit.
+///
+/// The algorithm:
+/// 1. List commits from `from_ref` to `to_ref`
+/// 2. For each commit (newest first), run `git diff --name-status --find-renames`
+///    against its parent
+/// 3. Parse `R` entries to extract directory-level component renames
+/// 4. Deduplicate: keep the highest-similarity entry per (old_dir, new_dir) pair
+///
+/// Returns an empty vec on any git failure.
+pub fn detect_git_component_renames(
+    repo: &Path,
+    from_ref: &str,
+    to_ref: &str,
+) -> Vec<GitComponentRename> {
+    // Get commit list from from_ref to to_ref (oldest to newest)
+    let rev_output = Command::new("git")
+        .args([
+            "rev-list",
+            "--reverse",
+            &format!("{}..{}", from_ref, to_ref),
+        ])
+        .current_dir(repo)
+        .output();
+
+    let rev_output = match rev_output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::debug!(
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "git rev-list for component renames returned non-zero"
+            );
+            return vec![];
+        }
+        Err(e) => {
+            tracing::debug!(%e, "Failed to run git rev-list for component renames");
+            return vec![];
+        }
+    };
+
+    let commits_str = String::from_utf8_lossy(&rev_output.stdout);
+    let commits: Vec<&str> = commits_str.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if commits.is_empty() {
+        return vec![];
+    }
+
+    tracing::debug!(
+        count = commits.len(),
+        "Scanning commits for git component renames"
+    );
+
+    // Track best rename per (old_dir, new_dir) pair
+    let mut best: std::collections::HashMap<(String, String), GitComponentRename> =
+        std::collections::HashMap::new();
+
+    for commit_sha in &commits {
+        // Diff this commit against its parent
+        let diff_output = Command::new("git")
+            .args([
+                "diff",
+                "--name-status",
+                "--find-renames",
+                &format!("{}~1..{}", commit_sha, commit_sha),
+            ])
+            .current_dir(repo)
+            .output();
+
+        let diff_output = match diff_output {
+            Ok(o) if o.status.success() => o,
+            // Skip commits that fail (e.g., initial commit has no parent)
+            _ => continue,
+        };
+
+        let stdout = String::from_utf8_lossy(&diff_output.stdout);
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+
+            // Only process R (rename) entries: "R090\told_path\tnew_path"
+            let status = parts[0];
+            if !status.starts_with('R') {
+                continue;
+            }
+
+            // Parse similarity from status (e.g., "R090" → 90)
+            let similarity: u32 = status[1..].parse().unwrap_or(0);
+
+            let old_path = parts[1];
+            let new_path = parts[2];
+
+            // Only consider source files (component files start with uppercase)
+            let old_filename = old_path.rsplit('/').next().unwrap_or("");
+            let new_filename = new_path.rsplit('/').next().unwrap_or("");
+            if !is_component_source_file(old_filename)
+                || !is_component_source_file(new_filename)
+            {
+                continue;
+            }
+
+            // Extract parent directories
+            let old_dir = match old_path.rsplit_once('/') {
+                Some((dir, _)) => dir,
+                None => continue,
+            };
+            let new_dir = match new_path.rsplit_once('/') {
+                Some((dir, _)) => dir,
+                None => continue,
+            };
+
+            // Only interesting if directories are different (actual component move)
+            if old_dir == new_dir {
+                continue;
+            }
+
+            // Extract component names from directory paths
+            // e.g., "packages/module/src/NotAuthorized" → "NotAuthorized"
+            let old_component = old_dir.rsplit('/').next().unwrap_or(old_dir);
+            let new_component = new_dir.rsplit('/').next().unwrap_or(new_dir);
+
+            // Component names should start with uppercase
+            if !old_component.starts_with(|c: char| c.is_ascii_uppercase())
+                || !new_component.starts_with(|c: char| c.is_ascii_uppercase())
+            {
+                continue;
+            }
+
+            let key = (old_dir.to_string(), new_dir.to_string());
+            let entry = best.entry(key).or_insert_with(|| GitComponentRename {
+                old_component: old_component.to_string(),
+                new_component: new_component.to_string(),
+                similarity: 0,
+            });
+
+            // Keep highest similarity
+            if similarity > entry.similarity {
+                entry.similarity = similarity;
+            }
+        }
+    }
+
+    let result: Vec<GitComponentRename> = best.into_values().collect();
+
+    if !result.is_empty() {
+        for rename in &result {
+            tracing::info!(
+                old = %rename.old_component,
+                new = %rename.new_component,
+                similarity = rename.similarity,
+                "Git component rename detected"
+            );
+        }
+    }
+
+    result
+}
+
+/// Check if a filename looks like a component source file.
+/// Must end with .tsx/.ts and start with an uppercase letter.
+fn is_component_source_file(filename: &str) -> bool {
+    (filename.ends_with(".tsx") || filename.ends_with(".ts"))
+        && !filename.ends_with(".test.tsx")
+        && !filename.ends_with(".test.ts")
+        && !filename.ends_with(".spec.tsx")
+        && !filename.ends_with(".spec.ts")
+        && !filename.ends_with(".d.ts")
+        && filename != "index.ts"
+        && filename != "index.tsx"
+        && filename.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
 // ── Ref name utilities ───────────────────────────────────────────────
 
 /// Sanitize a git ref name for use as a directory name.
