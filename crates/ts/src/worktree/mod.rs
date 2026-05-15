@@ -11,6 +11,7 @@ mod tsc;
 
 pub use error::WorktreeError;
 pub use guard::WorktreeGuard;
+pub use nvm::build_node_env;
 pub use package_manager::PackageManager;
 
 /// Per-ref build configuration for worktree operations.

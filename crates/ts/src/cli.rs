@@ -83,6 +83,16 @@ pub struct TsAnalyzeArgs {
     /// Runs in the worktree before CSS extraction.
     #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
     pub dep_build_command: Option<String>,
+
+    /// Node.js version for the "from" ref of the dependency repo.
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
+    pub from_dep_node_version: Option<String>,
+
+    /// Node.js version for the "to" ref of the dependency repo.
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
+    pub to_dep_node_version: Option<String>,
 }
 
 /// TypeScript-specific arguments for the `extract` command.
@@ -203,4 +213,14 @@ pub struct TsKonveyorArgs {
     /// Runs in the worktree before CSS extraction.
     #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
     pub dep_build_command: Option<String>,
+
+    /// Node.js version for the "from" ref of the dependency repo.
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
+    pub from_dep_node_version: Option<String>,
+
+    /// Node.js version for the "to" ref of the dependency repo.
+    /// Resolved via nvm. Requires nvm to be installed.
+    #[arg(long, requires = "dep_repo", help_heading = "Dependency Repo")]
+    pub to_dep_node_version: Option<String>,
 }
