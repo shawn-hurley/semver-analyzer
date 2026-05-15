@@ -62,10 +62,31 @@ pub fn generate_sd_rules(
     ));
 
     // ── Prop↔child migration rules ──────────────────────────────────
-    rules.extend(generate_prop_child_migration_rules(
+    let prop_child_rules = generate_prop_child_migration_rules(
         report,
         sd,
         &component_packages,
+    );
+
+    // Build coverage set: (component, prop) pairs covered by prop-to-child rules
+    let prop_to_child_covered: HashSet<(String, String)> = prop_child_rules
+        .iter()
+        .filter_map(|r| {
+            let fs = r.fix_strategy.as_ref()?;
+            let comp = fs.component.clone()?;
+            let prop = fs.from.clone().or_else(|| fs.prop.clone())?;
+            Some((comp, prop))
+        })
+        .collect();
+
+    rules.extend(prop_child_rules);
+
+    // ── Unmapped removed prop rules (props not covered by prop-to-child) ─
+    rules.extend(generate_unmapped_removed_prop_rules(
+        report,
+        sd,
+        &component_packages,
+        &prop_to_child_covered,
     ));
 
     // ── Prop movement between family members ──────────────────────────
@@ -149,6 +170,17 @@ pub fn generate_sd_rules(
         sd,
         &component_packages,
         &rename_targets,
+    ));
+
+    // ── Icon children-to-prop rules ────────────────────────────────
+    // Detect components where icon content passed as children should move
+    // to an existing `icon` prop. Fires for components that have:
+    //   1. An `icon: ReactNode` prop in BOTH v5 and v6 (not new)
+    //   2. Accept children
+    //   3. Have a BEM icon CSS token (e.g., styles.buttonIcon)
+    rules.extend(generate_icon_children_to_prop_rules(
+        sd,
+        &component_packages,
     ));
 
     // ── Deprecated prop rules (@deprecated JSDoc) ────────────────────
@@ -1511,6 +1543,156 @@ fn generate_prop_child_migration_rules(
     rules
 }
 
+// ── Unmapped removed prop rules ──────────────────────────────────────────
+
+/// Generate rules for removed props that are NOT covered by prop-to-child rules.
+///
+/// When a component's API is completely restructured (e.g., DualListSelector
+/// changed from a monolithic props-based API to composable children), many
+/// removed props don't have exact matches on child components. These props
+/// fall through the prop-to-child matching and, due to the P0-C suppression
+/// chain, get zero rules. This function fills the gap by generating
+/// individual `JSX_PROP`-level rules for each uncovered removed prop.
+///
+/// All rules use `LlmAssisted` strategy with the `family` label so the
+/// fix-engine consolidates them into the family migration LLM prompt,
+/// giving the LLM full context (target_structure, prop mappings, etc.)
+/// alongside the specific violation.
+fn generate_unmapped_removed_prop_rules(
+    report: &AnalysisReport<TypeScript>,
+    sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+    prop_to_child_covered: &HashSet<(String, String)>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for tree in &sd.composition_trees {
+        // Find the TypeSummary for this family root
+        let type_summary = report
+            .packages
+            .iter()
+            .flat_map(|pkg| &pkg.type_summaries)
+            .find(|comp| comp.name == tree.root);
+
+        let Some(comp) = type_summary else {
+            continue;
+        };
+
+        if comp.removed_members.is_empty() {
+            continue;
+        }
+
+        let pkg = pkg_for(&tree.root, component_packages);
+
+        // Classify all removed props using the shared classifier
+        let classifications = crate::konveyor::classify_removed_props(
+            &comp.removed_members,
+            &comp.language_data.child_components,
+        );
+
+        for c in &classifications {
+            // Skip children and className (ubiquitous, not actionable)
+            if c.name == "children" || c.name == "className" {
+                continue;
+            }
+
+            // Skip props already covered by prop-to-child rules
+            if prop_to_child_covered.contains(&(tree.root.clone(), c.name.clone())) {
+                continue;
+            }
+
+            // Skip props that have individual rename rules in the report
+            // (they're covered by the TD pipeline's rename rules)
+            let has_rename_rule = report.changes.iter().any(|fc| {
+                fc.breaking_api_changes.iter().any(|api| {
+                    api.change == ApiChangeType::Renamed
+                        && api.symbol == format!("{}.{}", tree.root, c.name)
+                })
+            });
+            if has_rename_rule {
+                continue;
+            }
+
+            let type_hint = c.old_type.as_deref().unwrap_or("unknown type");
+            let migration_guidance = match (c.target_child.as_deref(), c.mechanism.as_str()) {
+                (Some(child), "prop") => format!(
+                    "Move `{prop}` to the `<{child}>` child component as a prop.",
+                    prop = c.name,
+                ),
+                (Some(child), "children") => format!(
+                    "Pass `{prop}` content as children of `<{child}>`.",
+                    prop = c.name,
+                ),
+                (_, "removed") => format!(
+                    "This prop has no direct equivalent in the new API.",
+                ),
+                _ => format!(
+                    "Review the new composable API for the correct migration.",
+                ),
+            };
+
+            let rule_id = format!(
+                "sd-unmapped-removed-{}-{}",
+                sanitize(&tree.root),
+                sanitize(&c.name),
+            );
+
+            let message = format!(
+                "Property `{prop}` ({type_hint}) was removed from `<{component}>`.\n\
+                 {guidance}\n\n\
+                 The {component} API has been restructured. Refer to the family \
+                 migration context for the complete new API structure.",
+                prop = c.name,
+                component = tree.root,
+                type_hint = type_hint,
+                guidance = migration_guidance,
+            );
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=removed-prop".into(),
+                    format!("package={}", pkg),
+                    format!("family={}", tree.root),
+                ],
+                effort: 3,
+                category: "mandatory".into(),
+                description: format!(
+                    "Property `{}` removed from <{}>",
+                    c.name, tree.root
+                ),
+                message,
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", c.name),
+                        location: "JSX_PROP".into(),
+                        component: Some(format!("^{}$", tree.root)),
+                        parent: None,
+                        parent_from: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        value: None,
+                        from: Some(pkg.to_string()),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "LlmAssisted".into(),
+                    component: Some(tree.root.clone()),
+                    prop: Some(c.name.clone()),
+                    ..Default::default()
+                }),
+            });
+        }
+    }
+
+    rules
+}
+
 // ── Prop movement between family members ─────────────────────────────────
 
 /// Detect props that moved from one family member to another.
@@ -2298,8 +2480,42 @@ pub fn generate_family_strategies(
             continue;
         }
 
-        // 1. Render target structure with props
-        let target_jsx = render_family_target_with_props(tree, &sd.new_component_props);
+        // 1. Render target structure with props, excluding deprecated members.
+        // A member is considered deprecated if:
+        //   (a) it was removed from the family (in old tree but not new), OR
+        //   (b) it has a FamilyMemberRemoved composition change, OR
+        //   (c) it has a deprecated_replacement entry (renamed to something else)
+        let deprecated_for_render: HashSet<String> = {
+            let old_m: HashSet<&str> = sd
+                .old_composition_trees
+                .iter()
+                .find(|t| t.root == tree.root)
+                .map(|t| t.family_members.iter().map(|m| m.as_str()).collect())
+                .unwrap_or_default();
+            let new_m: HashSet<&str> =
+                tree.family_members.iter().map(|m| m.as_str()).collect();
+            let mut deprecated: HashSet<String> = old_m
+                .difference(&new_m)
+                .map(|s| s.to_string())
+                .collect();
+            // Add members flagged as removed in composition changes
+            for cc in &sd.composition_changes {
+                if cc.family == tree.root {
+                    if let CompositionChangeType::FamilyMemberRemoved { member } = &cc.change_type {
+                        deprecated.insert(member.clone());
+                    }
+                }
+            }
+            // Add members that are deprecated replacements (old component renamed)
+            for dr in &sd.deprecated_replacements {
+                if tree.family_members.contains(&dr.old_component) {
+                    deprecated.insert(dr.old_component.clone());
+                }
+            }
+            deprecated
+        };
+        let target_jsx =
+            render_family_target_with_props(tree, &sd.new_component_props, &deprecated_for_render);
 
         // 2. Retained props (props on root in new version)
         let retained_props: Vec<String> = sd
@@ -3082,13 +3298,16 @@ fn infer_appearance_defaults(
 fn render_family_target_with_props(
     tree: &CompositionTree,
     new_props: &HashMap<String, BTreeSet<String>>,
+    deprecated_members: &HashSet<String>,
 ) -> String {
     let mut lines = Vec::new();
 
-    // Build children lookup: parent → [child]
+    // Build children lookup: parent → [child], excluding deprecated members
     let mut parent_children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for edge in &tree.edges {
-        if edge.relationship != ChildRelationship::Internal {
+        if edge.relationship != ChildRelationship::Internal
+            && !deprecated_members.contains(edge.child.as_str())
+        {
             parent_children
                 .entry(edge.parent.as_str())
                 .or_default()
@@ -3849,13 +4068,17 @@ fn generate_prop_value_conformance_rules(
                         // CSS property effects — a much stronger signal than
                         // name similarity.
                         for rem in &removed {
-                            // Try added values (with directional boost)
+                            // Try added values (with directional boost).
+                            // Threshold 0.32: raised from 0.3 to reject
+                            // false matches like "no-background" → "secondary"
+                            // (0.308) while preserving correct ones like
+                            // "dark" → "secondary" (0.333).
                             let best_added = added_values
                                 .iter()
                                 .filter(|a| {
                                     semver_analyzer_core::diff::name_similarity(rem, a)
                                         + directional_similarity_boost(rem, a)
-                                        >= 0.3
+                                        >= 0.32
                                 })
                                 .max_by(|a, b| {
                                     let sa = semver_analyzer_core::diff::name_similarity(rem, a)
@@ -3906,12 +4129,19 @@ fn generate_prop_value_conformance_rules(
                         replacement = replacement,
                     )
                 } else {
+                    // No direct replacement found. The value was removed without
+                    // a clear successor. Guide the LLM to consider removing the
+                    // prop entirely OR choosing from valid values.
                     format!(
                         "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
-                         Valid values: {}",
+                         No direct replacement was found. Consider removing the `{}` prop \
+                         entirely, or choose from the valid values: {}\n\n\
+                         If the prop is not essential, removing it is preferred over \
+                         guessing a replacement.",
                         value,
                         prop,
                         component,
+                        prop,
                         new_values
                             .iter()
                             .map(|v| format!("\"{}\"", v))
@@ -4036,7 +4266,11 @@ fn generate_prop_value_conformance_rules(
                 }
             }
 
-            // Build value mapping: old value → new value on the replacement prop
+            // Build value mapping: old value → new value on the replacement prop.
+            // Use a minimum similarity threshold of 0.32 to avoid false
+            // mappings like "gold" → "orangered" (sim=0.222). When no
+            // sufficiently similar match exists, the value is left unmapped
+            // and the rule emits a "Valid values: ..." list for the LLM.
             let mut value_map: HashMap<String, String> = HashMap::new();
             {
                 let mut candidates: Vec<(&String, &String, f64)> = Vec::new();
@@ -4052,7 +4286,10 @@ fn generate_prop_value_conformance_rules(
                 });
                 let mut used_old: HashSet<&str> = HashSet::new();
                 let mut used_new: HashSet<&str> = HashSet::new();
-                for (old_val, new_val, _sim) in &candidates {
+                for (old_val, new_val, sim) in &candidates {
+                    if *sim < 0.32 {
+                        break; // remaining candidates are even lower
+                    }
                     if used_old.contains(old_val.as_str())
                         || used_new.contains(new_val.as_str())
                     {
@@ -4157,6 +4394,107 @@ fn generate_prop_value_conformance_rules(
                         strategy: "LlmAssisted".into(),
                         component: Some(component.clone()),
                         prop: Some(old_prop.clone()),
+                        from: Some(old_val.to_string()),
+                        replacement: new_val.cloned(),
+                        ..Default::default()
+                    }),
+                });
+            }
+
+            // ── New-prop value rules ──────────────────────────────────
+            //
+            // Generate additional rules that fire on invalid old values
+            // used on the NEW prop name. This covers two cases:
+            //   1. Consumer code already uses the new prop with an old value
+            //      (e.g., <Banner color="gold"> in v5 via HTML pass-through)
+            //   2. The pattern-fix renamed the old prop to the new prop but
+            //      didn't change the value (e.g., variant="gold" → color="gold")
+            //
+            // Only generate for old values NOT in the new prop's valid set.
+            for old_val in &old_values {
+                if new_values.contains(old_val) {
+                    // Value is valid on the new prop — no rule needed
+                    continue;
+                }
+
+                let new_prop_rule_id = format!(
+                    "sd-prop-value-{}-{}-{}",
+                    sanitize(&component),
+                    sanitize(new_member),
+                    sanitize(old_val),
+                );
+
+                // Skip if a Phase 1 rule already covers this exact combination
+                if rules.iter().any(|r| r.rule_id == new_prop_rule_id) {
+                    continue;
+                }
+
+                let new_val = value_map.get(old_val.as_str());
+
+                let message = if let Some(nv) = new_val {
+                    format!(
+                        "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
+                         Use \"{}\" instead.\n\n\
+                         Old: <{component} {new_member}=\"{old_val}\" />\n\
+                         New: <{component} {new_member}=\"{new_val}\" />",
+                        old_val, new_member, component, nv,
+                        component = component,
+                        new_member = new_member,
+                        old_val = old_val,
+                        new_val = nv,
+                    )
+                } else {
+                    format!(
+                        "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
+                         No direct replacement was found. Consider removing the `{}` prop \
+                         entirely, or choose from the valid values: {}",
+                        old_val,
+                        new_member,
+                        component,
+                        new_member,
+                        new_values
+                            .iter()
+                            .map(|v| format!("\"{}\"", v))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+
+                rules.push(KonveyorRule {
+                    rule_id: new_prop_rule_id,
+                    labels: vec![
+                        "source=semver-analyzer".into(),
+                        "change-type=prop-value-removed".into(),
+                        format!("package={}", pkg),
+                    ],
+                    effort: 1,
+                    category: "mandatory".into(),
+                    description: format!(
+                        "Value \"{}\" not valid for `{}` prop on <{}>",
+                        old_val, new_member, component,
+                    ),
+                    message,
+                    links: vec![],
+                    when: KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: format!("^{}$", new_member),
+                            location: "JSX_PROP".into(),
+                            component: Some(format!("^{}$", component)),
+                            parent: None,
+                            not_parent: None,
+                            child: None,
+                            not_child: None,
+                            requires_child: None,
+                            parent_from: None,
+                            value: Some(format!("^{}$", regex_escape(old_val))),
+                            from: Some(pkg.to_string()),
+                            file_pattern: None,
+                        },
+                    },
+                    fix_strategy: Some(FixStrategyEntry {
+                        strategy: "PropValueChange".into(),
+                        component: Some(component.clone()),
+                        prop: Some(new_member.clone()),
                         from: Some(old_val.to_string()),
                         replacement: new_val.cloned(),
                         ..Default::default()
@@ -4536,7 +4874,7 @@ fn generate_prop_default_changed_rules(
             Some(nv) => format!(
                 "The default value of `{}` on <{}> changed from `{}` to `{}`.\n\
                  Existing code relying on the old default may behave differently.\n\n\
-                 To preserve v5 behavior, add the prop explicitly:\n  \
+                 Review whether your code relies on the old default. If so, add the prop explicitly:\n  \
                  <{} {}={{{}}} />",
                 prop_name, change.component, old_val, nv,
                 change.component, prop_name, old_val,
@@ -4544,7 +4882,7 @@ fn generate_prop_default_changed_rules(
             None => format!(
                 "The default value of `{}` on <{}> was removed (was `{}`).\n\
                  Existing code relying on the old default may behave differently.\n\n\
-                 To preserve v5 behavior, add the prop explicitly:\n  \
+                 Review whether your code relies on the old default. If so, add the prop explicitly:\n  \
                  <{} {}={{{}}} />",
                 prop_name, change.component, old_val,
                 change.component, prop_name, old_val,
@@ -4565,7 +4903,7 @@ fn generate_prop_default_changed_rules(
                 format!("package={}", pkg),
             ],
             effort: 1,
-            category: "mandatory".into(),
+            category: "potential".into(),
             description: format!(
                 "Default value of `{}` on <{}> changed (was `{}`)",
                 prop_name, change.component, old_val,
@@ -4588,8 +4926,16 @@ fn generate_prop_default_changed_rules(
                     file_pattern: None,
                 },
             },
+            // Props that control DOM structure (hasBodyWrapper, hasNoPadding)
+            // are upgraded to LlmAssisted because their default change has
+            // visible structural impact that the LLM should address. Other
+            // default changes (closeBtnAriaLabel, tooltipPosition) stay Manual.
             fix_strategy: Some(FixStrategyEntry {
-                strategy: "LlmAssisted".into(),
+                strategy: if prop_name.starts_with("has") || prop_name.contains("Wrapper") {
+                    "LlmAssisted".into()
+                } else {
+                    "Manual".into()
+                },
                 component: Some(change.component.clone()),
                 prop: Some(prop_name),
                 ..Default::default()
@@ -4672,6 +5018,17 @@ fn generate_new_absorbing_prop_rules(
                 continue;
             }
 
+            // Skip props that indicate structured/specific content slots
+            // rather than generic children absorption. Array-typed slots
+            // like splitButtonItems or selectOptions are for specific use
+            // cases (split buttons, structured lists), not for absorbing
+            // free-form children. Without this filter, the LLM incorrectly
+            // moves children to these props (e.g., TC046: icon moved to
+            // splitButtonItems instead of the icon prop).
+            if prop_type.contains("[]") || prop_type.contains("Array") {
+                continue;
+            }
+
             let pkg = pkg_for(component, component_packages);
 
             let message = format!(
@@ -4731,6 +5088,152 @@ fn generate_new_absorbing_prop_rules(
                 }),
             });
         }
+    }
+
+    rules
+}
+
+// ── Icon children-to-prop rules ─────────────────────────────────────────
+//
+// Detect components where icon content passed as children should move to
+// an existing `icon` prop. This catches the pattern where the `icon` prop
+// existed in both v5 and v6 but v5 allowed icons as children (which v6
+// no longer styles correctly).
+//
+// Heuristic: component has (1) an `icon: ReactNode` prop in BOTH versions,
+// (2) accepts children, and (3) has a BEM icon CSS token like
+// `styles.buttonIcon` or `styles.menuToggleIcon`.
+//
+// This is distinct from `generate_new_absorbing_prop_rules` which handles
+// NEW props that didn't exist before. This handles EXISTING props where
+// the usage pattern (children vs prop) changed.
+
+fn generate_icon_children_to_prop_rules(
+    sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for (component, new_props) in &sd.new_component_props {
+        // 1. Must have an "icon" prop in BOTH old and new versions
+        let old_props = match sd.old_component_props.get(component) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !old_props.contains("icon") || !new_props.contains("icon") {
+            continue;
+        }
+
+        // 2. The icon prop must be ReactNode/ReactElement type
+        let icon_type = sd
+            .new_component_prop_types
+            .get(component)
+            .and_then(|m| m.get("icon"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !is_react_node_type(icon_type) {
+            continue;
+        }
+
+        // 3. Must accept children in both versions
+        let old_has_children = sd
+            .old_profiles
+            .get(component)
+            .map(|p| p.has_children_prop)
+            .unwrap_or(false);
+        let new_has_children = sd
+            .new_profiles
+            .get(component)
+            .map(|p| p.has_children_prop)
+            .unwrap_or(false);
+        if !old_has_children || !new_has_children {
+            continue;
+        }
+
+        // 4. Must have a BEM icon CSS token (e.g., styles.buttonIcon,
+        //    styles.menuToggleIcon). Check both old and new profiles.
+        let has_icon_token = |profile: &crate::sd_types::ComponentSourceProfile| -> bool {
+            profile.css_tokens_used.iter().any(|token| {
+                let t = token
+                    .strip_prefix("styles.")
+                    .or_else(|| token.strip_prefix("styles.modifiers."))
+                    .unwrap_or(token);
+                // Match tokens like "buttonIcon", "menuToggleIcon", etc.
+                // The token should end with "Icon" (case-sensitive) and
+                // NOT be just "Icon" by itself.
+                t.len() > 4 && t.ends_with("Icon") && t != "Icon"
+            })
+        };
+
+        let old_has_icon_token = sd
+            .old_profiles
+            .get(component)
+            .map(|p| has_icon_token(p))
+            .unwrap_or(false);
+        let new_has_icon_token = sd
+            .new_profiles
+            .get(component)
+            .map(|p| has_icon_token(p))
+            .unwrap_or(false);
+
+        if !old_has_icon_token && !new_has_icon_token {
+            continue;
+        }
+
+        let pkg = pkg_for(component, component_packages);
+
+        let rule_id = format!("sd-icon-children-to-prop-{}", sanitize(component));
+
+        let message = format!(
+            "In PatternFly v6, icon content in <{component}> must be passed to the \
+             `icon` prop instead of as children.\n\n\
+             If <{component}> contains only an icon element (from @patternfly/react-icons), \
+             move it to the `icon` prop and make the element self-closing:\n  \
+             Before: <{component} variant=\"plain\"><TimesIcon /></{component}>\n  \
+             After:  <{component} variant=\"plain\" icon={{<TimesIcon />}} />\n\n\
+             If <{component}> contains an icon AND text, move just the icon:\n  \
+             Before: <{component}><PlusCircleIcon /> Add item</{component}>\n  \
+             After:  <{component} icon={{<PlusCircleIcon />}}>Add item</{component}>"
+        );
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=children-to-prop".into(),
+                format!("package={}", pkg),
+            ],
+            effort: 1,
+            category: "mandatory".into(),
+            description: format!(
+                "Icon content in <{}> must use the `icon` prop, not children",
+                component,
+            ),
+            message,
+            links: vec![],
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", component),
+                    location: "JSX_COMPONENT".into(),
+                    component: None,
+                    parent: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                    parent_from: None,
+                    value: None,
+                    from: Some(pkg.to_string()),
+                    file_pattern: None,
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry {
+                strategy: "LlmAssisted".into(),
+                component: Some(component.clone()),
+                prop: Some("icon".into()),
+                ..Default::default()
+            }),
+        });
     }
 
     rules
@@ -9511,7 +10014,10 @@ mod tests {
             "closeBtnAriaLabel should be in old props (enriched from TD report)"
         );
 
-        // onClose should be in new_props (enriched from TD report for Label)
+        // onClose should be in new_props (enriched from TD report for Label).
+        // It stays in new_props (not cross-matched with onClick) because
+        // automatic cross-name prop matching was reverted — the evaluator
+        // considers onClick→onClose an incorrect semantic change for Chip→Label.
         assert!(
             ctx.new_props.contains_key("onClose"),
             "onClose should be in new_props (enriched from TD report). \
@@ -9949,8 +10455,9 @@ mod tests {
             rules.len()
         );
 
-        // Find the rule for "no-background" → should map to "secondary"
-        // (name_similarity("no-background", "secondary") = 0.308, passes 0.3)
+        // Find the rule for "no-background" → should NOT map to any value.
+        // name_similarity("no-background", "secondary") = 0.308 is below the
+        // 0.4 threshold. The LLM should choose from the valid values list.
         let nobg_rule = rules
             .iter()
             .find(|r| r.rule_id.contains("no-background") || r.rule_id.contains("no_background"))
@@ -9961,8 +10468,8 @@ mod tests {
             .and_then(|s| s.replacement.as_ref());
         assert_eq!(
             nobg_repl.map(|s| s.as_str()),
-            Some("secondary"),
-            "TC021: no-background should map to secondary (sim=0.308)"
+            None,
+            "TC021: no-background should NOT map (sim=0.308 < 0.32 threshold)"
         );
 
         // Find the rule for "light-200" → no replacement from string similarity.
@@ -10624,6 +11131,133 @@ mod tests {
             default_replacement.map(|s| s.as_str()),
             Some("default"),
             "default should map to default on color prop"
+        );
+    }
+
+    /// TC014: When Banner.variant is removed and replaced by Banner.color,
+    /// Phase 2 should generate BOTH old-prop rules (variant="gold") AND
+    /// new-prop rules (color="gold") for values that are invalid on the
+    /// new prop. This ensures that:
+    ///   1. <Banner variant="gold"> is caught by sd-prop-replaced-banner-variant-gold
+    ///   2. <Banner color="gold"> is caught by sd-prop-value-banner-color-gold
+    ///
+    /// Real data: v5 variant had {blue, default, gold, green, red},
+    /// v6 color has {blue, green, red} (gold and default not in new type).
+    #[test]
+    fn test_phase2_generates_new_prop_value_rules_for_invalid_old_values() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Banner/Banner.BannerProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "BannerProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some(
+                    "property: variant: 'blue' | 'default' | 'gold' | 'green' | 'red'".into(),
+                ),
+                after: None,
+                description: "variant prop removed, replaced by color".into(),
+                migration_target: None,
+                removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                    new_member: "color".into(),
+                }),
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Banner".into(), "@patternfly/react-core".into());
+        // v6 color prop accepts a subset of the old variant values
+        // (gold is NOT valid, default is NOT valid)
+        sd.new_component_prop_types.insert(
+            "Banner".into(),
+            [("color".into(), "'blue' | 'green' | 'red'".into())]
+                .into_iter()
+                .collect(),
+        );
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // ── Old-prop rules (fires on <Banner variant="...">) ──
+        let old_prop_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.starts_with("sd-prop-replaced-banner-variant-"))
+            .collect();
+        assert_eq!(
+            old_prop_rules.len(),
+            5,
+            "Should generate 5 old-prop rules for all variant values. Got: {:?}",
+            old_prop_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+
+        // ── New-prop rules (fires on <Banner color="...">) ──
+        // Only for values that are NOT valid on the new color prop.
+        // gold and default are not in {blue, green, red}.
+        let new_prop_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.starts_with("sd-prop-value-banner-color-"))
+            .collect();
+
+        // gold should have a new-prop rule
+        let gold_rule = new_prop_rules
+            .iter()
+            .find(|r| r.rule_id.contains("-gold"));
+        assert!(
+            gold_rule.is_some(),
+            "TC014: Should generate sd-prop-value-banner-color-gold for invalid \
+             old value on new prop. Got rules: {:?}",
+            new_prop_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+
+        // gold rule should fire on <Banner color="gold">
+        let gold = gold_rule.unwrap();
+        let refs = semver_analyzer_konveyor_core::extract_frontend_refs(&gold.when);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].pattern, "^color$", "Should match new prop name 'color'");
+        assert_eq!(refs[0].location, "JSX_PROP");
+        assert_eq!(refs[0].component.as_deref(), Some("^Banner$"));
+        assert_eq!(refs[0].value.as_deref(), Some("^gold$"));
+
+        // gold rule should use PropValueChange strategy
+        let gold_strat = gold.fix_strategy.as_ref().unwrap();
+        assert_eq!(gold_strat.strategy, "PropValueChange");
+        assert_eq!(gold_strat.from.as_deref(), Some("gold"));
+
+        // default should also have a new-prop rule (not in {blue, green, red})
+        assert!(
+            new_prop_rules.iter().any(|r| r.rule_id.contains("-default")),
+            "TC014: Should generate sd-prop-value-banner-color-default"
+        );
+
+        // blue should NOT have a new-prop rule (valid on new color prop)
+        assert!(
+            !new_prop_rules.iter().any(|r| r.rule_id.contains("-blue")),
+            "TC014: blue is valid on color prop, should NOT generate new-prop rule"
+        );
+        // green should NOT have a new-prop rule
+        assert!(
+            !new_prop_rules.iter().any(|r| r.rule_id.contains("-green")),
+            "TC014: green is valid on color prop, should NOT generate new-prop rule"
+        );
+        // red should NOT have a new-prop rule
+        assert!(
+            !new_prop_rules.iter().any(|r| r.rule_id.contains("-red")),
+            "TC014: red is valid on color prop, should NOT generate new-prop rule"
         );
     }
 
@@ -11383,6 +12017,86 @@ mod tests {
         );
     }
 
+    /// Fix 7: Prop-default rules should use Manual strategy and potential
+    /// category, NOT LlmAssisted/mandatory. This prevents the LLM from
+    /// blindly adding props like closeBtnAriaLabel="close" to every
+    /// component instance.
+    #[test]
+    fn test_prop_default_strategy_is_manual_for_generic_props() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "Label".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'closeBtnAriaLabel' prop on Label removed (was 'close')".into(),
+            old_value: Some("'close'".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+        sd.component_packages
+            .insert("Label".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert!(!rules.is_empty(), "Should generate a rule for closeBtnAriaLabel");
+
+        let rule = &rules[0];
+        assert_eq!(
+            rule.category, "potential",
+            "Fix 7: Prop-default rules should be 'potential', not 'mandatory'"
+        );
+        let strategy = rule.fix_strategy.as_ref().unwrap();
+        assert_eq!(
+            strategy.strategy, "Manual",
+            "Fix 7: Generic prop-default rules should use 'Manual', not 'LlmAssisted'"
+        );
+        assert!(
+            rule.message.contains("Review whether"),
+            "Fix 7: Message should say 'Review whether', not 'To preserve v5 behavior'"
+        );
+    }
+
+    /// Fix 11: Structural props like hasBodyWrapper should get LlmAssisted
+    /// strategy since they control DOM structure.
+    #[test]
+    fn test_prop_default_strategy_is_llm_for_structural_props() {
+        use crate::sd_types::SourceLevelCategory;
+
+        let mut sd = SdPipelineResult::default();
+        sd.source_level_changes.push(crate::sd_types::SourceLevelChange {
+            component: "PageSection".into(),
+            category: SourceLevelCategory::PropDefault,
+            description:
+                "Default value for 'hasBodyWrapper' prop on PageSection removed (was true)".into(),
+            old_value: Some("true".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_default_changed_rules(&sd, &pkgs);
+        assert!(!rules.is_empty(), "Should generate a rule for hasBodyWrapper");
+
+        let rule = &rules[0];
+        let strategy = rule.fix_strategy.as_ref().unwrap();
+        assert_eq!(
+            strategy.strategy, "LlmAssisted",
+            "Fix 11: Structural prop hasBodyWrapper should get 'LlmAssisted'"
+        );
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // PropDefault trivial-default suppression
     //
@@ -12074,6 +12788,56 @@ mod tests {
         );
     }
 
+    /// Fix 8: Array-typed ReactNode props (React.ReactNode[]) should NOT
+    /// generate absorbing-prop rules. These are structured slots like
+    /// splitButtonItems, not generic children absorbers.
+    #[test]
+    fn test_new_absorbing_prop_skips_array_typed_reactnode() {
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "MenuToggle".into(),
+            ["children", "variant", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "MenuToggle".into(),
+            ["children", "icon", "splitButtonItems", "variant", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "MenuToggle".into(),
+            [
+                ("icon".into(), "React.ReactNode".into()),
+                ("splitButtonItems".into(), "React.ReactNode[]".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut profile = crate::sd_types::ComponentSourceProfile::default();
+        profile.has_children_prop = true;
+        sd.new_profiles.insert("MenuToggle".into(), profile);
+        sd.component_packages
+            .insert("MenuToggle".into(), "@patternfly/react-core".into());
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_new_absorbing_prop_rules(&sd, &pkgs, &HashSet::new());
+
+        // icon (React.ReactNode) should generate a rule
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("icon")),
+            "Fix 8: icon (React.ReactNode) should generate an absorbing-prop rule"
+        );
+        // splitButtonItems (React.ReactNode[]) should NOT
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("splitbuttonitems")),
+            "Fix 8: splitButtonItems (React.ReactNode[]) should NOT generate a rule"
+        );
+    }
+
     /// Props that already existed in old version should NOT generate rules.
     #[test]
     fn test_new_absorbing_prop_skips_existing_props() {
@@ -12219,6 +12983,268 @@ mod tests {
             rules[0].rule_id.contains("banner"),
             "The one rule should be for 'banner'. Got: {}",
             rules[0].rule_id
+        );
+    }
+
+    /// Fix 6: render_family_target_with_props should exclude deprecated members
+    /// from the rendered JSX reference. This prevents contradictory prompts
+    /// where the reference shows a deprecated component as valid.
+    #[test]
+    fn test_render_family_target_excludes_deprecated_members() {
+        use crate::sd_types::{ChildRelationship, CompositionEdge, CompositionTree, EdgeStrength};
+
+        let tree = CompositionTree {
+            root: "LoginPage".into(),
+            family_members: vec![
+                "LoginPage".into(),
+                "LoginMainFooterLinksItem".into(),
+                "LoginForm".into(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "LoginPage".into(),
+                    child: "LoginMainFooterLinksItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    strength: EdgeStrength::Allowed,
+                    bem_evidence: None,
+                    prop_name: None,
+                },
+                CompositionEdge {
+                    parent: "LoginPage".into(),
+                    child: "LoginForm".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    strength: EdgeStrength::Allowed,
+                    bem_evidence: None,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        let props: HashMap<String, BTreeSet<String>> = HashMap::new();
+
+        // Without deprecated filter: both children appear
+        let no_filter: HashSet<String> = HashSet::new();
+        let output = render_family_target_with_props(&tree, &props, &no_filter);
+        assert!(
+            output.contains("LoginMainFooterLinksItem"),
+            "Without filter, deprecated member should appear"
+        );
+
+        // With deprecated filter: LoginMainFooterLinksItem is excluded
+        let deprecated: HashSet<String> =
+            ["LoginMainFooterLinksItem".to_string()].into_iter().collect();
+        let output = render_family_target_with_props(&tree, &props, &deprecated);
+        assert!(
+            !output.contains("LoginMainFooterLinksItem"),
+            "Fix 6: Deprecated member should be excluded from rendered reference. Got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("LoginForm"),
+            "Non-deprecated members should still appear"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Icon children-to-prop detection
+    //
+    // TC007: Button has icon prop (ReactNode) in BOTH v5 and v6, accepts
+    //        children, and has styles.buttonIcon CSS token. Rule should
+    //        fire telling the LLM to move icon children to icon prop.
+    //
+    // TC046: MenuToggle has the same pattern with styles.menuToggleIcon.
+    //
+    // NavItem should NOT match because its icon prop is NEW in v6 (handled
+    // by generate_new_absorbing_prop_rules instead).
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// TC007 + TC046: Components with existing icon prop + BEM icon token
+    /// should generate icon-children-to-prop rules.
+    #[test]
+    fn test_icon_children_to_prop_button_and_menutoggle() {
+        let mut sd = SdPipelineResult::default();
+
+        // ── Button: icon prop in both, has styles.buttonIcon ──
+        sd.old_component_props.insert(
+            "Button".into(),
+            ["children", "icon", "variant", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Button".into(),
+            ["children", "icon", "variant", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Button".into(),
+            [("icon".into(), "React.ReactNode | null".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut button_old = crate::sd_types::ComponentSourceProfile::default();
+        button_old.has_children_prop = true;
+        button_old
+            .css_tokens_used
+            .insert("styles.buttonIcon".into());
+        button_old.css_tokens_used.insert("styles.button".into());
+        sd.old_profiles.insert("Button".into(), button_old);
+
+        let mut button_new = crate::sd_types::ComponentSourceProfile::default();
+        button_new.has_children_prop = true;
+        button_new
+            .css_tokens_used
+            .insert("styles.buttonIcon".into());
+        button_new.css_tokens_used.insert("styles.button".into());
+        sd.new_profiles.insert("Button".into(), button_new);
+
+        sd.component_packages
+            .insert("Button".into(), "@patternfly/react-core".into());
+
+        // ── MenuToggle: icon prop in both, has styles.menuToggleIcon ──
+        sd.old_component_props.insert(
+            "MenuToggle".into(),
+            ["children", "icon", "variant"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "MenuToggle".into(),
+            ["children", "icon", "variant"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "MenuToggle".into(),
+            [("icon".into(), "React.ReactNode".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut mt_old = crate::sd_types::ComponentSourceProfile::default();
+        mt_old.has_children_prop = true;
+        mt_old
+            .css_tokens_used
+            .insert("styles.menuToggleIcon".into());
+        sd.old_profiles.insert("MenuToggle".into(), mt_old);
+
+        let mut mt_new = crate::sd_types::ComponentSourceProfile::default();
+        mt_new.has_children_prop = true;
+        mt_new
+            .css_tokens_used
+            .insert("styles.menuToggleIcon".into());
+        sd.new_profiles.insert("MenuToggle".into(), mt_new);
+
+        sd.component_packages
+            .insert("MenuToggle".into(), "@patternfly/react-core".into());
+
+        // ── NavItem: icon prop is NEW in v6 (not in old) — should NOT match ──
+        sd.old_component_props.insert(
+            "NavItem".into(),
+            ["children", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "NavItem".into(),
+            ["children", "icon", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "NavItem".into(),
+            [("icon".into(), "React.ReactNode".into())]
+                .into_iter()
+                .collect(),
+        );
+        let mut nav_old = crate::sd_types::ComponentSourceProfile::default();
+        nav_old.has_children_prop = true;
+        sd.old_profiles.insert("NavItem".into(), nav_old);
+
+        let mut nav_new = crate::sd_types::ComponentSourceProfile::default();
+        nav_new.has_children_prop = true;
+        nav_new
+            .css_tokens_used
+            .insert("styles.navLinkIcon".into());
+        sd.new_profiles.insert("NavItem".into(), nav_new);
+
+        sd.component_packages
+            .insert("NavItem".into(), "@patternfly/react-core".into());
+
+        // ── Toolbar: has children but NO icon prop — should NOT match ──
+        sd.old_component_props.insert(
+            "Toolbar".into(),
+            ["children", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Toolbar".into(),
+            ["children", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let mut toolbar_old = crate::sd_types::ComponentSourceProfile::default();
+        toolbar_old.has_children_prop = true;
+        sd.old_profiles.insert("Toolbar".into(), toolbar_old);
+
+        let mut toolbar_new = crate::sd_types::ComponentSourceProfile::default();
+        toolbar_new.has_children_prop = true;
+        sd.new_profiles.insert("Toolbar".into(), toolbar_new);
+
+        sd.component_packages
+            .insert("Toolbar".into(), "@patternfly/react-core".into());
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_icon_children_to_prop_rules(&sd, &pkgs);
+
+        // Button should match
+        let button_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("button"));
+        assert!(
+            button_rule.is_some(),
+            "TC007: Button should generate icon-children-to-prop rule. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        let br = button_rule.unwrap();
+        assert_eq!(br.category, "mandatory");
+        assert!(
+            br.message.contains("`icon` prop"),
+            "Message should mention the icon prop: {}",
+            br.message
+        );
+        assert!(br.message.contains("icon={"));
+        let strat = br.fix_strategy.as_ref().unwrap();
+        assert_eq!(strat.strategy, "LlmAssisted");
+        assert_eq!(strat.prop.as_deref(), Some("icon"));
+
+        // MenuToggle should match
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("menutoggle")),
+            "TC046: MenuToggle should generate icon-children-to-prop rule"
+        );
+
+        // NavItem should NOT match (icon prop is new, not existing)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("navitem")),
+            "NavItem should NOT match (icon prop didn't exist in v5)"
+        );
+
+        // Toolbar should NOT match (no icon prop)
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("toolbar")),
+            "Toolbar should NOT match (no icon prop)"
         );
     }
 
@@ -12925,8 +13951,9 @@ mod tests {
 
         let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
 
-        // no-background should still map to an added value (primary or secondary)
-        // via string similarity: no-background → secondary (0.308 >= 0.3)
+        // no-background should NOT map via string similarity (0.308 < 0.32
+        // threshold). CSS bridge also has no match for transparent background.
+        // The rule will emit "Valid values: ..." and the LLM will choose.
         let nobg_rule = rules
             .iter()
             .find(|r| r.rule_id.contains("no-background") || r.rule_id.contains("no_background"))
@@ -12937,8 +13964,8 @@ mod tests {
             .and_then(|s| s.replacement.as_ref());
         assert_eq!(
             nobg_repl.map(|s| s.as_str()),
-            Some("secondary"),
-            "TC020: no-background should map to secondary (added value, sim=0.308)"
+            None,
+            "TC020: no-background should NOT map (sim=0.308 < 0.32 threshold)"
         );
 
         // light-200 should map to secondary via CSS bridge:
@@ -13347,5 +14374,212 @@ mod tests {
         } else {
             panic!("Expected FrontendReferenced condition");
         }
+    }
+
+    // ── Unmapped removed prop rule tests ──────────────────────────────
+
+    /// Removed props not covered by prop-to-child should generate
+    /// individual JSX_PROP rules with LlmAssisted strategy and family label.
+    #[test]
+    fn test_unmapped_removed_prop_generates_rules() {
+        use semver_analyzer_core::*;
+        use crate::language::TsReportData;
+
+        // Build a report with DualListSelector having 4 removed props
+        let mut report = build_test_report(vec![]);
+        report.packages.push(PackageChanges {
+            name: "@patternfly/react-core".into(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![TypeSummary {
+                name: "DualListSelector".into(),
+                definition_name: "DualListSelectorProps".into(),
+                status: TypeStatus::Modified,
+                member_summary: MemberSummary {
+                    total: 10,
+                    removed: 4,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.4,
+                },
+                removed_members: vec![
+                    RemovedMember {
+                        name: "availableOptions".into(),
+                        old_type: Some("property: availableOptions: React.ReactNode[]".into()),
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "chosenOptions".into(),
+                        old_type: Some("property: chosenOptions: React.ReactNode[]".into()),
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "onListChange".into(),
+                        old_type: Some("property: onListChange: (event: Event) => void".into()),
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "filterOption".into(),
+                        old_type: Some("property: filterOption: (option: React.ReactNode, input: string) => boolean".into()),
+                        removal_disposition: None,
+                    },
+                ],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![],
+                },
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        });
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("DualListSelector".into(), "@patternfly/react-core".into());
+        sd.composition_trees.push(crate::sd_types::CompositionTree {
+            root: "DualListSelector".into(),
+            family_members: vec![
+                "DualListSelector".into(),
+                "DualListSelectorPane".into(),
+            ],
+            edges: vec![],
+        });
+        let pkgs = sd.component_packages.clone();
+
+        // filterOption is covered by prop-to-child (simulating existing rule)
+        let covered: HashSet<(String, String)> = [(
+            "DualListSelector".to_string(),
+            "filterOption".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let rules = generate_unmapped_removed_prop_rules(&report, &sd, &pkgs, &covered);
+
+        // Should generate 3 rules (availableOptions, chosenOptions, onListChange)
+        // filterOption is covered by prop-to-child, so skipped
+        assert_eq!(
+            rules.len(),
+            3,
+            "Should generate 3 rules for uncovered removed props. \
+             filterOption should be skipped (covered by prop-to-child). Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // All should be LlmAssisted strategy
+        for rule in &rules {
+            let strategy = rule
+                .fix_strategy
+                .as_ref()
+                .expect("Should have fix strategy");
+            assert_eq!(
+                strategy.strategy, "LlmAssisted",
+                "Strategy should be LlmAssisted for {}",
+                rule.rule_id
+            );
+        }
+
+        // All should have family=DualListSelector label
+        for rule in &rules {
+            assert!(
+                rule.labels.iter().any(|l| l == "family=DualListSelector"),
+                "Rule {} should have family=DualListSelector label. Got: {:?}",
+                rule.rule_id,
+                rule.labels
+            );
+        }
+
+        // All should fire on JSX_PROP location
+        for rule in &rules {
+            if let KonveyorCondition::FrontendReferenced { ref referenced } = rule.when {
+                assert_eq!(
+                    referenced.location, "JSX_PROP",
+                    "Rule {} should fire on JSX_PROP",
+                    rule.rule_id
+                );
+                assert_eq!(
+                    referenced.component.as_deref(),
+                    Some("^DualListSelector$"),
+                    "Rule {} should target DualListSelector component",
+                    rule.rule_id
+                );
+            } else {
+                panic!("Expected FrontendReferenced condition for {}", rule.rule_id);
+            }
+        }
+
+        // Verify specific rules exist
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("availableoptions")),
+            "Should have a rule for availableOptions"
+        );
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("chosenoptions")),
+            "Should have a rule for chosenOptions"
+        );
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("onlistchange")),
+            "Should have a rule for onListChange"
+        );
+    }
+
+    /// Components with no removed props should generate no rules.
+    #[test]
+    fn test_unmapped_removed_prop_no_removed_props() {
+        use semver_analyzer_core::*;
+        use crate::language::TsReportData;
+
+        let mut report = build_test_report(vec![]);
+        report.packages.push(PackageChanges {
+            name: "@patternfly/react-core".into(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![TypeSummary {
+                name: "Button".into(),
+                definition_name: "ButtonProps".into(),
+                status: TypeStatus::Modified,
+                member_summary: MemberSummary {
+                    total: 5,
+                    removed: 0,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.0,
+                },
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![],
+                },
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        });
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Button".into(), "@patternfly/react-core".into());
+        sd.composition_trees.push(crate::sd_types::CompositionTree {
+            root: "Button".into(),
+            family_members: vec!["Button".into()],
+            edges: vec![],
+        });
+        let pkgs = sd.component_packages.clone();
+        let covered = HashSet::new();
+
+        let rules = generate_unmapped_removed_prop_rules(&report, &sd, &pkgs, &covered);
+        assert!(
+            rules.is_empty(),
+            "Components with no removed props should generate no rules"
+        );
     }
 }
