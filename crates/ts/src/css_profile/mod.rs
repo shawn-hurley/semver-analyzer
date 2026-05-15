@@ -589,8 +589,14 @@ fn merge_css_profile(existing: &mut CssBlockProfile, other: CssBlockProfile) {
 /// No prefix knowledge is required.
 fn extract_css_block_profile(source: &str, _component_dir: &str) -> Result<CssBlockProfile> {
     // Parse with lightningcss
-    let stylesheet = StyleSheet::parse(source, ParserOptions::default())
-        .map_err(|e| anyhow::anyhow!("CSS parse error: {}", e))?;
+    let stylesheet = StyleSheet::parse(
+        source,
+        ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("CSS parse error: {}", e))?;
 
     // Step 1: Detect the block class from the first standalone selector
     let block_class = detect_block_class(&stylesheet)
@@ -1290,8 +1296,14 @@ pub fn extract_component_css_modifiers_from_dir(
 fn extract_css_modifier_declarations(
     source: &str,
 ) -> Result<ComponentCssModifiers> {
-    let stylesheet = StyleSheet::parse(source, ParserOptions::default())
-        .map_err(|e| anyhow::anyhow!("CSS parse error: {}", e))?;
+    let stylesheet = StyleSheet::parse(
+        source,
+        ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("CSS parse error: {}", e))?;
 
     let block_class = match detect_block_class(&stylesheet) {
         Some(b) => b,

@@ -18,6 +18,7 @@ use semver_analyzer_core::{
 };
 
 use crate::language::{ChildComponent, ChildComponentStatus};
+use crate::sd_types::ReplacementEvidence;
 
 // Re-export all types and functions from semver-analyzer-konveyor-core.
 // That crate now re-exports shared types from the `konveyor-core` crate,
@@ -1718,6 +1719,149 @@ pub fn generate_rules(
                                  with <{replacement}>.",
                             );
                             message = message.replace(&old_text, &new_text);
+                        }
+                    }
+
+                    // ── Deprecated replacement lookup ────────────────────
+                    // When TD misclassifies a rename (e.g., two old symbols
+                    // map to the same new symbol and the wrong one wins by
+                    // name similarity), the SD pipeline may have detected
+                    // the correct mapping via git rename tracking or
+                    // rendering swap analysis. Use it as a fallback.
+                    //
+                    // Guard: skip CommitCoChange evidence — it's correlation-
+                    // based (same commit touched both components) and produces
+                    // false positives (e.g., DualListSelector → DragDrop).
+                    if comp.migration_target.is_none()
+                        && message.contains("no detected direct replacement")
+                    {
+                        if let Some(ref sd) = report.extensions.sd_result {
+                            if let Some(dr) = sd.deprecated_replacements.iter().find(|dr| {
+                                dr.old_component == comp.name
+                                    && dr.evidence_source != ReplacementEvidence::CommitCoChange
+                            }) {
+                                let replacement = &dr.new_component;
+
+                                // Build prop mappings from SD component prop lists.
+                                let old_props = sd
+                                    .old_component_props
+                                    .get(&comp.name)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let new_props = sd
+                                    .new_component_props
+                                    .get(replacement)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let new_props_set: HashSet<&str> =
+                                    new_props.iter().map(|s| s.as_str()).collect();
+
+                                // Prefix for prefix-strip matching:
+                                //   "InvalidObject" → "invalidObject"
+                                let prefix = {
+                                    let mut chars = comp.name.chars();
+                                    match chars.next() {
+                                        Some(c) => {
+                                            c.to_lowercase().to_string() + chars.as_str()
+                                        }
+                                        None => String::new(),
+                                    }
+                                };
+
+                                let mut prop_mappings: Vec<(String, String)> = Vec::new();
+                                let mut unmapped: Vec<String> = Vec::new();
+
+                                for old_prop in &old_props {
+                                    if old_prop == "children" || old_prop == "className" {
+                                        continue;
+                                    }
+                                    if new_props_set.contains(old_prop.as_str()) {
+                                        // Exact match (e.g., ouiaId → ouiaId)
+                                        prop_mappings
+                                            .push((old_prop.clone(), old_prop.clone()));
+                                    } else if let Some(stripped) =
+                                        old_prop.strip_prefix(&prefix)
+                                    {
+                                        // Prefix-strip match:
+                                        //   invalidObjectTitleText → TitleText → titleText
+                                        let candidate = {
+                                            let mut chars = stripped.chars();
+                                            match chars.next() {
+                                                Some(c) => {
+                                                    c.to_lowercase().to_string()
+                                                        + chars.as_str()
+                                                }
+                                                None => String::new(),
+                                            }
+                                        };
+                                        if new_props_set.contains(candidate.as_str()) {
+                                            prop_mappings
+                                                .push((old_prop.clone(), candidate));
+                                        } else {
+                                            unmapped.push(old_prop.clone());
+                                        }
+                                    } else {
+                                        unmapped.push(old_prop.clone());
+                                    }
+                                }
+
+                                // Build replacement text.
+                                let old_text = format!(
+                                    "This component has no detected direct replacement.\n\
+                                     Replace all <{}> usages with the recommended alternative.",
+                                    component_name,
+                                );
+
+                                let mut new_text =
+                                    format!("Use <{replacement}> instead.");
+
+                                // Import guidance: use pkg.name (the published
+                                // package name) since the replacement is always
+                                // within the same package. The SD component_packages
+                                // map may contain internal workspace names.
+                                if pkg.name.as_str() != component_name.as_str() {
+                                    new_text.push_str(&format!(
+                                        "\n\nImport change:\n\
+                                         \x20 Replace: import {{ {component_name} }} from '{pkg_name}';\n\
+                                         \x20 With:    import {{ {replacement} }} from '{pkg_name}';",
+                                        pkg_name = pkg.name,
+                                    ));
+                                }
+
+                                // Prop mappings.
+                                if !prop_mappings.is_empty() {
+                                    new_text.push_str("\n\nProperty mapping:");
+                                    for (old_name, new_name) in &prop_mappings {
+                                        if old_name == new_name {
+                                            new_text.push_str(&format!(
+                                                "\n  - {component_name}.{old_name}  \u{2192}  {replacement}.{new_name}",
+                                            ));
+                                        } else {
+                                            new_text.push_str(&format!(
+                                                "\n  - {component_name}.{old_name}  \u{2192}  {replacement}.{new_name} (renamed)",
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                // Unmapped props.
+                                if !unmapped.is_empty() {
+                                    new_text.push_str(&format!(
+                                        "\n\nRemoved with no direct equivalent: {}",
+                                        unmapped.join(", "),
+                                    ));
+                                }
+
+                                message = message.replace(&old_text, &new_text);
+
+                                tracing::debug!(
+                                    component = %comp.name,
+                                    replacement = %replacement,
+                                    evidence = ?dr.evidence_source,
+                                    prop_mappings = prop_mappings.len(),
+                                    "Enriched P0-C message via deprecated_replacement fallback"
+                                );
+                            }
                         }
                     }
 

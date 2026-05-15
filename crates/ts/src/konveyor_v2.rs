@@ -3513,6 +3513,111 @@ fn compute_css_modifier_bridge(
     hints
 }
 
+/// Detect prop value replacements from aria-label semantic grouping.
+///
+/// When a component's aria attribute uses an array expression like
+/// `['tertiary', 'horizontal-subnav'].includes(variant)`, the values
+/// in the array share a semantic role (e.g., both are "Local" nav types).
+/// If one value is removed from the prop's type union while the other
+/// survives, the surviving value is a strong replacement candidate.
+///
+/// This signal is narrow but high-confidence: the component author
+/// explicitly grouped these values together for the same behavioral
+/// branch. It fires only when:
+/// 1. The source-level change is direct (not propagated via dependency_chain)
+/// 2. The old expression contains `.includes(` with an array of values
+/// 3. Exactly 1 array member was removed from the prop type union
+/// 4. Exactly 1 array member survives in the prop type union
+///
+/// Returns a map from removed_value → surviving_value.
+fn compute_aria_grouping_hints(
+    component: &str,
+    removed_values: &HashSet<String>,
+    all_prop_values: &HashSet<String>,
+    sd: &SdPipelineResult,
+) -> HashMap<String, String> {
+    use regex::Regex;
+
+    let mut hints: HashMap<String, String> = HashMap::new();
+
+    // Match array expressions: ['val1', 'val2'].includes(
+    // Use lazy_static or build per-call (this runs once per type-changed prop).
+    let array_includes_re = Regex::new(r"\[([^\]]*)\]\.includes\(").unwrap();
+    let quoted_value_re = Regex::new(r"'([^']+)'").unwrap();
+
+    for slc in &sd.source_level_changes {
+        // Guard 1: Direct changes only (skip propagated)
+        if slc.dependency_chain.is_some() {
+            continue;
+        }
+
+        // Guard 2: Same component
+        if slc.component != component {
+            continue;
+        }
+
+        // Guard 3: Aria changes only
+        if slc.category != SourceLevelCategory::AriaChange {
+            continue;
+        }
+
+        // Guard 4: Old value must contain .includes( array
+        let old_value = match &slc.old_value {
+            Some(v) if v.contains(".includes(") => v,
+            _ => continue,
+        };
+
+        // Extract the array contents from [...].includes(
+        let array_capture = match array_includes_re.captures(old_value) {
+            Some(cap) => cap[1].to_string(),
+            None => continue,
+        };
+
+        // Extract all quoted string values from the array
+        let array_values: HashSet<String> = quoted_value_re
+            .captures_iter(&array_capture)
+            .map(|cap| cap[1].to_string())
+            .collect();
+
+        // Guard 5: Filter to only values that are actual prop values
+        // (excludes ternary result literals like 'Local', 'Global')
+        let prop_values_in_array: HashSet<&String> = array_values
+            .iter()
+            .filter(|v| all_prop_values.contains(v.as_str()))
+            .collect();
+
+        // Guard 6: Exactly 1 removed and 1 surviving in the array
+        let removed_in_array: Vec<&String> = prop_values_in_array
+            .iter()
+            .filter(|v| removed_values.contains(v.as_str()))
+            .copied()
+            .collect();
+        let surviving_in_array: Vec<&String> = prop_values_in_array
+            .iter()
+            .filter(|v| !removed_values.contains(v.as_str()))
+            .copied()
+            .collect();
+
+        if removed_in_array.len() != 1 || surviving_in_array.len() != 1 {
+            continue;
+        }
+
+        let removed_val = removed_in_array[0].clone();
+        let surviving_val = surviving_in_array[0].clone();
+
+        tracing::debug!(
+            component = %component,
+            removed = %removed_val,
+            replacement = %surviving_val,
+            "Aria-label semantic grouping: removed value was grouped with surviving value"
+        );
+
+        hints.insert(removed_val, surviving_val);
+    }
+
+    hints
+}
+
 /// Resolve a prop value to its CSS modifier class effect.
 ///
 /// Tries common naming conventions: value "cyan" → class "pf-m-cyan",
@@ -3991,6 +4096,34 @@ fn generate_prop_value_conformance_rules(
                 );
             }
 
+            // ── Aria-label semantic grouping ─────────────────────
+            // When a component's aria attribute groups variant values
+            // in an array expression (e.g., ['tertiary', 'horizontal-subnav']
+            // .includes(variant)), the values share a semantic role.
+            // If one is removed and the other survives, the survivor
+            // is a strong replacement candidate. This is a last-resort
+            // fallback after CSS bridge and string similarity.
+            let all_prop_values: HashSet<String> = old_values
+                .union(&new_values)
+                .cloned()
+                .collect();
+            let removed_set: HashSet<String> =
+                removed.iter().map(|s| s.to_string()).collect();
+            let aria_grouping_hints = compute_aria_grouping_hints(
+                &component,
+                &removed_set,
+                &all_prop_values,
+                sd,
+            );
+            if !aria_grouping_hints.is_empty() {
+                tracing::debug!(
+                    component = %component,
+                    prop = %prop,
+                    hints = ?aria_grouping_hints,
+                    "Aria-label semantic grouping produced value mappings"
+                );
+            }
+
             // Generate one rule per removed value for precise matching
             for value in &removed {
                 let rule_id = format!(
@@ -4108,11 +4241,13 @@ fn generate_prop_value_conformance_rules(
                     hints
                 };
 
-                // CSS bridge hints override string similarity when available
+                // CSS bridge hints override string similarity, aria grouping
+                // is the last-resort fallback for surviving-value mappings.
                 let replacement_hint = css_bridge_hints
                     .get(*value)
                     .cloned()
-                    .or_else(|| replacement_hints.get(*value).cloned());
+                    .or_else(|| replacement_hints.get(*value).cloned())
+                    .or_else(|| aria_grouping_hints.get(*value).cloned());
                 let message = if let Some(ref replacement) = replacement_hint {
                     format!(
                         "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
@@ -14820,6 +14955,625 @@ mod tests {
             spacer_lg_gap.message.contains("gapLg"),
             "TC085: Message should mention gapLg replacement. Got: {}",
             spacer_lg_gap.message
+        );
+    }
+
+    // ── Aria-label semantic grouping tests ──────────────────────────
+
+    /// TC051: Nav variant='tertiary' should map to 'horizontal-subnav' via
+    /// aria-label semantic grouping.
+    ///
+    /// Real PF data: Nav's aria-label uses
+    ///   `['tertiary', 'horizontal-subnav'].includes(variant) ? 'Local' : 'Global'`
+    /// in v5 and `variant === 'horizontal-subnav' ? 'Local' : 'Global'` in v6.
+    /// Both values were grouped as "Local" navigation types. When 'tertiary'
+    /// is removed from the variant type union, 'horizontal-subnav' is the
+    /// surviving group member → replacement candidate.
+    #[test]
+    fn test_aria_grouping_nav_tertiary_maps_to_horizontal_subnav() {
+        use semver_analyzer_core::*;
+
+        // Real Nav.variant type change from PF5 → PF6
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Nav/Nav.NavProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav' | 'tertiary'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Nav".into(), "@patternfly/react-core".into());
+
+        // Real aria-label source-level change from PF5 → PF6
+        sd.source_level_changes.push(SourceLevelChange {
+            component: "Nav".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-label on <nav> in Nav changed from \
+                '{ariaLabel || ([\"tertiary\", \"horizontal-subnav\"].includes(variant) \
+                ? \"Local\" : \"Global\")}' to \
+                '{ariaLabel || (variant === \"horizontal-subnav\" ? \"Local\" : \"Global\")}}'"
+                .into(),
+            old_value: Some(
+                "{ariaLabel || (['tertiary', 'horizontal-subnav'].includes(variant) \
+                 ? 'Local' : 'Global')}"
+                    .into(),
+            ),
+            new_value: Some(
+                "{ariaLabel || (variant === 'horizontal-subnav' ? 'Local' : 'Global')}".into(),
+            ),
+            has_test_implications: true,
+            test_description: Some(
+                "Changed aria-label value will affect accessibility queries".into(),
+            ),
+            element: Some("nav".into()),
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have exactly 1 rule for the removed value 'tertiary'
+        let tertiary_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("tertiary"))
+            .expect("TC051: Should have a rule for removed value 'tertiary'");
+
+        // Replacement should be 'horizontal-subnav' from aria grouping
+        let replacement = tertiary_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("horizontal-subnav"),
+            "TC051: tertiary should map to horizontal-subnav via aria grouping. \
+             Rule message: {}",
+            tertiary_rule.message
+        );
+
+        // Message should indicate the replacement
+        assert!(
+            tertiary_rule.message.contains("horizontal-subnav"),
+            "TC051: Message should mention horizontal-subnav. Got: {}",
+            tertiary_rule.message
+        );
+        assert!(
+            !tertiary_rule
+                .message
+                .contains("no detected direct replacement"),
+            "TC051: Message should NOT contain 'no detected direct replacement'"
+        );
+    }
+
+    /// Propagated aria-label changes (e.g., App renders Nav) should NOT
+    /// produce aria grouping hints. Only direct component changes fire.
+    ///
+    /// Real PF data: App has the same aria-label change as Nav but with
+    /// dependency_chain = ["App", "Nav", "..."].
+    #[test]
+    fn test_aria_grouping_propagated_change_does_not_fire() {
+        use semver_analyzer_core::*;
+
+        // Hypothetical: App has a variant type change (it doesn't in reality,
+        // but we need to test that propagated aria changes are filtered out
+        // even when type data matches).
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/App.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "AppProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav' | 'tertiary'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("App".into(), "@patternfly/react-core".into());
+
+        // Real propagated aria change from PF data — has dependency_chain
+        sd.source_level_changes.push(SourceLevelChange {
+            component: "App".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "App renders Nav which has a behavioral change: \
+                aria-label on <nav> changed"
+                .into(),
+            old_value: Some(
+                "{ariaLabel || (['tertiary', 'horizontal-subnav'].includes(variant) \
+                 ? 'Local' : 'Global')}"
+                    .into(),
+            ),
+            new_value: Some(
+                "{ariaLabel || (variant === 'horizontal-subnav' ? 'Local' : 'Global')}".into(),
+            ),
+            has_test_implications: true,
+            test_description: Some(
+                "Via Nav: Changed aria-label value will affect accessibility queries".into(),
+            ),
+            element: Some("nav".into()),
+            migration_from: None,
+            // Real dependency chain from PF data
+            dependency_chain: Some(vec![
+                "App".into(),
+                "Nav".into(),
+                "aria-label on <nav> in Nav changed".into(),
+            ]),
+        });
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // The tertiary rule should exist but with NO replacement
+        // (propagated aria change filtered, no CSS data, no string sim match)
+        let tertiary_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("tertiary"))
+            .expect("Should have a rule for removed value 'tertiary'");
+
+        let replacement = tertiary_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            None,
+            "Propagated aria changes should NOT produce a replacement hint. \
+             dependency_chain should block this. Got replacement: {:?}",
+            replacement
+        );
+    }
+
+    /// PageSection.variant should NOT be affected by aria grouping
+    /// because PageSection has no aria change with .includes() arrays.
+    ///
+    /// Real PF data: PageSection.variant changed from
+    /// 'default'|'dark'|'darker'|'light' → 'default'|'secondary'.
+    /// Existing behavior: dark→secondary, darker→secondary (string sim),
+    /// light→None (no match). Signal 1 must not alter this.
+    #[test]
+    fn test_aria_grouping_no_effect_on_pagesection_variant() {
+        use semver_analyzer_core::*;
+
+        // Real PageSection.variant type change from PF5 → PF6
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Page/PageSection.PageSectionProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "PageSectionProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'dark' | 'darker' | 'default' | 'light'".into(),
+                ),
+                after: Some("property: variant: 'default' | 'secondary'".into()),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("PageSection".into(), "@patternfly/react-core".into());
+
+        // PageSection has NO aria changes with .includes() — empty source_level_changes
+        // (real PF data: PageSection source_level_changes are css_token, prop_default,
+        // rendered_component, dom_structure, composition — never aria with arrays)
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // dark → secondary (string sim = 0.43, above 0.32 threshold)
+        let dark_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("-dark") && !r.rule_id.contains("darker"));
+        if let Some(rule) = dark_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                Some("secondary"),
+                "PageSection dark should still map to secondary via string sim"
+            );
+        }
+
+        // darker → secondary (string sim = 0.43)
+        let darker_rule = rules.iter().find(|r| r.rule_id.contains("darker"));
+        if let Some(rule) = darker_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                Some("secondary"),
+                "PageSection darker should still map to secondary via string sim"
+            );
+        }
+
+        // light → None (no string sim match, no CSS bridge, no aria grouping)
+        let light_rule = rules.iter().find(|r| r.rule_id.contains("light"));
+        if let Some(rule) = light_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                None,
+                "PageSection light should NOT have a replacement — aria grouping \
+                 must not fire for PageSection (no .includes() aria change exists)"
+            );
+        }
+    }
+
+    /// Label.color should NOT be affected by aria grouping. Label has aria
+    /// changes but none use .includes() array expressions with color values.
+    ///
+    /// Real PF data: Label's aria changes are about closeBtnAriaLabel and
+    /// aria-hidden on TimesIcon — none reference color values.
+    /// The CSS bridge (when populated) handles cyan→teal and gold→yellow.
+    #[test]
+    fn test_aria_grouping_no_effect_on_label_color() {
+        use semver_analyzer_core::*;
+
+        // Real Label.color type change
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Label/Label.LabelProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "LabelProps.color".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: color: 'blue' | 'cyan' | 'gold' | 'green' | 'grey' | 'orange' | 'purple' | 'red'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: color: 'blue' | 'green' | 'grey' | 'orange' | 'orangered' | 'purple' | 'red' | 'teal' | 'yellow'"
+                        .into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Label".into(), "@patternfly/react-core".into());
+
+        // Real Label aria changes from PF data — none have .includes() with color values
+        sd.source_level_changes.push(SourceLevelChange {
+            component: "Label".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-label on <Button> in Label changed".into(),
+            old_value: Some("{closeBtnAriaLabel}".into()),
+            new_value: Some("{closeBtnAriaLabel || `Close ${children}`}".into()),
+            has_test_implications: false,
+            test_description: None,
+            element: Some("Button".into()),
+            migration_from: None,
+            dependency_chain: None,
+        });
+        sd.source_level_changes.push(SourceLevelChange {
+            component: "Label".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-hidden attribute removed from <TimesIcon> in Label".into(),
+            old_value: Some("true".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: Some("TimesIcon".into()),
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // cyan and gold rules should exist but with NO replacement from aria grouping
+        // (without CSS bridge data in this test, they fall through to string sim)
+        for removed_val in ["cyan", "gold"] {
+            let rule = rules
+                .iter()
+                .find(|r| r.rule_id.contains(removed_val))
+                .unwrap_or_else(|| {
+                    panic!("Should have a rule for removed Label color '{}'", removed_val)
+                });
+
+            // Verify aria grouping didn't produce a hint
+            // (String sim may produce a hint for gold→yellow, but not from aria grouping)
+            let msg = &rule.message;
+            // The message should NOT say "Use X instead" based on aria data
+            // (it may say so from string sim — that's OK and expected)
+            assert!(
+                !msg.contains("aria"),
+                "Label color rule for '{}' should NOT mention aria grouping in message",
+                removed_val
+            );
+        }
+    }
+
+    /// DrawerContent.colorVariant should NOT be affected by aria grouping.
+    /// DrawerContent has NO aria changes in its source-level changes.
+    ///
+    /// Real PF data: DrawerContent has zero source_level_changes entries.
+    #[test]
+    fn test_aria_grouping_no_effect_on_drawer_colorvariant() {
+        use semver_analyzer_core::*;
+
+        // Real DrawerContent.colorVariant type change
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Drawer/DrawerContent.DrawerContentProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "DrawerContentProps.colorVariant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: colorVariant: 'default' | 'light-200' | 'no-background'".into(),
+                ),
+                after: Some(
+                    "property: colorVariant: 'default' | 'primary' | 'secondary'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("DrawerContent".into(), "@patternfly/react-core".into());
+
+        // DrawerContent has NO source_level_changes — empty (real PF data)
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // light-200 should have no replacement (no CSS bridge, no string sim, no aria)
+        let light200_rule = rules.iter().find(|r| r.rule_id.contains("light-200"));
+        if let Some(rule) = light200_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                None,
+                "DrawerContent light-200 should NOT have a replacement from aria grouping"
+            );
+        }
+
+        // no-background should have no replacement
+        let nobg_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("no-background") || r.rule_id.contains("no_background"));
+        if let Some(rule) = nobg_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                None,
+                "DrawerContent no-background should NOT have a replacement from aria grouping"
+            );
+        }
+    }
+
+    /// Multi-member array guard: when an .includes() array has 3+ values
+    /// and 1 is removed but 2+ survive, the hint should NOT fire because
+    /// the replacement is ambiguous.
+    #[test]
+    fn test_aria_grouping_multi_member_array_no_match() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/TestComponent.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "TestComponentProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("property: variant: 'a' | 'b' | 'c' | 'd'".into()),
+                after: Some("property: variant: 'b' | 'c' | 'd'".into()),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("TestComponent".into(), "@test/pkg".into());
+
+        // Aria change with 3-member array: ['a', 'b', 'c'].includes(variant)
+        // 'a' is removed, 'b' and 'c' survive → ambiguous, don't pick
+        sd.source_level_changes.push(SourceLevelChange {
+            component: "TestComponent".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-label changed".into(),
+            old_value: Some(
+                "{label || (['a', 'b', 'c'].includes(variant) ? 'Group1' : 'Group2')}".into(),
+            ),
+            new_value: Some(
+                "{label || (['b', 'c'].includes(variant) ? 'Group1' : 'Group2')}".into(),
+            ),
+            has_test_implications: false,
+            test_description: None,
+            element: Some("div".into()),
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        let a_rule = rules.iter().find(|r| r.rule_id.contains("-a"));
+        if let Some(rule) = a_rule {
+            let replacement = rule
+                .fix_strategy
+                .as_ref()
+                .and_then(|s| s.replacement.as_ref());
+            assert_eq!(
+                replacement.map(|s| s.as_str()),
+                None,
+                "Multi-member array (2 survivors) should NOT produce a replacement — \
+                 ambiguous which survivor is the intended replacement"
+            );
+        }
+    }
+
+    /// Non-prop values in the .includes() array expression (like ternary
+    /// result strings 'Local', 'Global') should be filtered out and not
+    /// confused with actual prop values.
+    #[test]
+    fn test_aria_grouping_filters_non_prop_values() {
+        use semver_analyzer_core::*;
+
+        // Same Nav setup as the positive test
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from(
+                "packages/react-core/src/components/Nav/Nav.NavProps.d.ts",
+            ),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavProps.variant".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav' | 'tertiary'"
+                        .into(),
+                ),
+                after: Some(
+                    "property: variant: 'default' | 'horizontal' | 'horizontal-subnav'".into(),
+                ),
+                description: "type changed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("Nav".into(), "@patternfly/react-core".into());
+
+        // The expression has 'Local' and 'Global' in addition to variant values
+        // These should be filtered out by Guard 5
+        sd.source_level_changes.push(SourceLevelChange {
+            component: "Nav".into(),
+            category: SourceLevelCategory::AriaChange,
+            description: "aria-label changed".into(),
+            old_value: Some(
+                "{ariaLabel || (['tertiary', 'horizontal-subnav'].includes(variant) \
+                 ? 'Local' : 'Global')}"
+                    .into(),
+            ),
+            new_value: Some(
+                "{ariaLabel || (variant === 'horizontal-subnav' ? 'Local' : 'Global')}".into(),
+            ),
+            has_test_implications: true,
+            test_description: None,
+            element: Some("nav".into()),
+            migration_from: None,
+            dependency_chain: None,
+        });
+
+        let pkgs = sd.component_packages.clone();
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // tertiary should map to horizontal-subnav (NOT to 'Local' or 'Global')
+        let tertiary_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("tertiary"))
+            .expect("Should have a rule for removed value 'tertiary'");
+
+        let replacement = tertiary_rule
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("horizontal-subnav"),
+            "Should map to horizontal-subnav, not 'Local' or 'Global'. \
+             Non-prop ternary result values must be filtered out."
+        );
+
+        // Verify 'Local' and 'Global' are not in the replacement
+        assert_ne!(
+            replacement.map(|s| s.as_str()),
+            Some("Local"),
+            "Must NOT map to 'Local' — that's a ternary result, not a variant value"
+        );
+        assert_ne!(
+            replacement.map(|s| s.as_str()),
+            Some("Global"),
+            "Must NOT map to 'Global' — that's a ternary result, not a variant value"
         );
     }
 }
