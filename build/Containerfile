@@ -76,6 +76,7 @@ ARG PF_TO_NODE_VERSION=20
 ARG PF_FROM_INSTALL_CMD="corepack yarn install"
 ARG PF_FROM_BUILD_CMD="corepack yarn build"
 ARG PF_TO_BUILD_CMD="yarn build:generate && yarn build:esm"
+ARG PF_DEP_NODE_VERSION=18
 ARG PF_DEP_BUILD_CMD="export NODE_ENV=development && yarn install && npx gulp buildPatternfly"
 ARG TOKEN_MAPPINGS_URL=https://raw.githubusercontent.com/konveyor-ecosystem/semver-analyzer/refs/heads/main/hack/integration/patternfly-token-mappings.yaml
 
@@ -87,6 +88,7 @@ RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | b
     && source "$NVM_DIR/nvm.sh" \
     && nvm install "$PF_FROM_NODE_VERSION" \
     && nvm install "$PF_TO_NODE_VERSION" \
+    && nvm install "$PF_DEP_NODE_VERSION" \
     && nvm alias default "$PF_TO_NODE_VERSION" \
     && npm install -g corepack && corepack enable
 
@@ -104,6 +106,8 @@ RUN source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
     --dep-repo /src/patternfly \
     --dep-from "$PF_DEP_FROM" --dep-to "$PF_DEP_TO" \
     --dep-build-command "$PF_DEP_BUILD_CMD" \
+    --from-dep-node-version "$PF_DEP_NODE_VERSION" \
+    --to-dep-node-version "$PF_DEP_NODE_VERSION" \
     --from-node-version "$PF_FROM_NODE_VERSION" \
     --to-node-version "$PF_TO_NODE_VERSION" \
     --from-install-command "$PF_FROM_INSTALL_CMD" \
