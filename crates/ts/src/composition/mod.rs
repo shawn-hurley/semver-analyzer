@@ -1378,6 +1378,33 @@ pub fn build_composition_tree_v2(
             if !has_signal {
                 continue;
             }
+
+            // Guard: skip PMC upgrade for pure passthrough wrappers.
+            //
+            // A passthrough wrapper renders no components internally, has no
+            // non-trivial props (only children/className/ref), and passes
+            // children through a single DOM element. Such a component is
+            // just a styled <div> that wraps arbitrary content. CSS grid on
+            // a passthrough wrapper creates CHP (children must be inside it
+            // for grid layout) but NOT PMC (the wrapper doesn't require
+            // specific children to function).
+            //
+            // Example: DrawerHead is a <div class="pf-c-drawer__head">
+            // that uses grid to position DrawerActions alongside content.
+            // But DrawerHead works fine without DrawerActions — it's just
+            // a content container. Without this guard, Step 9.5 would add
+            // PMC=YES, generating a false requiresChild rule (TC022).
+            if let Some(parent_profile) = profiles.get(&edge.parent) {
+                let is_passthrough = parent_profile.rendered_components.is_empty()
+                    && parent_profile.prop_types.keys().all(|prop| {
+                        matches!(prop.as_str(), "children" | "className" | "ref")
+                    })
+                    && parent_profile.children_slot_path.len() <= 1;
+                if is_passthrough {
+                    continue;
+                }
+            }
+
             edge.strength = edge.strength.combine(&EdgeStrength::Wrapper);
             edge.required = edge.strength.parent_requires_child();
         }

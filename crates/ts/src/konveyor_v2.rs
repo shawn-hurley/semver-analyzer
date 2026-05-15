@@ -12591,8 +12591,16 @@ mod tests {
         pkgs.insert("DrawerActions".into(), "@patternfly/react-core".into());
         pkgs.insert("DrawerCloseButton".into(), "@patternfly/react-core".into());
 
-        // Current (broken) tree: DrawerHead→DrawerActions is Required (CHP+PMC).
-        // This generates a requiresChild rule that causes over-fixing.
+        // Fixed tree: DrawerHead→DrawerActions is Structural (CHP-only, PMC=NO).
+        // DrawerHead is a pure passthrough wrapper — it accepts arbitrary
+        // children and uses CSS grid to position DrawerActions alongside
+        // content when present. But DrawerHead works fine without
+        // DrawerActions (e.g., just a title). Step 9.5's passthrough guard
+        // prevents the PMC upgrade, keeping the edge Structural.
+        //
+        // With Structural strength, generate_conformance_rules produces:
+        //   - notParent rule for DrawerActions (must be inside DrawerHead when used)
+        //   - NO requiresChild rule for DrawerHead (DrawerActions is optional)
         let tree = CompositionTree {
             root: "Drawer".into(),
             family_members: vec![
@@ -12603,7 +12611,7 @@ mod tests {
             ],
             edges: vec![
                 make_edge("Drawer", "DrawerHead", EdgeStrength::Required),
-                make_edge("DrawerHead", "DrawerActions", EdgeStrength::Required),
+                make_edge("DrawerHead", "DrawerActions", EdgeStrength::Structural),
                 make_edge("DrawerActions", "DrawerCloseButton", EdgeStrength::Required),
             ],
         };
@@ -12611,8 +12619,9 @@ mod tests {
         let rules = generate_conformance_rules(&[tree], &[], &pkgs);
 
         // Check that NO requiresChild rule exists for DrawerHead.
-        // A requiresChild rule on DrawerHead causes over-fixing (TC022).
-        // Note: short_component_id strips "Drawer" prefix, so "DrawerHead" → "head"
+        // A requiresChild rule on DrawerHead causes over-fixing (TC022):
+        // the LLM adds unnecessary DrawerActions/DrawerCloseButton when
+        // the consumer's DrawerHead is valid without them.
         let drawer_head_requires: Vec<_> = rules
             .iter()
             .filter(|r| {
@@ -12629,6 +12638,17 @@ mod tests {
                 .iter()
                 .map(|r| &r.rule_id)
                 .collect::<Vec<_>>()
+        );
+
+        // Verify the notParent rule still exists for DrawerActions
+        // (DrawerActions must be inside DrawerHead when used)
+        let actions_not_parent: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("-actions-in-"))
+            .collect();
+        assert!(
+            !actions_not_parent.is_empty(),
+            "TC022: DrawerActions should still have a notParent rule (must be inside DrawerHead when used)"
         );
     }
 
