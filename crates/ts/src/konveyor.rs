@@ -1199,6 +1199,60 @@ pub fn generate_rules(
                     }
                 }
 
+                // Enrich with per-constant change descriptions from the report.
+                // This gives the LLM specific guidance per component instead of
+                // a vague "N constants had type changes" message.
+                let mut per_constant_details = Vec::new();
+                for sym_name in symbol_names.iter().take(10) {
+                    // Look up the ApiChange for this symbol in the report
+                    for fc in &report.changes {
+                        for change in &fc.breaking_api_changes {
+                            if change.symbol == *sym_name
+                                && change.change == cg.change_type
+                            {
+                                let detail = match (&change.before, &change.after) {
+                                    (Some(before), Some(after)) => {
+                                        // Summarize the change concisely
+                                        let before_short = if before.len() > 80 {
+                                            format!("{}...", &before[..77])
+                                        } else {
+                                            before.clone()
+                                        };
+                                        let after_short = if after.len() > 80 {
+                                            format!("{}...", &after[..77])
+                                        } else {
+                                            after.clone()
+                                        };
+                                        format!(
+                                            "  - {}: {} → {}",
+                                            sym_name, before_short, after_short
+                                        )
+                                    }
+                                    (Some(before), None) => {
+                                        format!("  - {}: removed (was {})", sym_name, before)
+                                    }
+                                    _ => format!("  - {}: {}", sym_name, change.description),
+                                };
+                                per_constant_details.push(detail);
+                                break;
+                            }
+                        }
+                        if per_constant_details.len() >= 10 {
+                            break;
+                        }
+                    }
+                }
+                if !per_constant_details.is_empty() {
+                    message.push_str("\n\nPer-constant changes:\n");
+                    message.push_str(&per_constant_details.join("\n"));
+                    if symbol_names.len() > 10 {
+                        message.push_str(&format!(
+                            "\n  ... and {} more",
+                            symbol_names.len() - 10
+                        ));
+                    }
+                }
+
                 // Build fix strategy.  For renamed constants we need per-token
                 // Rename mappings, not a generic strategy_hint (which is often
                 // CssVariablePrefix — wrong for import-level renames).
@@ -3784,6 +3838,53 @@ fn api_change_to_rules(
                     }
                 }
             }
+        }
+    }
+
+    // ── Enrich interface signature-changed rules with member-level renames ──
+    //
+    // When an interface's base class changes (e.g., ErrorStateProps extends
+    // Omit<EmptyStateProps, 'children'> → Omit<..., 'children' | 'titleText'>),
+    // the LLM needs to know which concrete props were renamed. Scan sibling
+    // ApiChange entries in the same file for member-level renames like
+    // ErrorStateProps.errorTitle → titleText.
+    if change.kind == ApiChangeKind::Interface
+        && matches!(
+            change.change,
+            ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
+        )
+    {
+        let interface_prefix = format!("{}.", change.symbol);
+        let mut member_renames_found: Vec<(String, String)> = Vec::new();
+        for sibling in &file_changes.breaking_api_changes {
+            if !sibling.symbol.starts_with(&interface_prefix) {
+                continue;
+            }
+            let prop_name = &sibling.symbol[interface_prefix.len()..];
+            if let Some(RemovalDisposition::ReplacedByMember { ref new_member }) =
+                sibling.removal_disposition
+            {
+                member_renames_found.push((prop_name.to_string(), new_member.clone()));
+            } else if sibling.change == ApiChangeType::Renamed {
+                if let Some(ref after) = sibling.after {
+                    // Extract just the prop name from after (might be "property: newName: type")
+                    let new_name = after
+                        .strip_prefix("property: ")
+                        .and_then(|s| s.split(':').next())
+                        .unwrap_or(after)
+                        .trim();
+                    member_renames_found.push((prop_name.to_string(), new_name.to_string()));
+                }
+            }
+        }
+        if !member_renames_found.is_empty() {
+            message.push_str("\n\nProp renames in this interface:");
+            for (old_name, new_name) in &member_renames_found {
+                message.push_str(&format!("\n  - {} → {}", old_name, new_name));
+            }
+            message.push_str(
+                "\n\nUpdate your code to use the new prop names listed above.",
+            );
         }
     }
 

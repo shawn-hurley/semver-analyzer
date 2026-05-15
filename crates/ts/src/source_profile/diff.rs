@@ -1035,57 +1035,87 @@ fn diff_children_slot(
 ) {
     if old.children_slot_path != new.children_slot_path
         && !old.children_slot_path.is_empty()
-        && !new.children_slot_path.is_empty()
     {
-        // Check if the new path introduces an HTML element wrapper around
-        // {children} that wasn't there before. When this happens, tests using
-        // getByText() will match the wrapper element (e.g., <span>) instead
-        // of the component's root element (e.g., <button>), breaking
-        // assertions like toBeInstanceOf(HTMLButtonElement) and toHaveFocus().
-        let new_html_wrapper = new
-            .children_slot_path
-            .iter()
-            .find(|tag| is_html_element(tag));
-        let old_has_html_wrapper = old
-            .children_slot_path
-            .iter()
-            .any(|tag| is_html_element(tag));
-        let wrapper_introduced = new_html_wrapper.is_some() && !old_has_html_wrapper;
-
-        let (category, has_test_implications) = if wrapper_introduced {
-            (SourceLevelCategory::DomStructure, true)
-        } else {
-            (SourceLevelCategory::Composition, false)
-        };
-
-        let wrapper_tag = new_html_wrapper.cloned();
-
-        changes.push(SourceLevelChange {
-            component: component.to_string(),
-            category,
-            description: format!(
-                "Internal wrapper structure around children in {component} changed from {} to {}",
-                old.children_slot_path.join(" > "),
-                new.children_slot_path.join(" > "),
-            ),
-            old_value: Some(old.children_slot_path.join(" > ")),
-            new_value: Some(new.children_slot_path.join(" > ")),
-            has_test_implications,
-            test_description: if wrapper_introduced {
-                Some(format!(
-                    "Children of {} are now wrapped in <{}>. Tests using getByText() \
-                     will match the wrapper element, not the component root. \
-                     Use getByRole() or .closest() instead.",
+        if new.children_slot_path.is_empty() {
+            // Wrapper completely removed — children are now rendered directly
+            // without intermediate wrapper elements. This is a structural DOM
+            // change that can break CSS selectors and test queries that depend
+            // on the wrapper. E.g., PageSection in PF6 no longer wraps children
+            // in a <div> body element by default.
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::DomStructure,
+                description: format!(
+                    "{} no longer wraps children in wrapper element(s) (was: {}). \
+                     Children are now rendered directly. DOM structure changed.",
                     component,
-                    wrapper_tag.as_deref().unwrap_or("element"),
-                ))
+                    old.children_slot_path.join(" > "),
+                ),
+                old_value: Some(old.children_slot_path.join(" > ")),
+                new_value: None,
+                has_test_implications: true,
+                test_description: Some(format!(
+                    "Children of {} are no longer wrapped in <{}>. Tests querying \
+                     the wrapper element will fail. CSS selectors targeting the \
+                     wrapper structure may need updating.",
+                    component,
+                    old.children_slot_path.last().unwrap_or(&"element".to_string()),
+                )),
+                element: old.children_slot_path.last().cloned(),
+                migration_from: None,
+                dependency_chain: None,
+            });
+        } else {
+            // Check if the new path introduces an HTML element wrapper around
+            // {children} that wasn't there before. When this happens, tests using
+            // getByText() will match the wrapper element (e.g., <span>) instead
+            // of the component's root element (e.g., <button>), breaking
+            // assertions like toBeInstanceOf(HTMLButtonElement) and toHaveFocus().
+            let new_html_wrapper = new
+                .children_slot_path
+                .iter()
+                .find(|tag| is_html_element(tag));
+            let old_has_html_wrapper = old
+                .children_slot_path
+                .iter()
+                .any(|tag| is_html_element(tag));
+            let wrapper_introduced = new_html_wrapper.is_some() && !old_has_html_wrapper;
+
+            let (category, has_test_implications) = if wrapper_introduced {
+                (SourceLevelCategory::DomStructure, true)
             } else {
-                None
-            },
-            element: wrapper_tag,
-            migration_from: None,
-            dependency_chain: None,
-        });
+                (SourceLevelCategory::Composition, false)
+            };
+
+            let wrapper_tag = new_html_wrapper.cloned();
+
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category,
+                description: format!(
+                    "Internal wrapper structure around children in {component} changed from {} to {}",
+                    old.children_slot_path.join(" > "),
+                    new.children_slot_path.join(" > "),
+                ),
+                old_value: Some(old.children_slot_path.join(" > ")),
+                new_value: Some(new.children_slot_path.join(" > ")),
+                has_test_implications,
+                test_description: if wrapper_introduced {
+                    Some(format!(
+                        "Children of {} are now wrapped in <{}>. Tests using getByText() \
+                         will match the wrapper element, not the component root. \
+                         Use getByRole() or .closest() instead.",
+                        component,
+                        wrapper_tag.as_deref().unwrap_or("element"),
+                    ))
+                } else {
+                    None
+                },
+                element: wrapper_tag,
+                migration_from: None,
+                dependency_chain: None,
+            });
+        }
     }
 
     if old.has_children_prop && !new.has_children_prop {
@@ -1868,5 +1898,82 @@ mod tests {
             .collect();
 
         assert_eq!(dep.len(), 0, "Should not emit for props not in old version");
+    }
+
+    /// Fix 11: diff_children_slot should detect wrapper removal (old path
+    /// non-empty, new path empty). Previously this case was silently skipped
+    /// because the guard required both paths to be non-empty.
+    #[test]
+    fn test_diff_children_slot_wrapper_removed() {
+        let old = ComponentSourceProfile {
+            children_slot_path: vec!["div".into()],
+            has_children_prop: true,
+            ..Default::default()
+        };
+        let new = ComponentSourceProfile {
+            children_slot_path: vec![],
+            has_children_prop: true,
+            ..Default::default()
+        };
+
+        let mut changes = Vec::new();
+        diff_children_slot(&old, &new, "PageSection", &mut changes);
+
+        assert!(
+            !changes.is_empty(),
+            "Fix 11: Should detect wrapper removal (old=[div], new=[])"
+        );
+
+        let change = &changes[0];
+        assert_eq!(
+            change.category,
+            SourceLevelCategory::DomStructure,
+            "Wrapper removal should be DomStructure category"
+        );
+        assert!(
+            change.description.contains("no longer wraps children"),
+            "Description should mention wrapper removal. Got: {}",
+            change.description
+        );
+        assert!(
+            change.has_test_implications,
+            "Wrapper removal should have test implications"
+        );
+        assert_eq!(
+            change.old_value.as_deref(),
+            Some("div"),
+            "old_value should be the removed wrapper path"
+        );
+        assert!(
+            change.new_value.is_none(),
+            "new_value should be None for wrapper removal"
+        );
+    }
+
+    /// Existing behavior preserved: wrapper CHANGE (both non-empty) still works.
+    #[test]
+    fn test_diff_children_slot_wrapper_changed() {
+        let old = ComponentSourceProfile {
+            children_slot_path: vec!["div".into()],
+            has_children_prop: true,
+            ..Default::default()
+        };
+        let new = ComponentSourceProfile {
+            children_slot_path: vec!["span".into()],
+            has_children_prop: true,
+            ..Default::default()
+        };
+
+        let mut changes = Vec::new();
+        diff_children_slot(&old, &new, "TestComponent", &mut changes);
+
+        assert!(
+            !changes.is_empty(),
+            "Should detect wrapper change (div → span)"
+        );
+        assert!(
+            changes[0].description.contains("changed from div to span"),
+            "Description should mention the wrapper change"
+        );
     }
 }

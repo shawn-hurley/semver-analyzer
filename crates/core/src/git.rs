@@ -458,11 +458,14 @@ pub fn detect_git_component_renames(
             let old_path = parts[1];
             let new_path = parts[2];
 
-            // Only consider source files (component files start with uppercase)
+            // Only consider component files (start with uppercase).
+            // Accept both source (.tsx/.ts) and declaration (.d.ts) files so
+            // that renames in packages like react-component-groups (which
+            // publish .d.ts API surfaces) are detected.
             let old_filename = old_path.rsplit('/').next().unwrap_or("");
             let new_filename = new_path.rsplit('/').next().unwrap_or("");
-            if !is_component_source_file(old_filename)
-                || !is_component_source_file(new_filename)
+            if !is_component_file(old_filename)
+                || !is_component_file(new_filename)
             {
                 continue;
             }
@@ -526,15 +529,29 @@ pub fn detect_git_component_renames(
 
 /// Check if a filename looks like a component source file.
 /// Must end with .tsx/.ts and start with an uppercase letter.
+#[allow(dead_code)]
 fn is_component_source_file(filename: &str) -> bool {
+    is_component_file_impl(filename, false)
+}
+
+/// Check if a filename looks like a component file (source or declaration).
+/// Like `is_component_source_file` but also accepts `.d.ts` files, which is
+/// needed for git rename detection in packages like `react-component-groups`
+/// where the API surface is defined via `.d.ts` files.
+fn is_component_file(filename: &str) -> bool {
+    is_component_file_impl(filename, true)
+}
+
+fn is_component_file_impl(filename: &str, allow_dts: bool) -> bool {
     (filename.ends_with(".tsx") || filename.ends_with(".ts"))
         && !filename.ends_with(".test.tsx")
         && !filename.ends_with(".test.ts")
         && !filename.ends_with(".spec.tsx")
         && !filename.ends_with(".spec.ts")
-        && !filename.ends_with(".d.ts")
+        && (allow_dts || !filename.ends_with(".d.ts"))
         && filename != "index.ts"
         && filename != "index.tsx"
+        && filename != "index.d.ts"
         && filename.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
@@ -944,5 +961,41 @@ mod tests {
             extract_family_from_components_path("packages/react-core/src/helpers/util.ts"),
             None
         );
+    }
+
+    /// Fix 5: is_component_file should accept .d.ts files for git rename
+    /// detection. This enables detecting renames like InvalidObject.d.ts →
+    /// MissingPage.d.ts in packages that publish .d.ts API surfaces.
+    #[test]
+    fn test_is_component_file_accepts_dts() {
+        // .d.ts files should be accepted by is_component_file
+        assert!(
+            is_component_file("InvalidObject.d.ts"),
+            "Fix 5: .d.ts files should be accepted for rename detection"
+        );
+        assert!(
+            is_component_file("MissingPage.d.ts"),
+            "Fix 5: .d.ts files should be accepted for rename detection"
+        );
+
+        // But NOT by is_component_source_file (original behavior preserved)
+        assert!(
+            !is_component_source_file("InvalidObject.d.ts"),
+            ".d.ts files should still be excluded from source-file checks"
+        );
+
+        // Regular .tsx/.ts still accepted by both
+        assert!(is_component_file("Button.tsx"));
+        assert!(is_component_source_file("Button.tsx"));
+
+        // index.d.ts excluded
+        assert!(!is_component_file("index.d.ts"));
+
+        // Lowercase excluded
+        assert!(!is_component_file("utils.d.ts"));
+
+        // Test files excluded
+        assert!(!is_component_file("Button.test.tsx"));
+        assert!(!is_component_file("Button.spec.ts"));
     }
 }
