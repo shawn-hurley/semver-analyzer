@@ -4577,8 +4577,77 @@ fn generate_prop_value_conformance_rules(
 
             let pkg = pkg_for(&component, component_packages);
 
+            // Compute value mapping hints using the same algorithm as Phase 2.
+            // Since the prop was renamed (all old values removed from the new
+            // type), this is always a "complete replacement" scenario: greedy
+            // N:M assignment with no threshold, so every removed value gets
+            // a best-match among the new values.
+            let added_values: Vec<&String> =
+                new_values.difference(&old_values).collect();
+            let surviving: HashSet<&String> =
+                old_values.intersection(&new_values).collect();
+
+            let replacement_hints: HashMap<String, String> = {
+                let mut hints = HashMap::new();
+
+                if added_values.len() == 1 && removed.len() == 1 {
+                    // 1:1: only one removed, only one added → auto-map
+                    hints.insert(removed[0].clone(), added_values[0].clone());
+                } else if surviving.is_empty() && !added_values.is_empty() {
+                    // Complete replacement: greedy best-match, no threshold.
+                    let mut candidates: Vec<(&String, &String, f64)> = Vec::new();
+                    for rem in &removed {
+                        for add in &added_values {
+                            let sim = semver_analyzer_core::diff::name_similarity(rem, add)
+                                + directional_similarity_boost(rem, add);
+                            candidates.push((rem, add, sim));
+                        }
+                    }
+                    candidates.sort_by(|a, b| {
+                        b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut used_added_vals: HashSet<&str> = HashSet::new();
+                    let mut used_removed_vals: HashSet<&str> = HashSet::new();
+                    for (rem, add, _sim) in &candidates {
+                        if used_removed_vals.contains(rem.as_str())
+                            || used_added_vals.contains(add.as_str())
+                        {
+                            continue;
+                        }
+                        hints.insert(rem.to_string(), add.to_string());
+                        used_removed_vals.insert(rem);
+                        used_added_vals.insert(add);
+                    }
+                } else {
+                    // Partial replacement: each removed value independently
+                    // picks its best match among added values (threshold 0.3).
+                    for rem in &removed {
+                        let best_added = added_values
+                            .iter()
+                            .filter(|a| {
+                                semver_analyzer_core::diff::name_similarity(rem, a)
+                                    + directional_similarity_boost(rem, a)
+                                    >= 0.3
+                            })
+                            .max_by(|a, b| {
+                                let sa = semver_analyzer_core::diff::name_similarity(rem, a)
+                                    + directional_similarity_boost(rem, a);
+                                let sb = semver_analyzer_core::diff::name_similarity(rem, b)
+                                    + directional_similarity_boost(rem, b);
+                                sa.partial_cmp(&sb)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        if let Some(add) = best_added {
+                            hints.insert(rem.to_string(), add.to_string());
+                        }
+                    }
+                }
+
+                hints
+            };
+
             for value in &removed {
-                let replacement_hint: Option<String> = None;
+                let replacement_hint = replacement_hints.get(*value).cloned();
 
                 // Generate rules for BOTH old and new prop names, since the
                 // rename fix may or may not have been applied yet.
@@ -4623,11 +4692,17 @@ fn generate_prop_value_conformance_rules(
                         )
                     };
 
+                    let change_type_label = if replacement_hint.is_some() {
+                        "change-type=prop-value-removed"
+                    } else {
+                        "change-type=type-changed"
+                    };
+
                     rules.push(KonveyorRule {
                         rule_id,
                         labels: vec![
                             "source=semver-analyzer".into(),
-                            "change-type=type-changed".into(),
+                            change_type_label.into(),
                             format!("package={}", pkg),
                         ],
                         effort: 1,
@@ -14594,6 +14669,137 @@ mod tests {
         assert!(
             rules.is_empty(),
             "Components with no removed props should generate no rules"
+        );
+    }
+
+    // ── Phase 3 value mapping tests ──────────────────────────────────
+
+    /// TC085: Phase 3 renamed props should compute value replacement hints.
+    /// ToolbarItem.spacer → gap: spacerLg→gapLg, spacerMd→gapMd, etc.
+    #[test]
+    fn test_phase3_renamed_prop_value_mapping() {
+        use semver_analyzer_core::*;
+
+        let report = build_test_report(vec![FileChanges {
+            file: std::path::PathBuf::from("src/ToolbarItem.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ToolbarItemProps.spacer".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("spacer".into()),
+                after: Some("gap".into()),
+                description: "property spacer was renamed to gap".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }]);
+
+        let mut sd = SdPipelineResult::default();
+        sd.component_packages
+            .insert("ToolbarItem".into(), "@patternfly/react-core".into());
+        // Old prop type: spacerNone | spacerSm | spacerMd | spacerLg
+        sd.old_component_prop_types.insert(
+            "ToolbarItem".into(),
+            [(
+                "spacer".into(),
+                "'spacerNone' | 'spacerSm' | 'spacerMd' | 'spacerLg'".into(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        // New prop type: gapNone | gapSm | gapMd | gapLg | gapXl
+        sd.new_component_prop_types.insert(
+            "ToolbarItem".into(),
+            [(
+                "gap".into(),
+                "'gapNone' | 'gapSm' | 'gapMd' | 'gapLg' | 'gapXl'".into(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let pkgs = sd.component_packages.clone();
+
+        let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
+
+        // Should have rules for spacerNone, spacerSm, spacerMd, spacerLg
+        // on BOTH old prop name (spacer) and new prop name (gap) = 8 rules total
+        let spacer_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("toolbaritem"))
+            .collect();
+        assert!(
+            spacer_rules.len() >= 8,
+            "TC085: Should have at least 8 rules (4 values x 2 prop names). Got {}",
+            spacer_rules.len()
+        );
+
+        // Check that spacerLg on the gap prop has replacement=gapLg
+        let spacer_lg_gap = spacer_rules
+            .iter()
+            .find(|r| r.rule_id.contains("-gap-spacerlg"))
+            .expect("TC085: Should have a rule for gap prop with spacerLg value");
+        let replacement = spacer_lg_gap
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("gapLg"),
+            "TC085: spacerLg should map to gapLg. Got: {:?}",
+            replacement
+        );
+
+        // Check spacerMd → gapMd
+        let spacer_md_gap = spacer_rules
+            .iter()
+            .find(|r| r.rule_id.contains("-gap-spacermd"))
+            .expect("TC085: Should have a rule for gap prop with spacerMd value");
+        let replacement = spacer_md_gap
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("gapMd"),
+            "TC085: spacerMd should map to gapMd. Got: {:?}",
+            replacement
+        );
+
+        // Check spacerNone → gapNone
+        let spacer_none = spacer_rules
+            .iter()
+            .find(|r| r.rule_id.contains("-gap-spacernone"))
+            .expect("TC085: Should have a rule for gap prop with spacerNone value");
+        let replacement = spacer_none
+            .fix_strategy
+            .as_ref()
+            .and_then(|s| s.replacement.as_ref());
+        assert_eq!(
+            replacement.map(|s| s.as_str()),
+            Some("gapNone"),
+            "TC085: spacerNone should map to gapNone. Got: {:?}",
+            replacement
+        );
+
+        // Rules WITH replacement should have prop-value-removed label
+        assert!(
+            spacer_lg_gap
+                .labels
+                .iter()
+                .any(|l| l == "change-type=prop-value-removed"),
+            "TC085: Rule with replacement should have prop-value-removed label"
+        );
+
+        // Verify message includes the replacement
+        assert!(
+            spacer_lg_gap.message.contains("gapLg"),
+            "TC085: Message should mention gapLg replacement. Got: {}",
+            spacer_lg_gap.message
         );
     }
 }
