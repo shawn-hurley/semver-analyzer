@@ -4129,32 +4129,45 @@ fn generate_prop_value_conformance_rules(
                         replacement = replacement,
                     )
                 } else {
-                    // No direct replacement found. The value was removed without
-                    // a clear successor. Guide the LLM to consider removing the
-                    // prop entirely OR choosing from valid values.
+                    // No direct replacement found. The value was removed from
+                    // the union type without a clear successor. Present the
+                    // valid values neutrally and let the LLM choose based on
+                    // semantic understanding. Do NOT bias toward prop removal —
+                    // that caused TC051 where the LLM removed variant='tertiary'
+                    // entirely instead of replacing with 'horizontal-subnav'.
                     format!(
                         "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
-                         No direct replacement was found. Consider removing the `{}` prop \
-                         entirely, or choose from the valid values: {}\n\n\
-                         If the prop is not essential, removing it is preferred over \
-                         guessing a replacement.",
+                         Choose the appropriate replacement from the valid values: {}\n\n\
+                         Review the component documentation to determine which value \
+                         best matches the behavior of \"{}\".",
                         value,
                         prop,
                         component,
-                        prop,
                         new_values
                             .iter()
                             .map(|v| format!("\"{}\"", v))
                             .collect::<Vec<_>>()
                             .join(", "),
+                        value,
                     )
+                };
+
+                // Use type-changed for rules without a direct replacement:
+                // the prop still exists, its allowed values changed. This
+                // prevents the fix-engine from treating it as a removal.
+                // Rules WITH a replacement keep prop-value-removed since
+                // the specific value was deterministically mapped.
+                let change_type_label = if replacement_hint.is_some() {
+                    "change-type=prop-value-removed"
+                } else {
+                    "change-type=type-changed"
                 };
 
                 rules.push(KonveyorRule {
                     rule_id,
                     labels: vec![
                         "source=semver-analyzer".into(),
-                        "change-type=prop-value-removed".into(),
+                        change_type_label.into(),
                         format!("package={}", pkg),
                     ],
                     effort: 1,
@@ -4446,17 +4459,18 @@ fn generate_prop_value_conformance_rules(
                 } else {
                     format!(
                         "The value \"{}\" is no longer valid for the `{}` prop on <{}>.\n\
-                         No direct replacement was found. Consider removing the `{}` prop \
-                         entirely, or choose from the valid values: {}",
+                         Choose the appropriate replacement from the valid values: {}\n\n\
+                         Review the component documentation to determine which value \
+                         best matches the behavior of \"{}\".",
                         old_val,
                         new_member,
                         component,
-                        new_member,
                         new_values
                             .iter()
                             .map(|v| format!("\"{}\"", v))
                             .collect::<Vec<_>>()
                             .join(", "),
+                        old_val,
                     )
                 };
 
@@ -4464,7 +4478,7 @@ fn generate_prop_value_conformance_rules(
                     rule_id: new_prop_rule_id,
                     labels: vec![
                         "source=semver-analyzer".into(),
-                        "change-type=prop-value-removed".into(),
+                        "change-type=type-changed".into(),
                         format!("package={}", pkg),
                     ],
                     effort: 1,
@@ -4613,7 +4627,7 @@ fn generate_prop_value_conformance_rules(
                         rule_id,
                         labels: vec![
                             "source=semver-analyzer".into(),
-                            "change-type=prop-value-removed".into(),
+                            "change-type=type-changed".into(),
                             format!("package={}", pkg),
                         ],
                         effort: 1,
