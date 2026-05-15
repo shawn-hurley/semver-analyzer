@@ -2121,6 +2121,74 @@ fn generate_deprecated_migration_rules(
         }
     }
 
+    // ── Second pass: /next profiles that lost name collisions ──────────
+    //
+    // When a component exists in both main and /next paths in the old
+    // version (e.g., DualListSelector in v5), old_component_packages
+    // only records the main version. The /next version is preserved in
+    // old_next_component_packages. Check if any of these /next components
+    // were promoted to main in the new version.
+    for (component, next_pkg) in &sd.old_next_component_packages {
+        let new_pkg = sd.component_packages.get(component);
+        let new_pkg_val = new_pkg.cloned().unwrap_or_default();
+        let new_is_main = !new_pkg_val.is_empty()
+            && !new_pkg_val.contains("/deprecated")
+            && !new_pkg_val.contains("/next");
+
+        if new_is_main {
+            let rule_id = format!("sd-next-promoted-{}", sanitize(component));
+            // Skip if we already generated a rule for this component
+            // (from the main loop above)
+            if rules.iter().any(|r| r.rule_id == rule_id) {
+                continue;
+            }
+            let message = format!(
+                "`{component}` was promoted from preview (`{next_pkg}`) to main exports.\n\
+                 Change import from `{next_pkg}` to `{new_pkg_val}`.\n",
+            );
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=import-path-change".into(),
+                    format!("package={}", next_pkg),
+                    format!("target-package={}", new_pkg_val),
+                ],
+                effort: 1,
+                category: "mandatory".into(),
+                description: format!(
+                    "{} promoted from /next to main — update import path",
+                    component
+                ),
+                message,
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", component),
+                        location: "IMPORT".into(),
+                        component: None,
+                        parent: None,
+                        parent_from: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        value: None,
+                        from: Some(next_pkg.clone()),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "ImportPathChange".into(),
+                    from: Some(next_pkg.clone()),
+                    to: Some(new_pkg_val.clone()),
+                    ..Default::default()
+                }),
+            });
+        }
+    }
+
     rules
 }
 
@@ -13213,5 +13281,71 @@ mod tests {
             promotion_rules.is_empty(),
             "main → main should NOT generate a promotion rule"
         );
+    }
+
+    /// TC024: When a component exists in BOTH main and /next in v5
+    /// (profile key collision), the /next version is preserved in
+    /// old_next_component_packages and generates a promotion rule.
+    ///
+    /// Real-world case: DualListSelector in PF v5 has:
+    ///   - src/components/DualListSelector/ (main, old monolithic API)
+    ///   - src/next/components/DualListSelector/ (preview, new composable API)
+    /// In PF v6, the /next version was promoted to main.
+    /// old_component_packages has @patternfly/react-core (main wins collision),
+    /// old_next_component_packages has @patternfly/react-core/next.
+    #[test]
+    fn test_next_promotion_from_collision_uses_old_next_packages() {
+        let mut sd = SdPipelineResult::default();
+        // Main version wins in old_component_packages
+        sd.old_component_packages.insert(
+            "DualListSelector".into(),
+            "@patternfly/react-core".into(),
+        );
+        // /next version preserved in old_next_component_packages
+        sd.old_next_component_packages.insert(
+            "DualListSelector".into(),
+            "@patternfly/react-core/next".into(),
+        );
+        // In v6, component is at main (promoted from /next)
+        sd.component_packages.insert(
+            "DualListSelector".into(),
+            "@patternfly/react-core".into(),
+        );
+
+        let component_packages = sd.component_packages.clone();
+        let rules = generate_deprecated_migration_rules(&sd, &component_packages);
+
+        let promotion_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("next-promoted") && r.rule_id.contains("duallistselector"))
+            .expect("TC024: Should generate a /next promotion rule from old_next_component_packages");
+
+        // Verify fix strategy targets /next → main
+        let strategy = promotion_rule
+            .fix_strategy
+            .as_ref()
+            .expect("Should have a fix strategy");
+        assert_eq!(strategy.strategy, "ImportPathChange");
+        assert_eq!(
+            strategy.from.as_deref(),
+            Some("@patternfly/react-core/next"),
+            "from should be the /next package"
+        );
+        assert_eq!(
+            strategy.to.as_deref(),
+            Some("@patternfly/react-core"),
+            "to should be the main package"
+        );
+
+        // Verify the rule targets imports from /next
+        if let KonveyorCondition::FrontendReferenced { ref referenced } = promotion_rule.when {
+            assert_eq!(
+                referenced.from.as_deref(),
+                Some("@patternfly/react-core/next"),
+                "Rule should target imports from /next"
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
     }
 }

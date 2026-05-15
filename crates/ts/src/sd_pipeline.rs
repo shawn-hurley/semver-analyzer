@@ -68,6 +68,13 @@ pub fn run_sd(
     // These are used in Phase A.5 to diff against their non-deprecated replacements.
     let mut deprecated_removed_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
 
+    // Secondary map for /next profiles that lost name collisions in old_profiles.
+    // When a component name exists in both main and /next paths (e.g.,
+    // DualListSelector in v5), the main version wins in old_profiles.
+    // The /next version is preserved here so the rule generator can detect
+    // /next → main promotions and generate ImportPathChange rules.
+    let mut old_next_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+
     // Extract profiles at both refs for changed files, diff them
     for file_info in &changed_files {
         let old_source = read_git_file(repo, from_ref, &file_info.path);
@@ -86,14 +93,27 @@ pub fn run_sd(
                     .or_insert_with(|| profile.clone());
             }
 
-            // When a component exists in both main and deprecated paths,
-            // prefer the main (non-deprecated) version.
+            // When a component exists in both main and deprecated/next paths,
+            // prefer the main (non-deprecated, non-next) version. Preserve
+            // evicted /next profiles in old_next_profiles for rule generation.
             let is_deprecated = file_info.path.contains("/deprecated/");
+            let is_next = file_info.path.contains("/next/");
             if let Some(existing) = old_profiles.get(&file_info.component_name) {
                 let existing_is_deprecated = existing.file.contains("/deprecated/");
-                if existing_is_deprecated && !is_deprecated {
-                    old_profiles.insert(file_info.component_name.clone(), profile);
+                let existing_is_next = existing.file.contains("/next/");
+                if (existing_is_deprecated || existing_is_next) && !is_deprecated && !is_next {
+                    // Main path wins — evict the existing deprecated/next profile
+                    let evicted = old_profiles.insert(file_info.component_name.clone(), profile);
+                    if let Some(evicted_prof) = evicted {
+                        if existing_is_next {
+                            old_next_profiles.insert(file_info.component_name.clone(), evicted_prof);
+                        }
+                    }
+                } else if is_next && !existing_is_next {
+                    // Non-next already in map; stash the /next version
+                    old_next_profiles.insert(file_info.component_name.clone(), profile);
                 }
+                // else: keep existing (non-deprecated, non-next wins)
             } else {
                 old_profiles.insert(file_info.component_name.clone(), profile);
             }
@@ -152,6 +172,9 @@ pub fn run_sd(
     // The deprecated version is preserved here so deprecated families
     // can use the correct profile for composition tree building.
     let mut deprecated_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+    // Secondary map for /next profiles that lost name collisions.
+    // Same pattern as deprecated_profiles but for /next preview components.
+    let mut next_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
     for file_info in &all_to_files {
         if let Some(source) = read_git_file(repo, to_ref, &file_info.path) {
             let profile = source_profile::extract_profile(
@@ -160,20 +183,29 @@ pub fn run_sd(
                 &source,
             );
             let is_deprecated = file_info.path.contains("/deprecated/");
+            let is_next = file_info.path.contains("/next/");
             if let Some(existing) = new_profiles.get(&file_info.component_name) {
                 let existing_is_deprecated = existing.file.contains("/deprecated/");
-                // Main path wins over deprecated path
-                if existing_is_deprecated && !is_deprecated {
-                    // Preserve the deprecated profile before overwriting
+                let existing_is_next = existing.file.contains("/next/");
+                // Main path wins over deprecated and /next paths
+                if (existing_is_deprecated || existing_is_next) && !is_deprecated && !is_next {
+                    // Preserve the evicted profile before overwriting
                     let evicted = new_profiles.insert(file_info.component_name.clone(), profile);
-                    if let Some(dep_prof) = evicted {
-                        deprecated_profiles.insert(file_info.component_name.clone(), dep_prof);
+                    if let Some(evicted_prof) = evicted {
+                        if existing_is_deprecated {
+                            deprecated_profiles.insert(file_info.component_name.clone(), evicted_prof);
+                        } else if existing_is_next {
+                            next_profiles.insert(file_info.component_name.clone(), evicted_prof);
+                        }
                     }
                 } else if is_deprecated {
                     // Non-deprecated already in map; stash the deprecated version
                     deprecated_profiles.insert(file_info.component_name.clone(), profile);
+                } else if is_next {
+                    // Non-next already in map; stash the /next version
+                    next_profiles.insert(file_info.component_name.clone(), profile);
                 }
-                // else: keep the existing (non-deprecated or first-seen)
+                // else: keep the existing (non-deprecated, non-next or first-seen)
             } else {
                 new_profiles.insert(file_info.component_name.clone(), profile);
             }
@@ -441,6 +473,7 @@ pub fn run_sd(
         let all_family_profiles = collect_family_profiles(
             &new_profiles,
             &deprecated_profiles,
+            &next_profiles,
             &all_member_names,
             family_name,
         );
@@ -768,6 +801,17 @@ pub fn run_sd(
         })
         .collect();
 
+    // Build /next component packages from old_next_profiles.
+    // These are components that existed at /next in the old version but
+    // lost the name collision to the main-path version in old_profiles.
+    // Used for detecting /next → main promotions.
+    let old_next_component_packages: HashMap<String, String> = old_next_profiles
+        .iter()
+        .filter_map(|(name, profile)| {
+            resolve_component_package(&profile.file).map(|pkg| (name.clone(), pkg))
+        })
+        .collect();
+
     let component_packages: HashMap<String, String> = new_profiles
         .iter()
         .filter_map(|(name, profile)| {
@@ -783,6 +827,7 @@ pub fn run_sd(
         conformance_checks,
         component_packages,
         old_component_packages,
+        old_next_component_packages,
         old_component_props,
         new_component_props,
         old_component_prop_types,
@@ -987,10 +1032,12 @@ fn group_by_family(files: &[ComponentFile]) -> BTreeMap<String, Vec<&ComponentFi
 fn collect_family_profiles(
     all_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
     deprecated_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
+    next_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
     family_exports: &[String],
     family_name: &str,
 ) -> HashMap<String, crate::sd_types::ComponentSourceProfile> {
     let is_deprecated_family = family_name.starts_with("deprecated/");
+    let is_next_family = family_name.starts_with("next/");
     family_exports
         .iter()
         .filter_map(|name| {
@@ -999,6 +1046,13 @@ fn collect_family_profiles(
             if is_deprecated_family {
                 if let Some(dep_prof) = deprecated_profiles.get(name) {
                     return Some((name.clone(), dep_prof.clone()));
+                }
+            }
+            // For /next families, prefer the /next version of a profile
+            // when it exists (handles name collisions like DualListSelector).
+            if is_next_family {
+                if let Some(next_prof) = next_profiles.get(name) {
+                    return Some((name.clone(), next_prof.clone()));
                 }
             }
             all_profiles.get(name).map(|p| (name.clone(), p.clone()))

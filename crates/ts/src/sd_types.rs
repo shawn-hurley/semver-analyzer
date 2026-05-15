@@ -883,6 +883,15 @@ pub struct SdPipelineResult {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub old_component_packages: HashMap<String, String>,
 
+    /// Component name → npm package name for components that were in /next
+    /// subpath in the OLD version. Separate from old_component_packages
+    /// because the same component name can exist in both main and /next
+    /// paths (e.g., DualListSelector in v5 has a main version AND a
+    /// /next preview version). old_component_packages keeps the main
+    /// version; this map keeps the /next version for promotion detection.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub old_next_component_packages: HashMap<String, String>,
+
     /// Component name → all prop names, for both old and new versions.
     /// Used for child→prop migration detection (comparing which props
     /// existed in old vs new). Serialized so `--from-report` works.
