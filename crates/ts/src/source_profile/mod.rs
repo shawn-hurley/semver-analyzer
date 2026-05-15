@@ -28,7 +28,7 @@ use managed_attrs::extract_managed_attributes;
 use prop_defaults::extract_prop_defaults;
 use prop_style::extract_prop_style_bindings;
 use react_api::detect_react_api_usage;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
@@ -213,6 +213,14 @@ struct FullSourceInfo {
     // ── cloneElement ────────────────────────────────────────────────
     /// Props injected via cloneElement, detected during AST walk.
     clone_element_injections: Vec<crate::sd_types::CloneElementInjection>,
+
+    // ── Same-file type aliases / enums ──────────────────────────────
+    /// Maps type alias or enum names to their resolved string literal union.
+    /// e.g., `"BannerColor"` → `"'red' | 'orangered' | 'orange' | ..."`.
+    /// Only populated for declarations whose body is a union of string
+    /// literals (type aliases) or whose members all have string
+    /// initializers (enums).
+    string_type_aliases: HashMap<String, String>,
 }
 
 /// Extract all AST-level info from a full source file in a single parse.
@@ -230,6 +238,14 @@ fn extract_source_info(source: &str, component_name: &str) -> FullSourceInfo {
     for stmt in &parsed.program.body {
         // Extract imports, interfaces, and JSX from top-level statements
         extract_from_module_stmt(stmt, source, component_name, &mut info, comments);
+    }
+
+    // Resolve named type references in prop_types using same-file aliases.
+    // e.g., if prop type is "BannerColor" and we collected
+    //   BannerColor → "'red' | 'orangered' | ..."
+    // replace the prop type with the resolved union string.
+    if !info.string_type_aliases.is_empty() {
+        resolve_prop_type_aliases(&mut info);
     }
 
     info
@@ -288,6 +304,14 @@ fn extract_from_module_stmt<'a>(
             extract_extends_from_interface(iface, component_name, source, info, comments);
         }
 
+        // ── Bare type aliases / enums ────────────────────────────────
+        Statement::TSTypeAliasDeclaration(alias) => {
+            collect_string_type_alias(alias, source, info);
+        }
+        Statement::TSEnumDeclaration(enum_decl) => {
+            collect_string_enum(enum_decl, info);
+        }
+
         // Walk all other statements for JSX
         _ => walk_stmt_for_jsx(stmt, source, info, false),
     }
@@ -304,6 +328,12 @@ fn extract_from_decl<'a>(
     match decl {
         Declaration::TSInterfaceDeclaration(iface) => {
             extract_extends_from_interface(iface, component_name, source, info, comments);
+        }
+        Declaration::TSTypeAliasDeclaration(alias) => {
+            collect_string_type_alias(alias, source, info);
+        }
+        Declaration::TSEnumDeclaration(enum_decl) => {
+            collect_string_enum(enum_decl, info);
         }
         Declaration::FunctionDeclaration(f) => {
             if let Some(body) = &f.body {
@@ -401,6 +431,150 @@ fn extract_extends_from_interface(
                 }
             }
         }
+    }
+}
+
+/// Resolve named type references in `prop_types` using same-file type aliases.
+///
+/// For each prop type string, checks if it contains a named type reference
+/// that matches a collected alias. Two cases:
+///
+/// 1. **Exact match**: `"BannerColor"` → replaced with `"'red' | 'orangered' | ..."`
+/// 2. **Union member**: `"DrawerContentColorVariant | 'default' | 'primary'"` →
+///    the named segment is replaced with its resolved values, producing
+///    `"'default' | 'primary' | 'secondary' | 'default' | 'primary'"`
+///    (downstream `parse_union_string_values` handles dedup).
+fn resolve_prop_type_aliases(info: &mut FullSourceInfo) {
+    let aliases = &info.string_type_aliases;
+    let mut resolved_types: Vec<(String, String)> = Vec::new();
+
+    for (prop_name, type_str) in &info.prop_types {
+        // Fast path: exact match (e.g., "BannerColor")
+        if let Some(resolved) = aliases.get(type_str.trim()) {
+            resolved_types.push((prop_name.clone(), resolved.clone()));
+            continue;
+        }
+
+        // Check if the type string contains a union with named references.
+        // Split on `|` and resolve each segment.
+        if type_str.contains('|') {
+            let mut any_resolved = false;
+            let mut segments: Vec<String> = Vec::new();
+
+            for segment in type_str.split('|') {
+                let trimmed = segment.trim();
+                if let Some(resolved) = aliases.get(trimmed) {
+                    segments.push(resolved.clone());
+                    any_resolved = true;
+                } else {
+                    segments.push(trimmed.to_string());
+                }
+            }
+
+            if any_resolved {
+                resolved_types.push((prop_name.clone(), segments.join(" | ")));
+            }
+        }
+    }
+
+    for (prop_name, resolved) in resolved_types {
+        info.prop_types.insert(prop_name, resolved);
+    }
+}
+
+/// Collect a type alias declaration if its body is a union of string literals.
+///
+/// Given `export type BannerColor = 'red' | 'orangered' | 'blue'`, this
+/// stores `"BannerColor" → "'red' | 'orangered' | 'blue'"` in the info's
+/// `string_type_aliases` map.  Only string literal members are extracted;
+/// non-string members (generics, type references, etc.) are skipped.
+fn collect_string_type_alias(
+    alias: &oxc_ast::ast::TSTypeAliasDeclaration,
+    _source: &str,
+    info: &mut FullSourceInfo,
+) {
+    let name = alias.id.name.as_str();
+
+    // Only resolve type aliases with no type parameters (simple aliases)
+    if alias.type_parameters.is_some() {
+        return;
+    }
+
+    let values = extract_string_literals_from_type(&alias.type_annotation);
+    if !values.is_empty() {
+        let union_str = values
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        info.string_type_aliases.insert(name.to_string(), union_str);
+    }
+}
+
+/// Collect a TS enum declaration if all members have string literal initializers.
+///
+/// Given `export enum DrawerColorVariant { default = 'default', secondary = 'secondary' }`,
+/// this stores `"DrawerColorVariant" → "'default' | 'secondary'"`.
+fn collect_string_enum(enum_decl: &oxc_ast::ast::TSEnumDeclaration, info: &mut FullSourceInfo) {
+    let name = enum_decl.id.name.as_str();
+
+    let mut values = Vec::new();
+    for member in &enum_decl.body.members {
+        match &member.initializer {
+            Some(oxc_ast::ast::Expression::StringLiteral(s)) => {
+                values.push(s.value.to_string());
+            }
+            Some(oxc_ast::ast::Expression::TemplateLiteral(t)) if t.expressions.is_empty() => {
+                // Template literal with no interpolations → treat as string
+                if let Some(q) = t.quasis.first() {
+                    values.push(q.value.raw.to_string());
+                }
+            }
+            _ => {
+                // Non-string initializer or missing → not a pure string enum
+                return;
+            }
+        }
+    }
+
+    if !values.is_empty() {
+        let union_str = values
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        info.string_type_aliases.insert(name.to_string(), union_str);
+    }
+}
+
+/// Extract string literal values from a type AST node.
+///
+/// Handles:
+/// - `TSUnionType` — recursively extracts from each member
+/// - `TSLiteralType` with `StringLiteral` — extracts the string value
+/// - `TSParenthesizedType` — unwraps parentheses
+/// - Other types — ignored (returns empty for that branch)
+fn extract_string_literals_from_type(ts_type: &oxc_ast::ast::TSType) -> Vec<String> {
+    use oxc_ast::ast::TSType;
+    match ts_type {
+        TSType::TSUnionType(union) => {
+            let mut values = Vec::new();
+            for member in &union.types {
+                values.extend(extract_string_literals_from_type(member));
+            }
+            values
+        }
+        TSType::TSLiteralType(lit) => {
+            if let oxc_ast::ast::TSLiteral::StringLiteral(s) = &lit.literal {
+                vec![s.value.to_string()]
+            } else {
+                vec![]
+            }
+        }
+        TSType::TSParenthesizedType(p) => {
+            extract_string_literals_from_type(&p.type_annotation)
+        }
+        _ => vec![],
     }
 }
 
@@ -1555,6 +1729,213 @@ mod tests {
         assert!(
             !child.unwrap().conditional,
             "Child should be unconditional (appears in both conditional and unconditional contexts)"
+        );
+    }
+
+    // ── Type alias / enum resolution tests ──────────────────────────
+
+    #[test]
+    fn test_type_alias_resolved_in_prop_types() {
+        // Simulates PF6 Banner: type alias BannerColor + color?: BannerColor
+        let source = r#"
+            export type BannerColor = 'red' | 'orangered' | 'orange' | 'yellow' | 'green' | 'teal' | 'blue' | 'purple';
+
+            export interface BannerProps {
+                color?: BannerColor;
+                children?: React.ReactNode;
+            }
+
+            export const Banner = ({ color, children }: BannerProps) => (
+                <div>{children}</div>
+            );
+        "#;
+
+        let profile = extract_profile("Banner", "components/Banner/Banner.tsx", source);
+        let color_type = profile.prop_types.get("color").expect("color prop type");
+
+        // Should be resolved to inline union, not "BannerColor"
+        assert!(
+            color_type.contains("'red'"),
+            "Expected resolved union with 'red', got: {color_type}"
+        );
+        assert!(
+            color_type.contains("'teal'"),
+            "Expected resolved union with 'teal', got: {color_type}"
+        );
+        assert!(
+            !color_type.contains("BannerColor"),
+            "Should NOT contain the type alias name, got: {color_type}"
+        );
+    }
+
+    #[test]
+    fn test_enum_resolved_in_prop_types() {
+        // Simulates PF6 DrawerContentColorVariant enum
+        let source = r#"
+            export enum DrawerContentColorVariant {
+                default = 'default',
+                primary = 'primary',
+                secondary = 'secondary'
+            }
+
+            export interface DrawerContentProps {
+                colorVariant?: DrawerContentColorVariant;
+            }
+
+            export const DrawerContent = ({ colorVariant }: DrawerContentProps) => (
+                <div />
+            );
+        "#;
+
+        let profile = extract_profile(
+            "DrawerContent",
+            "components/Drawer/DrawerContent.tsx",
+            source,
+        );
+        let cv_type = profile
+            .prop_types
+            .get("colorVariant")
+            .expect("colorVariant prop type");
+
+        assert!(
+            cv_type.contains("'default'"),
+            "Expected resolved enum with 'default', got: {cv_type}"
+        );
+        assert!(
+            cv_type.contains("'secondary'"),
+            "Expected resolved enum with 'secondary', got: {cv_type}"
+        );
+        assert!(
+            !cv_type.contains("DrawerContentColorVariant"),
+            "Should NOT contain the enum name, got: {cv_type}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_type_alias_and_inline_union() {
+        // Simulates DrawerPanelContent: DrawerColorVariant | 'no-background' | 'default'
+        let source = r#"
+            export enum DrawerColorVariant {
+                default = 'default',
+                secondary = 'secondary',
+                noBackground = 'no-background'
+            }
+
+            export interface DrawerPanelContentProps {
+                colorVariant?: DrawerColorVariant | 'no-background' | 'default' | 'secondary';
+            }
+
+            export const DrawerPanelContent = ({ colorVariant }: DrawerPanelContentProps) => (
+                <div />
+            );
+        "#;
+
+        let profile = extract_profile(
+            "DrawerPanelContent",
+            "components/Drawer/DrawerPanelContent.tsx",
+            source,
+        );
+        let cv_type = profile
+            .prop_types
+            .get("colorVariant")
+            .expect("colorVariant prop type");
+
+        // The DrawerColorVariant segment should be resolved to its enum values
+        assert!(
+            !cv_type.contains("DrawerColorVariant"),
+            "Named type should be resolved, got: {cv_type}"
+        );
+        // Should contain all values (from both the enum and the inline union)
+        assert!(
+            cv_type.contains("'no-background'"),
+            "Should contain 'no-background', got: {cv_type}"
+        );
+        assert!(
+            cv_type.contains("'default'"),
+            "Should contain 'default', got: {cv_type}"
+        );
+    }
+
+    #[test]
+    fn test_non_string_type_alias_not_resolved() {
+        // Type aliases that aren't string literal unions should be left as-is
+        let source = r#"
+            export type CustomHandler = (event: Event) => void;
+
+            export interface FooProps {
+                onCustom?: CustomHandler;
+                children?: React.ReactNode;
+            }
+
+            export const Foo = ({ onCustom, children }: FooProps) => (
+                <div onClick={onCustom}>{children}</div>
+            );
+        "#;
+
+        let profile = extract_profile("Foo", "components/Foo/Foo.tsx", source);
+        let handler_type = profile.prop_types.get("onCustom").expect("onCustom prop type");
+
+        // Non-string type alias should NOT be resolved (no string literals in body)
+        assert_eq!(
+            handler_type, "CustomHandler",
+            "Non-string alias should remain as-is"
+        );
+    }
+
+    #[test]
+    fn test_generic_type_alias_not_resolved() {
+        // Type aliases with type parameters should not be resolved
+        let source = r#"
+            export type Nullable<T> = T | null;
+
+            export interface BarProps {
+                value?: Nullable<string>;
+            }
+
+            export const Bar = ({ value }: BarProps) => (
+                <div>{value}</div>
+            );
+        "#;
+
+        let profile = extract_profile("Bar", "components/Bar/Bar.tsx", source);
+        let value_type = profile.prop_types.get("value").expect("value prop type");
+
+        // Generic type alias with <T> should not be collected/resolved
+        assert!(
+            value_type.contains("Nullable"),
+            "Generic alias should remain unresolved, got: {value_type}"
+        );
+    }
+
+    #[test]
+    fn test_enum_with_numeric_values_not_resolved() {
+        // Enums with non-string initializers should not be collected
+        let source = r#"
+            export enum Priority {
+                Low = 0,
+                Medium = 1,
+                High = 2
+            }
+
+            export interface TaskProps {
+                priority?: Priority;
+            }
+
+            export const Task = ({ priority }: TaskProps) => (
+                <div>{priority}</div>
+            );
+        "#;
+
+        let profile = extract_profile("Task", "components/Task/Task.tsx", source);
+        let priority_type = profile
+            .prop_types
+            .get("priority")
+            .expect("priority prop type");
+
+        // Numeric enum should NOT be resolved
+        assert_eq!(
+            priority_type, "Priority",
+            "Numeric enum should remain as-is"
         );
     }
 }
