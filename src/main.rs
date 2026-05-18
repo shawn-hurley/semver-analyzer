@@ -393,6 +393,9 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
     // Print degradation summary if any non-fatal issues were recorded
     diagnostics::print_degradation_summary(&result.degradation, reporter);
 
+    // Print transitive dependency bump notices (peer dep narrowing)
+    diagnostics::print_transitive_bump_summary(&report.manifest_changes, reporter);
+
     write_json_output(&report, common.output.as_deref(), reporter)?;
     Ok(())
 }
@@ -509,8 +512,50 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         analyzer.lang.build_report(&result, repo, from, to)
     };
 
+    // Print transitive dependency bump notices (peer dep narrowing)
+    diagnostics::print_transitive_bump_summary(&report.manifest_changes, reporter);
+
     // Build package info cache
     let mut pkg_info_cache = konveyor::build_package_info_cache(&report);
+
+    // Apply CLI package name mappings (e.g., internal workspace name → published npm name)
+    for mapping in &args.package_name_map {
+        if let Some((internal, published)) = mapping.split_once('=') {
+            // Find the cache entry whose name matches the internal name and rename it
+            for info in pkg_info_cache.values_mut() {
+                if info.name == internal {
+                    info!(
+                        internal = %internal,
+                        published = %published,
+                        "Applying package name mapping"
+                    );
+                    info.name = published.to_string();
+                }
+            }
+        }
+    }
+
+    // Apply CLI package version overrides (e.g., "0.0.0-fixed" → actual npm versions)
+    for version_spec in &args.package_version {
+        if let Some((pkg_name, versions)) = version_spec.split_once('=') {
+            if let Some((old_ver, new_ver)) = versions.split_once(':') {
+                // Find the cache entry by published name (after name mapping)
+                for info in pkg_info_cache.values_mut() {
+                    if info.name == pkg_name {
+                        info!(
+                            package = %pkg_name,
+                            old_version = %old_ver,
+                            new_version = %new_ver,
+                            "Applying package version override"
+                        );
+                        info.old_version = Some(old_ver.to_string());
+                        info.version = Some(new_ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let pkg_cache: HashMap<String, String> = pkg_info_cache
         .iter()
         .map(|(k, v)| (k.clone(), v.name.clone()))
@@ -619,6 +664,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                 .or_insert_with(|| semver_analyzer_ts::konveyor_frontend::PackageInfo {
                     name: name.clone(),
                     version: Some(version.clone()),
+                    old_version: None,
                 });
         }
     }
@@ -752,6 +798,65 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             }
             strategies.extend(family_strategies);
 
+            // Suppress TD prop-value-change rules when SD prop-value-removed
+            // rules cover the same (component, prop, value). The SD rules have
+            // better replacement guidance (CSS modifier bridge, greedy N:M
+            // matching) so they should take priority over the TD rules.
+            {
+                // Collect (prop_pattern, value_pattern) keys from SD rules
+                let sd_value_keys: std::collections::HashSet<(String, String)> = sd_rules
+                    .iter()
+                    .filter(|r| {
+                        r.labels
+                            .iter()
+                            .any(|l| l == "change-type=prop-value-removed")
+                    })
+                    .flat_map(|r| {
+                        semver_analyzer_konveyor_core::extract_frontend_refs(&r.when)
+                            .into_iter()
+                            .filter(|f| f.location == "JSX_PROP")
+                            .filter_map(|f| {
+                                let value = f.value.as_ref()?;
+                                Some((f.pattern.clone(), value.clone()))
+                            })
+                    })
+                    .collect();
+
+                if !sd_value_keys.is_empty() {
+                    let before = all_rules.len();
+                    all_rules.retain(|r| {
+                        let is_td_prop_value = r
+                            .labels
+                            .iter()
+                            .any(|l| l == "change-type=prop-value-change");
+                        if !is_td_prop_value {
+                            return true;
+                        }
+                        // Check if any SD rule covers this same prop+value
+                        let dominated = semver_analyzer_konveyor_core::extract_frontend_refs(
+                            &r.when,
+                        )
+                        .iter()
+                        .filter(|f| f.location == "JSX_PROP")
+                        .any(|f| {
+                            if let Some(ref value) = f.value {
+                                sd_value_keys.contains(&(f.pattern.clone(), value.clone()))
+                            } else {
+                                false
+                            }
+                        });
+                        !dominated
+                    });
+                    let suppressed = before - all_rules.len();
+                    if suppressed > 0 {
+                        info!(
+                            suppressed,
+                            "Suppressed TD prop-value-change rules covered by SD prop-value-removed rules"
+                        );
+                    }
+                }
+            }
+
             all_rules.extend(sd_rules);
 
             // Suppress the v1 catch-all CSS class prefix rule when
@@ -769,11 +874,44 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                 }
             }
 
+            // Dump CSS class inventories to files if requested
+            if args.dump_css_inventory {
+                orchestrator::dump_css_inventory_to_files(
+                    &sd.old_css_class_inventory,
+                    &sd.new_css_class_inventory,
+                    &common.output_dir,
+                );
+            }
+
             sd_rule_phase.finish_with_detail("SD rules generated", &format!("{} rules", sd_count));
         }
     }
 
-    let fix_guidance = konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
+    // Tag each fix strategy with its source package.
+    // Rules carry `package=<npm-name>` labels; propagate to the strategy so the
+    // fix-engine can group entries by originating package at merge time.
+    for rule in &all_rules {
+        let pkg_label = rule
+            .labels
+            .iter()
+            .find_map(|l| l.strip_prefix("package="));
+        if let Some(pkg) = pkg_label {
+            if let Some(entry) = strategies.get_mut(&rule.rule_id) {
+                if entry.source_package.is_none() {
+                    entry.source_package = Some(pkg.to_string());
+                }
+            }
+        }
+    }
+
+    let fix_guidance = konveyor::FixGuidanceDoc {
+        migration: konveyor::MigrationInfo {
+            from_ref: report.comparison.from_ref.clone(),
+            to_ref: report.comparison.to_ref.clone(),
+            generated_by: format!("semver-analyzer v{}", report.metadata.tool_version),
+        },
+        summary: konveyor::compute_fix_summary(&strategies),
+    };
     let rule_count = all_rules.len();
     rule_phase.finish_with_detail("Rules generated", &format!("{} rules", rule_count));
 
@@ -1087,6 +1225,9 @@ async fn cmd_analyze_java(
     // Print degradation summary
     diagnostics::print_degradation_summary(&result.degradation, reporter);
 
+    // Print transitive dependency bump notices (peer dep narrowing)
+    diagnostics::print_transitive_bump_summary(&report.manifest_changes, reporter);
+
     Ok(())
 }
 
@@ -1155,6 +1296,9 @@ async fn cmd_konveyor_java(
         );
     };
 
+    // Print transitive dependency bump notices (peer dep narrowing)
+    diagnostics::print_transitive_bump_summary(&report.manifest_changes, reporter);
+
     // Build Konveyor config from CLI args
     let konveyor_config = semver_analyzer_java::JavaKonveyorConfig::from_args(
         args.project_name.as_deref(),
@@ -1173,6 +1317,22 @@ async fn cmd_konveyor_java(
         let sd_rules =
             semver_analyzer_java::konveyor::generate_sd_rules(sd_result, &konveyor_config);
         all_rules.extend(sd_rules);
+
+        // Enrich removal rules with migration mappings mined from test files
+        if !sd_result.migration_mappings.is_empty() {
+            let enriched = semver_analyzer_java::konveyor::enrich_rules_with_migration_mappings(
+                &mut all_rules,
+                &sd_result.migration_mappings,
+            );
+            if enriched > 0 {
+                reporter.println(&format!(
+                    "Enriched {} removal rules with migration mappings ({} class mappings, {} method pairs)",
+                    enriched,
+                    sd_result.migration_mappings.len(),
+                    sd_result.migration_mappings.iter().map(|m| m.method_mappings.len()).sum::<usize>(),
+                ));
+            }
+        }
     }
 
     // Class migration rules (mostly-emptied base classes)
@@ -1186,25 +1346,159 @@ async fn cmd_konveyor_java(
         all_rules.extend(class_rules);
     }
 
-    // Namespace migration rules (e.g., javax.persistence=jakarta.persistence@group:artifact:version)
+    // Auto-detect namespace migrations from manifest dependency changes.
+    //
+    // Strategy 1: DependencyCoordinateChanged (direct javax→jakarta renames)
+    // Strategy 2: DependencyAdded for jakarta.* deps (infer javax.* counterpart)
+    //
+    // Both strategies detect when the library switched from javax to jakarta APIs.
+    let mut ns_migrations: Vec<semver_analyzer_java::konveyor::NamespaceMigration> = Vec::new();
+    let mut detected_ns: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for mc in &report.manifest_changes {
+        match mc.change_type {
+            semver_analyzer_java::JavaManifestChangeType::DependencyCoordinateChanged => {
+                // Direct coordinate rename detected
+                if let (Some(old_coord), Some(new_coord)) =
+                    (mc.before.as_deref(), mc.after.as_deref())
+                {
+                    if let Some(mig) = infer_namespace_migration(old_coord, new_coord) {
+                        if detected_ns.insert(mig.old_ns.clone()) {
+                            ns_migrations.push(mig);
+                        }
+                    }
+                }
+            }
+            semver_analyzer_java::JavaManifestChangeType::DependencyAdded => {
+                // A jakarta.* dep was added -- infer the javax.* counterpart
+                if let Some(new_coord) = mc.after.as_deref() {
+                    let new_group = new_coord.split(':').next().unwrap_or("");
+                    if new_group.starts_with("jakarta.") {
+                        let old_ns = new_group.replacen("jakarta.", "javax.", 1);
+                        let new_ns = new_group.to_string();
+                        if detected_ns.insert(old_ns.clone()) {
+                            let parts: Vec<&str> = new_coord.split(':').collect();
+                            let dependency = if parts.len() >= 3 {
+                                Some((
+                                    format!("{}:{}", parts[0], parts[1]),
+                                    parts[2].to_string(),
+                                ))
+                            } else {
+                                None
+                            };
+                            ns_migrations.push(
+                                semver_analyzer_java::konveyor::NamespaceMigration {
+                                    old_ns,
+                                    new_ns,
+                                    dependency,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Deduplicate by old_ns (same namespace might appear in multiple submodule manifests)
+    ns_migrations.sort_by(|a, b| a.old_ns.cmp(&b.old_ns));
+    ns_migrations.dedup_by(|a, b| a.old_ns == b.old_ns);
+
+    if !ns_migrations.is_empty() {
+        reporter.println(&format!(
+            "Auto-detected {} namespace migration(s) from manifest changes",
+            ns_migrations.len()
+        ));
+    }
+
+    // Add any manually-specified namespace migrations (--namespace-migration flag)
     if !args.namespace_migrations.is_empty() {
-        let ns_migrations: Vec<semver_analyzer_java::konveyor::NamespaceMigration> = args
+        let manual_migrations: Vec<semver_analyzer_java::konveyor::NamespaceMigration> = args
             .namespace_migrations
             .iter()
             .filter_map(|s| semver_analyzer_java::konveyor::parse_namespace_migration(s))
             .collect();
-
-        if !ns_migrations.is_empty() {
-            let ns_rules = semver_analyzer_java::konveyor::generate_namespace_migration_rules(
-                &ns_migrations,
-                &konveyor_config,
-            );
-            reporter.println(&format!(
-                "Generated {} namespace migration rules",
-                ns_rules.len()
-            ));
-            all_rules.extend(ns_rules);
+        // Manual overrides take precedence -- add only those not already detected
+        let detected_ns: std::collections::HashSet<String> =
+            ns_migrations.iter().map(|m| m.old_ns.clone()).collect();
+        for m in manual_migrations {
+            if !detected_ns.contains(&m.old_ns) {
+                ns_migrations.push(m);
+            }
         }
+    }
+
+    if !ns_migrations.is_empty() {
+        let ns_rules = semver_analyzer_java::konveyor::generate_namespace_migration_rules(
+            &ns_migrations,
+            &konveyor_config,
+        );
+        reporter.println(&format!(
+            "Generated {} namespace migration rules ({} import + {} dependency)",
+            ns_rules.len(),
+            ns_rules
+                .iter()
+                .filter(|r| r.labels.iter().any(|l| l == "change-type=import-path-change"))
+                .count(),
+            ns_rules
+                .iter()
+                .filter(|r| r.labels.iter().any(|l| l == "change-type=dependency-update"))
+                .count(),
+        ));
+        all_rules.extend(ns_rules);
+    }
+
+    // Detect group ID changes (e.g., org.hibernate → org.hibernate.orm) and
+    // generate EnsureDependency rules for each published submodule.
+    {
+        let mut group_dep_rules = Vec::new();
+        for mc in &report.manifest_changes {
+            if matches!(
+                mc.change_type,
+                semver_analyzer_java::JavaManifestChangeType::ProjectIdentityChanged
+            ) && mc.field == "project:group"
+            {
+                if let (Some(old_group), Some(new_group)) =
+                    (mc.before.as_deref(), mc.after.as_deref())
+                {
+                    reporter.println(&format!(
+                        "Detected group ID change: {} → {}",
+                        old_group, new_group
+                    ));
+
+                    // Discover published submodules from settings.gradle at the to_ref
+                    let submodules = if let (Some(ref repo_path), Some(ref to_ref)) =
+                        (&common.repo, &common.to)
+                    {
+                        discover_gradle_submodules(repo_path, to_ref)
+                    } else {
+                        Vec::new()
+                    };
+
+                    if submodules.is_empty() {
+                        reporter.println("  No submodules found — generating rule for root artifact only");
+                    }
+
+                    // Generate EnsureDependency rules for each submodule
+                    let to_version = common.to.as_deref().unwrap_or("0.0.0");
+                    let dep_rules = semver_analyzer_java::konveyor::generate_group_id_migration_rules(
+                        old_group,
+                        new_group,
+                        to_version,
+                        &submodules,
+                        &konveyor_config,
+                    );
+                    reporter.println(&format!(
+                        "Generated {} dependency rules for group ID change ({} submodules)",
+                        dep_rules.len(),
+                        submodules.len()
+                    ));
+                    group_dep_rules.extend(dep_rules);
+                }
+            }
+        }
+        all_rules.extend(group_dep_rules);
     }
 
     gen_phase.finish_with_detail("Generated rules", &format!("{} rules", all_rules.len()));
@@ -1248,6 +1542,81 @@ async fn cmd_konveyor_java(
     ));
 
     Ok(())
+}
+
+/// Discover submodule names from `settings.gradle` at a given git ref.
+///
+/// Parses `include '...'` directives and returns the artifact names
+/// (the last segment of the project path, e.g., `hibernate-core` from
+/// `:hibernate:hibernate-core` or just `hibernate-core` from `hibernate-core`).
+#[cfg(feature = "java")]
+fn discover_gradle_submodules(repo: &Path, git_ref: &str) -> Vec<String> {
+    let mut submodules = Vec::new();
+
+    for settings_file in &["settings.gradle", "settings.gradle.kts"] {
+        let output = std::process::Command::new("git")
+            .args(["show", &format!("{}:{}", git_ref, settings_file)])
+            .current_dir(repo)
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let content = String::from_utf8_lossy(&output.stdout);
+                // Parse include directives:
+                //   include 'hibernate-core'
+                //   include(':hibernate-core')
+                let re = regex::Regex::new(r#"include\s*[\(]?\s*['"]([^'"]+)['"]"#).unwrap();
+                for cap in re.captures_iter(&content) {
+                    let project_path = &cap[1];
+                    // Extract the artifact name (last segment after ':')
+                    let artifact = project_path
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or(project_path)
+                        .trim();
+                    if !artifact.is_empty()
+                        && !artifact.contains("test")
+                        && !artifact.contains("documentation")
+                        && !artifact.contains("release")
+                        && !artifact.starts_with("hibernate-orm-build")
+                    {
+                        submodules.push(artifact.to_string());
+                    }
+                }
+                break; // Found settings file, no need to check .kts
+            }
+        }
+    }
+
+    submodules.sort();
+    submodules.dedup();
+    submodules
+}
+
+/// Infer a namespace migration from a dependency coordinate change.
+#[cfg(feature = "java")]
+fn infer_namespace_migration(
+    old_coord: &str,
+    new_coord: &str,
+) -> Option<semver_analyzer_java::konveyor::NamespaceMigration> {
+    let old_group = old_coord.split(':').next()?;
+    let new_group = new_coord.split(':').next()?;
+
+    if old_group.starts_with("javax.") && new_group.starts_with("jakarta.") {
+        let parts: Vec<&str> = new_coord.split(':').collect();
+        let dependency = if parts.len() >= 3 {
+            Some((format!("{}:{}", parts[0], parts[1]), parts[2].to_string()))
+        } else {
+            None
+        };
+        Some(semver_analyzer_java::konveyor::NamespaceMigration {
+            old_ns: old_group.to_string(),
+            new_ns: new_group.to_string(),
+            dependency,
+        })
+    } else {
+        None
+    }
 }
 
 // ─── Output helpers ─────────────────────────────────────────────────────

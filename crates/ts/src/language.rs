@@ -624,35 +624,51 @@ impl Language for TypeScript {
     fn discover_package_manifests(repo: &Path, git_ref: &str) -> Vec<(String, String)> {
         let mut results = Vec::new();
 
-        // Use `git ls-tree` to discover workspace packages under packages/
-        let output = match std::process::Command::new("git")
-            .args(["ls-tree", "--name-only", git_ref, "packages/"])
-            .current_dir(repo)
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
-            _ => return results,
-        };
+        // Try multiple potential packages locations.
+        // Standard repos use "packages/" at root; some repos (e.g., openshift/console)
+        // nest them under "frontend/packages/" or similar.
+        let candidate_prefixes = ["packages/", "frontend/packages/"];
 
-        let listing = String::from_utf8_lossy(&output.stdout);
-        for line in listing.lines() {
-            let dir_name = line.trim_start_matches("packages/");
-            if dir_name.is_empty() {
-                continue;
+        for prefix in &candidate_prefixes {
+            let output = match std::process::Command::new("git")
+                .args(["ls-tree", "--name-only", git_ref, prefix])
+                .current_dir(repo)
+                .output()
+            {
+                Ok(o) if o.status.success() && !o.stdout.is_empty() => o,
+                _ => continue,
+            };
+
+            let listing = String::from_utf8_lossy(&output.stdout);
+            for line in listing.lines() {
+                let dir_name = line.trim_start_matches(prefix);
+                if dir_name.is_empty() {
+                    continue;
+                }
+
+                let pkg_json_path = format!("{}/package.json", line);
+
+                // Read the package.json at this ref to get the npm package name
+                if let Some(content) =
+                    semver_analyzer_core::git::read_git_file(repo, git_ref, &pkg_json_path)
+                {
+                    let name = serde_json::from_str::<serde_json::Value>(&content)
+                        .ok()
+                        .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| dir_name.to_string());
+
+                    results.push((pkg_json_path, name));
+                }
             }
 
-            let pkg_json_path = format!("{}/package.json", line);
-
-            // Read the package.json at this ref to get the npm package name
-            if let Some(content) =
-                semver_analyzer_core::git::read_git_file(repo, git_ref, &pkg_json_path)
-            {
-                let name = serde_json::from_str::<serde_json::Value>(&content)
-                    .ok()
-                    .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| dir_name.to_string());
-
-                results.push((pkg_json_path, name));
+            // If we found packages at this prefix, don't try others
+            if !results.is_empty() {
+                tracing::info!(
+                    prefix = %prefix,
+                    count = results.len(),
+                    "Found workspace packages"
+                );
+                break;
             }
         }
 
@@ -714,6 +730,63 @@ impl Language for TypeScript {
         sd_result.new_css_class_inventory = params.new_css_class_inventory.clone();
         sd_result.dep_repo_packages = params.dep_repo_packages.clone();
 
+        // Extract CSS modifier declarations from built dep-repo worktrees.
+        // These are used for evidence-based prop value mapping (e.g., matching
+        // removed "cyan" to added "teal" by comparing what CSS each modifier
+        // applies). Extracted here in the language impl, not the orchestrator,
+        // because the types are TypeScript/CSS-specific.
+        if let Some(ref dep_from) = params.dep_from_dir {
+            sd_result.old_css_modifiers =
+                crate::css_profile::extract_component_css_modifiers_from_dir(dep_from)
+                    .map_err(|e| {
+                        tracing::warn!(%e, "Failed to extract old CSS modifier declarations");
+                        e
+                    })
+                    .unwrap_or_default();
+        }
+        if let Some(ref dep_dir) = params.dep_dir {
+            sd_result.new_css_modifiers =
+                crate::css_profile::extract_component_css_modifiers_from_dir(dep_dir)
+                    .map_err(|e| {
+                        tracing::warn!(%e, "Failed to extract new CSS modifier declarations");
+                        e
+                    })
+                    .unwrap_or_default();
+        }
+
+        // Resolve CSS variable chains to terminal values for modifier effects.
+        // This enables resolved-value comparison (Phase 2) — matching modifiers
+        // by actual rendered output (hex colors, sizes) rather than just which
+        // token slots they override (Phase 1 structural matching).
+        if let Some(ref dep_from) = params.dep_from_dir {
+            if let Ok(old_resolution_map) =
+                crate::css_profile::build_css_variable_resolution_map_from_dir(dep_from)
+            {
+                tracing::info!(
+                    entries = old_resolution_map.len(),
+                    "Built old CSS variable resolution map"
+                );
+                crate::css_profile::resolve_modifier_effects(
+                    &mut sd_result.old_css_modifiers,
+                    &old_resolution_map,
+                );
+            }
+        }
+        if let Some(ref dep_dir) = params.dep_dir {
+            if let Ok(new_resolution_map) =
+                crate::css_profile::build_css_variable_resolution_map_from_dir(dep_dir)
+            {
+                tracing::info!(
+                    entries = new_resolution_map.len(),
+                    "Built new CSS variable resolution map"
+                );
+                crate::css_profile::resolve_modifier_effects(
+                    &mut sd_result.new_css_modifiers,
+                    &new_resolution_map,
+                );
+            }
+        }
+
         Ok(TsAnalysisExtensions {
             sd_result: Some(sd_result),
             hierarchy_deltas: Vec::new(),
@@ -752,6 +825,50 @@ impl Language for TypeScript {
                 &already_detected,
             );
         deprecated_replacements.extend(commit_replacements);
+
+        // Step 3: Git file rename detection fallback (for packages that don't
+        // use deprecated/ directories, like react-component-groups).
+        // Scans per-commit git rename detection to find component directory
+        // renames (e.g., NotAuthorized/ → UnauthorizedAccess/).
+        let git_renames =
+            semver_analyzer_core::git::detect_git_component_renames(repo, from_ref, to_ref);
+
+        if !git_renames.is_empty() {
+            // Collect already-detected names BEFORE mutating deprecated_replacements
+            let already_detected_2: std::collections::HashSet<String> = deprecated_replacements
+                .iter()
+                .map(|r| r.old_component.clone())
+                .collect();
+
+            // Collect names of all removed/relocated components from structural changes
+            let removed_components: std::collections::HashSet<&str> = structural_changes
+                .iter()
+                .filter(|sc| {
+                    matches!(
+                        sc.change_type,
+                        semver_analyzer_core::types::StructuralChangeType::Removed(_)
+                            | semver_analyzer_core::types::StructuralChangeType::Relocated { .. }
+                    )
+                })
+                .filter_map(|sc| sc.symbol.split('.').next())
+                .collect();
+
+            for rename in &git_renames {
+                // Only create a replacement if:
+                // 1. The old component was actually removed/relocated in the API diff
+                // 2. Not already detected by Strategy 1 or 2
+                if removed_components.contains(rename.old_component.as_str())
+                    && !already_detected_2.contains(&rename.old_component)
+                {
+                    deprecated_replacements.push(crate::sd_types::DeprecatedReplacement {
+                        old_component: rename.old_component.clone(),
+                        new_component: rename.new_component.clone(),
+                        evidence_hosts: vec![format!("git-rename-R{:03}", rename.similarity)],
+                        evidence_source: crate::sd_types::ReplacementEvidence::GitRename,
+                    });
+                }
+            }
+        }
 
         // Log all detected replacements
         if !deprecated_replacements.is_empty() {

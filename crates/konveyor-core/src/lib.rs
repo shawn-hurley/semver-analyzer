@@ -66,10 +66,9 @@ pub use konveyor_core::rule::{
 
 // Fix strategy types
 pub use konveyor_core::fix::{
-    extract_fix_strategies, strategy_priority, write_fix_strategies, DeprecatedMigrationContext,
-    FixConfidence, FixGuidanceDoc, FixGuidanceEntry, FixSource, FixStrategyEntry,
-    FixStrategyKind as FixStrategy, FixSummary, MappingEntry, MemberMappingEntry, MigrationInfo,
-    PropMigrationEntry,
+    compute_fix_summary, extract_fix_strategies, strategy_priority, write_fix_strategies,
+    DeprecatedMigrationContext, FixGuidanceDoc, FixStrategyEntry, FixSummary, MappingEntry,
+    MemberMappingEntry, MigrationInfo, PropMigrationEntry,
 };
 
 // ── User-supplied rename patterns ───────────────────────────────────────
@@ -413,6 +412,13 @@ pub struct PackageInfo {
     pub name: String,
     /// Package version at the new ref (read from disk).
     pub version: Option<String>,
+    /// Package version at the old ref (from_ref).
+    ///
+    /// Used to calculate the `upperbound` for dependency update rules.
+    /// Packages in a monorepo may have independent version numbers
+    /// (e.g., `@patternfly/react-charts` is v7.x in PF5, v8.x in PF6),
+    /// so the repo-level git tag cannot be used as a universal bound.
+    pub old_version: Option<String>,
 }
 
 // ── Shared functions ────────────────────────────────────────────────────
@@ -855,7 +861,19 @@ pub fn consolidation_key(
         if has_codemod {
             return rule.rule_id.clone();
         }
-        // Non-codemod renamed constants: group by package
+
+    // Removed properties: ALWAYS keep as singleton regardless of has-codemod.
+    // Grouping multiple RemoveProp rules into one combined rule causes the
+    // js-scanner to emit only one incident per JSX element (for the first
+    // matching `or` condition). The fix-engine then only removes that one
+    // prop, leaving the others. Each removed prop needs its own rule so the
+    // scanner generates a separate incident for each.
+    // (TC031: hasIcon + isDynamic both removed but only hasIcon was fixed
+    //  when they shared group-44.)
+    } else if change_type == "removed" && kind == "property" {
+        return rule.rule_id.clone();
+    } else if change_type == "removed" && kind == "constant" {
+        // Non-codemod removed constants: group by package
         let symbol = rule.description.split('`').nth(1).unwrap_or("");
         let is_component_constant = symbol
             .chars()
@@ -1428,6 +1446,51 @@ pub fn api_change_to_strategy(
                         .rsplit_once('.')
                         .map(|(_, p)| p)
                         .unwrap_or(&change.symbol);
+
+                    // Check for boolean↔enum type coercion.
+                    //
+                    // When the old and new prop have incompatible types
+                    // (boolean vs enum), a mechanical Rename produces wrong
+                    // output:
+                    //   - enum→boolean: border="dark" → isBordered="dark" (wrong)
+                    //   - boolean→enum: isLabelBeforeButton → labelPosition (missing value)
+                    //
+                    // Route to LlmAssisted so the LLM handles value conversion.
+                    //
+                    // Skip for absorption format (new_member contains "=")
+                    // since those are already correct as Rename
+                    // (e.g., isOverflowLabel → variant="overflow").
+                    if !new_member.contains('=') {
+                        if let Some(ref before) = change.before {
+                            // Parse type from "property: propName: typeString"
+                            let parts: Vec<&str> = before.splitn(3, ": ").collect();
+                            if parts.len() == 3 {
+                                let old_type = parts[2].trim();
+                                let old_is_boolean = old_type == "boolean";
+                                let old_is_enum = old_type.contains('|');
+                                let new_is_boolean_name = (new_member.starts_with("is")
+                                    && new_member.len() > 2
+                                    && new_member.as_bytes()[2].is_ascii_uppercase())
+                                    || (new_member.starts_with("has")
+                                        && new_member.len() > 3
+                                        && new_member.as_bytes()[3].is_ascii_uppercase());
+
+                                if (old_is_boolean && !new_is_boolean_name)
+                                    || (old_is_enum && new_is_boolean_name)
+                                {
+                                    let (component, prop) =
+                                        extract_component_prop(&change.symbol);
+                                    let mut e = FixStrategyEntry::new("LlmAssisted");
+                                    e.component = component;
+                                    e.prop = prop;
+                                    e.replacement = Some(new_member.clone());
+                                    e.from = change.before.clone();
+                                    return Some(e);
+                                }
+                            }
+                        }
+                    }
+
                     return Some(FixStrategyEntry::rename(old_name, new_member));
                 }
 
@@ -1920,6 +1983,35 @@ pub fn build_frontend_condition(
             }
         }
 
+        ApiChangeKind::EnumMember => {
+            // Enum member changes are best handled by the language-specific
+            // rule generator (which can look up components that reference the
+            // enum). If we reach here, fall back to IMPORT-level detection on
+            // the parent enum name.
+            let parent_pattern = if change.symbol.contains('.') {
+                let parent = change.symbol.split('.').next().unwrap_or(&change.symbol);
+                format!("^{}$", regex_escape(parent))
+            } else {
+                pattern
+            };
+            KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: parent_pattern,
+                    location: "IMPORT".to_string(),
+                    component: None,
+                    parent: None,
+                    value: None,
+                    from,
+                    file_pattern: None,
+                    parent_from: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                },
+            }
+        }
+
         _ => {
             let is_component = match_name
                 .chars()
@@ -2221,6 +2313,7 @@ pub fn api_kind_label(kind: &ApiChangeKind) -> &'static str {
         ApiChangeKind::Field => "field",
         ApiChangeKind::Property => "property",
         ApiChangeKind::ModuleExport => "module-export",
+        ApiChangeKind::EnumMember => "enum-member",
     }
 }
 
@@ -3005,5 +3098,188 @@ rename_patterns:
             Some("t_global_icon_color_regular")
         );
         assert_eq!(patterns.get_token_mapping("nonexistent_token"), None);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Boolean↔Enum type coercion in api_change_to_strategy
+    //
+    // When a prop is Removed with ReplacedByMember and the old/new types
+    // are incompatible (boolean↔enum), the strategy should be LlmAssisted
+    // instead of Rename, because mechanical text replacement produces
+    // wrong output (e.g., border="dark" → isBordered="dark").
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// TC005 real-world scenario: Avatar `border: 'dark' | 'light'` was removed,
+    /// replaced by `isBordered: boolean`.
+    ///
+    /// The SD enrichment matched border→isBordered (ReplacedByMember).
+    /// api_change_to_strategy should produce LlmAssisted (not Rename)
+    /// because the type changed from enum to boolean.
+    ///
+    /// A mechanical Rename would produce `isBordered="dark"` which is wrong —
+    /// the correct fix is to strip the value: `<Avatar isBordered />`.
+    #[test]
+    fn test_enum_to_boolean_prop_replacement_uses_llm() {
+        let change = ApiChange {
+            symbol: "Avatar.border".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: border: 'dark' | 'light'".into()),
+            after: None,
+            description:
+                "property `border` was removed from `AvatarProps`".into(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "isBordered".into(),
+            }),
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+
+        assert_eq!(
+            s.strategy, "LlmAssisted",
+            "TC005: enum→boolean replacement should use LlmAssisted, not Rename. \
+             A Rename would produce isBordered=\"dark\" which is wrong."
+        );
+        assert_eq!(s.component.as_deref(), Some("Avatar"));
+        assert_eq!(s.prop.as_deref(), Some("border"));
+        assert_eq!(s.replacement.as_deref(), Some("isBordered"));
+    }
+
+    /// TC011 real-world scenario: Checkbox `isLabelBeforeButton: boolean` was
+    /// removed, replaced by `labelPosition: 'start' | 'end'`.
+    ///
+    /// A mechanical Rename would produce `labelPosition` with no value,
+    /// but the correct fix is `labelPosition="start"`.
+    #[test]
+    fn test_boolean_to_enum_prop_replacement_uses_llm() {
+        let change = ApiChange {
+            symbol: "Checkbox.isLabelBeforeButton".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: isLabelBeforeButton: boolean".into()),
+            after: None,
+            description:
+                "property `isLabelBeforeButton` was removed from `CheckboxProps`"
+                    .into(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "labelPosition".into(),
+            }),
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+
+        assert_eq!(
+            s.strategy, "LlmAssisted",
+            "TC011: boolean→enum replacement should use LlmAssisted, not Rename. \
+             A Rename would produce `labelPosition` with no value instead of `labelPosition=\"start\"`."
+        );
+        assert_eq!(s.component.as_deref(), Some("Checkbox"));
+        assert_eq!(s.prop.as_deref(), Some("isLabelBeforeButton"));
+        assert_eq!(s.replacement.as_deref(), Some("labelPosition"));
+    }
+
+    /// Same-type prop rename: FormGroup `labelIcon: ReactElement` → `labelHelp: ReactElement`.
+    /// Both are the same type (ReactElement). This should produce Rename (no type coercion).
+    #[test]
+    fn test_same_type_prop_rename_stays_rename() {
+        let change = ApiChange {
+            symbol: "FormGroup.labelIcon".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: labelIcon: ReactElement".into()),
+            after: None,
+            description: "property `labelIcon` was removed".into(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "labelHelp".into(),
+            }),
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+
+        assert_eq!(
+            s.strategy, "Rename",
+            "Same-type prop rename (ReactElement→ReactElement) should stay as Rename"
+        );
+        assert_eq!(s.from.as_deref(), Some("labelIcon"));
+        assert_eq!(s.to.as_deref(), Some("labelHelp"));
+    }
+
+    /// CSS binding absorption: Label `isOverflowLabel` → `variant="overflow"`.
+    /// The new_member contains "=" (value expression). This should stay Rename
+    /// because the text replacement `isOverflowLabel` → `variant="overflow"` is correct.
+    #[test]
+    fn test_absorption_prop_stays_rename() {
+        let change = ApiChange {
+            symbol: "Label.isOverflowLabel".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("isOverflowLabel".into()),
+            after: None,
+            description: "property `isOverflowLabel` was removed".into(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "variant=\"overflow\"".into(),
+            }),
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+
+        assert_eq!(
+            s.strategy, "Rename",
+            "Absorption format (new_member contains '=') should stay Rename. \
+             The text replacement isOverflowLabel → variant=\"overflow\" is correct."
+        );
+        assert_eq!(s.from.as_deref(), Some("isOverflowLabel"));
+        assert_eq!(s.to.as_deref(), Some("variant=\"overflow\""));
+    }
+
+    /// Prop rename with no type info in `before`: should stay Rename.
+    /// Some code paths produce `before` without type annotation.
+    #[test]
+    fn test_prop_rename_no_type_info_stays_rename() {
+        let change = ApiChange {
+            symbol: "Page.header".into(),
+            qualified_name: String::new(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::Removed,
+            before: Some("property: header".into()),
+            after: None,
+            description: "property `header` was removed".into(),
+            migration_target: None,
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "masthead".into(),
+            }),
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+
+        assert_eq!(
+            s.strategy, "Rename",
+            "Prop rename without type info should stay Rename (can't detect type mismatch)"
+        );
+        assert_eq!(s.from.as_deref(), Some("header"));
+        assert_eq!(s.to.as_deref(), Some("masthead"));
     }
 }

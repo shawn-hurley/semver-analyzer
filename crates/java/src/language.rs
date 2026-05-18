@@ -704,9 +704,18 @@ impl Language for Java {
     const RENAMEABLE_SYMBOL_KINDS: &'static [SymbolKind] =
         &[SymbolKind::Interface, SymbolKind::Class, SymbolKind::Enum];
     const NAME: &'static str = "java";
-    const MANIFEST_FILES: &'static [&'static str] =
-        &["pom.xml", "build.gradle", "build.gradle.kts"];
+    const MANIFEST_FILES: &'static [&'static str] = &[
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "gradle/libraries.gradle",
+        "gradle/base-information.gradle",
+    ];
     const SOURCE_FILE_PATTERNS: &'static [&'static str] = &["*.java"];
+
+    fn discover_package_manifests(repo: &Path, git_ref: &str) -> Vec<(String, String)> {
+        discover_submodule_manifests(repo, git_ref)
+    }
 
     fn extract(
         &self,
@@ -966,6 +975,16 @@ impl Language for Java {
                 sd.new_profiles.len(),
                 sd.inheritance_summary.len()
             ));
+            if !sd.migration_mappings.is_empty() {
+                let total_methods: usize =
+                    sd.migration_mappings.iter().map(|m| m.method_mappings.len()).sum();
+                lines.push(format!(
+                    "SD: {} migration mappings ({} method pairs) from {} examples",
+                    sd.migration_mappings.len(),
+                    total_methods,
+                    sd.migration_examples.len()
+                ));
+            }
         }
         lines
     }
@@ -986,6 +1005,56 @@ fn java_package(qualified_name: &str) -> &str {
         }
     }
     qualified_name
+}
+
+/// Discover submodule manifest files (build.gradle / pom.xml) across the repo tree.
+///
+/// Uses `git ls-tree` to find all build files without requiring a worktree checkout.
+/// Returns `(path, module_name)` pairs where module_name is extracted from the
+/// parent directory name.
+fn discover_submodule_manifests(repo: &Path, git_ref: &str) -> Vec<(String, String)> {
+    let output = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", git_ref])
+        .current_dir(repo)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    let manifest_names = ["build.gradle", "build.gradle.kts", "pom.xml"];
+    let mut results = Vec::new();
+
+    for line in output.lines() {
+        let path = line.trim();
+        // Skip root-level files (already in MANIFEST_FILES)
+        if !path.contains('/') {
+            continue;
+        }
+        let file_name = path.rsplit('/').next().unwrap_or("");
+        if !manifest_names.contains(&file_name) {
+            continue;
+        }
+        // Skip buildSrc, test fixtures, documentation examples
+        if path.contains("buildSrc")
+            || path.contains("test-fixtures")
+            || path.contains("documentation/")
+            || path.contains("userguide/")
+        {
+            continue;
+        }
+        // Extract module name from path (parent directory)
+        let module = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.rsplit('/').next().unwrap_or(parent))
+            .unwrap_or(path)
+            .to_string();
+
+        results.push((path.to_string(), module));
+    }
+
+    results
 }
 
 #[cfg(test)]

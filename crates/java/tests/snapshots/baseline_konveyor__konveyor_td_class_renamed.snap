@@ -1,8 +1,9 @@
 ---
 source: crates/java/tests/baseline_konveyor.rs
+assertion_line: 119
 expression: normalize_rules(&rules)
 ---
-- rule_id: java-rename-oldservice
+- rule_id: java-migrate-oldservice
   labels:
     - source=semver-analyzer
     - change-type=renamed

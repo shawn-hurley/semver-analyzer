@@ -371,10 +371,12 @@ cargo test -p semver-analyzer-ts --lib
 
 ### Remaining Future Work
 
-8. **Fix-guidance data alignment**: The fix-guidance.yaml pipeline has a data
-   corruption bug where rule IDs are mapped to wrong symbols (e.g., Text
-   component rule IDs mapped to ModalProps descriptions). This is a generation
-   pipeline bug, not a rename detector issue.
+8. ~~**Fix-guidance data alignment**~~: RESOLVED — The broken per-entry
+   `generate_fix_guidance()` function (positional indexing mismatch between
+   report changes and rules) was removed. `fix-guidance.yaml` now contains
+   only summary statistics derived from `fix-strategies.json` via
+   `compute_fix_summary()`. Per-rule fix details are in `fix-strategies.json`
+   (key-based, always correct).
 
 9. **Cross-boundary profile diffing**: The SD pipeline currently diffs profiles
    at the same file path across versions. It does NOT compare deprecated Select's

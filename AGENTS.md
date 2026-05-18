@@ -217,6 +217,11 @@ from structural evidence.**
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
 | 8.6 | Secondary BEM block sub-root | Structural | BEM element CSS classes are designed to be styled inside their block's container (CHP=YES, PMC=NO) |
 | 8.7 | Prop-passed detection | Allowed | ReactNode/ReactElement prop name matches child component name |
+| 8.8 | Bidirectional CHP cycle downgrade | Allowed | When A→B and B→A both have CHP, downgrades the weaker direction to Allowed (prevents cycles) |
+| 9 | Dedup | — | Deduplicates edges between the same parent-child pair |
+| 9.5 | Pure composition wrapper PMC upgrade | Required | Upgrades Structural→Required for grid/pure-container parents without Internal edges. **Skips passthrough wrappers.** |
+| 9.6 | Suppress root shortcuts | — | Removes root→child edges when a non-root intermediate has an equally-strong path |
+| 10 | Drop unconnected members | — | Removes members with zero edges (unless barrel-file exports) |
 
 *Steps 2, 3, 3b use `Allowed` instead of `Required` when the child component
 equals the family root — this indicates recursive/self-nesting (e.g., DataList
@@ -357,6 +362,27 @@ from root) also has an edge to the child. The wrapper is always present,
 so the root's direct edge is a DOM shortcut bypassing the API wrapper
 (e.g., DescriptionList→DescriptionListTerm via `<dl>→<dt>` bypasses
 DescriptionListGroup).
+
+Step 9.5 upgrades Structural edges from "pure composition wrapper" parents
+to Required (adds PMC=YES). A parent qualifies when it has CSS grid or
+pure-container HTML tag evidence AND no Internal outgoing edges (all
+children are consumer-placed). The heuristic: such parents exist to
+contain their children, so empty usage is meaningless.
+
+**Passthrough wrapper guard**: Step 9.5 skips the PMC upgrade when the
+parent is a pure passthrough wrapper — a component that renders no
+components internally, has no non-trivial props (only `children`,
+`className`, `ref`), and passes children through a single DOM element.
+Such a component is just a styled `<div>` that wraps arbitrary content.
+CSS grid on a passthrough wrapper creates CHP (children need the grid
+container for layout) but NOT PMC (the wrapper works fine without
+specific children). Example: `DrawerHead` is a `<div class="pf-c-drawer__head">`
+that uses grid to position `DrawerActions` alongside content, but
+functions perfectly without `DrawerActions` (e.g., just a title).
+
+Step 9.6 has two paths described in `suppress_root_edges_with_intermediate`.
+Must run AFTER Step 9.5 so that Required wrappers (from PMC upgrade)
+participate in the intermediate suppression logic.
 
 After all steps, members with zero edges (no incoming AND no outgoing) are
 dropped from the tree **unless** they are barrel-file exports. Exported
@@ -750,7 +776,7 @@ two constraint dimensions (CHP = child-must-have-parent, PMC =
 parent-must-have-child), verified against upstream PF6 documentation at
 v6.4.1. This is the definitive reference for conformance rule correctness.
 
-**Category A: Both Required (CHP=YES, PMC=YES) — 33 edges**
+**Category A: Both Required (CHP=YES, PMC=YES) — 32 edges**
 
 Both `notParent` and `requiresChild` rules are valid for these edges.
 All edges verified as `required` strength in the actual composition tree.
@@ -763,7 +789,6 @@ real defect; which specific child satisfies it is flexible.
 |--------|--------|-------|--------|
 | DataList | DataListItemCells | DataListCell | CSS `>` + purpose |
 | DescriptionList | DescriptionList | DescriptionListGroup | DOM `<dl>` nesting + CSS grid |
-| Drawer | DrawerHead | DrawerActions | CSS grid parent-child |
 | FormSelect | FormSelect | FormSelectOptionGroup † | DOM `<select>` nesting; select must contain options or optgroups |
 | FormSelect | FormSelectOptionGroup | FormSelectOption † | DOM `<optgroup>` nesting; optgroup must contain options |
 | Hint | Hint | HintBody † | CSS grid; hint must contain body or footer |
@@ -795,7 +820,9 @@ real defect; which specific child satisfies it is flexible.
 | Wizard | WizardNav | WizardNavItem | CSS + nav purpose |
 | deprecated/Wizard | WizardNav | WizardNavItem | Same as v6 |
 
-**Category B: CHP-only (CHP=YES, PMC=NO) — 32 edges**
+**Category B: CHP-only (CHP=YES, PMC=NO) — 33 edges**
+(Includes DrawerHead→DrawerActions, moved from Cat A — see passthrough
+wrapper guard in Step 9.5)
 
 Only `notParent` is valid. `requiresChild` is **wrong** for these edges.
 The child must be inside the parent IF used, but the parent does NOT
@@ -804,6 +831,7 @@ require the child.
 | Family | Parent | Child | Signal | Why PMC=NO |
 |--------|--------|-------|--------|------------|
 | Alert | AlertGroup | Alert | DOM context | Alert is standalone; AlertGroup can be empty (toast/dynamic) |
+| Drawer | DrawerHead | DrawerActions | CSS grid | DrawerHead is a passthrough wrapper; DrawerActions is optional (Step 9.5 passthrough guard prevents PMC upgrade) |
 | Card | Card | CardHeader | CSS `>` | PF docs: "may omit these components" |
 | Card | Card | CardTitle | CSS `>` | PF docs: "may omit these components" |
 | Card | Card | CardBody | CSS `>` | PF docs: "recommended" but not required |
@@ -869,8 +897,8 @@ be stronger but CSS/context signals are insufficient.
 
 | Category | Count | % | Current Status |
 |----------|-------|---|----------------|
-| A: Both Required (correct) | 33 | 42% | Correct — both rules valid |
-| B: CHP-only | 32 | 41% | `notParent` valid; `requiresChild` wrong if generated |
+| A: Both Required (correct) | 32 | 41% | Correct — both rules valid |
+| B: CHP-only | 33 | 42% | `notParent` valid; `requiresChild` wrong if generated |
 | C: PMC-only | 1 | 1% | `requiresChild` valid; `notParent` wrong |
 | D: Both Allowed | 12 | 15% | No conformance rules generated |
 | **Total** | **78** | | |
@@ -904,6 +932,7 @@ the child and the wrong parent because it supports recursive nesting
 | ChartBullet | ChartBullet must contain ChartBulletComparativeErrorMeasure (+ 6 more) | ✓ Not emitted — prop_passed edges are excluded from PMC maps in conformance rule generation | Edge strength is still Wrapper (wrong) but rule gen filters it correctly |
 | DescriptionList | DescriptionList must contain DescriptionListTerm | ✓ FIXED — Step 9.6 suppresses DOM shortcut edges | — |
 | DescriptionList | DescriptionList must contain DescriptionListTermHelpText | ✓ FIXED — same | — |
+| Drawer | DrawerHead must contain DrawerActions | ✓ FIXED — Step 9.5 passthrough wrapper guard prevents PMC upgrade. DrawerHead is a passthrough wrapper (no non-trivial props, no rendered components), so DrawerActions is optional (Cat B). | Edge reclassified from Cat A to Cat B |
 
 **Wrong-level edges (parent-child at wrong depth):**
 
@@ -1026,6 +1055,31 @@ version's profile for a deprecated family. The deprecated version of a
 component may render different sub-components (e.g., deprecated
 `ModalContent` renders `ModalBoxBody/Footer/Header` while v6
 `ModalContent` renders `{children}` passthrough).
+
+#### `/next` Profile Key Collision
+
+The same collision pattern applies to `/next` paths. When a component
+name exists in both main and `/next` paths (e.g., `DualListSelector` in
+v5 has a monolithic API at `src/components/DualListSelector/` and a
+composable preview API at `src/next/components/DualListSelector/`), the
+main version wins in `old_profiles`. The `/next` version is preserved
+in `old_next_profiles`.
+
+- `old_next_profiles` — Phase A secondary map for `/next` profiles that
+  lost name collisions in `old_profiles`
+- `next_profiles` — Phase B secondary map for new-version `/next`
+  collisions (parallel to `deprecated_profiles`)
+- `old_next_component_packages` field on `SdPipelineResult` — built from
+  `old_next_profiles`, maps component → `@pkg/next` package path
+- `collect_family_profiles()` accepts `next_profiles` and prefers the
+  `/next` version when building `next/` family trees
+
+The `/next` package data enables:
+- `generate_deprecated_migration_rules()` Case 3: detects `/next` → main
+  promotions and generates `ImportPathChange` rules
+- Second pass in the same function iterates `old_next_component_packages`
+  to catch collision cases (e.g., DualListSelector from
+  `@patternfly/react-core/next`)
 
 #### `collapse_internal_nodes` Algorithm (CRITICAL)
 
@@ -1362,10 +1416,140 @@ LLM into adding unnecessary imports.
 
 Key file: `crates/ts/src/konveyor_v2.rs` (search "New imports")
 
+#### CSS Modifier Bridge for Value Mapping
+
+`compute_css_modifier_bridge()` in `konveyor_v2.rs` matches removed enum
+values to replacement values by comparing what CSS properties each
+modifier class declares. Produces evidence-based mappings (e.g.,
+`cyan→teal` via matching `BackgroundColor` hex values) instead of relying
+on name similarity which fails for semantic renames.
+
+Key behaviors:
+- Candidates include BOTH added values AND surviving values (values that
+  exist in both old and new enums). Surviving values can be valid
+  replacements when a removed value's functionality was merged.
+- BEM block lookup uses prefix matching for sub-components: `DrawerContent`
+  (camelCase `drawerContent`) finds modifier data under parent block
+  `drawer` via longest-matching-prefix.
+- When neither CSS bridge nor added-value string matching produces a hint,
+  the rule emits "Valid values: ..." with no specific replacement. The
+  surviving-value string similarity fallback was removed because it
+  produced false matches (e.g., `tertiary→horizontal`, `nav→subnav`,
+  `cyan→orange`).
+
+#### Value Rule Labels and Messages
+
+Rules for removed enum values use conditional labels:
+- **`change-type=prop-value-removed`** — when a deterministic replacement
+  mapping exists (CSS bridge or string similarity found a match)
+- **`change-type=type-changed`** — when no replacement was found. The
+  prop still exists; its allowed values changed. This prevents the
+  fix-engine from treating it as a removal.
+
+Messages for no-replacement rules use neutral wording: "Choose the
+appropriate replacement from the valid values" without bias toward
+prop removal. Previous wording ("Consider removing the prop entirely",
+"removing is preferred over guessing") caused the LLM to delete props
+instead of replacing values (e.g., Nav `variant='tertiary'` was removed
+entirely instead of being replaced with `horizontal-subnav`).
+
+#### Absorbing-Prop Rule Suppression
+
+`generate_new_absorbing_prop_rules()` generates rules for newly added
+`ReactNode` props that may absorb children content (e.g., new `icon`
+prop on a component that previously took icons as children).
+
+**Rename target filter**: Absorbing-prop rules are NOT generated for
+props that are rename targets of existing props. When a prop is renamed
+(e.g., `header→masthead` on Page), a dedicated rename rule already
+covers the migration. Without this filter, the absorbing-prop rule
+fires redundantly on every component usage, creating noise that pushes
+the LLM toward over-modification (e.g., adding `hasBodyWrapper={false}`
+to every `PageSection`).
+
+#### Unmapped Removed Prop Rules
+
+`generate_unmapped_removed_prop_rules()` fills a coverage gap between
+`prop-to-child` rules and the P0-C (component-removal) rule.
+
+When a component qualifies for P0-C, individual prop rules are
+suppressed (they'd be redundant). When SD generates `prop-to-child`
+rules for the same component, the P0-C is also suppressed. But
+`prop-to-child` only covers props with exact name matches on child
+components — remaining removed props get zero rules.
+
+This function generates one `JSX_PROP`-level rule per uncovered removed
+prop, with `strategy: LlmAssisted` and `family=` label so the fix-engine
+consolidates them into the family migration LLM prompt. The `JSX_PROP`
+location ensures no false positives on imports.
+
+#### Phase 3 Value Mapping
+
+Phase 3 generates rules for renamed props with value changes (e.g.,
+`spacer→gap` where `spacerLg→gapLg`). It uses the same three-branch
+value mapping algorithm as Phase 2:
+- 1:1 auto-mapping when exactly one removed and one added
+- Complete replacement (all old values removed): greedy N:M assignment
+  with `name_similarity()` + directional boost, no threshold
+- Partial replacement: per-value independent matching with 0.3 threshold
+
+Previously `replacement_hint` was hardcoded to `None` in Phase 3. Now
+it computes mappings, producing deterministic `PropValueChange` fix
+strategies with explicit replacements (e.g., `spacerLg→gapLg`).
+
+#### Appearance Inference for Deprecated Replacements
+
+`infer_appearance_defaults()` in `konveyor_v2.rs` compares CSS modifier
+inventories between old and new components to detect when the old
+component's fixed appearance corresponds to a specific variant value
+on the new component.
+
+Algorithm:
+1. Find variant-like props (union string types) on the new component
+   that the old component didn't have
+2. For each variant value, check if `pf-m-{value}` exists as a CSS
+   modifier on the old vs new component
+3. Values where the modifier exists only on the new component are
+   candidates for the old component's default appearance
+4. Single candidate → specific recommendation; multiple → list for LLM
+
+Example: Chip has no `pf-m-outline` modifier (outline IS its default).
+Label has `pf-m-outline` as an explicit variant. The algorithm detects
+`outline` as a candidate and adds guidance: "Consider which variant
+value matches Chip's look: add, outline."
+
+Results are stored in `appearance_notes` on `DeprecatedMigrationContext`
+and rendered in the fix-engine's LLM prompt.
+
+#### `/next` Promotion Rules
+
+`generate_deprecated_migration_rules()` Case 3 generates `ImportPathChange`
+rules for components promoted from `/next` to main. The rule fires on
+`IMPORT` location with `from: @pkg/next` and strategy
+`ImportPathChange { from: @pkg/next, to: @pkg }`.
+
+A second pass iterates `old_next_component_packages` to catch components
+that lost the name collision in `old_profiles` (e.g., DualListSelector
+in v5 exists at both main and `/next` — only the `/next` package is
+recorded in `old_next_component_packages`).
+
+#### Deprecated Replacement Family Remapping
+
+The `component_to_family` map in `konveyor.rs` remaps deprecated
+components to their replacement families (e.g., Chip→Label, Tile→Card)
+so rules get the replacement family's label for fix-engine consolidation.
+
+**Scoped guard**: The remapping only affects components whose v6 package
+is `/deprecated`. This prevents contamination of `/next` and main-path
+components. Without this guard, DualListSelector at `@patternfly/react-core`
+(main) was incorrectly remapped to the DragDrop family because the
+deprecated DualListSelector had a (wrong) `CommitCoChange` replacement
+linking it to DragDrop.
+
 ### Testing
 
 ```sh
-cargo test -p semver-analyzer-ts --lib    # ~650 unit tests
+cargo test -p semver-analyzer-ts --lib    # ~987 unit tests
 cargo test -p semver-analyzer-ts          # + integration tests
 cargo test                                # full suite
 ```

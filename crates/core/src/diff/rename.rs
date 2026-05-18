@@ -791,7 +791,7 @@ fn tokenize_name(name: &str) -> BTreeSet<String> {
 /// - Substring matches: `hasSelectableInput` / `hasClickableInput` → share "has" + "Input"
 ///
 /// Returns a value in [0.0, 1.0] where 1.0 = identical.
-pub(super) fn name_similarity(a: &str, b: &str) -> f64 {
+pub fn name_similarity(a: &str, b: &str) -> f64 {
     if a == b {
         return 1.0;
     }

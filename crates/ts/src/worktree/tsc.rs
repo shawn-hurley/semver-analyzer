@@ -231,7 +231,7 @@ pub fn run_project_build(
     node_env: &[(String, String)],
 ) -> Result<(), WorktreeError> {
     let needs_shell = build_command
-        .map(|c| super::needs_shell(c))
+        .map(super::needs_shell)
         .unwrap_or(false);
 
     let (cmd, args) = if let Some(custom) = build_command {

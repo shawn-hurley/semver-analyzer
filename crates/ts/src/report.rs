@@ -93,6 +93,13 @@ pub(crate) fn build_report(
     // Pass through SD pipeline results when present (v2 pipeline).
     report.extensions.sd_result = results.extensions.sd_result.clone();
 
+    // Enrich removal_disposition using SD prop replacement detection.
+    // This catches prop renames that the TD pipeline's rename detector missed
+    // due to threshold boundaries (e.g., isActive→isClicked at 0.444 similarity
+    // vs 0.45 threshold) by using per-component SD data: prop_style_bindings,
+    // old/new component props, and prop types.
+    enrich_removal_dispositions_from_sd(&mut report);
+
     report
 }
 
@@ -931,6 +938,22 @@ fn build_package_summaries(
             .filter_map(|c| c.symbol.strip_suffix("Props").map(|s| s.to_string()))
             .collect();
         set.extend(props_with_migration);
+
+        // Also exclude constants whose companion Props interface has any
+        // breaking change. These components already get individual rules
+        // from the TypeSummary built in Step 4, so including them in a
+        // combined constant group creates redundant duplicate incidents.
+        let props_with_breaking_changes: Vec<String> = structural_changes
+            .iter()
+            .filter(|c| {
+                c.is_breaking
+                    && c.symbol.ends_with("Props")
+                    && matches!(c.kind, SymbolKind::Interface | SymbolKind::TypeAlias)
+            })
+            .filter_map(|c| c.symbol.strip_suffix("Props").map(|s| s.to_string()))
+            .collect();
+        set.extend(props_with_breaking_changes);
+
         set
     };
 
@@ -989,7 +1012,7 @@ fn build_package_summaries(
         {
             "CssVariablePrefix".to_string()
         } else {
-            "ConstantGroup".to_string()
+            "LlmAssisted".to_string()
         };
 
         let group = ConstantGroup {
@@ -2237,6 +2260,1044 @@ fn collect_added_files(repo: &Path, from_ref: &str, to_ref: &str) -> Vec<PathBuf
     }
 }
 
+// ─── SD-based prop replacement detection ─────────────────────────────────
+
+/// Enrich `removal_disposition` on removed prop entries using SD pipeline data.
+///
+/// The TD pipeline's rename detector uses type fingerprinting and name similarity
+/// to match removed/added props as renames. Some legitimate renames miss the
+/// thresholds:
+///
+/// - `isActive → isClicked` (0.444 similarity, needs 0.45 for primitive-ambiguous)
+/// - `border → isBordered` (0.500 similarity, needs 0.60 for name-only pass)
+/// - `variant → color` (0.143 similarity, fundamentally a prop split)
+///
+/// The SD pipeline has per-component data that provides additional correlation
+/// signals: `prop_style_bindings` (which props drive which CSS modifiers),
+/// `old/new_component_props` (removed/added prop sets), and prop type maps.
+///
+/// This function uses three tiers of matching:
+///
+/// **Tier 1 (1:1 ratio):** Single removed prop + single added prop on a
+/// component → strong rename signal (Avatar `border → isBordered`).
+///
+/// **Tier 2 (CSS binding):** Removed prop had a `prop_style_bindings` entry
+/// and one or more added props also have bindings. Score by combined prop name +
+/// modifier name similarity, pick the best (Button `isActive → isClicked`).
+///
+/// **Tier 3 (1:N prop split):** Single removed enum prop with multiple added
+/// props. Match old values' semantic domain to new prop names
+/// (Banner `variant → color`).
+fn enrich_removal_dispositions_from_sd(report: &mut AnalysisReport<TypeScript>) {
+    let sd = match report.extensions.sd_result {
+        Some(ref sd) => sd,
+        None => return,
+    };
+
+    // ── Step 0: Verify TD renames using CSS binding continuity ────────
+    //
+    // The TD pipeline's rename detector pairs removed/added props by type
+    // fingerprint and name similarity. It can produce false renames when
+    // multiple new props have the same type (e.g., boolean) and one happens
+    // to pass the similarity threshold despite being unrelated.
+    //
+    // Example: Label `isOverflowLabel → isClickable` is a false rename.
+    // The SD profiles show that `isOverflowLabel` controlled CSS modifier
+    // `overflow`, which still exists in v6 (now via `variant="overflow"`).
+    // Meanwhile `isClickable` controls a different modifier (`clickable`).
+    //
+    // Detection: a TD rename is invalidated when:
+    //   1. The old prop had a prop_style_binding (CSS modifier)
+    //   2. That modifier still exists in the new version's BEM modifiers
+    //   3. The supposed rename target has a DIFFERENT CSS modifier
+    //
+    // When invalidated, reclassify from Renamed → Removed so downstream
+    // generates RemoveProp instead of a wrong Rename codemod.
+    {
+        let mut invalidated = 0usize;
+        for fc in report.changes.iter_mut() {
+            for change in fc.breaking_api_changes.iter_mut() {
+                if change.change != ApiChangeType::Renamed {
+                    continue;
+                }
+                if !matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field) {
+                    continue;
+                }
+                let (comp, old_prop) = match change.symbol.rsplit_once('.') {
+                    Some((c, p)) => (c, p),
+                    None => continue,
+                };
+                let new_prop = match change.after.clone() {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                // Look up old prop's CSS modifier — first from prop_style_bindings,
+                // then fall back to deriving from the prop name (strip is/has/use prefix).
+                let old_profile = match sd.old_profiles.get(comp) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let old_modifier = old_profile
+                    .prop_style_bindings
+                    .get(old_prop)
+                    .and_then(extract_css_modifier_name)
+                    .or_else(|| prop_to_bem_modifier(old_prop));
+                let old_modifier = match old_modifier {
+                    Some(m) => m,
+                    None => continue, // Can't derive modifier name → can't verify
+                };
+
+                // Check if old modifier still exists in new BEM modifiers
+                let new_profile = match sd.new_profiles.get(comp) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                // ── CSS resolved-value validation ────────────────────────
+                //
+                // Whether the old modifier was removed or survives in v6 BEM,
+                // compare the resolved CSS effects of the old and new modifiers.
+                // If both have CSS modifier data and there's zero overlap in
+                // normalized property keys → the modifiers affect completely
+                // different CSS properties → false rename.
+                match check_css_resolved_value_mismatch(sd, old_profile, old_prop, &new_prop) {
+                    CssRenameVerdict::Invalidate(reason) => {
+                        tracing::info!(
+                            component = comp,
+                            old_prop = old_prop,
+                            false_target = &new_prop,
+                            reason = %reason,
+                            "Invalidating TD rename: CSS resolved-value comparison \
+                             shows old and new modifiers affect different CSS properties"
+                        );
+                        change.change = ApiChangeType::Removed;
+                        change.after = None;
+                        change.before = Some(format!("property: {}: boolean", old_prop));
+                        change.removal_disposition = None;
+                        change.description = format!(
+                            "property `{}` was removed from `{}` \
+                             (TD rename to `{}` invalidated: {})",
+                            old_prop, comp, new_prop, reason
+                        );
+                        invalidated += 1;
+                        continue;
+                    }
+                    CssRenameVerdict::Validate => {
+                        // CSS confirms the modifiers affect the same properties.
+                        // The rename is valid regardless of BEM modifier survival.
+                        continue;
+                    }
+                    CssRenameVerdict::Inconclusive => {
+                        // No CSS data available. Fall back to BEM modifier survival check.
+                    }
+                }
+
+                if !new_profile.bem_modifiers.contains(&old_modifier) {
+                    continue; // Modifier was removed, CSS check inconclusive → allow rename
+                }
+
+                // Old modifier survives in v6 BEM. Check if the rename target
+                // maps to the same modifier (continuity).
+                let new_css_tokens = new_profile.prop_style_bindings.get(&new_prop);
+                let new_modifier_from_bindings = new_css_tokens.and_then(extract_css_modifier_name);
+
+                if new_modifier_from_bindings.as_deref() == Some(old_modifier.as_str()) {
+                    continue; // Same modifier → rename is valid (modifier continuity)
+                }
+
+                // Different (or absent) modifier on the rename target, but the old
+                // modifier still exists in BEM → false rename. Invalidate.
+                tracing::info!(
+                    component = comp,
+                    old_prop = old_prop,
+                    false_target = new_prop,
+                    old_modifier = %old_modifier,
+                    new_modifier = ?new_modifier_from_bindings,
+                    "Invalidating TD rename: old CSS modifier still exists in new BEM, \
+                     rename target has different modifier"
+                );
+
+                // Check if the old modifier name was absorbed as a new value
+                // on an existing enum prop (e.g., variant gained 'overflow').
+                let absorbed_by = sd
+                    .old_component_prop_types
+                    .get(comp)
+                    .and_then(|old_types| {
+                        sd.new_component_prop_types.get(comp).and_then(|new_types| {
+                            // Look for props that exist in both versions where the
+                            // new version's type gained the old modifier as a value
+                            let old_prop_set: HashSet<&String> = sd
+                                .old_component_props
+                                .get(comp)
+                                .map(|p| p.iter().collect())
+                                .unwrap_or_default();
+                            let new_prop_set: HashSet<&String> = sd
+                                .new_component_props
+                                .get(comp)
+                                .map(|p| p.iter().collect())
+                                .unwrap_or_default();
+
+                            // Only consider props that exist in both versions
+                            for shared_prop in old_prop_set.intersection(&new_prop_set) {
+                                let old_type = old_types.get(shared_prop.as_str());
+                                let new_type = new_types.get(shared_prop.as_str());
+
+                                if let (Some(ot), Some(nt)) = (old_type, new_type) {
+                                    // Check if new type has the modifier as a value
+                                    // that the old type didn't have
+                                    if nt.contains('|') && nt.contains(&old_modifier) {
+                                        let old_has = ot.contains(&old_modifier);
+                                        if !old_has {
+                                            return Some((
+                                                shared_prop.to_string(),
+                                                old_modifier.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        })
+                    });
+
+                change.change = ApiChangeType::Removed;
+                change.after = None;
+
+                if let Some((absorbing_prop, value)) = absorbed_by {
+                    // The old boolean was absorbed as a value on an existing enum prop.
+                    // Format: isOverflowLabel → variant="overflow"
+                    // Set before to the old prop name (not quoted → hits prop rename path)
+                    // and ReplacedByMember with the value expression.
+                    let replacement = format!("{}=\"{}\"", absorbing_prop, value);
+                    tracing::info!(
+                        component = comp,
+                        old_prop = old_prop,
+                        replacement = %replacement,
+                        "Prop-to-value absorption detected: boolean prop absorbed \
+                         as enum value on existing prop"
+                    );
+                    change.before = Some(old_prop.to_string());
+                    change.removal_disposition = Some(RemovalDisposition::ReplacedByMember {
+                        new_member: replacement,
+                    });
+                    change.description = format!(
+                        "property `{}` was removed from `{}`: \
+                         use `{}=\"{}\"` instead",
+                        old_prop, comp, absorbing_prop, value
+                    );
+                } else {
+                    change.before = Some(format!("property: {}: boolean", old_prop));
+                    change.removal_disposition = None;
+                    change.description = format!(
+                        "property `{}` was removed from `{}` \
+                         (TD rename to `{}` invalidated by CSS binding analysis)",
+                        old_prop, comp, new_prop
+                    );
+                }
+                invalidated += 1;
+            }
+        }
+        if invalidated > 0 {
+            tracing::info!(
+                count = invalidated,
+                "Invalidated TD renames via CSS binding verification"
+            );
+        }
+    }
+
+    // ── Step 1: Build per-component removed/added prop sets ───────────
+    let mut matches: Vec<(String, String, String)> = Vec::new(); // (component, old_prop, new_prop)
+
+    // Clone member_renames to avoid borrow conflict with report.changes
+    let member_renames = report.member_renames.clone();
+
+    for (component, old_props) in &sd.old_component_props {
+        // Look up new props: first try same component name, then check
+        // if the component was renamed and look up under the new name.
+        let new_props = match sd.new_component_props.get(component) {
+            Some(p) => p,
+            None => match member_renames.get(component) {
+                Some(new_name) => match sd.new_component_props.get(new_name) {
+                    Some(p) => p,
+                    None => continue,
+                },
+                None => continue,
+            },
+        };
+
+        let old_set: HashSet<&String> = old_props.iter().collect();
+        let new_set: HashSet<&String> = new_props.iter().collect();
+        let removed: Vec<&String> = old_set.difference(&new_set).copied().collect();
+        let added: Vec<&String> = new_set.difference(&old_set).copied().collect();
+
+        if removed.is_empty() || added.is_empty() {
+            continue;
+        }
+
+        // Step 2: Filter out props already matched by TD rename detector.
+        // Props with a removal_disposition are excluded (already handled).
+        // Renamed props are included in the matching pool so the N:M greedy
+        // matcher can detect and fix duplicate rename targets (TC028).
+        let already_matched: HashSet<String> = report
+            .changes
+            .iter()
+            .flat_map(|fc| fc.breaking_api_changes.iter())
+            .filter(|c| {
+                let comp = c.symbol.rsplit_once('.').map(|(c, _)| c).unwrap_or("");
+                comp == component && c.removal_disposition.is_some()
+            })
+            .filter_map(|c| c.symbol.rsplit_once('.').map(|(_, p)| p.to_string()))
+            .collect();
+
+        // Collect TD rename targets for this component. If two props
+        // share the same target, both need to go through the matcher.
+        let mut rename_target_counts: HashMap<String, Vec<String>> = HashMap::new();
+        for fc in report.changes.iter() {
+            for c in &fc.breaking_api_changes {
+                let comp = c.symbol.rsplit_once('.').map(|(co, _)| co).unwrap_or("");
+                if comp == component && c.change == ApiChangeType::Renamed {
+                    if let Some(target) = c.after.as_ref() {
+                        let prop = c.symbol.rsplit_once('.').map(|(_, p)| p.to_string())
+                            .unwrap_or_default();
+                        rename_target_counts
+                            .entry(target.clone())
+                            .or_default()
+                            .push(prop);
+                    }
+                }
+            }
+        }
+
+        // Props involved in duplicate rename targets need re-matching
+        let duplicate_rename_props: HashSet<String> = rename_target_counts
+            .values()
+            .filter(|props| props.len() > 1)
+            .flatten()
+            .cloned()
+            .collect();
+
+        // Non-duplicate renamed props: exclude from matching, pre-seed their
+        // targets as used so the matcher doesn't reassign them
+        let mut rename_preseed: HashSet<String> = HashSet::new();
+        for (target, props) in &rename_target_counts {
+            if props.len() == 1 {
+                rename_preseed.insert(target.clone());
+            }
+        }
+
+        let mut unmatched_removed: Vec<&String> = removed
+            .iter()
+            .filter(|p| {
+                !already_matched.contains(p.as_str())
+                    && (
+                        // Include if it's a Removed prop without disposition
+                        !rename_target_counts.values().any(|props| props.contains(p))
+                        // OR if it's a Renamed prop involved in a duplicate
+                        || duplicate_rename_props.contains(p.as_str())
+                    )
+            })
+            .copied()
+            .collect();
+
+        // Also add duplicate-renamed props that aren't in the removed set
+        // (they were renamed, so they're in old_props but not in the removed
+        // diff because the new name exists in new_props too)
+        let removed_set: HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
+        let extra_renamed: Vec<String> = duplicate_rename_props
+            .iter()
+            .filter(|p| !removed_set.contains(p.as_str()) && !already_matched.contains(p.as_str()))
+            .cloned()
+            .collect();
+
+        // We need owned references for the extra renamed props
+        let mut unmatched_removed_owned: Vec<String> = unmatched_removed
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        unmatched_removed_owned.extend(extra_renamed);
+
+        // Rebuild unmatched_removed from owned data
+        unmatched_removed = unmatched_removed_owned.iter().collect();
+
+        let unmatched_added: Vec<&String> = added.clone();
+
+        if unmatched_removed.is_empty() {
+            continue;
+        }
+
+        // Get profiles for CSS binding data
+        let old_profile = sd.old_profiles.get(component);
+        let new_profile = sd.new_profiles.get(component);
+        let old_bindings = old_profile
+            .map(|p| &p.prop_style_bindings)
+            .cloned()
+            .unwrap_or_default();
+        let new_bindings = new_profile
+            .map(|p| &p.prop_style_bindings)
+            .cloned()
+            .unwrap_or_default();
+
+        // Track which added props have been used (greedy matching).
+        // Pre-seed with non-duplicate rename targets so the matcher
+        // doesn't reassign props that are already correctly matched.
+        let mut used_added: HashSet<String> = rename_preseed.clone();
+
+        // ── Tier 1: N:M greedy matching with augmented similarity ────────
+        //
+        // Score every (removed, added) pair using augmented name similarity
+        // (with boolean prefix stripping and component prefix stripping).
+        // When types are incompatible (boolean↔enum), require higher
+        // similarity threshold (0.6) to compensate for the type mismatch.
+        // When types are compatible or unavailable, use lower threshold (0.4).
+        //
+        // Greedy assignment: sort by score descending, pick the best
+        // unmatched pair, repeat. This handles 1:1, N:N, and partial matches.
+        {
+            let old_types_map = sd.old_component_prop_types.get(component);
+            let new_types_map = sd
+                .new_component_prop_types
+                .get(component)
+                .or_else(|| {
+                    member_renames
+                        .get(component)
+                        .and_then(|new_name| sd.new_component_prop_types.get(new_name))
+                });
+
+            let mut candidates: Vec<(&String, &String, f64)> = Vec::new();
+            for rem in &unmatched_removed {
+                for add in &unmatched_added {
+                    let sim = augmented_prop_similarity_with_component(rem, add, component);
+
+                    // Type compatibility check with relaxation:
+                    // - Types compatible or unknown: threshold 0.4
+                    // - Types incompatible (boolean↔enum): threshold 0.5
+                    let old_type = old_types_map.and_then(|m| m.get(rem.as_str()));
+                    let new_type = new_types_map.and_then(|m| m.get(add.as_str()));
+                    let types_compatible = match (old_type, new_type) {
+                        (Some(ot), Some(nt)) => prop_types_compatible(ot, nt),
+                        _ => true, // No type info: assume compatible
+                    };
+                    let threshold = if types_compatible { 0.4 } else { 0.5 };
+
+                    if sim >= threshold {
+                        // Apply a ranking penalty for type-incompatible
+                        // matches so that type-compatible candidates win
+                        // when scores are close. This prevents cases like
+                        // isActive→state (sim=0.50, incompatible) beating
+                        // isActive→isClicked (sim=0.44, compatible). (TC008)
+                        let ranking_score = if types_compatible {
+                            sim
+                        } else {
+                            sim * 0.8
+                        };
+                        candidates.push((rem, add, ranking_score));
+                    }
+                }
+            }
+
+            // Sort by score descending for greedy assignment
+            candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut used_removed: HashSet<&str> = HashSet::new();
+            for (rem, add, sim) in &candidates {
+                if used_removed.contains(rem.as_str()) || used_added.contains(add.as_str()) {
+                    continue;
+                }
+                tracing::info!(
+                    component = %component,
+                    removed = %rem,
+                    added = %add,
+                    similarity = sim,
+                    tier = 1,
+                    "SD prop replacement: greedy N:M match"
+                );
+                matches.push((
+                    component.clone(),
+                    rem.to_string(),
+                    add.to_string(),
+                ));
+                used_added.insert(add.to_string());
+                used_removed.insert(rem.as_str());
+            }
+
+            // ── Residual matching: last-resort pairing for leftovers ────
+            // After greedy assignment, if there are remaining unmatched
+            // removed and added props AND the greedy pass already matched
+            // at least one pair (establishing a naming pattern), try
+            // pairing leftovers with a lower threshold (0.25).
+            // This catches cases like errorDescription→bodyText (sim=0.27)
+            // after errorTitle→titleText has already been assigned.
+            let leftover_removed: Vec<&&String> = unmatched_removed
+                .iter()
+                .filter(|r| !used_removed.contains(r.as_str()))
+                .collect();
+            let leftover_added: Vec<&&String> = unmatched_added
+                .iter()
+                .filter(|a| !used_added.contains(a.as_str()))
+                .collect();
+
+            // Only do residual matching if the primary greedy pass
+            // already matched at least one pair (evidence of naming pattern)
+            if !used_removed.is_empty()
+                && !leftover_removed.is_empty()
+                && !leftover_added.is_empty()
+            {
+                let mut residual: Vec<(&&String, &&String, f64)> = Vec::new();
+                for rem in &leftover_removed {
+                    for add in &leftover_added {
+                        let sim = augmented_prop_similarity_with_component(rem, add, component);
+                        if sim >= 0.2 {
+                            // Only check type compatibility as a hard veto for
+                            // truly incompatible pairs (boolean vs named interface)
+                            let old_type = old_types_map.and_then(|m| m.get(rem.as_str()));
+                            let new_type = new_types_map.and_then(|m| m.get(add.as_str()));
+                            let type_vetoed = matches!(
+                                (old_type, new_type),
+                                (Some(ot), Some(nt)) if !prop_types_compatible(ot, nt)
+                            ) && sim < 0.5;
+                            if !type_vetoed {
+                                residual.push((rem, add, sim));
+                            }
+                        }
+                    }
+                }
+                residual.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                let mut res_used_rem: HashSet<&str> = HashSet::new();
+                for (rem, add, sim) in &residual {
+                    if res_used_rem.contains(rem.as_str()) || used_added.contains(add.as_str()) {
+                        continue;
+                    }
+                    tracing::info!(
+                        component = %component,
+                        removed = %rem,
+                        added = %add,
+                        similarity = sim,
+                        tier = "1-residual",
+                        "SD prop replacement: residual match"
+                    );
+                    matches.push((
+                        component.clone(),
+                        rem.to_string(),
+                        add.to_string(),
+                    ));
+                    used_added.insert(add.to_string());
+                    res_used_rem.insert(rem.as_str());
+                    used_removed.insert(rem.as_str());
+                }
+            }
+
+            // Skip to next component if all removed props are matched
+            if used_removed.len() == unmatched_removed.len() {
+                continue;
+            }
+        }
+
+        for removed_prop in &unmatched_removed {
+            // Skip props already matched by Tier 1 greedy
+            if matches.iter().any(|(c, r, _)| c == component && r == removed_prop.as_str()) {
+                continue;
+            }
+
+            // Tier 2: CSS binding correlation
+            let old_css = old_bindings.get(removed_prop.as_str());
+            if let Some(old_css_tokens) = old_css {
+                let old_modifier = extract_css_modifier_name(old_css_tokens);
+
+                let mut best_candidate: Option<(&String, f64)> = None;
+                for added_prop in &unmatched_added {
+                    if used_added.contains(added_prop.as_str()) {
+                        continue;
+                    }
+                    let new_css = new_bindings.get(added_prop.as_str());
+                    if let Some(new_css_tokens) = new_css {
+                        let new_modifier = extract_css_modifier_name(new_css_tokens);
+                        let prop_sim =
+                            semver_analyzer_core::diff::name_similarity(removed_prop, added_prop);
+                        let mod_sim = match (&old_modifier, &new_modifier) {
+                            (Some(om), Some(nm)) => {
+                                semver_analyzer_core::diff::name_similarity(om, nm)
+                            }
+                            _ => 0.0,
+                        };
+                        let combined = prop_sim + mod_sim;
+                        if combined > best_candidate.map(|(_, s)| s).unwrap_or(0.0) {
+                            best_candidate = Some((added_prop, combined));
+                        }
+                    }
+                }
+
+                // Require minimum combined score to avoid false matches
+                if let Some((best_prop, score)) = best_candidate {
+                    if score >= 0.3 {
+                        tracing::info!(
+                            component = %component,
+                            removed = %removed_prop,
+                            added = %best_prop,
+                            score = score,
+                            tier = 2,
+                            "SD prop replacement: CSS binding match"
+                        );
+                        matches.push((
+                            component.clone(),
+                            removed_prop.to_string(),
+                            best_prop.to_string(),
+                        ));
+                        used_added.insert(best_prop.to_string());
+                        continue;
+                    }
+                }
+            }
+
+            // Tier 3: 1:N prop split (single removed enum prop, multiple added)
+            if unmatched_removed.len() == 1 && unmatched_added.len() >= 2 {
+                let old_types = sd.old_component_prop_types.get(component);
+                let new_types = sd.new_component_prop_types.get(component);
+                if let Some(old_type) = old_types.and_then(|t| t.get(removed_prop.as_str())) {
+                    if old_type.contains('|') {
+                        // Parse the old enum values
+                        let old_values = parse_union_string_values(old_type);
+                        if !old_values.is_empty() {
+                            let mut candidates: Vec<(&String, f64)> = Vec::new();
+                            for added_prop in &unmatched_added {
+                                if used_added.contains(added_prop.as_str()) {
+                                    continue;
+                                }
+                                // Signal 1: old values contain the added prop name
+                                // or vice versa (e.g., "blue" matches domain of "color")
+                                let prop_lower = added_prop.to_lowercase();
+                                let semantic_hits = old_values
+                                    .iter()
+                                    .filter(|v| {
+                                        let vl = v.to_lowercase();
+                                        vl.contains(&prop_lower) || prop_lower.contains(&vl)
+                                    })
+                                    .count();
+                                let semantic_ratio =
+                                    semantic_hits as f64 / old_values.len() as f64;
+
+                                // Signal 2: new prop's type name matches the old prop
+                                // name pattern. E.g., old prop "variant" with new type
+                                // "BannerColor" → the type encodes the replacement domain.
+                                // Check if the new type is a named enum (not inline union)
+                                // that shares a prefix with the component name.
+                                let type_signal = if let Some(new_type) =
+                                    new_types.and_then(|t| t.get(added_prop.as_str()))
+                                {
+                                    // New type is a named reference (e.g., BannerColor) —
+                                    // check if it starts with the component name
+                                    if !new_type.contains('|')
+                                        && !new_type.contains('{')
+                                        && new_type
+                                            .starts_with(component.as_str())
+                                    {
+                                        // The type references are specific to this component
+                                        // (BannerColor, BannerStatus). Prefer the one that
+                                        // is the "primary" replacement — the one whose
+                                        // prop name is more general. Use a small bonus.
+                                        0.1
+                                    } else {
+                                        0.0
+                                    }
+                                } else {
+                                    0.0
+                                };
+
+                                // Name similarity is intentionally NOT used here.
+                                // In prop splits, the old and new prop names are
+                                // semantically different ("variant" → "color"/"status")
+                                // and name similarity is misleading (it would prefer
+                                // "status" over "color" for "variant"). Instead we rely
+                                // on semantic_ratio, type_signal, and alphabetical
+                                // tiebreaker for deterministic results.
+                                let score = semantic_ratio + type_signal;
+                                candidates.push((added_prop, score));
+                            }
+
+                            // Sort by score descending, then alphabetically for ties.
+                            // Alphabetical tiebreaker ensures deterministic results and
+                            // tends to prefer simpler/shorter names (e.g., "color" < "status").
+                            candidates.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.0.cmp(b.0))
+                            });
+
+                            if let Some((best_prop, _score)) = candidates.first() {
+                                tracing::info!(
+                                    component = %component,
+                                    removed = %removed_prop,
+                                    added = %best_prop,
+                                    tier = 3,
+                                    "SD prop replacement: 1:N prop split match"
+                                );
+                                matches.push((
+                                    component.clone(),
+                                    removed_prop.to_string(),
+                                    best_prop.to_string(),
+                                ));
+                                used_added.insert(best_prop.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: Apply matches to the report's ApiChange entries.
+    if matches.is_empty() {
+        return;
+    }
+
+    let match_map: HashMap<(String, String), String> = matches
+        .into_iter()
+        .map(|(comp, old, new)| ((comp, old), new))
+        .collect();
+
+    let mut enriched = 0usize;
+    let mut renamed_fixed = 0usize;
+    for fc in report.changes.iter_mut() {
+        for change in fc.breaking_api_changes.iter_mut() {
+            if !matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field) {
+                continue;
+            }
+            if let Some((comp, prop)) = change.symbol.rsplit_once('.') {
+                let key = (comp.to_string(), prop.to_string());
+                if let Some(new_member) = match_map.get(&key) {
+                    if change.change == ApiChangeType::Removed
+                        && change.removal_disposition.is_none()
+                    {
+                        // Standard case: set disposition on Removed changes
+                        change.removal_disposition =
+                            Some(RemovalDisposition::ReplacedByMember {
+                                new_member: new_member.clone(),
+                            });
+                        enriched += 1;
+                    } else if change.change == ApiChangeType::Renamed {
+                        // Fix duplicate TD rename targets: update the
+                        // rename target if the matcher found a better one
+                        let current_target = change.after.as_deref().unwrap_or("");
+                        if current_target != new_member {
+                            tracing::info!(
+                                symbol = %change.symbol,
+                                old_target = current_target,
+                                new_target = %new_member,
+                                "SD enrichment: correcting duplicate TD rename target"
+                            );
+                            change.after = Some(new_member.clone());
+                            // Update description to reflect the corrected target
+                            if let Some(old_name) = change.symbol.rsplit_once('.').map(|(_, p)| p) {
+                                change.description = format!(
+                                    "property `{}` was renamed to `{}`",
+                                    old_name, new_member
+                                );
+                            }
+                            renamed_fixed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if enriched > 0 || renamed_fixed > 0 {
+        tracing::info!(
+            enriched = enriched,
+            renamed_fixed = renamed_fixed,
+            "Enriched removal_disposition from SD prop replacement detection"
+        );
+    }
+}
+
+/// Extract the CSS modifier name from a set of CSS tokens.
+///
+/// Given `{"styles.modifiers.active"}`, returns `Some("active")`.
+/// Check if two prop type strings are structurally compatible for
+/// 1:1 replacement inference in the Tier 1 matcher.
+///
+/// Rejects pairings where one type is a simple primitive (`boolean`,
+/// `string`, etc.) and the other is a complex/named type (interface
+/// reference, object literal, array, function). This prevents false
+/// renames like `isHidden: boolean` → `contentBodyProps: AccordionExpandableContentBodyProps`.
+///
+/// Union types (`'dark' | 'light'`) are treated as non-primitive since
+/// they have specific domain semantics.
+fn prop_types_compatible(old_type: &str, new_type: &str) -> bool {
+    const PRIMITIVES: &[&str] = &[
+        "boolean", "string", "number", "void", "null",
+        "undefined", "never", "any", "unknown",
+    ];
+    fn is_primitive(t: &str) -> bool {
+        let trimmed = t.trim();
+        PRIMITIVES.iter().any(|p| trimmed.eq_ignore_ascii_case(p))
+    }
+
+    let old_prim = is_primitive(old_type);
+    let new_prim = is_primitive(new_type);
+
+    // Reject when one is primitive and the other is not
+    // (e.g., boolean vs AccordionExpandableContentBodyProps)
+    if old_prim != new_prim {
+        return false;
+    }
+
+    true
+}
+
+/// Boolean prefix patterns commonly used in React prop names.
+const BOOLEAN_PREFIXES: &[&str] = &["is", "has", "use", "with", "should", "can"];
+
+/// Strip a boolean prefix (is/has/use/with/should/can) from a prop name.
+/// Returns the remainder with its first character lowercased.
+/// E.g., "isBordered" → "bordered", "usePageInsets" → "pageInsets".
+/// If no prefix matches, returns the original name.
+fn strip_boolean_prefix(name: &str) -> String {
+    for prefix in BOOLEAN_PREFIXES {
+        if name.len() > prefix.len() && name.starts_with(prefix) {
+            let rest = &name[prefix.len()..];
+            // Must start with uppercase (camelCase boundary)
+            if rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+                // Lowercase the first char of the remainder
+                let mut chars = rest.chars();
+                let first = chars.next().unwrap().to_ascii_lowercase();
+                return format!("{}{}", first, chars.as_str());
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// Compute augmented name similarity between two prop names.
+/// Takes the max of:
+/// 1. Raw name similarity
+/// 2. Similarity after stripping boolean prefixes from both
+fn augmented_prop_similarity(a: &str, b: &str) -> f64 {
+    let raw = semver_analyzer_core::diff::name_similarity(a, b);
+    let sa = strip_boolean_prefix(a);
+    let sb = strip_boolean_prefix(b);
+    let stripped = semver_analyzer_core::diff::name_similarity(&sa, &sb);
+    raw.max(stripped)
+}
+
+/// Like `augmented_prop_similarity` but also tries stripping the component
+/// name as a lowercase prefix from prop names.
+/// E.g., "errorTitle" on component "ErrorState" → strip "error" → "title".
+fn augmented_prop_similarity_with_component(a: &str, b: &str, component: &str) -> f64 {
+    let base = augmented_prop_similarity(a, b);
+
+    // Try stripping component-derived prefix.
+    // For "ErrorState", try prefix "error" (lowercase of first word before
+    // a capitalized boundary). For "NotAuthorized", try "notAuthorized" etc.
+    // Simple heuristic: take the component name, lowercase it, see if either
+    // prop name starts with that prefix.
+    let comp_lower = component[..1].to_lowercase() + &component[1..];
+
+    // Try all camelCase boundary prefixes of the component name
+    let mut best = base;
+    for i in 1..comp_lower.len() {
+        if comp_lower.as_bytes().get(i).is_some_and(|c| c.is_ascii_uppercase()) {
+            let prefix = &comp_lower[..i];
+            let sa = strip_component_prefix(a, prefix);
+            let sb = strip_component_prefix(b, prefix);
+            let sim = semver_analyzer_core::diff::name_similarity(&sa, &sb);
+            best = best.max(sim);
+        }
+    }
+    // Also try full component name as prefix (lowercase)
+    let full_prefix = component.to_lowercase();
+    let sa = strip_component_prefix(a, &full_prefix);
+    let sb = strip_component_prefix(b, &full_prefix);
+    let sim = semver_analyzer_core::diff::name_similarity(&sa, &sb);
+    best = best.max(sim);
+
+    best
+}
+
+/// Derive a BEM modifier name from a boolean prop name by stripping common
+/// prefixes (`is`, `has`, `use`, `should`).
+///
+/// Returns `None` if no prefix matches (prop doesn't follow the boolean naming
+/// convention).
+///
+/// Examples:
+/// - `isActive` → `Some("active")`
+/// - `usePageInsets` → `Some("pageInsets")`
+/// - `hasNoPadding` → `Some("noPadding")`
+/// - `variant` → `None` (no boolean prefix)
+fn prop_to_bem_modifier(prop: &str) -> Option<String> {
+    for prefix in &["is", "has", "use", "should"] {
+        if let Some(rest) = prop.strip_prefix(prefix) {
+            if !rest.is_empty() && rest.starts_with(|c: char| c.is_uppercase()) {
+                let mut result = String::with_capacity(rest.len());
+                let mut chars = rest.chars();
+                if let Some(first) = chars.next() {
+                    result.push(first.to_ascii_lowercase());
+                }
+                result.extend(chars);
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a camelCase modifier name to a kebab-case CSS class name with `pf-m-` prefix.
+///
+/// Examples:
+/// - `"pageInsets"` → `"pf-m-page-insets"`
+/// - `"noPadding"` → `"pf-m-no-padding"`
+/// - `"active"` → `"pf-m-active"`
+fn modifier_to_css_class(modifier: &str) -> String {
+    let mut result = String::from("pf-m-");
+    for (i, ch) in modifier.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('-');
+        }
+        result.push(ch.to_ascii_lowercase());
+    }
+    result
+}
+
+/// Result of CSS resolved-value comparison for rename validation.
+enum CssRenameVerdict {
+    /// CSS data confirms the modifiers affect different properties → false rename.
+    Invalidate(String),
+    /// CSS data confirms the modifiers affect the same properties → true rename.
+    Validate,
+    /// Insufficient CSS data to make a determination.
+    Inconclusive,
+}
+
+/// Check whether a proposed boolean prop rename is supported or contradicted
+/// by CSS resolved-value comparison.
+///
+/// Derives BEM modifier names from old/new prop names, looks up their
+/// CSS effects from `old_css_modifiers`/`new_css_modifiers`, and compares
+/// the normalized resolved override keys. If zero overlap, the modifiers
+/// affect completely different CSS properties → false rename.
+fn check_css_resolved_value_mismatch(
+    sd: &crate::sd_types::SdPipelineResult,
+    old_profile: &crate::sd_types::ComponentSourceProfile,
+    old_prop: &str,
+    new_prop: &str,
+) -> CssRenameVerdict {
+    // Derive modifier names from prop names
+    let (old_modifier, new_modifier) = match (prop_to_bem_modifier(old_prop), prop_to_bem_modifier(new_prop)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    // Get the component's BEM block name for CSS modifier lookup
+    let bem_block = match old_profile.bem_block.as_deref() {
+        Some(b) if !b.is_empty() => b,
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    // Look up CSS modifier effects
+    let (old_css_mods, new_css_mods) = match (sd.old_css_modifiers.get(bem_block), sd.new_css_modifiers.get(bem_block)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    let old_css_class = modifier_to_css_class(&old_modifier);
+    let new_css_class = modifier_to_css_class(&new_modifier);
+
+    let (old_effect, new_effect) = match (old_css_mods.get(&old_css_class), new_css_mods.get(&new_css_class)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return CssRenameVerdict::Inconclusive,
+    };
+
+    // Normalize resolved override keys: strip --pf-v5-c-{block} / --pf-v6-c-{block}
+    // prefix to get the essence (e.g., `__content--PaddingLeft`).
+    let strip_prefix = |key: &str| -> String {
+        // Pattern: --pf-v{N}-c-{block-name}--{rest} or --pf-v{N}-c-{block}__...
+        // We want to strip everything up to and including the block name.
+        if let Some(idx) = key.find("--c-") {
+            let after_c = &key[idx + 4..]; // skip "--c-"
+            // Find the next "--" or "__" after the block name
+            if let Some(sep) = after_c.find("--").or_else(|| after_c.find("__")) {
+                return after_c[sep..].to_string();
+            }
+        }
+        key.to_string()
+    };
+
+    let old_keys: HashSet<String> = old_effect
+        .resolved_overrides
+        .keys()
+        .map(|k| strip_prefix(k))
+        .collect();
+    let new_keys: HashSet<String> = new_effect
+        .resolved_overrides
+        .keys()
+        .map(|k| strip_prefix(k))
+        .collect();
+
+    // If either has no resolved overrides, check direct properties
+    if old_keys.is_empty() && new_keys.is_empty() {
+        let old_direct: HashSet<&str> = old_effect.direct_properties.keys().map(|s| s.as_str()).collect();
+        let new_direct: HashSet<&str> = new_effect.direct_properties.keys().map(|s| s.as_str()).collect();
+        if old_direct.is_empty() || new_direct.is_empty() {
+            return CssRenameVerdict::Inconclusive;
+        }
+        let overlap = old_direct.intersection(&new_direct).count();
+        if overlap == 0 {
+            return CssRenameVerdict::Invalidate(format!(
+                "CSS modifiers {} and {} affect completely different CSS properties \
+                 (old: {:?}, new: {:?})",
+                old_css_class, new_css_class, old_direct, new_direct
+            ));
+        }
+        return CssRenameVerdict::Validate;
+    }
+
+    if old_keys.is_empty() || new_keys.is_empty() {
+        return CssRenameVerdict::Inconclusive;
+    }
+
+    let overlap = old_keys.intersection(&new_keys).count();
+    if overlap == 0 {
+        CssRenameVerdict::Invalidate(format!(
+            "CSS modifiers {} and {} affect completely different CSS properties \
+             (old: {:?}, new: {:?})",
+            old_css_class, new_css_class, old_keys, new_keys
+        ))
+    } else {
+        CssRenameVerdict::Validate
+    }
+}
+
+/// Strip a component-derived prefix from a prop name if it matches.
+/// E.g., strip_component_prefix("errorTitle", "error") → "title"
+fn strip_component_prefix(prop: &str, prefix: &str) -> String {
+    let prop_lower = prop.to_lowercase();
+    if prop_lower.starts_with(prefix) && prop.len() > prefix.len() {
+        let rest = &prop[prefix.len()..];
+        // Lowercase the first char of the remainder
+        let mut chars = rest.chars();
+        let first = chars.next().unwrap().to_ascii_lowercase();
+        return format!("{}{}", first, chars.as_str());
+    }
+    prop.to_string()
+}
+
+/// Given `{"styles.modifiers[status]"}`, returns `Some("status")`.
+/// Returns `None` if no modifier token is found.
+fn extract_css_modifier_name(tokens: &BTreeSet<String>) -> Option<String> {
+    for token in tokens {
+        if let Some(rest) = token.strip_prefix("styles.modifiers.") {
+            return Some(rest.to_string());
+        }
+        // Handle bracket syntax: styles.modifiers[foo]
+        if let Some(rest) = token.strip_prefix("styles.modifiers[") {
+            if let Some(name) = rest.strip_suffix(']') {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Extract the type portion from a property signature string.
 ///
 /// Given `"property: splitButtonOptions: SplitButtonOptions"`, returns
@@ -2322,7 +3383,7 @@ fn symbol_kind_to_api_kind(kind: SymbolKind) -> ApiChangeKind {
         SymbolKind::Property => ApiChangeKind::Property,
         SymbolKind::Namespace => ApiChangeKind::ModuleExport,
         SymbolKind::Struct => ApiChangeKind::Class,
-        SymbolKind::EnumMember => ApiChangeKind::Property,
+        SymbolKind::EnumMember => ApiChangeKind::EnumMember,
         SymbolKind::Constructor => ApiChangeKind::Method,
         SymbolKind::GetAccessor | SymbolKind::SetAccessor => ApiChangeKind::Property,
     }
@@ -4552,5 +5613,1880 @@ mod tests {
                 .is_empty(),
             "TestChild should still have empty absorbed_members"
         );
+    }
+
+    // ── SD-based prop replacement detection tests ─────────────────────
+
+    use crate::sd_types::{ComponentSourceProfile, SdPipelineResult};
+
+    /// Helper: build a minimal AnalysisReport with SD data for prop replacement tests.
+    fn build_report_with_sd(
+        changes: Vec<FileChanges<TypeScript>>,
+        sd: SdPipelineResult,
+    ) -> AnalysisReport<TypeScript> {
+        let mut report = AnalysisReport {
+            repository: PathBuf::new(),
+            comparison: Comparison {
+                from_ref: String::new(),
+                to_ref: String::new(),
+                from_sha: String::new(),
+                to_sha: String::new(),
+                commit_count: 0,
+                analysis_timestamp: String::new(),
+            },
+            summary: Summary {
+                total_breaking_changes: 0,
+                breaking_api_changes: 0,
+                breaking_behavioral_changes: 0,
+                files_with_breaking_changes: 0,
+            },
+            changes,
+            manifest_changes: vec![],
+            added_files: vec![],
+            packages: vec![],
+            member_renames: HashMap::new(),
+            inferred_rename_patterns: None,
+            metadata: AnalysisMetadata {
+                call_graph_analysis: String::new(),
+                tool_version: String::new(),
+                llm_usage: None,
+            },
+            extensions: crate::extensions::TsAnalysisExtensions::default(),
+        };
+        report.extensions.sd_result = Some(sd);
+        report
+    }
+
+    /// Helper: build a FileChanges with one removed prop entry.
+    fn removed_prop_change(component: &str, prop: &str, before: &str) -> FileChanges<TypeScript> {
+        FileChanges {
+            file: PathBuf::from(format!("src/{}.d.ts", component)),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: format!("{}.{}", component, prop),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some(format!("property: {}: {}", prop, before)),
+                after: None,
+                description: format!("property `{}` was removed", prop),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }
+    }
+
+    #[test]
+    fn sd_prop_replacement_tier1_one_to_one() {
+        // Avatar: border (removed) → isBordered (added) — 1:1 ratio
+        let changes = vec![removed_prop_change("Avatar", "border", "'dark' | 'light'")];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Avatar".into(),
+            ["alt", "border", "className", "size", "src"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Avatar".into(),
+            ["alt", "isBordered", "className", "size", "src"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert!(
+            change.removal_disposition.is_some(),
+            "border should have removal_disposition set"
+        );
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(new_member, "isBordered");
+            }
+            other => panic!("Expected ReplacedByMember, got {:?}", other),
+        }
+    }
+
+    /// When type information is available, the Tier 1 (1:1 ratio) matcher
+    /// must reject pairings where the types are structurally incompatible
+    /// (e.g., boolean vs a named interface type). This prevents false renames
+    /// like AccordionContent `isHidden → contentBodyProps`.
+    #[test]
+    fn sd_prop_replacement_tier1_rejects_incompatible_types() {
+        let changes = vec![removed_prop_change(
+            "AccordionContent",
+            "isHidden",
+            "boolean",
+        )];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "AccordionContent".into(),
+            ["isHidden", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "AccordionContent".into(),
+            ["contentBodyProps", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        // Provide type information so the guard fires
+        sd.old_component_prop_types.insert(
+            "AccordionContent".into(),
+            [
+                ("isHidden".into(), "boolean".into()),
+                ("className".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "AccordionContent".into(),
+            [
+                ("contentBodyProps".into(), "AccordionExpandableContentBodyProps".into()),
+                ("className".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert!(
+            change.removal_disposition.is_none(),
+            "isHidden should NOT be paired with contentBodyProps (incompatible types: boolean vs named interface)"
+        );
+    }
+
+    #[test]
+    fn sd_prop_replacement_tier2_css_binding() {
+        // Button: isActive (removed) → isClicked (added) via CSS binding match
+        let changes = vec![removed_prop_change("Button", "isActive", "boolean")];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Button".into(),
+            ["isActive", "variant", "isBlock"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Button".into(),
+            [
+                "isClicked",
+                "isExpanded",
+                "isFavorite",
+                "isHamburger",
+                "isSettings",
+                "variant",
+                "isBlock",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+
+        // Old profile with CSS binding for isActive
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.prop_style_bindings.insert(
+            "isActive".into(),
+            ["styles.modifiers.active"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.old_profiles.insert("Button".into(), old_profile);
+
+        // New profile with CSS bindings for multiple new props
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.prop_style_bindings.insert(
+            "isClicked".into(),
+            ["styles.modifiers.clicked"].iter().map(|s| s.to_string()).collect(),
+        );
+        new_profile.prop_style_bindings.insert(
+            "isFavorite".into(),
+            ["styles.modifiers.favorite"].iter().map(|s| s.to_string()).collect(),
+        );
+        new_profile.prop_style_bindings.insert(
+            "isHamburger".into(),
+            ["styles.modifiers.hamburger"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_profiles.insert("Button".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "isClicked",
+                    "isActive should match isClicked (active→clicked has best combined score)"
+                );
+            }
+            other => panic!("Expected ReplacedByMember(isClicked), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sd_prop_replacement_tier3_prop_split() {
+        // Banner: variant (removed, enum) → color + status (added)
+        let changes = vec![removed_prop_change(
+            "Banner",
+            "variant",
+            "'blue' | 'default' | 'gold' | 'green' | 'red'",
+        )];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Banner".into(),
+            ["variant", "isSticky"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Banner".into(),
+            ["color", "status", "isSticky"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.old_component_prop_types.insert(
+            "Banner".into(),
+            [("variant".into(), "'blue' | 'default' | 'gold' | 'green' | 'red'".into())]
+                .into_iter()
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Banner".into(),
+            [
+                ("color".into(), "BannerColor".into()),
+                ("status".into(), "BannerStatus".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "color",
+                    "variant with color values should match 'color' prop"
+                );
+            }
+            other => panic!("Expected ReplacedByMember(color), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sd_prop_replacement_no_match_many_to_many() {
+        // Modal: 4 removed string props, 2 added — too ambiguous, no match
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Modal.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                ApiChange {
+                    symbol: "Modal.bodyAriaLabel".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: bodyAriaLabel: string".into()),
+                    after: None,
+                    description: "removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+                ApiChange {
+                    symbol: "Modal.title".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: title: string".into()),
+                    after: None,
+                    description: "removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Modal".into(),
+            ["bodyAriaLabel", "title", "isOpen"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Modal".into(),
+            ["backdropClassName", "backdropId", "isOpen"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        // Neither prop should be matched — too ambiguous
+        for change in &report.changes[0].breaking_api_changes {
+            assert!(
+                change.removal_disposition.is_none(),
+                "Modal props should not be matched (many-to-many): {}",
+                change.symbol
+            );
+        }
+    }
+
+    #[test]
+    fn sd_prop_replacement_skips_already_matched() {
+        // A prop that already has removal_disposition should not be overwritten
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Test.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Test.oldProp".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some("property: oldProp: boolean".into()),
+                after: None,
+                description: "removed".into(),
+                migration_target: None,
+                removal_disposition: Some(RemovalDisposition::TrulyRemoved),
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Test".into(),
+            ["oldProp"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Test".into(),
+            ["newProp"].iter().map(|s| s.to_string()).collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        // Should remain TrulyRemoved, not overwritten
+        match &report.changes[0].breaking_api_changes[0].removal_disposition {
+            Some(RemovalDisposition::TrulyRemoved) => {}
+            other => panic!(
+                "Expected TrulyRemoved (unchanged), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_extract_css_modifier_name() {
+        let tokens: BTreeSet<String> =
+            ["styles.modifiers.active"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(extract_css_modifier_name(&tokens), Some("active".into()));
+
+        let bracket: BTreeSet<String> =
+            ["styles.modifiers[status]"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(extract_css_modifier_name(&bracket), Some("status".into()));
+
+        let empty: BTreeSet<String> =
+            ["styles.menu"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(extract_css_modifier_name(&empty), None);
+    }
+
+    #[test]
+    fn sd_rename_verification_invalidates_false_rename() {
+        // Label: TD said isOverflowLabel → isClickable (false rename)
+        // SD shows: isOverflowLabel mapped to modifier "overflow" which still exists
+        //           isClickable maps to modifier "clickable" (different)
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Label.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Label.isOverflowLabel".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("isOverflowLabel".into()),
+                after: Some("isClickable".into()),
+                description: "property isOverflowLabel renamed to isClickable".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+
+        // Old profile: isOverflowLabel → modifiers.overflow
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.prop_style_bindings.insert(
+            "isOverflowLabel".into(),
+            ["styles.modifiers.overflow"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.old_profiles.insert("Label".into(), old_profile);
+
+        // New profile: isClickable → modifiers.clickable, "overflow" still in BEM
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.prop_style_bindings.insert(
+            "isClickable".into(),
+            ["styles.modifiers.clickable"].iter().map(|s| s.to_string()).collect(),
+        );
+        new_profile.bem_modifiers.insert("overflow".into());
+        new_profile.bem_modifiers.insert("clickable".into());
+        sd.new_profiles.insert("Label".into(), new_profile);
+
+        // Prop sets (needed for the rest of enrichment to not crash)
+        sd.old_component_props.insert(
+            "Label".into(),
+            ["isOverflowLabel", "variant"]
+                .iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Label".into(),
+            ["isClickable", "status", "variant"]
+                .iter().map(|s| s.to_string()).collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Removed,
+            "False rename should be reclassified to Removed"
+        );
+        assert!(
+            change.after.is_none(),
+            "after should be cleared on invalidated rename"
+        );
+    }
+
+    #[test]
+    fn sd_rename_verification_with_prop_to_value_absorption() {
+        // Label: isOverflowLabel → variant="overflow" (prop-to-value absorption)
+        // The old modifier "overflow" matches a new value on the variant prop
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Label.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Label.isOverflowLabel".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("isOverflowLabel".into()),
+                after: Some("isClickable".into()),
+                description: "property isOverflowLabel renamed to isClickable".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.prop_style_bindings.insert(
+            "isOverflowLabel".into(),
+            ["styles.modifiers.overflow"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.old_profiles.insert("Label".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.prop_style_bindings.insert(
+            "isClickable".into(),
+            ["styles.modifiers.clickable"].iter().map(|s| s.to_string()).collect(),
+        );
+        new_profile.bem_modifiers.insert("overflow".into());
+        new_profile.bem_modifiers.insert("clickable".into());
+        sd.new_profiles.insert("Label".into(), new_profile);
+
+        // variant prop exists in both, type expanded with 'overflow'
+        sd.old_component_props.insert(
+            "Label".into(),
+            ["isOverflowLabel", "variant"]
+                .iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Label".into(),
+            ["isClickable", "status", "variant"]
+                .iter().map(|s| s.to_string()).collect(),
+        );
+        sd.old_component_prop_types.insert(
+            "Label".into(),
+            [("variant".into(), "'outline' | 'filled'".into())]
+                .into_iter().collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Label".into(),
+            [("variant".into(), "'outline' | 'filled' | 'overflow' | 'add'".into())]
+                .into_iter().collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(change.change, ApiChangeType::Removed);
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "variant=\"overflow\"",
+                    "Should detect absorption into variant='overflow'"
+                );
+            }
+            other => panic!(
+                "Expected ReplacedByMember with variant=\"overflow\", got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn sd_rename_verification_preserves_valid_rename() {
+        // FormGroup: labelIcon → labelHelp (valid rename)
+        // CSS modifier "help" didn't exist before, so the old modifier
+        // is NOT in new BEM → rename should NOT be invalidated
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/FormGroup.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "FormGroup.labelIcon".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("labelIcon".into()),
+                after: Some("labelHelp".into()),
+                description: "property labelIcon renamed to labelHelp".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        // No CSS bindings for labelIcon → no verification → rename preserved
+        sd.old_profiles
+            .insert("FormGroup".into(), ComponentSourceProfile::default());
+        sd.new_profiles
+            .insert("FormGroup".into(), ComponentSourceProfile::default());
+        sd.old_component_props.insert(
+            "FormGroup".into(),
+            ["labelIcon"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "FormGroup".into(),
+            ["labelHelp"].iter().map(|s| s.to_string()).collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Valid rename should be preserved"
+        );
+        assert_eq!(change.after.as_deref(), Some("labelHelp"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // TC-driven prop disposition tests
+    // Each test corresponds to a failing TC from the PF6 migration bench.
+    // These tests should FAIL with the current code and PASS after fixes.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// TC005: Avatar `border` (enum) should match `isBordered` (boolean)
+    /// even when type information is available.
+    ///
+    /// Currently fails because prop_types_compatible() rejects boolean
+    /// vs non-primitive (enum) pairings. The type guard should be relaxed
+    /// for boolean↔enum when name similarity is high (strip "is" prefix →
+    /// sim("border","Bordered") = 0.75).
+    #[test]
+    fn sd_prop_replacement_boolean_to_enum_with_types() {
+        let changes = vec![removed_prop_change("Avatar", "border", "'none' | 'dark' | 'light'")];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Avatar".into(),
+            ["alt", "border", "className", "size", "src"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Avatar".into(),
+            ["alt", "isBordered", "className", "size", "src"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        // Provide type info — this is what makes it different from the
+        // existing sd_prop_replacement_tier1_one_to_one test
+        sd.old_component_prop_types.insert(
+            "Avatar".into(),
+            [
+                ("border".into(), "'none' | 'dark' | 'light'".into()),
+                ("alt".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Avatar".into(),
+            [
+                ("isBordered".into(), "boolean".into()),
+                ("alt".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert!(
+            change.removal_disposition.is_some(),
+            "TC005: border should be matched to isBordered even with type info (boolean↔enum)"
+        );
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(new_member, "isBordered");
+            }
+            other => panic!(
+                "TC005: Expected ReplacedByMember(isBordered), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// TC011: Checkbox `isLabelBeforeButton` (boolean) should match
+    /// `labelPosition` (enum 'start'|'end').
+    ///
+    /// Currently fails because:
+    /// 1. prop_types_compatible() rejects boolean vs enum
+    /// 2. Name similarity is borderline (~0.45 raw, ~0.56 with "is" stripped)
+    #[test]
+    fn sd_prop_replacement_boolean_to_enum_label_position() {
+        let changes = vec![removed_prop_change(
+            "Checkbox",
+            "isLabelBeforeButton",
+            "boolean",
+        )];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Checkbox".into(),
+            [
+                "id",
+                "isLabelBeforeButton",
+                "isChecked",
+                "isDisabled",
+                "label",
+                "className",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+        sd.new_component_props.insert(
+            "Checkbox".into(),
+            [
+                "id",
+                "labelPosition",
+                "isChecked",
+                "isDisabled",
+                "label",
+                "className",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+
+        sd.old_component_prop_types.insert(
+            "Checkbox".into(),
+            [
+                ("isLabelBeforeButton".into(), "boolean".into()),
+                ("isChecked".into(), "boolean".into()),
+                ("isDisabled".into(), "boolean".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Checkbox".into(),
+            [
+                ("labelPosition".into(), "'start' | 'end'".into()),
+                ("isChecked".into(), "boolean".into()),
+                ("isDisabled".into(), "boolean".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert!(
+            change.removal_disposition.is_some(),
+            "TC011: isLabelBeforeButton should be matched to labelPosition (boolean→enum)"
+        );
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                // Accept either plain prop name or value-absorbed form
+                assert!(
+                    new_member == "labelPosition"
+                        || new_member.starts_with("labelPosition="),
+                    "TC011: Expected labelPosition or labelPosition=\"start\", got {}",
+                    new_member
+                );
+            }
+            other => panic!(
+                "TC011: Expected ReplacedByMember(labelPosition), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// TC028: ErrorState `errorTitle`→`titleText` and `errorDescription`→`bodyText`
+    /// with component name prefix stripping and N:N matching.
+    ///
+    /// Currently fails because:
+    /// 1. Tier 1 requires 1:1 ratio (2 removed, 2 added → skipped)
+    /// 2. No CSS bindings → Tier 2 skipped
+    /// 3. Not a union type → Tier 3 skipped
+    #[test]
+    fn sd_prop_replacement_n_to_n_component_prefix_strip() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/ErrorState.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                ApiChange {
+                    symbol: "ErrorState.errorTitle".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: errorTitle: string".into()),
+                    after: None,
+                    description: "property `errorTitle` was removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+                ApiChange {
+                    symbol: "ErrorState.errorDescription".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: errorDescription: string".into()),
+                    after: None,
+                    description: "property `errorDescription` was removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "ErrorState".into(),
+            ["errorTitle", "errorDescription", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "ErrorState".into(),
+            ["titleText", "bodyText", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.old_component_prop_types.insert(
+            "ErrorState".into(),
+            [
+                ("errorTitle".into(), "string".into()),
+                ("errorDescription".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "ErrorState".into(),
+            [
+                ("titleText".into(), "string".into()),
+                ("bodyText".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        // errorTitle should match titleText (strip "error" prefix:
+        // "Title" vs "titleText" → high similarity)
+        let title_change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("errorTitle"))
+            .expect("errorTitle change should exist");
+        assert!(
+            title_change.removal_disposition.is_some(),
+            "TC028: errorTitle should match titleText via component prefix stripping"
+        );
+        match &title_change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "titleText",
+                    "TC028: errorTitle should map to titleText"
+                );
+            }
+            other => panic!(
+                "TC028: Expected ReplacedByMember(titleText), got {:?}",
+                other
+            ),
+        }
+
+        // errorDescription should match bodyText (strip "error" prefix:
+        // "Description" vs "bodyText" — lower similarity but should still match
+        // via N:N greedy assignment after errorTitle→titleText is taken)
+        let desc_change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("errorDescription"))
+            .expect("errorDescription change should exist");
+        assert!(
+            desc_change.removal_disposition.is_some(),
+            "TC028: errorDescription should match bodyText via N:N greedy matching"
+        );
+        match &desc_change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "bodyText",
+                    "TC028: errorDescription should map to bodyText"
+                );
+            }
+            other => panic!(
+                "TC028: Expected ReplacedByMember(bodyText), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// TC028 real-world scenario: TD pipeline already emitted
+    /// `errorDescription` as `Renamed → titleText` (wrong — same target as
+    /// `errorTitle`). The SD enrichment should detect the duplicate rename
+    /// target and reassign `errorDescription → bodyText` via the N:M greedy
+    /// matcher.
+    ///
+    /// This tests the case where `Renamed` changes are included in the SD
+    /// enrichment matching pool so the greedy matcher can fix duplicate
+    /// assignments from the TD pipeline.
+    #[test]
+    fn sd_enrichment_fixes_duplicate_td_rename_target() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/ErrorState.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                // TD pipeline correctly renamed errorTitle → titleText
+                ApiChange {
+                    symbol: "ErrorState.errorTitle".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Renamed,
+                    before: Some("property: errorTitle: string".into()),
+                    after: Some("titleText".into()),
+                    description: "property `errorTitle` was renamed to `titleText`".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+                // TD pipeline INCORRECTLY renamed errorDescription → titleText
+                // (should be bodyText)
+                ApiChange {
+                    symbol: "ErrorState.errorDescription".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Renamed,
+                    before: Some("property: errorDescription: string".into()),
+                    after: Some("titleText".into()),
+                    description: "property `errorDescription` was renamed to `titleText`".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "ErrorState".into(),
+            ["errorTitle", "errorDescription", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "ErrorState".into(),
+            ["titleText", "bodyText", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.old_component_prop_types.insert(
+            "ErrorState".into(),
+            [
+                ("errorTitle".into(), "string".into()),
+                ("errorDescription".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "ErrorState".into(),
+            [
+                ("titleText".into(), "string".into()),
+                ("bodyText".into(), "string".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        // errorTitle should stay as Renamed → titleText (correct)
+        let title_change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("errorTitle"))
+            .expect("errorTitle change should exist");
+        assert_eq!(
+            title_change.change,
+            ApiChangeType::Renamed,
+            "TC028: errorTitle should stay Renamed"
+        );
+        assert_eq!(
+            title_change.after.as_deref(),
+            Some("titleText"),
+            "TC028: errorTitle rename target should stay titleText"
+        );
+
+        // errorDescription should be corrected from titleText → bodyText
+        let desc_change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("errorDescription"))
+            .expect("errorDescription change should exist");
+        assert_eq!(
+            desc_change.after.as_deref(),
+            Some("bodyText"),
+            "TC028: errorDescription should be corrected from titleText to bodyText. \
+             The TD pipeline incorrectly assigned both errorTitle and errorDescription \
+             to titleText. SD enrichment should detect the duplicate and reassign."
+        );
+    }
+
+    /// Renamed changes that don't have duplicate targets should NOT be modified.
+    /// Only intervene when there's a provable conflict.
+    #[test]
+    fn sd_enrichment_does_not_touch_valid_renames() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/FormGroup.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                // Correct 1:1 rename — no duplicate target
+                ApiChange {
+                    symbol: "FormGroup.labelIcon".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Renamed,
+                    before: Some("property: labelIcon: ReactElement".into()),
+                    after: Some("labelHelp".into()),
+                    description: "property `labelIcon` was renamed to `labelHelp`".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "FormGroup".into(),
+            ["labelIcon", "label", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "FormGroup".into(),
+            ["labelHelp", "label", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("labelIcon"))
+            .expect("labelIcon change should exist");
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Valid rename should stay Renamed"
+        );
+        assert_eq!(
+            change.after.as_deref(),
+            Some("labelHelp"),
+            "Valid rename target should stay unchanged"
+        );
+    }
+
+    /// TC008: Button `isActive` should match `isClicked` (both boolean),
+    /// NOT `state` (enum). The greedy matcher incorrectly picks `state`
+    /// because boolean-prefix stripping boosts "active" vs "state" to 0.50,
+    /// beating "isActive" vs "isClicked" at 0.44.
+    ///
+    /// Fix: apply a penalty factor to type-incompatible candidates so
+    /// type-compatible matches win when scores are close.
+    #[test]
+    fn sd_enrichment_prefers_type_compatible_match() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Button.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Button.isActive".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Removed,
+                before: Some("property: isActive: boolean".into()),
+                after: None,
+                description: "property `isActive` was removed".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        sd.old_component_props.insert(
+            "Button".into(),
+            ["isActive", "variant", "children"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Button".into(),
+            ["isClicked", "state", "variant", "children"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        // Type info: isActive is boolean, isClicked is boolean, state is enum
+        sd.old_component_prop_types.insert(
+            "Button".into(),
+            [("isActive".into(), "boolean".into())]
+                .into_iter()
+                .collect(),
+        );
+        sd.new_component_prop_types.insert(
+            "Button".into(),
+            [
+                ("isClicked".into(), "boolean".into()),
+                ("state".into(), "'attention' | 'read' | 'unread'".into()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("isActive"))
+            .expect("isActive change should exist");
+
+        match &change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "isClicked",
+                    "TC008: isActive should match isClicked (both boolean), \
+                     not state (enum). Type-compatible candidates should be \
+                     preferred when scores are close."
+                );
+            }
+            other => panic!(
+                "TC008: Expected ReplacedByMember(isClicked), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// TC082: TD falsely renamed `usePageInsets`→`hasNoPadding` on Toolbar.
+    ///
+    /// Known limitation: the TD pipeline matches these via type fingerprint
+    /// (both boolean, same component) with sim=0.40. A name-quality check
+    /// in Step 0 cannot distinguish this false rename from valid low-similarity
+    /// renames like `chips→labels` (sim=0.17) and `spacer→gap` (sim=0.17).
+    /// Fixing this requires changes to the TD pipeline's boolean pool
+    /// threshold, not the SD enrichment step.
+    #[test]
+    #[ignore = "TC082: needs TD pipeline boolean pool threshold fix, not Step 0"]
+    fn sd_step0_invalidates_low_quality_td_rename() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Toolbar.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Toolbar.usePageInsets".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("usePageInsets".into()),
+                after: Some("hasNoPadding".into()),
+                description: "property usePageInsets renamed to hasNoPadding".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        // No CSS bindings for either prop
+        sd.old_profiles
+            .insert("Toolbar".into(), ComponentSourceProfile::default());
+        sd.new_profiles
+            .insert("Toolbar".into(), ComponentSourceProfile::default());
+        sd.old_component_props.insert(
+            "Toolbar".into(),
+            ["usePageInsets", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "Toolbar".into(),
+            ["hasNoPadding", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Removed,
+            "TC082: False rename usePageInsets→hasNoPadding should be invalidated to Removed"
+        );
+        assert!(
+            change.after.is_none(),
+            "TC082: after should be cleared on invalidated rename"
+        );
+    }
+
+    /// TC054: NotAuthorized→UnauthorizedAccess component rename should
+    /// carry prop mappings: `title`→`titleText`, `description`→`bodyText`.
+    ///
+    /// Currently fails because:
+    /// 1. SD enrichment keys old/new props by component name, but old name
+    ///    (NotAuthorized) != new name (UnauthorizedAccess)
+    /// 2. Migration matching threshold (0.60) rejects title→titleText (0.56)
+    #[test]
+    fn sd_prop_replacement_component_rename_carries_props() {
+        // The report has a Removed change for NotAuthorized component
+        // with a MigrationTarget pointing to UnauthorizedAccess
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/NotAuthorized.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![
+                ApiChange {
+                    symbol: "NotAuthorized.title".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: title: string".into()),
+                    after: None,
+                    description: "property `title` was removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+                ApiChange {
+                    symbol: "NotAuthorized.description".into(),
+                    qualified_name: String::new(),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: Some("property: description: string".into()),
+                    after: None,
+                    description: "property `description` was removed".into(),
+                    migration_target: None,
+                    removal_disposition: None,
+                },
+            ],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+        // Old props under old name, new props under new name
+        sd.old_component_props.insert(
+            "NotAuthorized".into(),
+            ["title", "description", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        sd.new_component_props.insert(
+            "UnauthorizedAccess".into(),
+            ["titleText", "bodyText", "className"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+
+        // Tell the report about the component rename
+        let mut report = build_report_with_sd(changes, sd);
+        report
+            .member_renames
+            .insert("NotAuthorized".into(), "UnauthorizedAccess".into());
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let title_change = report.changes[0]
+            .breaking_api_changes
+            .iter()
+            .find(|c| c.symbol.contains("title") && !c.symbol.contains("description"))
+            .expect("title change should exist");
+        assert!(
+            title_change.removal_disposition.is_some(),
+            "TC054: title should match titleText via component rename prop mapping"
+        );
+        match &title_change.removal_disposition {
+            Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                assert_eq!(
+                    new_member, "titleText",
+                    "TC054: title should map to titleText"
+                );
+            }
+            other => panic!(
+                "TC054: Expected ReplacedByMember(titleText), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// TC082: usePageInsets → hasNoPadding is a false rename. Both are boolean
+    /// props on Toolbar, but they control completely different CSS modifiers:
+    /// - usePageInsets → pf-m-page-insets (horizontal content padding)
+    /// - hasNoPadding → pf-m-no-padding (vertical root padding)
+    ///
+    /// The CSS resolved-value comparison should detect zero overlap in
+    /// normalized CSS property keys and invalidate the rename.
+    #[test]
+    fn step0_css_resolved_value_invalidates_false_boolean_rename() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        // Build a Renamed change: Toolbar.usePageInsets → hasNoPadding
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Toolbar.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Toolbar.usePageInsets".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("usePageInsets".into()),
+                after: Some("hasNoPadding".into()),
+                description: "property `usePageInsets` was renamed to `hasNoPadding`".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+
+        // Old profile: Toolbar has BEM block "toolbar", usePageInsets is in BEM modifiers
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Toolbar".into();
+        old_profile.bem_block = Some("toolbar".into());
+        old_profile.bem_modifiers = ["fullHeight", "pageInsets", "static", "sticky"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.old_profiles.insert("Toolbar".into(), old_profile);
+
+        // New profile: Toolbar's BEM modifiers replaced pageInsets with noPadding
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Toolbar".into();
+        new_profile.bem_block = Some("toolbar".into());
+        new_profile.bem_modifiers = ["fullHeight", "noPadding", "static", "sticky"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.new_profiles.insert("Toolbar".into(), new_profile);
+
+        // Old CSS modifiers: pf-m-page-insets controls horizontal content padding
+        let mut old_page_insets = CssModifierEffect::default();
+        old_page_insets.resolved_overrides.insert(
+            "--pf-v5-c-toolbar__content--PaddingLeft".into(),
+            "1rem".into(),
+        );
+        old_page_insets.resolved_overrides.insert(
+            "--pf-v5-c-toolbar__content--PaddingRight".into(),
+            "1rem".into(),
+        );
+        let mut old_toolbar_mods = CssModifierMap::new();
+        old_toolbar_mods.insert("pf-m-page-insets".into(), old_page_insets);
+
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("toolbar".into(), old_toolbar_mods);
+        sd.old_css_modifiers = old_css;
+
+        // New CSS modifiers: pf-m-no-padding controls vertical root padding
+        let mut new_no_padding = CssModifierEffect::default();
+        new_no_padding.resolved_overrides.insert(
+            "--pf-v6-c-toolbar--PaddingBlockEnd".into(),
+            "0".into(),
+        );
+        new_no_padding.resolved_overrides.insert(
+            "--pf-v6-c-toolbar--m-sticky--PaddingBlockEnd".into(),
+            "0".into(),
+        );
+        new_no_padding.resolved_overrides.insert(
+            "--pf-v6-c-toolbar--m-sticky--PaddingBlockStart".into(),
+            "0".into(),
+        );
+        let mut new_toolbar_mods = CssModifierMap::new();
+        new_toolbar_mods.insert("pf-m-no-padding".into(), new_no_padding);
+
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("toolbar".into(), new_toolbar_mods);
+        sd.new_css_modifiers = new_css;
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Removed,
+            "TC082: usePageInsets → hasNoPadding should be invalidated (reclassified as Removed) \
+             because CSS modifiers pf-m-page-insets and pf-m-no-padding affect completely \
+             different CSS properties. Got: {:?}",
+            change.change
+        );
+        assert!(
+            change.after.is_none(),
+            "TC082: after field should be cleared when rename is invalidated"
+        );
+    }
+
+    /// Tabs.isSecondary → isSubtab is a TRUE rename. Both modifiers affect
+    /// the same CSS properties (font sizes for tab sub-elements).
+    /// The CSS resolved-value check should NOT invalidate this rename.
+    #[test]
+    fn step0_css_resolved_value_preserves_true_boolean_rename() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/Tabs.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Tabs.isSecondary".into(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("isSecondary".into()),
+                after: Some("isSubtab".into()),
+                description: "property `isSecondary` was renamed to `isSubtab`".into(),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+
+        let mut sd = SdPipelineResult::default();
+
+        // Old profile: secondary is in BEM modifiers
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Tabs".into();
+        old_profile.bem_block = Some("tabs".into());
+        old_profile.bem_modifiers = ["secondary", "box"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.old_profiles.insert("Tabs".into(), old_profile);
+
+        // New profile: secondary still exists (different purpose), subtab added
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Tabs".into();
+        new_profile.bem_block = Some("tabs".into());
+        new_profile.bem_modifiers = ["secondary", "subtab", "box"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sd.new_profiles.insert("Tabs".into(), new_profile);
+
+        // Old CSS: pf-m-secondary overrides font sizes
+        let mut old_secondary = CssModifierEffect::default();
+        old_secondary.resolved_overrides.insert(
+            "--pf-v5-c-tabs__add--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        old_secondary.resolved_overrides.insert(
+            "--pf-v5-c-tabs__item-action--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        old_secondary.resolved_overrides.insert(
+            "--pf-v5-c-tabs__link--FontSize".into(),
+            ".875rem".into(),
+        );
+        let mut old_tabs_mods = CssModifierMap::new();
+        old_tabs_mods.insert("pf-m-secondary".into(), old_secondary);
+
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("tabs".into(), old_tabs_mods);
+        sd.old_css_modifiers = old_css;
+
+        // New CSS: pf-m-subtab overrides the SAME font size properties
+        let mut new_subtab = CssModifierEffect::default();
+        new_subtab.resolved_overrides.insert(
+            "--pf-v6-c-tabs__add--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        new_subtab.resolved_overrides.insert(
+            "--pf-v6-c-tabs__item-action--c-button--FontSize".into(),
+            ".75rem".into(),
+        );
+        new_subtab.resolved_overrides.insert(
+            "--pf-v6-c-tabs__link--FontSize".into(),
+            ".75rem".into(),
+        );
+        let mut new_tabs_mods = CssModifierMap::new();
+        new_tabs_mods.insert("pf-m-subtab".into(), new_subtab);
+
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("tabs".into(), new_tabs_mods);
+        sd.new_css_modifiers = new_css;
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Tabs.isSecondary → isSubtab should remain Renamed because CSS modifiers \
+             pf-m-secondary and pf-m-subtab affect the same CSS properties (font sizes). \
+             Got: {:?}",
+            change.change
+        );
+    }
+
+    /// Helper: build a FileChanges with one Renamed prop entry.
+    fn renamed_prop_change(component: &str, old_prop: &str, new_prop: &str) -> FileChanges<TypeScript> {
+        FileChanges {
+            file: PathBuf::from(format!("src/{}.d.ts", component)),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: format!("{}.{}", component, old_prop),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some(old_prop.to_string()),
+                after: Some(new_prop.to_string()),
+                description: format!("property `{}` was renamed to `{}`", old_prop, new_prop),
+                migration_target: None,
+                removal_disposition: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }
+    }
+
+    /// Page.isTertiaryNavGrouped → isHorizontalSubnavGrouped is a TRUE rename.
+    /// Neither modifier appears in BEM or CSS data, so the check should be
+    /// inconclusive and the rename should be preserved.
+    #[test]
+    fn step0_css_inconclusive_preserves_rename_page_tertiary_nav_grouped() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("Page", "isTertiaryNavGrouped", "isHorizontalSubnavGrouped")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Page".into();
+        old_profile.bem_block = Some("page".into());
+        sd.old_profiles.insert("Page".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Page".into();
+        new_profile.bem_block = Some("page".into());
+        sd.new_profiles.insert("Page".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Page.isTertiaryNavGrouped → isHorizontalSubnavGrouped should remain Renamed \
+             (no CSS modifier data → inconclusive → preserve)"
+        );
+    }
+
+    /// Page.isTertiaryNavWidthLimited → isHorizontalSubnavWidthLimited is a TRUE rename.
+    /// Same as above — no CSS modifier data, should be inconclusive and preserved.
+    #[test]
+    fn step0_css_inconclusive_preserves_rename_page_tertiary_nav_width() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("Page", "isTertiaryNavWidthLimited", "isHorizontalSubnavWidthLimited")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Page".into();
+        old_profile.bem_block = Some("page".into());
+        sd.old_profiles.insert("Page".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Page".into();
+        new_profile.bem_block = Some("page".into());
+        sd.new_profiles.insert("Page".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Page.isTertiaryNavWidthLimited → isHorizontalSubnavWidthLimited should remain Renamed \
+             (no CSS modifier data → inconclusive → preserve)"
+        );
+    }
+
+    /// Non-boolean prop renames (no is/has/use prefix) should be untouched
+    /// by the CSS resolved-value check since prop_to_bem_modifier returns None.
+    #[test]
+    fn step0_css_skips_non_boolean_renames() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("FormGroup", "labelIcon", "labelHelp")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "FormGroup".into();
+        old_profile.bem_block = Some("formGroup".into());
+        sd.old_profiles.insert("FormGroup".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "FormGroup".into();
+        new_profile.bem_block = Some("formGroup".into());
+        sd.new_profiles.insert("FormGroup".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "FormGroup.labelIcon → labelHelp should remain Renamed \
+             (no boolean prefix → CSS check skipped)"
+        );
+    }
+
+    /// Toolbar.customChipGroupContent → customLabelGroupContent is a non-boolean
+    /// rename (ReactNode type). Should be untouched by CSS check.
+    #[test]
+    fn step0_css_skips_reactnode_renames() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("Toolbar", "customChipGroupContent", "customLabelGroupContent")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Toolbar".into();
+        old_profile.bem_block = Some("toolbar".into());
+        sd.old_profiles.insert("Toolbar".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Toolbar".into();
+        new_profile.bem_block = Some("toolbar".into());
+        sd.new_profiles.insert("Toolbar".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Toolbar.customChipGroupContent → customLabelGroupContent should remain Renamed \
+             (no boolean prefix → CSS check skipped)"
+        );
+    }
+
+    /// The existing isOverflowLabel case uses prop_style_bindings (original
+    /// Step 0 path). Verify the CSS resolved-value check doesn't interfere
+    /// when prop_style_bindings are present and the original check already
+    /// invalidates.
+    #[test]
+    fn step0_css_does_not_conflict_with_prop_style_bindings_path() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        // Label: isOverflowLabel → isClickable (false rename)
+        // prop_style_bindings says: isOverflowLabel → modifiers.overflow
+        // BEM says: overflow still in v6
+        // CSS resolved-value says: different effects (if data were present)
+        let changes = vec![renamed_prop_change("Label", "isOverflowLabel", "isClickable")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Label".into();
+        old_profile.bem_block = Some("label".into());
+        old_profile.prop_style_bindings.insert(
+            "isOverflowLabel".into(),
+            ["styles.modifiers.overflow"].iter().map(|s| s.to_string()).collect(),
+        );
+        old_profile.bem_modifiers = ["compact", "overflow"]
+            .iter().map(|s| s.to_string()).collect();
+        sd.old_profiles.insert("Label".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Label".into();
+        new_profile.bem_block = Some("label".into());
+        new_profile.prop_style_bindings.insert(
+            "isClickable".into(),
+            ["styles.modifiers.clickable"].iter().map(|s| s.to_string()).collect(),
+        );
+        new_profile.bem_modifiers = ["clickable", "compact", "overflow"]
+            .iter().map(|s| s.to_string()).collect();
+        sd.new_profiles.insert("Label".into(), new_profile);
+
+        // Also provide CSS modifier data to test the resolved-value path
+        let mut old_overflow = CssModifierEffect::default();
+        old_overflow.resolved_overrides.insert(
+            "--pf-v5-c-label--m-overflow--MaxWidth".into(), "16ch".into(),
+        );
+        let mut old_label_mods = CssModifierMap::new();
+        old_label_mods.insert("pf-m-overflow".into(), old_overflow);
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("label".into(), old_label_mods);
+        sd.old_css_modifiers = old_css;
+
+        let mut new_clickable = CssModifierEffect::default();
+        new_clickable.resolved_overrides.insert(
+            "--pf-v6-c-label--m-clickable--cursor".into(), "pointer".into(),
+        );
+        let mut new_label_mods = CssModifierMap::new();
+        new_label_mods.insert("pf-m-clickable".into(), new_clickable);
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("label".into(), new_label_mods);
+        sd.new_css_modifiers = new_css;
+
+        sd.old_component_props.insert(
+            "Label".into(),
+            ["isOverflowLabel", "variant"].iter().map(|s| s.to_string()).collect(),
+        );
+        sd.new_component_props.insert(
+            "Label".into(),
+            ["isClickable", "variant"].iter().map(|s| s.to_string()).collect(),
+        );
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Removed,
+            "Label.isOverflowLabel → isClickable should be invalidated \
+             (overflow modifier survives in v6 BEM, clickable is different)"
+        );
+    }
+
+    /// When a component has no BEM block, the CSS check should be inconclusive
+    /// and the rename should be preserved.
+    #[test]
+    fn step0_css_inconclusive_when_no_bem_block() {
+        use crate::sd_types::ComponentSourceProfile;
+
+        let changes = vec![renamed_prop_change("SomeComponent", "isOldProp", "isNewProp")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "SomeComponent".into();
+        // No bem_block set
+        sd.old_profiles.insert("SomeComponent".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "SomeComponent".into();
+        sd.new_profiles.insert("SomeComponent".into(), new_profile);
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Rename should be preserved when component has no BEM block"
+        );
+    }
+
+    /// When only the old modifier has CSS data but the new one doesn't,
+    /// the check should be inconclusive.
+    #[test]
+    fn step0_css_inconclusive_when_only_old_has_data() {
+        use crate::sd_types::{
+            ComponentCssModifiers, ComponentSourceProfile, CssModifierEffect, CssModifierMap,
+        };
+
+        let changes = vec![renamed_prop_change("Widget", "isActive", "isEnabled")];
+        let mut sd = SdPipelineResult::default();
+
+        let mut old_profile = ComponentSourceProfile::default();
+        old_profile.name = "Widget".into();
+        old_profile.bem_block = Some("widget".into());
+        sd.old_profiles.insert("Widget".into(), old_profile);
+
+        let mut new_profile = ComponentSourceProfile::default();
+        new_profile.name = "Widget".into();
+        new_profile.bem_block = Some("widget".into());
+        sd.new_profiles.insert("Widget".into(), new_profile);
+
+        // Only old has CSS modifier data
+        let mut old_active = CssModifierEffect::default();
+        old_active.resolved_overrides.insert(
+            "--pf-v5-c-widget--Color".into(), "blue".into(),
+        );
+        let mut old_mods = CssModifierMap::new();
+        old_mods.insert("pf-m-active".into(), old_active);
+        let mut old_css = ComponentCssModifiers::new();
+        old_css.insert("widget".into(), old_mods);
+        sd.old_css_modifiers = old_css;
+
+        // New CSS has the block but no pf-m-enabled entry
+        let new_mods = CssModifierMap::new();
+        let mut new_css = ComponentCssModifiers::new();
+        new_css.insert("widget".into(), new_mods);
+        sd.new_css_modifiers = new_css;
+
+        let mut report = build_report_with_sd(changes, sd);
+        enrich_removal_dispositions_from_sd(&mut report);
+
+        let change = &report.changes[0].breaking_api_changes[0];
+        assert_eq!(
+            change.change,
+            ApiChangeType::Renamed,
+            "Rename should be preserved when only old modifier has CSS data (inconclusive)"
+        );
+    }
+
+    /// Verify prop_to_bem_modifier helper correctly strips prefixes.
+    #[test]
+    fn test_prop_to_bem_modifier() {
+        assert_eq!(prop_to_bem_modifier("isActive"), Some("active".into()));
+        assert_eq!(prop_to_bem_modifier("isClicked"), Some("clicked".into()));
+        assert_eq!(prop_to_bem_modifier("usePageInsets"), Some("pageInsets".into()));
+        assert_eq!(prop_to_bem_modifier("hasNoPadding"), Some("noPadding".into()));
+        assert_eq!(prop_to_bem_modifier("shouldAnimate"), Some("animate".into()));
+        assert_eq!(prop_to_bem_modifier("isSecondary"), Some("secondary".into()));
+        assert_eq!(prop_to_bem_modifier("isSubtab"), Some("subtab".into()));
+
+        // No boolean prefix → None
+        assert_eq!(prop_to_bem_modifier("variant"), None);
+        assert_eq!(prop_to_bem_modifier("labelIcon"), None);
+        assert_eq!(prop_to_bem_modifier("customChipGroupContent"), None);
+        assert_eq!(prop_to_bem_modifier("spacer"), None);
+        assert_eq!(prop_to_bem_modifier("header"), None);
+
+        // Prefix but next char is lowercase → None (e.g., "island")
+        assert_eq!(prop_to_bem_modifier("island"), None);
+        assert_eq!(prop_to_bem_modifier("useful"), None);
+        assert_eq!(prop_to_bem_modifier("has"), None);
+    }
+
+    /// Verify modifier_to_css_class helper correctly converts to kebab-case.
+    #[test]
+    fn test_modifier_to_css_class() {
+        assert_eq!(modifier_to_css_class("active"), "pf-m-active");
+        assert_eq!(modifier_to_css_class("pageInsets"), "pf-m-page-insets");
+        assert_eq!(modifier_to_css_class("noPadding"), "pf-m-no-padding");
+        assert_eq!(modifier_to_css_class("secondary"), "pf-m-secondary");
+        assert_eq!(modifier_to_css_class("subtab"), "pf-m-subtab");
+        assert_eq!(modifier_to_css_class("horizontalSubnavGrouped"), "pf-m-horizontal-subnav-grouped");
+        assert_eq!(modifier_to_css_class("fullHeight"), "pf-m-full-height");
     }
 }

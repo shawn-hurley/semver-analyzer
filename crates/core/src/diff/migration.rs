@@ -264,10 +264,12 @@ where
             // Allow up to 8 unmatched members per side — covers newly-added
             // interfaces like ContentProps (8 members, 6 unmatched after exact match).
             const MAX_FUZZY_SET_SIZE: usize = 8;
-            // Threshold of 0.60 catches suffix-extension renames like
-            // isVisited → isVisitedLink (0.69) and isPlain → isPlainList (0.64).
-            // The previous 0.70 threshold rejected both of these.
-            const FUZZY_MIN_SIMILARITY: f64 = 0.60;
+            // Threshold of 0.50 catches suffix-extension renames like
+            // isVisited → isVisitedLink (0.69), isPlain → isPlainList (0.64),
+            // and prop renames during component renames like title → titleText
+            // (0.556). The previous 0.60 threshold rejected title→titleText
+            // (TC054: NotAuthorized→UnauthorizedAccess prop mapping).
+            const FUZZY_MIN_SIMILARITY: f64 = 0.50;
 
             if removed_only_names.len() <= MAX_FUZZY_SET_SIZE
                 && added_only_names.len() <= MAX_FUZZY_SET_SIZE
@@ -354,11 +356,37 @@ where
                 fuzzy_matches.iter().map(|m| m.old_name.clone()).collect();
             all_matching.extend(fuzzy_matches);
 
-            let removed_only: Vec<String> = removed_only_names
+            let mut removed_only: Vec<String> = removed_only_names
                 .iter()
                 .filter(|m| !fuzzy_old_names.contains(**m))
                 .map(|m| m.to_string())
                 .collect();
+
+            // Leftover 1:1 pairing: when exactly 1 removed and 1 added
+            // member remain unmatched after exact + fuzzy, pair them
+            // regardless of similarity. This catches cases like
+            // description → bodyText (sim=0.27) where the names are
+            // too different for any threshold but there's no other option.
+            // (TC028: ErrorState errorDescription → bodyText)
+            let fuzzy_new_names: HashSet<String> =
+                all_matching.iter().map(|m| m.new_name.clone()).collect();
+            let leftover_added: Vec<&str> = added_only_names
+                .iter()
+                .filter(|m| !fuzzy_new_names.contains(**m))
+                .copied()
+                .collect();
+            if removed_only.len() == 1 && leftover_added.len() == 1 {
+                tracing::debug!(
+                    old = removed_only[0],
+                    new = leftover_added[0],
+                    "Leftover 1:1 pairing in migration (no other candidates)"
+                );
+                all_matching.push(MemberMapping {
+                    old_name: removed_only[0].clone(),
+                    new_name: leftover_added[0].to_string(),
+                });
+                removed_only.clear();
+            }
 
             // Keep the best match (highest overlap ratio).
             if best_match
@@ -415,7 +443,115 @@ where
         }
     }
 
+    // Fallback: name-prefix stripping for zero-member removed classes.
+    //
+    // Classes like MySQL5InnoDBDialect have zero extractable public methods
+    // (only protected overrides or constructors), so the member-overlap
+    // algorithm skips them. When such a class is removed, try stripping
+    // version numbers from the name to find a consolidated base class.
+    //
+    // Pattern: "FooV5BarDialect" → strip digits/version suffixes → "FooDialect"
+    // If a class named "FooDialect" exists in the new API in the same package,
+    // treat it as a migration target with 0% overlap but high naming confidence.
+    for removed_sym in &removed_interfaces {
+        // Skip if already matched
+        if matched_removed.contains(removed_sym.qualified_name.as_str()) {
+            continue;
+        }
+        // Only apply to zero-member classes
+        if !removed_sym.members.is_empty() {
+            continue;
+        }
+
+        let name = &removed_sym.name;
+        // Try stripping version numbers and common suffixes like "InnoDB"
+        if let Some(base_name) = strip_version_from_name(name) {
+            // Look for the base-name class in the same package in the new API
+            if let Some(replacement) = new_containers.iter().find(|c| {
+                c.name == base_name && semantics.same_family(removed_sym, c)
+            }) {
+                if !matched_removed.contains(removed_sym.qualified_name.as_str()) {
+                    matched_removed.insert(&removed_sym.qualified_name);
+
+                    let old_extends = removed_sym.extends.clone();
+                    let new_extends = replacement.extends.clone();
+                    let (old_ext, new_ext) = if old_extends != new_extends {
+                        (old_extends, new_extends)
+                    } else {
+                        (None, None)
+                    };
+
+                    results.push(MigrationMatch {
+                        removed: removed_sym,
+                        target: MigrationTarget {
+                            removed_symbol: removed_sym.name.clone(),
+                            removed_qualified_name: removed_sym.qualified_name.clone(),
+                            removed_package: removed_sym.package.clone(),
+                            replacement_symbol: replacement.name.clone(),
+                            replacement_qualified_name: replacement.qualified_name.clone(),
+                            replacement_package: replacement.package.clone(),
+                            matching_members: Vec::new(),
+                            removed_only_members: Vec::new(),
+                            overlap_ratio: 0.0,
+                            old_extends: old_ext,
+                            new_extends: new_ext,
+                        },
+                    });
+
+                    tracing::debug!(
+                        removed = %removed_sym.name,
+                        replacement = %replacement.name,
+                        "Name-prefix fallback: stripped version from class name"
+                    );
+                }
+            }
+        }
+    }
+
     results
+}
+
+/// Strip version numbers and version-related suffixes from a class name.
+///
+/// Examples:
+/// - `MySQL5InnoDBDialect` → `MySQLDialect` (strip "5InnoDB")
+/// - `MySQL57InnoDBDialect` → `MySQLDialect` (strip "57InnoDB")
+/// - `PostgreSQL10Dialect` → `PostgreSQLDialect` (strip "10")
+/// - `PostgreSQL92Dialect` → `PostgreSQLDialect` (strip "92")
+/// - `H2Dialect` → None (single digit, too ambiguous)
+///
+/// The heuristic: find runs of digits optionally followed by a non-digit
+/// suffix (like "InnoDB") that sits between the letter-only prefix and the
+/// trailing base suffix (like "Dialect"). Returns None if no version pattern
+/// is found or if stripping would leave less than 3 characters.
+fn strip_version_from_name(name: &str) -> Option<String> {
+    // Find common trailing suffixes to preserve
+    let suffixes = ["Dialect", "Type", "Strategy", "Factory", "Provider", "Handler"];
+    let trailing_suffix = suffixes.iter().find(|s| name.ends_with(*s))?;
+
+    let prefix_part = &name[..name.len() - trailing_suffix.len()];
+    if prefix_part.len() < 2 {
+        return None;
+    }
+
+    // Find where the version part starts: first digit in the prefix
+    let digit_start = prefix_part.find(|c: char| c.is_ascii_digit())?;
+    if digit_start == 0 {
+        return None; // Name starts with digit, not a version suffix
+    }
+
+    let base_prefix = &prefix_part[..digit_start];
+    if base_prefix.len() < 2 {
+        return None; // Too short to be meaningful
+    }
+
+    let result = format!("{}{}", base_prefix, trailing_suffix);
+    // Don't return if result equals original (no version to strip)
+    if result == name {
+        return None;
+    }
+
+    Some(result)
 }
 
 /// Check if a symbol kind is a "container" (has members).
@@ -431,6 +567,32 @@ mod tests {
     use super::*;
     use crate::diff::MinimalSemantics;
     use crate::types::{Symbol, SymbolKind, Visibility};
+
+    #[test]
+    fn test_strip_version_from_name_dialects() {
+        assert_eq!(
+            strip_version_from_name("MySQL5InnoDBDialect"),
+            Some("MySQLDialect".to_string())
+        );
+        assert_eq!(
+            strip_version_from_name("MySQL57InnoDBDialect"),
+            Some("MySQLDialect".to_string())
+        );
+        assert_eq!(
+            strip_version_from_name("PostgreSQL10Dialect"),
+            Some("PostgreSQLDialect".to_string())
+        );
+        assert_eq!(
+            strip_version_from_name("PostgreSQL92Dialect"),
+            Some("PostgreSQLDialect".to_string())
+        );
+        // Already the base name -- no version to strip
+        assert_eq!(strip_version_from_name("MySQLDialect"), None);
+        // Too short after stripping
+        assert_eq!(strip_version_from_name("H2Dialect"), None);
+        // No recognized suffix
+        assert_eq!(strip_version_from_name("MySQL5"), None);
+    }
 
     fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
         let mut sym = Symbol::new(
@@ -980,5 +1142,126 @@ mod tests {
         assert_eq!(results[0].target.matching_members.len(), 6);
         assert!(results[0].target.removed_only_members.is_empty());
         assert!(results[0].target.overlap_ratio > 0.85);
+    }
+
+    /// TC054: NotAuthorizedProps → UnauthorizedAccessProps migration.
+    /// Props `title` and `description` should be fuzzy-matched to
+    /// `titleText` and `bodyText` instead of landing in `removed_only_members`.
+    ///
+    /// `title→titleText` has name_similarity ~0.556 (5/9).
+    /// The fuzzy threshold must be ≤0.55 to catch this.
+    #[test]
+    fn test_fuzzy_prop_rename_in_migration_title_to_titletext() {
+        let old_props = make_interface(
+            "NotAuthorizedProps",
+            "src/NotAuthorized/NotAuthorized.d.ts",
+            &[
+                "title",
+                "description",
+                "className",
+                "serviceName",
+                "primaryAction",
+            ],
+        );
+
+        let new_props = make_interface(
+            "UnauthorizedAccessProps",
+            "src/UnauthorizedAccess/UnauthorizedAccess.d.ts",
+            &[
+                "titleText",
+                "bodyText",
+                "className",
+                "serviceName",
+                "primaryAction",
+            ],
+        );
+
+        let removed = vec![&old_props];
+        let old_symbols = vec![&old_props];
+        let new_symbols = vec![&new_props];
+
+        // Need dir_renames to enable cross-directory matching
+        let mut dir_renames = HashMap::new();
+        dir_renames.insert(
+            "src/NotAuthorized".to_string(),
+            vec!["src/UnauthorizedAccess".to_string()],
+        );
+
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &dir_renames,
+        );
+
+        assert_eq!(
+            results.len(),
+            1,
+            "TC054: Should detect NotAuthorizedProps → UnauthorizedAccessProps migration"
+        );
+
+        let mig = &results[0].target;
+        assert_eq!(mig.replacement_symbol, "UnauthorizedAccessProps");
+
+        // className, serviceName, primaryAction should be exact matches
+        let exact_matches: Vec<&MemberMapping> = mig
+            .matching_members
+            .iter()
+            .filter(|m| m.old_name == m.new_name)
+            .collect();
+        assert!(
+            exact_matches.len() >= 3,
+            "TC054: Should have at least 3 exact prop matches (className, serviceName, primaryAction), got {}",
+            exact_matches.len()
+        );
+
+        // title→titleText should be a fuzzy match
+        let title_match = mig
+            .matching_members
+            .iter()
+            .find(|m| m.old_name == "title");
+        assert!(
+            title_match.is_some(),
+            "TC054: 'title' should be fuzzy-matched to 'titleText', not in removed_only. \
+             removed_only = {:?}",
+            mig.removed_only_members
+        );
+        assert_eq!(
+            title_match.unwrap().new_name,
+            "titleText",
+            "TC054: title should map to titleText"
+        );
+
+        assert!(
+            !mig.removed_only_members.contains(&"title".to_string()),
+            "TC054: 'title' should NOT be in removed_only_members"
+        );
+
+        // description→bodyText should be caught by leftover 1:1 pairing.
+        // After title→titleText is matched (fuzzy), description is the only
+        // remaining removed and bodyText is the only remaining added.
+        let desc_match = mig
+            .matching_members
+            .iter()
+            .find(|m| m.old_name == "description");
+        assert!(
+            desc_match.is_some(),
+            "TC054/TC028: 'description' should be matched to 'bodyText' via leftover \
+             1:1 pairing. removed_only = {:?}",
+            mig.removed_only_members
+        );
+        assert_eq!(
+            desc_match.unwrap().new_name,
+            "bodyText",
+            "TC054/TC028: description should map to bodyText"
+        );
+
+        // removed_only should be empty — all props matched
+        assert!(
+            mig.removed_only_members.is_empty(),
+            "TC054: All props should be matched, removed_only = {:?}",
+            mig.removed_only_members
+        );
     }
 }

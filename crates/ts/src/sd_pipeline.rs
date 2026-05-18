@@ -68,6 +68,13 @@ pub fn run_sd(
     // These are used in Phase A.5 to diff against their non-deprecated replacements.
     let mut deprecated_removed_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
 
+    // Secondary map for /next profiles that lost name collisions in old_profiles.
+    // When a component name exists in both main and /next paths (e.g.,
+    // DualListSelector in v5), the main version wins in old_profiles.
+    // The /next version is preserved here so the rule generator can detect
+    // /next → main promotions and generate ImportPathChange rules.
+    let mut old_next_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+
     // Extract profiles at both refs for changed files, diff them
     for file_info in &changed_files {
         let old_source = read_git_file(repo, from_ref, &file_info.path);
@@ -86,14 +93,27 @@ pub fn run_sd(
                     .or_insert_with(|| profile.clone());
             }
 
-            // When a component exists in both main and deprecated paths,
-            // prefer the main (non-deprecated) version.
+            // When a component exists in both main and deprecated/next paths,
+            // prefer the main (non-deprecated, non-next) version. Preserve
+            // evicted /next profiles in old_next_profiles for rule generation.
             let is_deprecated = file_info.path.contains("/deprecated/");
+            let is_next = file_info.path.contains("/next/");
             if let Some(existing) = old_profiles.get(&file_info.component_name) {
                 let existing_is_deprecated = existing.file.contains("/deprecated/");
-                if existing_is_deprecated && !is_deprecated {
-                    old_profiles.insert(file_info.component_name.clone(), profile);
+                let existing_is_next = existing.file.contains("/next/");
+                if (existing_is_deprecated || existing_is_next) && !is_deprecated && !is_next {
+                    // Main path wins — evict the existing deprecated/next profile
+                    let evicted = old_profiles.insert(file_info.component_name.clone(), profile);
+                    if let Some(evicted_prof) = evicted {
+                        if existing_is_next {
+                            old_next_profiles.insert(file_info.component_name.clone(), evicted_prof);
+                        }
+                    }
+                } else if is_next && !existing_is_next {
+                    // Non-next already in map; stash the /next version
+                    old_next_profiles.insert(file_info.component_name.clone(), profile);
                 }
+                // else: keep existing (non-deprecated, non-next wins)
             } else {
                 old_profiles.insert(file_info.component_name.clone(), profile);
             }
@@ -152,6 +172,9 @@ pub fn run_sd(
     // The deprecated version is preserved here so deprecated families
     // can use the correct profile for composition tree building.
     let mut deprecated_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+    // Secondary map for /next profiles that lost name collisions.
+    // Same pattern as deprecated_profiles but for /next preview components.
+    let mut next_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
     for file_info in &all_to_files {
         if let Some(source) = read_git_file(repo, to_ref, &file_info.path) {
             let profile = source_profile::extract_profile(
@@ -160,20 +183,29 @@ pub fn run_sd(
                 &source,
             );
             let is_deprecated = file_info.path.contains("/deprecated/");
+            let is_next = file_info.path.contains("/next/");
             if let Some(existing) = new_profiles.get(&file_info.component_name) {
                 let existing_is_deprecated = existing.file.contains("/deprecated/");
-                // Main path wins over deprecated path
-                if existing_is_deprecated && !is_deprecated {
-                    // Preserve the deprecated profile before overwriting
+                let existing_is_next = existing.file.contains("/next/");
+                // Main path wins over deprecated and /next paths
+                if (existing_is_deprecated || existing_is_next) && !is_deprecated && !is_next {
+                    // Preserve the evicted profile before overwriting
                     let evicted = new_profiles.insert(file_info.component_name.clone(), profile);
-                    if let Some(dep_prof) = evicted {
-                        deprecated_profiles.insert(file_info.component_name.clone(), dep_prof);
+                    if let Some(evicted_prof) = evicted {
+                        if existing_is_deprecated {
+                            deprecated_profiles.insert(file_info.component_name.clone(), evicted_prof);
+                        } else if existing_is_next {
+                            next_profiles.insert(file_info.component_name.clone(), evicted_prof);
+                        }
                     }
                 } else if is_deprecated {
                     // Non-deprecated already in map; stash the deprecated version
                     deprecated_profiles.insert(file_info.component_name.clone(), profile);
+                } else if is_next {
+                    // Non-next already in map; stash the /next version
+                    next_profiles.insert(file_info.component_name.clone(), profile);
                 }
-                // else: keep the existing (non-deprecated or first-seen)
+                // else: keep the existing (non-deprecated, non-next or first-seen)
             } else {
                 new_profiles.insert(file_info.component_name.clone(), profile);
             }
@@ -441,6 +473,7 @@ pub fn run_sd(
         let all_family_profiles = collect_family_profiles(
             &new_profiles,
             &deprecated_profiles,
+            &next_profiles,
             &all_member_names,
             family_name,
         );
@@ -753,10 +786,26 @@ pub fn run_sd(
         .filter(|(_, profile)| !profile.required_props.is_empty())
         .map(|(name, profile)| (name.clone(), profile.required_props.clone()))
         .collect();
+    let old_required_props: HashMap<String, BTreeSet<String>> = old_profiles
+        .iter()
+        .filter(|(_, profile)| !profile.required_props.is_empty())
+        .map(|(name, profile)| (name.clone(), profile.required_props.clone()))
+        .collect();
 
     // Build component→package maps for both versions.
     // Used for detecting deprecated↔main migrations.
     let old_component_packages: HashMap<String, String> = old_profiles
+        .iter()
+        .filter_map(|(name, profile)| {
+            resolve_component_package(&profile.file).map(|pkg| (name.clone(), pkg))
+        })
+        .collect();
+
+    // Build /next component packages from old_next_profiles.
+    // These are components that existed at /next in the old version but
+    // lost the name collision to the main-path version in old_profiles.
+    // Used for detecting /next → main promotions.
+    let old_next_component_packages: HashMap<String, String> = old_next_profiles
         .iter()
         .filter_map(|(name, profile)| {
             resolve_component_package(&profile.file).map(|pkg| (name.clone(), pkg))
@@ -778,11 +827,13 @@ pub fn run_sd(
         conformance_checks,
         component_packages,
         old_component_packages,
+        old_next_component_packages,
         old_component_props,
         new_component_props,
         old_component_prop_types,
         new_component_prop_types,
         new_required_props,
+        old_required_props,
         dep_repo_packages: HashMap::new(), // populated by orchestrator from --dep-repo
         removed_css_blocks: Vec::new(),       // populated by orchestrator from dep-repo diff
         removed_css_entry_files: Vec::new(), // populated by orchestrator from dep-repo diff
@@ -792,6 +843,10 @@ pub fn run_sd(
         deprecated_replacements: Vec::new(),     // populated by orchestrator from rendering swaps
         old_profiles,
         new_profiles,
+        old_css_modifiers: HashMap::new(),           // populated by orchestrator from dep-repo CSS
+        new_css_modifiers: HashMap::new(),           // populated by orchestrator from dep-repo CSS
+        old_css_property_targets: HashMap::new(),    // populated by orchestrator from dep-repo CSS
+        new_css_property_targets: HashMap::new(),    // populated by orchestrator from dep-repo CSS
     })
 }
 
@@ -977,10 +1032,12 @@ fn group_by_family(files: &[ComponentFile]) -> BTreeMap<String, Vec<&ComponentFi
 fn collect_family_profiles(
     all_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
     deprecated_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
+    next_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
     family_exports: &[String],
     family_name: &str,
 ) -> HashMap<String, crate::sd_types::ComponentSourceProfile> {
     let is_deprecated_family = family_name.starts_with("deprecated/");
+    let is_next_family = family_name.starts_with("next/");
     family_exports
         .iter()
         .filter_map(|name| {
@@ -989,6 +1046,13 @@ fn collect_family_profiles(
             if is_deprecated_family {
                 if let Some(dep_prof) = deprecated_profiles.get(name) {
                     return Some((name.clone(), dep_prof.clone()));
+                }
+            }
+            // For /next families, prefer the /next version of a profile
+            // when it exists (handles name collisions like DualListSelector).
+            if is_next_family {
+                if let Some(next_prof) = next_profiles.get(name) {
+                    return Some((name.clone(), next_prof.clone()));
                 }
             }
             all_profiles.get(name).map(|p| (name.clone(), p.clone()))
@@ -1124,35 +1188,6 @@ fn extract_from_path(line: &str) -> Option<String> {
 }
 
 // ── CSS grid nesting enrichment ─────────────────────────────────────────
-
-/// Enrich composition trees with CSS grid layout nesting.
-///
-/// For each tree, find the matching CSS profile (by block name) and use
-/// grid layout signals to move edges from flat (root → all) to nested
-/// (root → grid-items, grid-items → non-grid-items).
-///
-/// Algorithm:
-/// 1. Match CSS profile to tree via the BEM block name
-/// 2. Identify grid items (elements with `grid-column`) → direct children of root
-///    Convert a camelCase suffix to kebab-case for CSS element matching.
-///    "ContentSection" → "content-section"
-///    "item" → "item"
-///    "expandableContent" → "expandable-content"
-#[allow(dead_code)]
-fn camel_to_kebab(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() {
-            if i > 0 {
-                result.push('-');
-            }
-            result.push(ch.to_ascii_lowercase());
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
 
 // ── Internal node collapsing ────────────────────────────────────────────
 
@@ -2503,6 +2538,66 @@ fn enrich_all_props_from_extends(
 ///
 /// Uses a cache so each helper file is parsed only once even when 30+
 /// components import the same helper.
+/// Cached result from parsing a helper function: either a rich param mapping
+/// (which return keys reference which parameters) or a flat list of return keys.
+#[derive(Debug, Clone)]
+enum HelperResolution {
+    /// Rich mapping: we know which parameters flow to which return keys.
+    Mapped(crate::source_profile::managed_attrs::ReturnKeyParamMapping),
+    /// Flat fallback: we only know the return object keys, not which params produce them.
+    FlatKeys(Vec<String>),
+}
+
+impl HelperResolution {
+    fn all_keys(&self) -> Vec<String> {
+        match self {
+            HelperResolution::Mapped(m) => m.key_to_params.iter().map(|(k, _)| k.clone()).collect(),
+            HelperResolution::FlatKeys(keys) => keys.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            HelperResolution::Mapped(m) => m.key_to_params.is_empty(),
+            HelperResolution::FlatKeys(keys) => keys.is_empty(),
+        }
+    }
+
+    /// Get the return keys that a specific argument position controls.
+    /// If we have param mapping, only return keys whose value expression
+    /// references the parameter at `arg_position`. Falls back to all keys
+    /// if no mapping is available or arg_position is out of range.
+    fn keys_for_arg_position(&self, arg_position: Option<usize>) -> Vec<String> {
+        match (self, arg_position) {
+            (HelperResolution::Mapped(mapping), Some(pos)) => {
+                if pos < mapping.param_names.len() {
+                    let param_name = &mapping.param_names[pos];
+                    // Only include keys whose value references this parameter
+                    let scoped: Vec<String> = mapping
+                        .key_to_params
+                        .iter()
+                        .filter(|(_, params)| params.iter().any(|p| p == param_name))
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    if scoped.is_empty() {
+                        // Param doesn't flow to any return key — no attrs to override
+                        Vec::new()
+                    } else {
+                        scoped
+                    }
+                } else {
+                    // arg_position out of range — fall back to all keys
+                    self.all_keys()
+                }
+            }
+            _ => {
+                // No mapping or no arg_position — fall back to all keys
+                self.all_keys()
+            }
+        }
+    }
+}
+
 fn enrich_overridden_attributes(
     repo: &Path,
     git_ref: &str,
@@ -2511,8 +2606,8 @@ fn enrich_overridden_attributes(
 ) -> usize {
     let _span = info_span!("enrich_overridden_attributes").entered();
 
-    // Cache: (resolved_file_path, function_name) -> Vec<String> (attribute keys)
-    let mut helper_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
+    // Cache: (resolved_file_path, function_name) -> HelperResolution
+    let mut helper_cache: HashMap<(String, String), HelperResolution> = HashMap::new();
     let mut enriched_count = 0usize;
 
     // Collect component names to iterate (avoid borrow conflict)
@@ -2575,72 +2670,37 @@ fn enrich_overridden_attributes(
             let cache_key = (resolved_path.clone(), bare_name.to_string());
 
             if !helper_cache.contains_key(&cache_key) {
-                // Read the resolved file
                 let resolved_source = read_git_file(repo, git_ref, &resolved_path);
 
-                // Try extracting directly from the resolved file first
-                let mut keys = resolved_source
-                    .as_ref()
-                    .map(|src| {
-                        crate::source_profile::managed_attrs::extract_return_object_keys(
-                            src,
-                            bare_name,
-                        )
-                    })
-                    .unwrap_or_default();
+                // Try to extract a rich param mapping first, then fall back to flat keys.
+                let resolution = resolve_helper_function(
+                    &resolved_source,
+                    bare_name,
+                    repo,
+                    git_ref,
+                    &resolved_path,
+                );
 
-                // If direct extraction failed (function not found — probably a
-                // barrel file that re-exports from another module), follow
-                // re-export chains to find the actual helper source.
-                if keys.is_empty() {
-                    if let Some(ref barrel_source) = resolved_source {
-                        let reexport_sources =
-                            find_reexport_sources(barrel_source, bare_name, &resolved_path);
-                        for candidate in &reexport_sources {
-                            // Try the candidate directly, then probe extensions
-                            let try_paths = [
-                                candidate.clone(),
-                                format!("{}.ts", candidate.trim_end_matches(".ts")),
-                                format!("{}.tsx", candidate.trim_end_matches(".ts")),
-                            ];
-                            for try_path in &try_paths {
-                                if let Some(src) = read_git_file(repo, git_ref, try_path) {
-                                    let found =
-                                        crate::source_profile::managed_attrs::extract_return_object_keys(
-                                            &src,
-                                            bare_name,
-                                        );
-                                    if !found.is_empty() {
-                                        keys = found;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !keys.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if !keys.is_empty() {
+                if !resolution.is_empty() {
                     debug!(
                         helper = %bare_name,
                         file = %resolved_path,
-                        keys = ?keys,
-                        "Extracted return object keys from helper function"
+                        keys = ?resolution.all_keys(),
+                        mapped = matches!(resolution, HelperResolution::Mapped(_)),
+                        "Extracted return object info from helper function"
                     );
                 }
 
-                helper_cache.insert(cache_key.clone(), keys);
+                helper_cache.insert(cache_key.clone(), resolution);
             }
 
-            let keys = match helper_cache.get(&cache_key) {
-                Some(k) if !k.is_empty() => k.clone(),
+            let resolution = match helper_cache.get(&cache_key) {
+                Some(r) if !r.is_empty() => r,
                 _ => continue,
             };
 
-            // Update the profile's managed_attributes with the resolved keys
+            // Update the profile's managed_attributes with the resolved keys,
+            // scoped per-binding using the param mapping when available.
             if let Some(profile) = profiles.get_mut(component_name) {
                 let mut any_updated = false;
                 for binding in &mut profile.managed_attributes {
@@ -2651,7 +2711,10 @@ fn enrich_overridden_attributes(
                         .unwrap_or(&binding.generator_function);
 
                     if binding_bare == bare_name && binding.overridden_attributes.is_empty() {
-                        binding.overridden_attributes = keys.clone();
+                        // Use param mapping to scope attrs to this specific prop's
+                        // argument position, falling back to all keys if unavailable.
+                        binding.overridden_attributes =
+                            resolution.keys_for_arg_position(binding.arg_position);
                         any_updated = true;
                     }
                 }
@@ -2660,7 +2723,7 @@ fn enrich_overridden_attributes(
                     trace!(
                         component = %component_name,
                         generator = %generator_function,
-                        attrs = ?keys,
+                        attrs = ?resolution.all_keys(),
                         "Enriched overridden_attributes from helper return object"
                     );
                 }
@@ -2669,6 +2732,69 @@ fn enrich_overridden_attributes(
     }
 
     enriched_count
+}
+
+/// Try to resolve a helper function's return structure. First attempts
+/// `extract_return_key_param_mapping` for a rich param→key mapping; falls
+/// back to `extract_return_object_keys` for flat key list. Follows barrel
+/// file re-export chains as needed.
+fn resolve_helper_function(
+    resolved_source: &Option<String>,
+    bare_name: &str,
+    repo: &Path,
+    git_ref: &str,
+    resolved_path: &str,
+) -> HelperResolution {
+    // Try rich mapping first, then fall back to flat keys
+    if let Some(ref src) = resolved_source {
+        // Attempt param mapping (rich)
+        if let Some(mapping) =
+            crate::source_profile::managed_attrs::extract_return_key_param_mapping(src, bare_name)
+        {
+            return HelperResolution::Mapped(mapping);
+        }
+        // Attempt flat keys
+        let keys =
+            crate::source_profile::managed_attrs::extract_return_object_keys(src, bare_name);
+        if !keys.is_empty() {
+            return HelperResolution::FlatKeys(keys);
+        }
+    }
+
+    // If direct extraction failed (function not found — probably a barrel
+    // file that re-exports from another module), follow re-export chains.
+    if let Some(ref barrel_source) = resolved_source {
+        let reexport_sources = find_reexport_sources(barrel_source, bare_name, resolved_path);
+        for candidate in &reexport_sources {
+            let try_paths = [
+                candidate.clone(),
+                format!("{}.ts", candidate.trim_end_matches(".ts")),
+                format!("{}.tsx", candidate.trim_end_matches(".ts")),
+            ];
+            for try_path in &try_paths {
+                if let Some(src) = read_git_file(repo, git_ref, try_path) {
+                    // Try rich mapping first
+                    if let Some(mapping) =
+                        crate::source_profile::managed_attrs::extract_return_key_param_mapping(
+                            &src, bare_name,
+                        )
+                    {
+                        return HelperResolution::Mapped(mapping);
+                    }
+                    // Fall back to flat keys
+                    let found =
+                        crate::source_profile::managed_attrs::extract_return_object_keys(
+                            &src, bare_name,
+                        );
+                    if !found.is_empty() {
+                        return HelperResolution::FlatKeys(found);
+                    }
+                }
+            }
+        }
+    }
+
+    HelperResolution::FlatKeys(Vec::new())
 }
 
 /// Parse import declarations from a source file.

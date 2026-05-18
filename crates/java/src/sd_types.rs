@@ -193,6 +193,74 @@ pub enum JavaSourceCategory {
     NativeRemoved,
 }
 
+// ── Migration example mining ────────────────────────────────────────────
+
+/// A single method-call pair mined from commented-out code adjacent to
+/// active code in library test files.
+///
+/// When library authors migrate their own tests from an old API to a new
+/// one, they often leave the old code as comments next to the replacement.
+/// Each pair captures one old→new method call mapping found this way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationExamplePair {
+    /// Old method call (e.g., `"Restrictions.eq"`).
+    pub old_call: String,
+    /// New method call (e.g., `"criteriaBuilder.equal"`).
+    pub new_call: String,
+    /// Fully qualified name of the old class (if resolved from imports).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_fqn: Option<String>,
+    /// Fully qualified name of the new class (if resolved from imports).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_fqn: Option<String>,
+}
+
+/// A complete migration example block: commented-out old code paired with
+/// adjacent active replacement code in the same method/scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationExample {
+    /// The commented-out old code (comment markers stripped).
+    pub old_code: String,
+    /// The adjacent active replacement code.
+    pub new_code: String,
+    /// Method-call pairs extracted from this example.
+    pub pairs: Vec<MigrationExamplePair>,
+    /// Source file where this example was found.
+    pub file: String,
+}
+
+/// Aggregated mapping from an old API class to a new API class, built
+/// statistically from multiple migration examples across test files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationMapping {
+    /// Old class simple name (e.g., `"Restrictions"`).
+    pub old_class: String,
+    /// Old fully qualified name (e.g., `"org.hibernate.criterion.Restrictions"`).
+    pub old_fqn: String,
+    /// New class simple name (e.g., `"CriteriaBuilder"`).
+    pub new_class: String,
+    /// New fully qualified name (e.g., `"jakarta.persistence.criteria.CriteriaBuilder"`).
+    pub new_fqn: String,
+    /// Method-level mappings between old and new class.
+    pub method_mappings: Vec<MethodMapping>,
+    /// Number of migration examples supporting this mapping.
+    pub example_count: usize,
+    /// Representative before/after code examples (capped).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pattern_examples: Vec<MigrationExample>,
+}
+
+/// A single method-name mapping within a class migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MethodMapping {
+    /// Old method name (e.g., `"eq"`).
+    pub old_method: String,
+    /// New method name (e.g., `"equal"`).
+    pub new_method: String,
+    /// Number of examples showing this specific pairing.
+    pub confidence: usize,
+}
+
 // ── Pipeline result ─────────────────────────────────────────────────────
 
 /// Full output of the Java SD pipeline.
@@ -214,6 +282,14 @@ pub struct JavaSdPipelineResult {
 
     /// Inheritance tree summary (new version).
     pub inheritance_summary: Vec<InheritanceEntry>,
+
+    /// Migration examples mined from commented-out code in test files.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub migration_examples: Vec<MigrationExample>,
+
+    /// Aggregated old→new API mappings built from migration examples.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub migration_mappings: Vec<MigrationMapping>,
 }
 
 /// An entry in the inheritance tree summary.

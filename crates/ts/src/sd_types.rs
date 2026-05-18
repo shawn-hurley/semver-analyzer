@@ -883,6 +883,15 @@ pub struct SdPipelineResult {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub old_component_packages: HashMap<String, String>,
 
+    /// Component name → npm package name for components that were in /next
+    /// subpath in the OLD version. Separate from old_component_packages
+    /// because the same component name can exist in both main and /next
+    /// paths (e.g., DualListSelector in v5 has a main version AND a
+    /// /next preview version). old_component_packages keeps the main
+    /// version; this map keeps the /next version for promotion detection.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub old_next_component_packages: HashMap<String, String>,
+
     /// Component name → all prop names, for both old and new versions.
     /// Used for child→prop migration detection (comparing which props
     /// existed in old vs new). Serialized so `--from-report` works.
@@ -905,6 +914,11 @@ pub struct SdPipelineResult {
     /// Used for required-prop-added conformance rules.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub new_required_props: HashMap<String, BTreeSet<String>>,
+
+    /// Component name → required prop names for the OLD version.
+    /// Used to detect optional→required prop transitions.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub old_required_props: HashMap<String, BTreeSet<String>>,
 
     /// Dependency repo packages (name → version at new ref).
     /// Used to generate dep-update rules for packages outside the main
@@ -964,7 +978,73 @@ pub struct SdPipelineResult {
     pub old_profiles: HashMap<String, ComponentSourceProfile>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub new_profiles: HashMap<String, ComponentSourceProfile>,
+
+    /// CSS modifier declarations per component, old version.
+    /// BEM block name → { modifier class → effect }.
+    /// Used to match removed prop values to added prop values by comparing
+    /// what CSS each modifier actually produces.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub old_css_modifiers: ComponentCssModifiers,
+
+    /// CSS modifier declarations per component, new version.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub new_css_modifiers: ComponentCssModifiers,
+
+    /// Reverse map: CSS custom property → actual CSS property it targets (old version).
+    /// Built by tracing `var()` usage in base component rules.
+    /// e.g., `"--pf-v5-c-label--BackgroundColor"` → `"background-color"`
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub old_css_property_targets: CssPropertyTargetMap,
+
+    /// Reverse map: CSS custom property → actual CSS property it targets (new version).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub new_css_property_targets: CssPropertyTargetMap,
 }
+
+/// Map from CSS custom property name to the actual CSS property it targets.
+///
+/// Built by tracing `var()` usage in non-modifier (base) component rules.
+/// e.g., `"--pf-v6-c-label--BackgroundColor"` → `"background-color"`
+pub type CssPropertyTargetMap = HashMap<String, String>;
+
+// ── CSS Modifier Effects ─────────────────────────────────────────────────
+
+/// What a CSS modifier class declares — the set of custom property
+/// overrides and direct CSS property values it applies.
+///
+/// Modifier classes (e.g., `.pf-m-cyan`) typically override component-level
+/// CSS custom properties (e.g., `--pf-v6-c-label--BackgroundColor`) and
+/// occasionally set direct CSS properties (e.g., `display: flex`).
+///
+/// Phase 1 stores raw declarations (var() references preserved as-is).
+/// Phase 2 resolves var() chains to terminal values (hex colors, pixels, etc.).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CssModifierEffect {
+    /// Custom property overrides: token name → raw value string.
+    /// e.g., `"--pf-v6-c-label--BackgroundColor"` → `"var(--pf-v6-c-label--m-blue--BackgroundColor)"`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_property_overrides: BTreeMap<String, String>,
+
+    /// Direct CSS property declarations (expanded from shorthands): property → value.
+    /// e.g., `"display"` → `"flex"`, `"overflow"` → `"hidden"`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub direct_properties: BTreeMap<String, String>,
+
+    /// (Phase 2) Resolved terminal values for custom property overrides.
+    /// Maps the SAME keys as `custom_property_overrides` but with var()
+    /// chains fully resolved to hex colors, pixel values, etc.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolved_overrides: BTreeMap<String, String>,
+}
+
+/// CSS modifier data for a single component, keyed by modifier class name.
+///
+/// Example for Label: `{ "pf-m-cyan" → CssModifierEffect { ... }, "pf-m-blue" → ... }`
+pub type CssModifierMap = HashMap<String, CssModifierEffect>;
+
+/// Per-component CSS modifier data for an entire library version.
+/// Keyed by BEM block name (e.g., `"label"`, `"nav"`, `"button"`).
+pub type ComponentCssModifiers = HashMap<String, CssModifierMap>;
 
 // ── Deprecated Replacement Detection ────────────────────────────────────
 
@@ -979,6 +1059,10 @@ pub enum ReplacementEvidence {
     /// the component also modified source files in the replacement component's
     /// directory (e.g., the Tile deprecation commit also modified `Card/CardHeader.tsx`).
     CommitCoChange,
+    /// Detected via git per-commit file rename detection: git detected that
+    /// component source files were renamed across directories (e.g.,
+    /// `src/NotAuthorized/NotAuthorized.tsx → src/UnauthorizedAccess/UnauthorizedAccess.tsx`).
+    GitRename,
 }
 
 /// A deprecated component that has a differently-named replacement,
