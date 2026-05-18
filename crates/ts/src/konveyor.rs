@@ -440,7 +440,16 @@ fn find_sibling_replacement_in_report(
     candidates.into_iter().next().map(|(name, _)| name)
 }
 
-fn build_migration_message_v2(comp: &TypeSummary<TypeScript>) -> String {
+/// Build the P0-C migration message for a component.
+///
+/// `treat_as_removed` controls the message framing:
+/// - `true`: "was removed" (IMPORT trigger path) — for genuinely removed components
+/// - `false`: "has been restructured" (JSX_PROP path) — for components that still
+///   exist but had many props removed (API simplification, not true removal)
+fn build_migration_message_v2(
+    comp: &TypeSummary<TypeScript>,
+    treat_as_removed: bool,
+) -> String {
     let component_name = &comp.name;
     let removal_count = comp.member_summary.removed;
     let total = comp.member_summary.total;
@@ -510,7 +519,7 @@ fn build_migration_message_v2(comp: &TypeSummary<TypeScript>) -> String {
                 target.removed_only_members.join(", ")
             ));
         }
-    } else if comp.status == TypeStatus::Removed || (removal_count == total && total <= 2) {
+    } else if treat_as_removed || (removal_count == total && total <= 2) {
         // Fully removed component
         msg.push_str(&format!(
             "MIGRATION: <{}> was removed.\n\n\
@@ -703,7 +712,7 @@ fn build_migration_message_v2(comp: &TypeSummary<TypeScript>) -> String {
              Also remove {} from the import statement.",
             component_name, replacement, component_name
         ));
-    } else if comp.status == TypeStatus::Removed || (removal_count == total && total <= 2) {
+    } else if treat_as_removed || (removal_count == total && total <= 2) {
         // Fully removed — tell LLM to remove the import
         msg.push_str(&format!(
             "Remove {} from the import statement.",
@@ -824,6 +833,52 @@ pub fn generate_rules(
         .sd_result
         .as_ref()
         .map(|sd| sd.old_component_prop_types.clone())
+        .unwrap_or_default();
+
+    // ── Pre-scan: detect "still exists" components ─────────────────────────
+    //
+    // Components where the TD pipeline marks `status = Removed` but the SD
+    // pipeline shows them still exported from the SAME package in v6. These
+    // components were simplified (many props removed) but NOT truly removed.
+    //
+    // Example: LoginMainFooterLinksItem — 4 of 6 props removed, but it's
+    // still exported from @patternfly/react-core. The v6 API changed from
+    // rendering an internal <a> tag to accepting children (e.g., a <Button>).
+    //
+    // For these components, P0-C should NOT say "was removed" or trigger on
+    // IMPORT. Instead, it should say "has been restructured" and trigger on
+    // the individual removed props (JSX_PROP), giving the LLM actionable
+    // per-prop context instead of a vague removal message.
+    let still_exists_same_pkg: HashSet<String> = report
+        .extensions
+        .sd_result
+        .as_ref()
+        .map(|sd| {
+            let mut set = HashSet::new();
+            for pkg in &report.packages {
+                for comp in &pkg.type_summaries {
+                    if comp.status != TypeStatus::Removed {
+                        continue;
+                    }
+                    // Check if the component still exists in the new packages
+                    // at the same package path (not moved to /deprecated).
+                    if let Some(new_pkg_path) = sd.component_packages.get(&comp.name) {
+                        if *new_pkg_path == pkg.name {
+                            tracing::debug!(
+                                component = %comp.name,
+                                package = %pkg.name,
+                                removed = comp.member_summary.removed,
+                                total = comp.member_summary.total,
+                                "Component marked Removed but still exists at same package — \
+                                 downgrading P0-C from IMPORT to JSX_PROP"
+                            );
+                            set.insert(comp.name.clone());
+                        }
+                    }
+                }
+            }
+            set
+        })
         .unwrap_or_default();
 
     // ── Pre-scan: collect components referenced in composition pattern changes ──
@@ -1041,7 +1096,13 @@ pub fn generate_rules(
 
     for pkg in &report.packages {
         for comp in &pkg.type_summaries {
-            let qualifies = comp.status == TypeStatus::Removed
+            // Use effective status: components that still exist at the same
+            // package don't qualify via the Removed branch. They must qualify
+            // via the removal count/ratio branches instead.
+            let effectively_removed =
+                comp.status == TypeStatus::Removed && !still_exists_same_pkg.contains(&comp.name);
+
+            let qualifies = effectively_removed
                 || (comp.member_summary.removed >= 3 && comp.member_summary.removal_ratio > 0.5)
                 || comp.member_summary.removed >= 5;
             if !qualifies {
@@ -1660,13 +1721,19 @@ pub fn generate_rules(
             // V2 path: read from pre-aggregated TypeSummary data
             for pkg in &report.packages {
                 for comp in &pkg.type_summaries {
+                    // Use effective status: components that still exist at the
+                    // same package are NOT treated as "Removed" for P0-C
+                    // purposes. They must qualify via removal count/ratio.
+                    let effectively_removed = comp.status == TypeStatus::Removed
+                        && !still_exists_same_pkg.contains(&comp.name);
+
                     // A component qualifies for a P0-C rule if:
-                    // - it was fully removed, OR
+                    // - it was fully removed (and not still-exists), OR
                     // - it has many props removed (>50% ratio), OR
                     // - it has a high absolute count of removals (>=5), indicating
                     //   significant restructuring even if total prop count is large
                     //   (e.g., Modal: 11 of 28 props removed = composition change)
-                    let qualifies = comp.status == TypeStatus::Removed
+                    let qualifies = effectively_removed
                         || (comp.member_summary.removed >= 3
                             && comp.member_summary.removal_ratio > 0.5)
                         || comp.member_summary.removed >= 5;
@@ -1692,7 +1759,8 @@ pub fn generate_rules(
                         sanitize_id(component_name)
                     );
                     let rule_id = unique_id(base_id, &mut id_counts);
-                    let mut message = build_migration_message_v2(comp);
+                    let mut message =
+                        build_migration_message_v2(comp, effectively_removed);
 
                     // ── Sibling replacement lookup ──────────────────────────
                     // When a component is removed with no migration target,
@@ -1701,7 +1769,7 @@ pub fn generate_rules(
                     // TextContent was renamed to Content, then Text should also
                     // suggest Content as a replacement.
                     if comp.migration_target.is_none()
-                        && (comp.status == TypeStatus::Removed || comp.member_summary.total <= 2)
+                        && (effectively_removed || comp.member_summary.total <= 2)
                     {
                         let sibling_replacement = find_sibling_replacement_in_report(comp, report);
                         if let Some(ref replacement) = sibling_replacement {
@@ -1869,7 +1937,7 @@ pub fn generate_rules(
                     // migration target, enrich the message with the new API
                     // structure from the composition tree.
                     if comp.migration_target.is_none()
-                        && (comp.status == TypeStatus::Removed || comp.member_summary.total <= 2)
+                        && (effectively_removed || comp.member_summary.total <= 2)
                     {
                         if let Some(ref sd) = report.extensions.sd_result {
                             let source_family = comp.source_files.iter().find_map(|f| {
@@ -1947,7 +2015,7 @@ pub fn generate_rules(
 
                     let pattern = format!("^{}$", regex_escape(component_name));
 
-                    let when = if comp.status == TypeStatus::Removed {
+                    let when = if effectively_removed {
                         // Fully removed — trigger on import (from either path)
                         if is_from_deprecated {
                             KonveyorCondition::Or {
@@ -7726,6 +7794,365 @@ mod tests {
         );
     }
 
+    // ── P0-C still-exists guard ──────────────────────────────────────
+    //
+    // When a component has status=Removed but the SD pipeline shows it
+    // still exists at the same package, P0-C should NOT say "was removed"
+    // and should NOT trigger on IMPORT. Instead, it should use JSX_PROP
+    // triggers for individual removed props (the "restructured" path).
+    //
+    // Scenario: LoginMainFooterLinksItem — 4 of 6 props removed, but
+    // the component still exists at @patternfly/react-core. The v6 API
+    // simplified from rendering an internal <a> to accepting children.
+
+    #[test]
+    fn test_p0c_still_exists_uses_jsx_prop_not_import() {
+        use crate::sd_types::{CompositionTree, SdPipelineResult};
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/LoginPage/LoginMainFooterLinksItem.tsx",
+            vec![make_api_change(
+                "LoginMainFooterLinksItem",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "LoginMainFooterLinksItem API simplified",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![TypeSummary {
+                name: "LoginMainFooterLinksItem".to_string(),
+                definition_name: "LoginMainFooterLinksItemProps".to_string(),
+                status: TypeStatus::Removed,
+                member_summary: MemberSummary {
+                    total: 6,
+                    removed: 4,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 4.0 / 6.0,
+                },
+                removed_members: vec![
+                    RemovedMember {
+                        name: "href".to_string(),
+                        old_type: Some("string".to_string()),
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "target".to_string(),
+                        old_type: Some("string".to_string()),
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "linkComponent".to_string(),
+                        old_type: Some("ReactNode".to_string()),
+                        removal_disposition: None,
+                    },
+                    RemovedMember {
+                        name: "linkComponentProps".to_string(),
+                        old_type: Some("any".to_string()),
+                        removal_disposition: None,
+                    },
+                ],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![],
+                },
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        // SD result: component still exists at the same package
+        report.extensions.sd_result = Some(SdPipelineResult {
+            composition_trees: vec![CompositionTree {
+                root: "LoginPage".into(),
+                family_members: vec![
+                    "LoginPage".into(),
+                    "LoginMainFooterLinksItem".into(),
+                ],
+                edges: vec![],
+            }],
+            component_packages: {
+                let mut pkgs = HashMap::new();
+                pkgs.insert(
+                    "LoginMainFooterLinksItem".into(),
+                    "@patternfly/react-core".into(),
+                );
+                pkgs.insert("LoginPage".into(), "@patternfly/react-core".into());
+                pkgs
+            },
+            ..SdPipelineResult::default()
+        });
+
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+
+        // Should still generate a P0-C rule (qualifies via removal count/ratio)
+        assert!(
+            !p0c_rules.is_empty(),
+            "Should still generate P0-C for component with 4/6 removals (67% ratio). \
+             Rule IDs: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        let rule = p0c_rules[0];
+
+        // Should NOT say "was removed" — the component still exists
+        assert!(
+            !rule.message.contains("was removed"),
+            "Should NOT say 'was removed' for a still-existing component. \
+             Message: {}",
+            rule.message
+        );
+
+        // Should say "restructured"
+        assert!(
+            rule.message.contains("restructured"),
+            "Should say 'restructured' for a simplified component. \
+             Message: {}",
+            rule.message
+        );
+
+        // Should NOT trigger on IMPORT — should use JSX_PROP
+        let when_yaml = serde_yaml::to_string(&rule.when).unwrap();
+        assert!(
+            !when_yaml.contains("IMPORT"),
+            "Should NOT trigger on IMPORT for a still-existing component. \
+             When: {}",
+            when_yaml
+        );
+        assert!(
+            when_yaml.contains("JSX_PROP"),
+            "Should trigger on JSX_PROP for individual removed props. \
+             When: {}",
+            when_yaml
+        );
+
+        // Should list the removed props in the trigger
+        assert!(
+            when_yaml.contains("href"),
+            "Should have href in JSX_PROP trigger. When: {}",
+            when_yaml
+        );
+        assert!(
+            when_yaml.contains("target"),
+            "Should have target in JSX_PROP trigger. When: {}",
+            when_yaml
+        );
+
+        // Should instruct to keep the import, not remove it
+        assert!(
+            rule.message.contains("Keep"),
+            "Should tell user to keep the import. Message: {}",
+            rule.message
+        );
+    }
+
+    #[test]
+    fn test_p0c_still_exists_zero_removals_skips_p0c() {
+        use crate::sd_types::{CompositionTree, SdPipelineResult};
+
+        // EmptyStateHeader: status=Removed, 0 removals, still in packages.
+        // With the guard, it no longer qualifies via Removed status.
+        // With 0 removals, it also doesn't qualify via removal count.
+        // So no P0-C rule should be generated.
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/EmptyState/EmptyStateHeader.tsx",
+            vec![make_api_change(
+                "EmptyStateHeader",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "EmptyStateHeader removed",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![TypeSummary {
+                name: "EmptyStateHeader".to_string(),
+                definition_name: "EmptyStateHeaderProps".to_string(),
+                status: TypeStatus::Removed,
+                member_summary: MemberSummary {
+                    total: 6,
+                    removed: 0,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.0,
+                },
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![],
+                },
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        // SD result: component still exists at the same package
+        report.extensions.sd_result = Some(SdPipelineResult {
+            composition_trees: vec![CompositionTree {
+                root: "EmptyState".into(),
+                family_members: vec![
+                    "EmptyState".into(),
+                    "EmptyStateHeader".into(),
+                ],
+                edges: vec![],
+            }],
+            component_packages: {
+                let mut pkgs = HashMap::new();
+                pkgs.insert(
+                    "EmptyStateHeader".into(),
+                    "@patternfly/react-core".into(),
+                );
+                pkgs.insert("EmptyState".into(), "@patternfly/react-core".into());
+                pkgs
+            },
+            ..SdPipelineResult::default()
+        });
+
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+
+        // Should NOT generate P0-C — 0 removals and still-exists override
+        // means it doesn't qualify via any branch
+        assert!(
+            p0c_rules.is_empty(),
+            "EmptyStateHeader with 0 removals and still-exists should NOT get a P0-C rule. \
+             Got rules: {:?}",
+            p0c_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_p0c_truly_removed_not_in_packages_still_triggers() {
+        // A component that is truly removed (not in component_packages)
+        // should still get the "was removed" P0-C with IMPORT trigger.
+        use crate::sd_types::SdPipelineResult;
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Text/Text.tsx",
+            vec![make_api_change(
+                "Text",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "Text component removed",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            type_summaries: vec![TypeSummary {
+                name: "Text".to_string(),
+                definition_name: "TextProps".to_string(),
+                status: TypeStatus::Removed,
+                member_summary: MemberSummary {
+                    total: 6,
+                    removed: 0,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.0,
+                },
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![],
+                },
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_exports: vec![],
+        }];
+
+        // SD result: Text is NOT in the new component_packages (truly removed)
+        report.extensions.sd_result = Some(SdPipelineResult {
+            composition_trees: vec![],
+            component_packages: HashMap::new(), // Empty — Text not in new packages
+            ..SdPipelineResult::default()
+        });
+
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+
+        // Should generate P0-C with "was removed" + IMPORT trigger
+        assert!(
+            !p0c_rules.is_empty(),
+            "Truly removed component should get a P0-C rule"
+        );
+        let rule = p0c_rules[0];
+        assert!(
+            rule.message.contains("was removed"),
+            "Truly removed component should say 'was removed'. Message: {}",
+            rule.message
+        );
+        let when_yaml = serde_yaml::to_string(&rule.when).unwrap();
+        assert!(
+            when_yaml.contains("IMPORT"),
+            "Truly removed component should trigger on IMPORT. When: {}",
+            when_yaml
+        );
+    }
+
     // build_migration_message_v2 with migration_target
     #[test]
     fn test_build_migration_message_v2_with_migration_target() {
@@ -7777,7 +8204,7 @@ mod tests {
             source_files: vec![],
         };
 
-        let msg = build_migration_message_v2(&comp);
+        let msg = build_migration_message_v2(&comp, true);
         assert!(
             msg.contains("Replace <EmptyStateHeader>"),
             "Should have migration header"
@@ -7856,7 +8283,8 @@ mod tests {
             source_files: vec![],
         };
 
-        let msg = build_migration_message_v2(&comp);
+        // treat_as_removed=false: status is Modified, so use the "restructured" path
+        let msg = build_migration_message_v2(&comp, false);
         assert!(msg.contains("restructured"), "Should mention restructured");
         assert!(
             msg.contains("10 of 14 props removed"),
@@ -7972,7 +8400,8 @@ mod tests {
             source_files: vec![],
         };
 
-        let msg = build_migration_message_v2(&comp);
+        // treat_as_removed=false: status is Modified, so use the "restructured" path
+        let msg = build_migration_message_v2(&comp, false);
 
         // ModalHeader: title is a known prop → "pass as props"
         assert!(
