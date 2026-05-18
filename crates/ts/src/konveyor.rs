@@ -18,7 +18,7 @@ use semver_analyzer_core::{
 };
 
 use crate::language::{ChildComponent, ChildComponentStatus};
-use crate::sd_types::ReplacementEvidence;
+use crate::sd_types::{ReplacementEvidence, SdPipelineResult};
 
 // Re-export all types and functions from semver-analyzer-konveyor-core.
 // That crate now re-exports shared types from the `konveyor-core` crate,
@@ -217,6 +217,162 @@ pub(crate) fn classify_removed_props(
 }
 
 type ConstantGroupEntries<'a> = Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>;
+
+/// Build an enriched `FixStrategyEntry` for a restructured component by
+/// comparing old and new source profiles from the SD pipeline.
+///
+/// When a component still exists but had many props removed (the
+/// `still_exists_same_pkg` path), the default bare `LlmAssisted` strategy
+/// gives the LLM no context about what changed internally. This function
+/// populates the strategy with:
+///
+/// - `component`: the component name
+/// - `from`: describes the old internal rendering (e.g., "internally rendered
+///   LinkComponent defaulting to <a>, children flowed through li > LinkComponent")
+/// - `to`: describes the new rendering (e.g., "renders {children} directly
+///   inside li — consumer must provide their own link element as children")
+/// - `removed_members`: the removed props with their types
+///
+/// This context flows into the LLM prompt via `format_strategy_context()`,
+/// giving the LLM enough signal to choose the right replacement pattern
+/// (e.g., `<Button component="a">` instead of a bare `<a>` tag).
+fn build_restructured_strategy(
+    component_name: &str,
+    removed_members: &[RemovedMember],
+    sd: &SdPipelineResult,
+) -> FixStrategyEntry {
+    let mut entry = FixStrategyEntry::new("LlmAssisted");
+    entry.component = Some(component_name.to_string());
+
+    // Populate removed_members with type info for strategy context.
+    entry.removed_members = removed_members
+        .iter()
+        .map(|m| {
+            if let Some(clean_type) = extract_clean_type(&m.old_type) {
+                format!("{}: {}", m.name, clean_type)
+            } else {
+                m.name.clone()
+            }
+        })
+        .collect();
+
+    let old_profile = sd.old_profiles.get(component_name);
+    let new_profile = sd.new_profiles.get(component_name);
+
+    if let (Some(old_p), Some(new_p)) = (old_profile, new_profile) {
+        // Detect rendered components that were removed (internal elements
+        // the component no longer renders).
+        let old_rendered: BTreeSet<&str> = old_p
+            .rendered_components
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        let new_rendered: BTreeSet<&str> = new_p
+            .rendered_components
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        let removed_rendered: Vec<&str> = old_rendered
+            .difference(&new_rendered)
+            .copied()
+            .collect();
+
+        if !removed_rendered.is_empty() {
+            // Build "from" description: what the component used to render.
+            let mut from_parts = Vec::new();
+            for name in &removed_rendered {
+                // Check if a prop controls this rendered component. Match by:
+                // 1. Prop name case-insensitively equals the component name
+                //    (e.g., prop "linkComponent" controls <LinkComponent>)
+                // 2. Prop name is a camelCase variant of the component name
+                let default_info = old_p
+                    .prop_defaults
+                    .iter()
+                    .find(|(prop_name, _)| {
+                        prop_name.eq_ignore_ascii_case(name)
+                    })
+                    .map(|(prop_name, default_val)| {
+                        format!(
+                            " (via prop '{}', default: {})",
+                            prop_name, default_val
+                        )
+                    });
+                from_parts.push(format!(
+                    "Internally rendered <{}>{}",
+                    name,
+                    default_info.unwrap_or_default()
+                ));
+            }
+
+            // Show how the children slot path changed.
+            if old_p.children_slot_path != new_p.children_slot_path {
+                from_parts.push(format!(
+                    "Children slot: {} → {}",
+                    if old_p.children_slot_path.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        old_p.children_slot_path.join(" > ")
+                    },
+                    if new_p.children_slot_path.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        new_p.children_slot_path.join(" > ")
+                    },
+                ));
+            }
+
+            entry.from = Some(from_parts.join(". "));
+
+            // Build "to" description: what the consumer must now provide.
+            let mut to_parts = Vec::new();
+            to_parts.push(format!(
+                "Component now renders {{children}} directly{}",
+                if new_p.children_slot_path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" inside {}", new_p.children_slot_path.join(" > "))
+                }
+            ));
+
+            // For each removed rendered component, explain what it was.
+            for name in &removed_rendered {
+                if let Some((prop_name, default_val)) = old_p
+                    .prop_defaults
+                    .iter()
+                    .find(|(prop_name, _)| prop_name.eq_ignore_ascii_case(name))
+                {
+                    let clean_default = default_val.trim_matches('\'').trim_matches('"');
+                    // Identify which removed props were forwarded to this
+                    // internal element. Props typed as the component's
+                    // linkComponentProps or containing "Props" in their name
+                    // are spread props. Others like href, target are direct.
+                    let forwarded: Vec<&str> = removed_members
+                        .iter()
+                        .filter(|m| m.name != *prop_name)
+                        .map(|m| m.name.as_str())
+                        .collect();
+
+                    to_parts.push(format!(
+                        "Previously rendered <{}> internally (prop '{}' \
+                         defaulted to '{}'). Consumer must now provide their \
+                         own <{}> element as children with props: {}",
+                        name,
+                        prop_name,
+                        clean_default,
+                        clean_default,
+                        forwarded.join(", ")
+                    ));
+                }
+            }
+
+            if !to_parts.is_empty() {
+                entry.to = Some(to_parts.join(". "));
+            }
+        }
+    }
+
+    entry
+}
 
 fn detect_collapsible_constant_groups<'a>(
     report: &'a AnalysisReport<TypeScript>,
@@ -2186,6 +2342,26 @@ pub fn generate_rules(
                         p0c_labels.push(format!("family={}", family));
                     }
 
+                    // For restructured components (still exist but heavily
+                    // modified), enrich the fix strategy with source profile
+                    // data describing the old/new rendering pattern. This
+                    // gives the LLM context about what the component used to
+                    // render internally so it can choose the right replacement
+                    // pattern (e.g., <Button component="a"> vs bare <a>).
+                    let fix_strategy = if !effectively_removed {
+                        if let Some(ref sd) = report.extensions.sd_result {
+                            build_restructured_strategy(
+                                component_name,
+                                &comp.removed_members,
+                                sd,
+                            )
+                        } else {
+                            FixStrategyEntry::new("LlmAssisted")
+                        }
+                    } else {
+                        FixStrategyEntry::new("LlmAssisted")
+                    };
+
                     rules.push(KonveyorRule {
                         rule_id,
                         labels: p0c_labels,
@@ -2198,7 +2374,7 @@ pub fn generate_rules(
                         message,
                         links: Vec::new(),
                         when,
-                        fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+                        fix_strategy: Some(fix_strategy),
                     });
                 }
             }
@@ -7807,7 +7983,9 @@ mod tests {
 
     #[test]
     fn test_p0c_still_exists_uses_jsx_prop_not_import() {
-        use crate::sd_types::{CompositionTree, SdPipelineResult};
+        use crate::sd_types::{
+            ComponentSourceProfile, CompositionTree, RenderedComponent, SdPipelineResult,
+        };
 
         let changes = vec![make_file_changes(
             "packages/react-core/src/components/LoginPage/LoginMainFooterLinksItem.tsx",
@@ -7872,7 +8050,38 @@ mod tests {
             added_exports: vec![],
         }];
 
-        // SD result: component still exists at the same package
+        // SD result: component still exists at the same package,
+        // with source profiles showing the rendering change.
+        let mut old_profiles = HashMap::new();
+        old_profiles.insert(
+            "LoginMainFooterLinksItem".to_string(),
+            ComponentSourceProfile {
+                name: "LoginMainFooterLinksItem".to_string(),
+                rendered_components: vec![RenderedComponent::unconditional("LinkComponent")],
+                prop_defaults: {
+                    let mut d = BTreeMap::new();
+                    d.insert("linkComponent".to_string(), "'a'".to_string());
+                    d.insert("href".to_string(), "''".to_string());
+                    d
+                },
+                children_slot_path: vec!["li".to_string(), "LinkComponent".to_string()],
+                has_children_prop: true,
+                ..ComponentSourceProfile::default()
+            },
+        );
+        let mut new_profiles = HashMap::new();
+        new_profiles.insert(
+            "LoginMainFooterLinksItem".to_string(),
+            ComponentSourceProfile {
+                name: "LoginMainFooterLinksItem".to_string(),
+                rendered_components: vec![],
+                prop_defaults: BTreeMap::new(),
+                children_slot_path: vec!["li".to_string()],
+                has_children_prop: true,
+                ..ComponentSourceProfile::default()
+            },
+        );
+
         report.extensions.sd_result = Some(SdPipelineResult {
             composition_trees: vec![CompositionTree {
                 root: "LoginPage".into(),
@@ -7891,6 +8100,8 @@ mod tests {
                 pkgs.insert("LoginPage".into(), "@patternfly/react-core".into());
                 pkgs
             },
+            old_profiles,
+            new_profiles,
             ..SdPipelineResult::default()
         });
 
@@ -7965,6 +8176,55 @@ mod tests {
             rule.message.contains("Keep"),
             "Should tell user to keep the import. Message: {}",
             rule.message
+        );
+
+        // Fix strategy should be enriched with source profile data
+        let strategy = rule
+            .fix_strategy
+            .as_ref()
+            .expect("Should have a fix strategy");
+        assert_eq!(strategy.strategy, "LlmAssisted");
+        assert_eq!(
+            strategy.component.as_deref(),
+            Some("LoginMainFooterLinksItem"),
+            "Strategy should name the component"
+        );
+
+        // Should describe the old rendering pattern
+        let from = strategy.from.as_ref().expect("Strategy should have 'from'");
+        assert!(
+            from.contains("LinkComponent"),
+            "Strategy 'from' should mention the removed rendered component. Got: {}",
+            from
+        );
+        assert!(
+            from.contains("linkComponent"),
+            "Strategy 'from' should mention the prop that controlled rendering. Got: {}",
+            from
+        );
+
+        // Should describe the new rendering pattern
+        let to = strategy.to.as_ref().expect("Strategy should have 'to'");
+        assert!(
+            to.contains("children"),
+            "Strategy 'to' should mention children rendering. Got: {}",
+            to
+        );
+        assert!(
+            to.contains("'a'"),
+            "Strategy 'to' should mention the old default element. Got: {}",
+            to
+        );
+
+        // Should list removed members with types
+        assert!(
+            !strategy.removed_members.is_empty(),
+            "Strategy should list removed members"
+        );
+        assert!(
+            strategy.removed_members.iter().any(|m| m.contains("href")),
+            "Removed members should include href. Got: {:?}",
+            strategy.removed_members
         );
     }
 

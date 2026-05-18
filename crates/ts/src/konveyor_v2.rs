@@ -3670,6 +3670,7 @@ fn modifier_structural_similarity(
     let old_slots: HashSet<String> = old
         .custom_property_overrides
         .keys()
+        .filter(|k| !is_global_css_token(k))
         .filter_map(|k| extract_token_slot(k))
         .chain(old.direct_properties.keys().cloned())
         .collect();
@@ -3677,6 +3678,7 @@ fn modifier_structural_similarity(
     let new_slots: HashSet<String> = new
         .custom_property_overrides
         .keys()
+        .filter(|k| !is_global_css_token(k))
         .filter_map(|k| extract_token_slot(k))
         .chain(new.direct_properties.keys().cloned())
         .collect();
@@ -3693,6 +3695,19 @@ fn modifier_structural_similarity(
     }
 
     intersection as f64 / union as f64
+}
+
+/// Returns true for global CSS custom properties that are not
+/// component-specific. Global tokens (e.g., `--pf-v5-global--Color--100`)
+/// are page-level theme overrides that modifiers set for dark/light
+/// context switching. They carry generic values (`#151515`, `#fff`)
+/// identical across all color modifiers of the same component, providing
+/// no discrimination for value mapping. Including them pollutes both
+/// structural similarity (mismatched slot names like `Color--100` vs
+/// `Color`) and resolved similarity (generic theme colors dilute the
+/// signal from the actual component-specific color).
+fn is_global_css_token(name: &str) -> bool {
+    name.contains("-global--")
 }
 
 /// Parse a CSS hex color string into (R, G, B) components.
@@ -3819,6 +3834,9 @@ fn modifier_resolved_similarity(
     // as it's the primary/base token, not a modifier-specific variant.
     let mut old_css: HashMap<&str, (&str, (u8, u8, u8))> = HashMap::new();
     for (custom_prop, resolved_value) in &old.resolved_overrides {
+        if is_global_css_token(custom_prop) {
+            continue;
+        }
         if let Some(css_prop) = old_targets.get(custom_prop.as_str()) {
             if let Some(color) = parse_hex_color(resolved_value) {
                 let entry = old_css.entry(css_prop.as_str()).or_insert((custom_prop.as_str(), color));
@@ -3832,6 +3850,9 @@ fn modifier_resolved_similarity(
 
     let mut new_css: HashMap<&str, (&str, (u8, u8, u8))> = HashMap::new();
     for (custom_prop, resolved_value) in &new.resolved_overrides {
+        if is_global_css_token(custom_prop) {
+            continue;
+        }
         if let Some(css_prop) = new_targets.get(custom_prop.as_str()) {
             if let Some(color) = parse_hex_color(resolved_value) {
                 let entry = new_css.entry(css_prop.as_str()).or_insert((custom_prop.as_str(), color));
@@ -4414,13 +4435,43 @@ fn generate_prop_value_conformance_rules(
                 }
             }
 
+            // ── CSS modifier bridge for Phase 2 ──────────────────
+            // Compare actual CSS modifier effects to map old values to
+            // new values. This is the same bridge used in Phase 1 for
+            // type-changed props, now also applied to removed-and-replaced
+            // props. It uses structural and resolved-value similarity to
+            // discover mappings like gold→yellow that string similarity
+            // cannot find (0.167 < 0.32 threshold).
+            let removed_for_bridge: Vec<&String> = old_values
+                .difference(&new_values)
+                .collect();
+            let new_for_bridge: Vec<&String> = new_values.iter().collect();
+            let css_bridge_hints = compute_css_modifier_bridge(
+                &component,
+                &removed_for_bridge,
+                &new_for_bridge,
+                &sd.old_css_modifiers,
+                &sd.new_css_modifiers,
+                &sd.old_css_property_targets,
+                &sd.new_css_property_targets,
+            );
+            if !css_bridge_hints.is_empty() {
+                tracing::debug!(
+                    component = %component,
+                    old_prop = %old_prop,
+                    new_member = %new_member,
+                    hints = ?css_bridge_hints,
+                    "Phase 2: CSS modifier bridge produced value mappings"
+                );
+            }
+
             // Build value mapping: old value → new value on the replacement prop.
-            // Use a minimum similarity threshold of 0.32 to avoid false
-            // mappings like "gold" → "orangered" (sim=0.222). When no
-            // sufficiently similar match exists, the value is left unmapped
-            // and the rule emits a "Valid values: ..." list for the LLM.
+            // CSS bridge hints override string similarity when available.
+            // String similarity uses a minimum threshold of 0.32 to avoid
+            // false mappings like "gold" → "orangered" (sim=0.222).
             let mut value_map: HashMap<String, String> = HashMap::new();
             {
+                // Start with string similarity matches
                 let mut candidates: Vec<(&String, &String, f64)> = Vec::new();
                 for old_val in &old_values {
                     for new_val in &new_values {
@@ -4446,6 +4497,11 @@ fn generate_prop_value_conformance_rules(
                     value_map.insert(old_val.to_string(), new_val.to_string());
                     used_old.insert(old_val);
                     used_new.insert(new_val);
+                }
+
+                // CSS bridge hints override string similarity
+                for (old_val, new_val) in &css_bridge_hints {
+                    value_map.insert(old_val.clone(), new_val.clone());
                 }
             }
 
@@ -4784,96 +4840,121 @@ fn generate_prop_value_conformance_rules(
             for value in &removed {
                 let replacement_hint = replacement_hints.get(*value).cloned();
 
-                // Generate rules for BOTH old and new prop names, since the
-                // rename fix may or may not have been applied yet.
-                for prop in &[&old_prop, &new_prop] {
-                    let rule_id = format!(
-                        "sd-prop-value-{}-{}-{}",
-                        sanitize(&component),
-                        sanitize(prop),
-                        sanitize(value),
-                    );
+                // Generate a single rule with an or-clause matching BOTH
+                // old and new prop names, since the prop rename fix may or
+                // may not have been applied yet. This ensures the value
+                // violation is detected regardless of whether the file has
+                // <ToolbarGroup spacer={{ default: "spacerLg" }}> (pre-rename)
+                // or <ToolbarGroup gap={{ default: "spacerLg" }}> (post-rename).
+                let rule_id = format!(
+                    "sd-prop-value-{}-{}-{}",
+                    sanitize(&component),
+                    sanitize(&new_prop),
+                    sanitize(value),
+                );
 
-                    let message = if let Some(ref replacement) = replacement_hint {
-                        format!(
-                            "The value \"{value}\" is no longer valid for the `{prop}` prop on <{component}>.\n\
-                             Use \"{replacement}\" instead.\n\n\
-                             Old: <{component} {prop}=\"{value}\" />\n\
-                             New: <{component} {prop}=\"{replacement}\" />\n\n\
-                             Note: `{old_prop}` was renamed to `{new_prop}`.",
-                            value = value,
-                            prop = prop,
-                            component = component,
-                            replacement = replacement,
-                            old_prop = old_prop,
-                            new_prop = new_prop,
-                        )
-                    } else {
-                        let valid = new_values
-                            .iter()
-                            .map(|v| format!("\"{}\"", v))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!(
-                            "The value \"{value}\" is no longer valid for the `{prop}` prop on <{component}>.\n\
-                             Note: `{old_prop}` was renamed to `{new_prop}`.\n\
-                             Valid values: {valid}",
-                            value = value,
-                            prop = prop,
-                            component = component,
-                            old_prop = old_prop,
-                            new_prop = new_prop,
-                            valid = valid,
-                        )
-                    };
+                let message = if let Some(ref replacement) = replacement_hint {
+                    format!(
+                        "The value \"{value}\" is no longer valid for the `{new_prop}` prop on <{component}>.\n\
+                         Use \"{replacement}\" instead.\n\n\
+                         Old: <{component} {old_prop}=\"{value}\" />\n\
+                         New: <{component} {new_prop}=\"{replacement}\" />\n\n\
+                         Note: `{old_prop}` was renamed to `{new_prop}`.",
+                        value = value,
+                        component = component,
+                        replacement = replacement,
+                        old_prop = old_prop,
+                        new_prop = new_prop,
+                    )
+                } else {
+                    let valid = new_values
+                        .iter()
+                        .map(|v| format!("\"{}\"", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "The value \"{value}\" is no longer valid for the `{new_prop}` prop on <{component}>.\n\
+                         Note: `{old_prop}` was renamed to `{new_prop}`.\n\
+                         Valid values: {valid}",
+                        value = value,
+                        component = component,
+                        old_prop = old_prop,
+                        new_prop = new_prop,
+                        valid = valid,
+                    )
+                };
 
-                    let change_type_label = if replacement_hint.is_some() {
-                        "change-type=prop-value-removed"
-                    } else {
-                        "change-type=type-changed"
-                    };
+                let change_type_label = if replacement_hint.is_some() {
+                    "change-type=prop-value-removed"
+                } else {
+                    "change-type=type-changed"
+                };
 
-                    rules.push(KonveyorRule {
-                        rule_id,
-                        labels: vec![
-                            "source=semver-analyzer".into(),
-                            change_type_label.into(),
-                            format!("package={}", pkg),
-                        ],
-                        effort: 1,
-                        category: "mandatory".into(),
-                        description: format!(
-                            "Value \"{}\" removed from `{}` prop on <{}> (renamed from `{}`)",
-                            value, prop, component, old_prop,
-                        ),
-                        message,
-                        links: vec![],
-                        when: KonveyorCondition::FrontendReferenced {
+                // Build or-clause matching both old and new prop names
+                let value_pattern = format!("^{}$", regex::escape(value));
+                let component_pattern = format!("^{}$", component);
+                let when = KonveyorCondition::Or {
+                    or: vec![
+                        KonveyorCondition::FrontendReferenced {
                             referenced: FrontendReferencedFields {
-                                pattern: format!("^{}$", prop),
+                                pattern: format!("^{}$", old_prop),
                                 location: "JSX_PROP".into(),
-                                component: Some(format!("^{}$", component)),
+                                component: Some(component_pattern.clone()),
                                 parent: None,
                                 not_parent: None,
                                 child: None,
                                 not_child: None,
                                 requires_child: None,
                                 parent_from: None,
-                                value: Some(format!("^{}$", regex::escape(value))),
+                                value: Some(value_pattern.clone()),
                                 from: Some(pkg.to_string()),
                                 file_pattern: None,
                             },
                         },
-                        fix_strategy: Some(FixStrategyEntry {
-                            strategy: "PropValueChange".into(),
-                            component: Some(component.clone()),
-                            prop: Some(prop.to_string()),
-                            from: Some(value.to_string()),
-                            replacement: replacement_hint.clone(),
-                            ..Default::default()
-                        }),
-                    });
-                }
+                        KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: format!("^{}$", new_prop),
+                                location: "JSX_PROP".into(),
+                                component: Some(component_pattern),
+                                parent: None,
+                                not_parent: None,
+                                child: None,
+                                not_child: None,
+                                requires_child: None,
+                                parent_from: None,
+                                value: Some(value_pattern),
+                                from: Some(pkg.to_string()),
+                                file_pattern: None,
+                            },
+                        },
+                    ],
+                };
+
+                rules.push(KonveyorRule {
+                    rule_id,
+                    labels: vec![
+                        "source=semver-analyzer".into(),
+                        change_type_label.into(),
+                        format!("package={}", pkg),
+                    ],
+                    effort: 1,
+                    category: "mandatory".into(),
+                    description: format!(
+                        "Value \"{}\" removed from `{}` prop on <{}> (renamed from `{}`)",
+                        value, new_prop, component, old_prop,
+                    ),
+                    message,
+                    links: vec![],
+                    when,
+                    fix_strategy: Some(FixStrategyEntry {
+                        strategy: "PropValueChange".into(),
+                        component: Some(component.clone()),
+                        prop: Some(new_prop.clone()),
+                        from: Some(value.to_string()),
+                        replacement: replacement_hint.clone(),
+                        ..Default::default()
+                    }),
+                });
             }
         }
     }
@@ -11992,6 +12073,117 @@ mod tests {
         );
     }
 
+    /// TC006: Banner gold → yellow via CSS modifier bridge with global
+    /// token filtering.
+    ///
+    /// PF5 Banner modifiers override GLOBAL tokens (for dark/light theme
+    /// switching) alongside one component-specific background color token.
+    /// Without filtering, the 9 global token overrides pollute the
+    /// similarity comparison because:
+    ///   - Structural: global slots like "Color--100" don't match v6's "Color"
+    ///   - Resolved: global tokens carry generic theme values (#151515, #fff)
+    ///     that are identical across all modifiers, providing no discrimination
+    ///
+    /// With `is_global_css_token()` filtering, only the component-specific
+    /// `--pf-v5-c-banner--BackgroundColor` override participates, and its
+    /// resolved color (#f0ab00, warm amber) correctly maps to v6 yellow
+    /// (#ffe072, warm yellow) rather than red (#fbc5c5, pink).
+    #[test]
+    fn test_css_bridge_banner_gold_to_yellow_with_global_tokens() {
+        use crate::sd_types::{CssModifierEffect, CssModifierMap, ComponentCssModifiers};
+
+        let mut old_mods = ComponentCssModifiers::new();
+        let mut old_banner = CssModifierMap::new();
+
+        // PF5 .pf-m-gold: 9 global token overrides + 1 component override
+        let mut gold = CssModifierEffect::default();
+        // Global theme overrides (dark-on-light context switching — NOT the gold color)
+        gold.custom_property_overrides.insert("--pf-v5-global--Color--100".into(), "var(--pf-v5-global--Color--dark-100)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--Color--200".into(), "var(--pf-v5-global--Color--dark-200)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--BackgroundColor--100".into(), "var(--pf-v5-global--BackgroundColor--light-100)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--BorderColor--100".into(), "var(--pf-v5-global--BorderColor--dark-100)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--primary-color--100".into(), "var(--pf-v5-global--primary-color--dark-100)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--link--Color".into(), "var(--pf-v5-global--link--Color--dark)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--link--Color--hover".into(), "var(--pf-v5-global--link--Color--dark--hover)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--icon--Color--light".into(), "var(--pf-v5-global--icon--Color--light--dark)".into());
+        gold.custom_property_overrides.insert("--pf-v5-global--icon--Color--dark".into(), "var(--pf-v5-global--icon--Color--dark--dark)".into());
+        // Component-specific override (THIS is the actual gold color)
+        gold.custom_property_overrides.insert("--pf-v5-c-banner--BackgroundColor".into(), "var(--pf-v5-c-banner--m-gold--BackgroundColor)".into());
+        // Resolved values
+        gold.resolved_overrides.insert("--pf-v5-global--Color--100".into(), "#151515".into());
+        gold.resolved_overrides.insert("--pf-v5-global--Color--200".into(), "#6a6e73".into());
+        gold.resolved_overrides.insert("--pf-v5-global--BackgroundColor--100".into(), "#fff".into());
+        gold.resolved_overrides.insert("--pf-v5-global--BorderColor--100".into(), "#d2d2d2".into());
+        gold.resolved_overrides.insert("--pf-v5-global--primary-color--100".into(), "#0066cc".into());
+        gold.resolved_overrides.insert("--pf-v5-global--link--Color".into(), "#0066cc".into());
+        gold.resolved_overrides.insert("--pf-v5-global--link--Color--hover".into(), "#004080".into());
+        gold.resolved_overrides.insert("--pf-v5-global--icon--Color--light".into(), "#6a6e73".into());
+        gold.resolved_overrides.insert("--pf-v5-global--icon--Color--dark".into(), "#151515".into());
+        gold.resolved_overrides.insert("--pf-v5-c-banner--BackgroundColor".into(), "#f0ab00".into());
+        old_banner.insert("pf-m-gold".into(), gold);
+        old_mods.insert("banner".into(), old_banner);
+
+        // PF6 Banner modifiers: component-specific only
+        let mut new_mods = ComponentCssModifiers::new();
+        let mut new_banner = CssModifierMap::new();
+
+        let mut yellow = CssModifierEffect::default();
+        yellow.custom_property_overrides.insert("--pf-v6-c-banner--m-yellow--BackgroundColor".into(), "#ffe072".into());
+        yellow.custom_property_overrides.insert("--pf-v6-c-banner--m-yellow--Color".into(), "#151515".into());
+        yellow.resolved_overrides.insert("--pf-v6-c-banner--m-yellow--BackgroundColor".into(), "#ffe072".into());
+        yellow.resolved_overrides.insert("--pf-v6-c-banner--m-yellow--Color".into(), "#151515".into());
+        new_banner.insert("pf-m-yellow".into(), yellow);
+
+        let mut red = CssModifierEffect::default();
+        red.custom_property_overrides.insert("--pf-v6-c-banner--m-red--BackgroundColor".into(), "#fbc5c5".into());
+        red.custom_property_overrides.insert("--pf-v6-c-banner--m-red--Color".into(), "#151515".into());
+        red.resolved_overrides.insert("--pf-v6-c-banner--m-red--BackgroundColor".into(), "#fbc5c5".into());
+        red.resolved_overrides.insert("--pf-v6-c-banner--m-red--Color".into(), "#151515".into());
+        new_banner.insert("pf-m-red".into(), red);
+
+        let mut orange = CssModifierEffect::default();
+        orange.custom_property_overrides.insert("--pf-v6-c-banner--m-orange--BackgroundColor".into(), "#fccb8f".into());
+        orange.custom_property_overrides.insert("--pf-v6-c-banner--m-orange--Color".into(), "#151515".into());
+        orange.resolved_overrides.insert("--pf-v6-c-banner--m-orange--BackgroundColor".into(), "#fccb8f".into());
+        orange.resolved_overrides.insert("--pf-v6-c-banner--m-orange--Color".into(), "#151515".into());
+        new_banner.insert("pf-m-orange".into(), orange);
+
+        new_mods.insert("banner".into(), new_banner);
+
+        // Target maps: custom property → CSS property
+        let mut old_targets = HashMap::new();
+        old_targets.insert("--pf-v5-c-banner--BackgroundColor".to_string(), "background-color".to_string());
+        // Global tokens might also be in the target map from other CSS files
+        old_targets.insert("--pf-v5-global--Color--100".to_string(), "color".to_string());
+
+        let mut new_targets = HashMap::new();
+        new_targets.insert("--pf-v6-c-banner--m-yellow--BackgroundColor".to_string(), "background-color".to_string());
+        new_targets.insert("--pf-v6-c-banner--m-yellow--Color".to_string(), "color".to_string());
+        new_targets.insert("--pf-v6-c-banner--m-red--BackgroundColor".to_string(), "background-color".to_string());
+        new_targets.insert("--pf-v6-c-banner--m-red--Color".to_string(), "color".to_string());
+        new_targets.insert("--pf-v6-c-banner--m-orange--BackgroundColor".to_string(), "background-color".to_string());
+        new_targets.insert("--pf-v6-c-banner--m-orange--Color".to_string(), "color".to_string());
+
+        let removed: Vec<String> = vec!["gold".into()];
+        let added: Vec<String> = vec!["yellow".into(), "red".into(), "orange".into()];
+        let removed_refs: Vec<&String> = removed.iter().collect();
+        let added_refs: Vec<&String> = added.iter().collect();
+
+        let hints = compute_css_modifier_bridge(
+            "Banner", &removed_refs, &added_refs,
+            &old_mods, &new_mods,
+            &old_targets, &new_targets,
+        );
+
+        assert_eq!(
+            hints.get("gold").map(String::as_str),
+            Some("yellow"),
+            "Banner gold (#f0ab00) should map to yellow (#ffe072), not {:?}. \
+             Global token noise must be filtered from the comparison.",
+            hints.get("gold"),
+        );
+    }
+
     // ── Color distance unit tests ───────────────────────────────────────
 
     #[test]
@@ -14881,24 +15073,28 @@ mod tests {
 
         let rules = generate_prop_value_conformance_rules(&report, &sd, &pkgs);
 
-        // Should have rules for spacerNone, spacerSm, spacerMd, spacerLg
-        // on BOTH old prop name (spacer) and new prop name (gap) = 8 rules total
+        // Should have 4 rules (one per removed value), each with an or-clause
+        // matching both old prop name (spacer) and new prop name (gap).
         let spacer_rules: Vec<_> = rules
             .iter()
             .filter(|r| r.rule_id.contains("toolbaritem"))
             .collect();
-        assert!(
-            spacer_rules.len() >= 8,
-            "TC085: Should have at least 8 rules (4 values x 2 prop names). Got {}",
-            spacer_rules.len()
+        assert_eq!(
+            spacer_rules.len(),
+            4,
+            "TC085: Should have 4 rules (1 per removed value with or-clause). Got: {:?}",
+            spacer_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
         );
 
-        // Check that spacerLg on the gap prop has replacement=gapLg
-        let spacer_lg_gap = spacer_rules
+        // Check that spacerLg rule has replacement=gapLg
+        let spacer_lg = spacer_rules
             .iter()
             .find(|r| r.rule_id.contains("-gap-spacerlg"))
-            .expect("TC085: Should have a rule for gap prop with spacerLg value");
-        let replacement = spacer_lg_gap
+            .expect("TC085: Should have a rule for spacerLg value");
+        let replacement = spacer_lg
             .fix_strategy
             .as_ref()
             .and_then(|s| s.replacement.as_ref());
@@ -14909,12 +15105,40 @@ mod tests {
             replacement
         );
 
+        // Verify the or-clause matches both old and new prop names
+        let refs = semver_analyzer_konveyor_core::extract_frontend_refs(&spacer_lg.when);
+        assert_eq!(
+            refs.len(),
+            2,
+            "TC085: spacerLg rule should have 2 when clauses (or). Got: {}",
+            refs.len()
+        );
+        let patterns: Vec<&str> = refs.iter().map(|r| r.pattern.as_str()).collect();
+        assert!(
+            patterns.contains(&"^spacer$"),
+            "TC085: Should match old prop name 'spacer'. Got: {:?}",
+            patterns
+        );
+        assert!(
+            patterns.contains(&"^gap$"),
+            "TC085: Should match new prop name 'gap'. Got: {:?}",
+            patterns
+        );
+        // Both should filter on the same value
+        for r in &refs {
+            assert_eq!(
+                r.value.as_deref(),
+                Some("^spacerLg$"),
+                "TC085: Both when clauses should filter on value spacerLg"
+            );
+        }
+
         // Check spacerMd → gapMd
-        let spacer_md_gap = spacer_rules
+        let spacer_md = spacer_rules
             .iter()
             .find(|r| r.rule_id.contains("-gap-spacermd"))
-            .expect("TC085: Should have a rule for gap prop with spacerMd value");
-        let replacement = spacer_md_gap
+            .expect("TC085: Should have a rule for spacerMd value");
+        let replacement = spacer_md
             .fix_strategy
             .as_ref()
             .and_then(|s| s.replacement.as_ref());
@@ -14929,7 +15153,7 @@ mod tests {
         let spacer_none = spacer_rules
             .iter()
             .find(|r| r.rule_id.contains("-gap-spacernone"))
-            .expect("TC085: Should have a rule for gap prop with spacerNone value");
+            .expect("TC085: Should have a rule for spacerNone value");
         let replacement = spacer_none
             .fix_strategy
             .as_ref()
@@ -14943,18 +15167,31 @@ mod tests {
 
         // Rules WITH replacement should have prop-value-removed label
         assert!(
-            spacer_lg_gap
+            spacer_lg
                 .labels
                 .iter()
                 .any(|l| l == "change-type=prop-value-removed"),
             "TC085: Rule with replacement should have prop-value-removed label"
         );
 
-        // Verify message includes the replacement
+        // Verify message includes the replacement and notes the rename
         assert!(
-            spacer_lg_gap.message.contains("gapLg"),
+            spacer_lg.message.contains("gapLg"),
             "TC085: Message should mention gapLg replacement. Got: {}",
-            spacer_lg_gap.message
+            spacer_lg.message
+        );
+        assert!(
+            spacer_lg.message.contains("renamed"),
+            "TC085: Message should note the prop rename. Got: {}",
+            spacer_lg.message
+        );
+
+        // Fix strategy should reference the new prop name
+        let strat = spacer_lg.fix_strategy.as_ref().unwrap();
+        assert_eq!(
+            strat.prop.as_deref(),
+            Some("gap"),
+            "TC085: Fix strategy should reference new prop name 'gap'"
         );
     }
 

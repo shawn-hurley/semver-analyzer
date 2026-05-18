@@ -759,31 +759,35 @@ impl Language for TypeScript {
         // by actual rendered output (hex colors, sizes) rather than just which
         // token slots they override (Phase 1 structural matching).
         if let Some(ref dep_from) = params.dep_from_dir {
-            if let Ok(old_resolution_map) =
+            if let Ok((old_resolution_map, old_property_targets)) =
                 crate::css_profile::build_css_variable_resolution_map_from_dir(dep_from)
             {
                 tracing::info!(
                     entries = old_resolution_map.len(),
-                    "Built old CSS variable resolution map"
+                    property_targets = old_property_targets.len(),
+                    "Built old CSS variable resolution map and property targets"
                 );
                 crate::css_profile::resolve_modifier_effects(
                     &mut sd_result.old_css_modifiers,
                     &old_resolution_map,
                 );
+                sd_result.old_css_property_targets = old_property_targets;
             }
         }
         if let Some(ref dep_dir) = params.dep_dir {
-            if let Ok(new_resolution_map) =
+            if let Ok((new_resolution_map, new_property_targets)) =
                 crate::css_profile::build_css_variable_resolution_map_from_dir(dep_dir)
             {
                 tracing::info!(
                     entries = new_resolution_map.len(),
-                    "Built new CSS variable resolution map"
+                    property_targets = new_property_targets.len(),
+                    "Built new CSS variable resolution map and property targets"
                 );
                 crate::css_profile::resolve_modifier_effects(
                     &mut sd_result.new_css_modifiers,
                     &new_resolution_map,
                 );
+                sd_result.new_css_property_targets = new_property_targets;
             }
         }
 

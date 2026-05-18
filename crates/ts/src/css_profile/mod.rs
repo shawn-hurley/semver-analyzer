@@ -1445,18 +1445,26 @@ pub type CssVariableResolutionMap = HashMap<String, String>;
 /// `patternfly-base.css` which contain `:root` definitions with palette and
 /// semantic tokens). Component CSS files contribute component-level tokens.
 ///
-/// Returns: variable name (with `--` prefix) → resolved terminal value.
+/// Also builds a property target map: custom property → the CSS property it
+/// targets (e.g., `--pf-v6-c-banner--BackgroundColor` → `background-color`).
+/// This is extracted from standard property declarations that use `var()`:
+/// `background-color: var(--pf-v6-c-banner--BackgroundColor)`.
+///
+/// Returns: (resolution_map, property_target_map).
 pub fn build_css_variable_resolution_map_from_dir(
     dir: &Path,
-) -> Result<CssVariableResolutionMap> {
+) -> Result<(CssVariableResolutionMap, crate::sd_types::CssPropertyTargetMap)> {
     let mut definitions: HashMap<String, String> = HashMap::new();
+    let mut property_targets: HashMap<String, String> = HashMap::new();
 
     // Walk ALL CSS files recursively to find custom property definitions
-    collect_css_definitions_recursive(dir, &mut definitions)?;
+    // AND standard property var() usages
+    collect_css_definitions_recursive(dir, &mut definitions, &mut property_targets)?;
 
     info!(
         raw_definitions = definitions.len(),
-        "Collected CSS custom property definitions for resolution"
+        property_targets = property_targets.len(),
+        "Collected CSS custom property definitions and property targets"
     );
 
     // Iteratively resolve var() references
@@ -1470,16 +1478,19 @@ pub fn build_css_variable_resolution_map_from_dir(
 
     info!(
         resolved = resolved.len(),
+        property_targets = property_targets.len(),
         "CSS variable resolution map built"
     );
 
-    Ok(resolved)
+    Ok((resolved, property_targets))
 }
 
-/// Recursively walk a directory and collect all CSS custom property definitions.
+/// Recursively walk a directory and collect all CSS custom property definitions
+/// and standard property `var()` usages.
 fn collect_css_definitions_recursive(
     dir: &Path,
     definitions: &mut HashMap<String, String>,
+    property_targets: &mut HashMap<String, String>,
 ) -> Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -1490,7 +1501,7 @@ fn collect_css_definitions_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            collect_css_definitions_recursive(&path, definitions)?;
+            collect_css_definitions_recursive(&path, definitions, property_targets)?;
         } else if path.extension().is_some_and(|e| e == "css") {
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
             if fname.contains(".min.") || fname.contains(".map") {
@@ -1498,7 +1509,7 @@ fn collect_css_definitions_recursive(
             }
 
             if let Ok(source) = std::fs::read_to_string(&path) {
-                collect_definitions_from_css(&source, definitions);
+                collect_definitions_from_css(&source, definitions, property_targets);
             }
         }
     }
@@ -1506,13 +1517,20 @@ fn collect_css_definitions_recursive(
     Ok(())
 }
 
-/// Parse a CSS source string and collect all custom property definitions.
+/// Parse a CSS source string and collect all custom property definitions
+/// and standard property `var()` usages.
 ///
 /// Extracts `--name: value` declarations from all rule blocks (including
 /// `:root`, component rules, modifier rules, etc.).
+///
+/// Also extracts property target mappings: when a standard CSS property uses
+/// `var(--custom-prop)`, records `--custom-prop → css-property-name`.
+/// e.g., `background-color: var(--pf-v6-c-banner--BackgroundColor)`
+/// → `{"--pf-v6-c-banner--BackgroundColor": "background-color"}`.
 fn collect_definitions_from_css(
     source: &str,
     definitions: &mut HashMap<String, String>,
+    property_targets: &mut HashMap<String, String>,
 ) {
     let stylesheet = match StyleSheet::parse(source, ParserOptions::default()) {
         Ok(s) => s,
@@ -1520,14 +1538,16 @@ fn collect_definitions_from_css(
     };
 
     for rule in &stylesheet.rules.0 {
-        collect_definitions_from_rule(rule, definitions);
+        collect_definitions_from_rule(rule, definitions, property_targets);
     }
 }
 
-/// Recursively walk CSS rules collecting custom property definitions.
+/// Recursively walk CSS rules collecting custom property definitions
+/// and standard property `var()` usages (property targets).
 fn collect_definitions_from_rule(
     rule: &CssRule,
     definitions: &mut HashMap<String, String>,
+    property_targets: &mut HashMap<String, String>,
 ) {
     match rule {
         CssRule::Style(style_rule) => {
@@ -1539,6 +1559,7 @@ fn collect_definitions_from_rule(
             {
                 let prop_name = property.property_id().name().to_string();
                 if prop_name.starts_with("--") {
+                    // Custom property definition: --name: value
                     if let Ok(value_str) = property.value_to_css_string(
                         lightningcss::printer::PrinterOptions::default(),
                     ) {
@@ -1547,25 +1568,70 @@ fn collect_definitions_from_rule(
                         // `:root` definitions come before component overrides)
                         definitions.entry(prop_name).or_insert(value);
                     }
+                } else {
+                    // Standard property: check if value uses var(--custom-prop)
+                    // e.g., background-color: var(--pf-v6-c-banner--BackgroundColor)
+                    // → record --pf-v6-c-banner--BackgroundColor → background-color
+                    if let Ok(value_str) = property.value_to_css_string(
+                        lightningcss::printer::PrinterOptions::default(),
+                    ) {
+                        let value = value_str.trim();
+                        if let Some(custom_prop) = extract_var_reference(value) {
+                            // Only record for PF component custom properties
+                            if custom_prop.starts_with("--pf-") {
+                                property_targets
+                                    .entry(custom_prop)
+                                    .or_insert_with(|| prop_name.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
         CssRule::Media(media_rule) => {
             for inner in &media_rule.rules.0 {
-                collect_definitions_from_rule(inner, definitions);
+                collect_definitions_from_rule(inner, definitions, property_targets);
             }
         }
         CssRule::Supports(supports_rule) => {
             for inner in &supports_rule.rules.0 {
-                collect_definitions_from_rule(inner, definitions);
+                collect_definitions_from_rule(inner, definitions, property_targets);
             }
         }
         CssRule::LayerBlock(layer_rule) => {
             for inner in &layer_rule.rules.0 {
-                collect_definitions_from_rule(inner, definitions);
+                collect_definitions_from_rule(inner, definitions, property_targets);
             }
         }
         _ => {}
+    }
+}
+
+/// Extract the custom property name from a `var()` reference.
+///
+/// Returns `Some("--pf-v6-c-banner--BackgroundColor")` for input
+/// `"var(--pf-v6-c-banner--BackgroundColor)"`.
+///
+/// Only extracts the first/outermost `var()` reference. Returns `None`
+/// if no `var()` is found or the reference doesn't start with `--`.
+fn extract_var_reference(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("var(") {
+        return None;
+    }
+
+    // Find the custom property name inside var(...)
+    let inner = &trimmed[4..]; // skip "var("
+    let end = inner.find(|c: char| c == ')' || c == ',');
+    let prop_name = match end {
+        Some(idx) => inner[..idx].trim(),
+        None => return None,
+    };
+
+    if prop_name.starts_with("--") {
+        Some(prop_name.to_string())
+    } else {
+        None
     }
 }
 
@@ -2651,7 +2717,7 @@ mod selector_relationship_tests {
             }
         "#;
         let mut defs = HashMap::new();
-        collect_definitions_from_css(css, &mut defs);
+        collect_definitions_from_css(css, &mut defs, &mut HashMap::new());
         resolve_var_chains(&mut defs);
 
         // lightningcss may minify hex colors (e.g., #0066cc → #06c)
@@ -2675,7 +2741,7 @@ mod selector_relationship_tests {
             }
         "#;
         let mut defs = HashMap::new();
-        collect_definitions_from_css(css, &mut defs);
+        collect_definitions_from_css(css, &mut defs, &mut HashMap::new());
         resolve_var_chains(&mut defs);
 
         assert_eq!(
@@ -2700,7 +2766,7 @@ mod selector_relationship_tests {
             }
         "#;
         let mut defs = HashMap::new();
-        collect_definitions_from_css(css, &mut defs);
+        collect_definitions_from_css(css, &mut defs, &mut HashMap::new());
         resolve_var_chains(&mut defs);
 
         // Full chain: label modifier token → semantic default → semantic 100 → palette → hex
@@ -2720,7 +2786,7 @@ mod selector_relationship_tests {
             }
         "#;
         let mut defs = HashMap::new();
-        collect_definitions_from_css(css, &mut defs);
+        collect_definitions_from_css(css, &mut defs, &mut HashMap::new());
         resolve_var_chains(&mut defs);
 
         assert_eq!(
@@ -2739,7 +2805,7 @@ mod selector_relationship_tests {
             }
         "#;
         let mut defs = HashMap::new();
-        collect_definitions_from_css(css, &mut defs);
+        collect_definitions_from_css(css, &mut defs, &mut HashMap::new());
         resolve_var_chains(&mut defs);
 
         assert_eq!(
@@ -2808,6 +2874,78 @@ mod selector_relationship_tests {
             yellow.resolved_overrides.get("--pf-v6-c-label--BackgroundColor").map(|s| s.as_str()),
             Some("#fff4cc"),
             "yellow BackgroundColor should resolve to #fff4cc"
+        );
+    }
+
+    /// Property target extraction: standard CSS properties using var()
+    /// should produce a reverse map from custom property → CSS property.
+    ///
+    /// Real PF6 pattern: `.pf-v6-c-banner { background-color: var(--pf-v6-c-banner--BackgroundColor); }`
+    /// → `{"--pf-v6-c-banner--BackgroundColor": "background-color"}`
+    #[test]
+    fn test_property_target_extraction() {
+        let css = r#"
+            .pf-v6-c-banner {
+                --pf-v6-c-banner--BackgroundColor: var(--pf-t--global--color--nonstatus--gray--default);
+                --pf-v6-c-banner--Color: var(--pf-t--global--text--color--regular);
+                background-color: var(--pf-v6-c-banner--BackgroundColor);
+                color: var(--pf-v6-c-banner--Color);
+            }
+            .pf-v6-c-banner.pf-m-yellow {
+                --pf-v6-c-banner--BackgroundColor: var(--pf-v6-c-banner--m-yellow--BackgroundColor);
+                --pf-v6-c-banner--Color: var(--pf-v6-c-banner--m-yellow--Color);
+            }
+        "#;
+        let mut defs = HashMap::new();
+        let mut targets = HashMap::new();
+        collect_definitions_from_css(css, &mut defs, &mut targets);
+
+        // Should extract property targets from the base rule
+        assert_eq!(
+            targets.get("--pf-v6-c-banner--BackgroundColor").map(|s| s.as_str()),
+            Some("background-color"),
+            "Should map --BackgroundColor custom property to background-color CSS property"
+        );
+        assert_eq!(
+            targets.get("--pf-v6-c-banner--Color").map(|s| s.as_str()),
+            Some("color"),
+            "Should map --Color custom property to color CSS property"
+        );
+
+        // Modifier-specific custom property definitions should NOT appear as targets
+        // (they define custom properties, not use var() in standard properties)
+        assert!(
+            !targets.contains_key("--pf-v6-c-banner--m-yellow--BackgroundColor"),
+            "Modifier token definitions should not appear as property targets"
+        );
+    }
+
+    /// Property target extraction with real PF5 drawer CSS.
+    /// Tests that `background-color: var(--pf-v5-c-drawer__content--BackgroundColor)`
+    /// produces the correct target mapping.
+    #[test]
+    fn test_property_target_extraction_drawer() {
+        let css = r#"
+            .pf-v5-c-drawer__content {
+                --pf-v5-c-drawer__content--BackgroundColor: #fff;
+                background-color: var(--pf-v5-c-drawer__content--BackgroundColor);
+            }
+            .pf-v5-c-drawer__panel {
+                --pf-v5-c-drawer__panel--BackgroundColor: #fff;
+                background-color: var(--pf-v5-c-drawer__panel--BackgroundColor);
+            }
+        "#;
+        let mut defs = HashMap::new();
+        let mut targets = HashMap::new();
+        collect_definitions_from_css(css, &mut defs, &mut targets);
+
+        assert_eq!(
+            targets.get("--pf-v5-c-drawer__content--BackgroundColor").map(|s| s.as_str()),
+            Some("background-color"),
+        );
+        assert_eq!(
+            targets.get("--pf-v5-c-drawer__panel--BackgroundColor").map(|s| s.as_str()),
+            Some("background-color"),
         );
     }
 }
