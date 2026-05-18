@@ -541,12 +541,28 @@ fn emit_type(source: &str, imports: Option<&ImportMap>, ts_type: &TSType, ctx: C
             if let Some(qualifier) = &import.qualifier {
                 let qual_str = import_qualifier_to_string(qualifier);
                 if let Some(type_args) = &import.type_arguments {
-                    let args: Vec<String> = type_args
+                    // Rule 7 (same as TSTypeReference): strip default generic
+                    // parameters. When ALL type arguments are `any`, omit them.
+                    // This handles tsc-generated .d.ts that uses import() syntax:
+                    //   import("react").RefAttributes<any> → RefAttributes
+                    // Without this, v5 (namespace syntax → RefAttributes via
+                    // TSTypeReference Rule 7) and v6 (import() syntax →
+                    // RefAttributes<any> without stripping) produce different
+                    // canonicalized types, causing false TypeChanged detections.
+                    if type_args
                         .params
                         .iter()
-                        .map(|a| emit_type(source, imports, a, Context::TopLevel))
-                        .collect();
-                    format!("{}<{}>", qual_str, args.join(", "))
+                        .all(|a| matches!(a, TSType::TSAnyKeyword(_)))
+                    {
+                        qual_str
+                    } else {
+                        let args: Vec<String> = type_args
+                            .params
+                            .iter()
+                            .map(|a| emit_type(source, imports, a, Context::TopLevel))
+                            .collect();
+                        format!("{}<{}>", qual_str, args.join(", "))
+                    }
                 } else {
                     qual_str
                 }
@@ -1616,6 +1632,65 @@ mod tests {
         assert_eq!(
             canon("(props: Foo) => ReactElement<any>"),
             "(props: Foo) => ReactElement"
+        );
+    }
+
+    // ── Rule 7 on TSImportType (import() syntax) ─────────────────────
+
+    #[test]
+    fn strip_any_in_import_type() {
+        // import("react").RefAttributes<any> should strip <any>
+        // just like React.RefAttributes<any> does via TSTypeReference.
+        assert_eq!(
+            canon(r#"import("react").RefAttributes<any>"#),
+            "RefAttributes"
+        );
+    }
+
+    #[test]
+    fn import_type_preserves_non_any_generic() {
+        // import("react").RefAttributes<HTMLDivElement> should keep the generic
+        assert_eq!(
+            canon(r#"import("react").RefAttributes<HTMLDivElement>"#),
+            "RefAttributes<HTMLDivElement>"
+        );
+    }
+
+    #[test]
+    fn import_type_complex_forwardref_strips_any() {
+        // Real PF v6 pattern: the full constant type from tsc-generated .d.ts
+        // import("react").ForwardRefExoticComponent<
+        //   Omit<BackToTopProps, "ref"> & import("react").RefAttributes<any>
+        // >
+        // The nested import("react").RefAttributes<any> should strip <any>.
+        let result = canon(
+            r#"import("react").ForwardRefExoticComponent<Omit<BackToTopProps, "ref"> & import("react").RefAttributes<any>>"#,
+        );
+        assert_eq!(
+            result,
+            r#"ForwardRefExoticComponent<Omit<BackToTopProps, "ref"> & RefAttributes>"#
+        );
+    }
+
+    #[test]
+    fn import_type_and_namespace_produce_same_canonical_form() {
+        // The key equivalence: both import() and namespace syntax should
+        // produce identical canonical forms after Rule 6 + Rule 7.
+        let imports = react_imports();
+
+        let from_namespace = canon_with_imports(
+            r#"React.ForwardRefExoticComponent<Omit<FooProps, "ref"> & React.RefAttributes<any>>"#,
+            &imports,
+        );
+        let from_import_type = canon(
+            r#"import("react").ForwardRefExoticComponent<Omit<FooProps, "ref"> & import("react").RefAttributes<any>>"#,
+        );
+
+        assert_eq!(
+            from_namespace, from_import_type,
+            "Namespace syntax and import() syntax should produce identical canonical forms. \
+             Namespace: {}, Import: {}",
+            from_namespace, from_import_type
         );
     }
 }
