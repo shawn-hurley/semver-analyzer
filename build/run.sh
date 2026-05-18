@@ -29,14 +29,14 @@ PROVIDER_PORT=9002
 
 # ── MemPalace init ──────────────────────────────────────────────────────
 if [[ "${DISABLE_MEMORY:-}" == "1" ]]; then
-    if [[ -f /root/.config/goose/config.yaml ]]; then
-        chmod 644 /root/.config/goose/config.yaml
-        yq -i '.extensions.mempalace.enabled = false' /root/.config/goose/config.yaml 2>/dev/null || true
-        chmod 444 /root/.config/goose/config.yaml
+    if [[ -f "$HOME/.config/goose/config.yaml" ]]; then
+        chmod 644 "$HOME/.config/goose/config.yaml"
+        yq -i '.extensions.mempalace.enabled = false' "$HOME/.config/goose/config.yaml" 2>/dev/null || true
+        chmod 444 "$HOME/.config/goose/config.yaml"
     fi
-elif [ ! -f /root/.mempalace/mempalace.yaml ]; then
-    mkdir -p /root/.mempalace
-    mempalace init /root/.mempalace --yes --no-llm 2>/dev/null || true
+elif [ ! -f "$HOME/.mempalace/mempalace.yaml" ]; then
+    mkdir -p "$HOME/.mempalace"
+    mempalace init "$HOME/.mempalace" --yes --no-llm 2>/dev/null || true
 fi
 
 # ── Defaults ─────────────────────────────────────────────────────────────
