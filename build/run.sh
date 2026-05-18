@@ -787,6 +787,7 @@ check_archive_integrity() {
 }
 
 main() {
+    require_command unbuffer
     check_archive_integrity
     mkdir -p "$LOGS_DIR"
 
