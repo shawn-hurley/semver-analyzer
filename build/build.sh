@@ -34,7 +34,7 @@ platform_lookup() {
 # ── Repo defaults ────────────────────────────────────────────────────────
 KANTRA_REPO_URL="https://github.com/konveyor/kantra.git"
 KANTRA_REPO_BRANCH="${KANTRA_REPO_BRANCH:-}"
-SEMVER_REPO_URL="https://github.com/konveyor-ecosystem/semver-analyzer.git"
+SEMVER_REPO_URL="${SEMVER_REPO_URL:-https://github.com/konveyor-ecosystem/semver-analyzer.git}"
 SEMVER_REPO_BRANCH="${SEMVER_REPO_BRANCH:-}"
 KONVEYOR_CORE_REPO_URL="https://github.com/konveyor-ecosystem/konveyor-core.git"
 KONVEYOR_CORE_REPO_BRANCH="${KONVEYOR_CORE_REPO_BRANCH:-}"
@@ -470,7 +470,7 @@ build_semver_analyzer() {
     git_clone "$KONVEYOR_CORE_REPO_URL" "$konveyor_core_src" "$KONVEYOR_CORE_REPO_BRANCH" "$log" \
         || die "Failed to clone konveyor-core. Check $log"
 
-    info "Cloning semver-analyzer..."
+    info "Cloning semver-analyzer from $SEMVER_REPO_URL:$SEMVER_REPO_BRANCH ..."
     git_clone "$SEMVER_REPO_URL" "$semver_src" "$SEMVER_REPO_BRANCH" "$log" \
         || die "Failed to clone semver-analyzer. Check $log"
 
