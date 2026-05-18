@@ -338,6 +338,8 @@ impl<L: Language> Analyzer<L> {
         dep_from: Option<&str>,
         dep_to: Option<&str>,
         dep_build_command: Option<&str>,
+        dep_from_node_version: Option<&str>,
+        dep_to_node_version: Option<&str>,
         llm_timeout: u64,
         progress: &ProgressReporter,
     ) -> Result<AnalysisResult<L>> {
@@ -373,6 +375,8 @@ impl<L: Language> Analyzer<L> {
         let dep_from_sd = dep_from.map(|s| s.to_string());
         let dep_to_sd = dep_to.map(|s| s.to_string());
         let dep_build_cmd_sd = dep_build_command.map(|s| s.to_string());
+        let dep_from_node_ver_sd = dep_from_node_version.map(|s| s.to_string());
+        let dep_to_node_ver_sd = dep_to_node_version.map(|s| s.to_string());
         let progress_sd = progress.clone();
         let shared_sd = shared.clone();
 
@@ -571,6 +575,9 @@ impl<L: Language> Analyzer<L> {
                             Ok(guard) => {
                                 // Run the user-provided build command in the worktree
                                 if let Some(cmd) = &dep_build_cmd_sd {
+                                    let dep_node_env = semver_analyzer_ts::worktree::build_node_env(
+                                        dep_to_node_ver_sd.as_deref(),
+                                    ).unwrap_or_default();
                                     tracing::info!(
                                         command = %cmd,
                                         worktree = %guard.path().display(),
@@ -579,6 +586,7 @@ impl<L: Language> Analyzer<L> {
                                     match std::process::Command::new("sh")
                                         .args(["-c", cmd])
                                         .current_dir(guard.path())
+                                        .envs(dep_node_env.iter().map(|(k, v)| (k, v)))
                                         .output()
                                     {
                                         Ok(output) if output.status.success() => {
@@ -663,6 +671,8 @@ impl<L: Language> Analyzer<L> {
                             to,
                             dep_worktree_guard.as_ref().map(|g| g.path()),
                             dep_build_cmd_sd.as_deref(),
+                            dep_from_node_ver_sd.as_deref(),
+                            dep_to_node_ver_sd.as_deref(),
                         )
                     } else {
                         CssInventoryResult {
@@ -2579,6 +2589,8 @@ fn analyze_css_class_inventories(
     to_ref: &str,
     to_worktree: Option<&Path>,
     build_command: Option<&str>,
+    from_node_version: Option<&str>,
+    _to_node_version: Option<&str>,
 ) -> CssInventoryResult {
     use semver_analyzer_ts::css_profile::{
         extract_css_class_inventory, extract_css_class_inventory_from_dir,
@@ -2599,6 +2611,9 @@ fn analyze_css_class_inventories(
             Ok(guard) => {
                 // Run build command to compile SCSS → CSS
                 if let Some(cmd) = build_command {
+                    let from_node_env = semver_analyzer_ts::worktree::build_node_env(
+                        from_node_version,
+                    ).unwrap_or_default();
                     tracing::info!(
                         command = %cmd,
                         worktree = %guard.path().display(),
@@ -2608,6 +2623,7 @@ fn analyze_css_class_inventories(
                     match std::process::Command::new("sh")
                         .args(["-c", cmd])
                         .current_dir(guard.path())
+                        .envs(from_node_env.iter().map(|(k, v)| (k, v)))
                         .output()
                     {
                         Ok(output) if output.status.success() => {
