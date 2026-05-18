@@ -535,6 +535,11 @@ generate_pf_rules() {
     step "9/19" "Generating PatternFly React rules"
     ensure_nvm
 
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    source "$nvm_dir/nvm.sh"
+    nvm install 18 && corepack enable
+    nvm install 20 && corepack enable
+
     local pf_react_src="$BUILD_TMP/patternfly-react"
     local pf_src="$BUILD_TMP/patternfly"
     local clone_log="$BUILD_TMP/clone-patternfly.log"
@@ -557,10 +562,11 @@ generate_pf_rules() {
         --dep-repo "$pf_src" \
         --dep-from "$PF_DEP_FROM" --dep-to "$PF_DEP_TO" \
         --dep-build-command "$dep_build_cmd" \
+        --from-dep-node-version 18 --to-dep-node-version 18 \
         --from-node-version 18 \
         --to-node-version 20 \
-        --from-install-command "npx yarn@1 install --frozen-lockfile" \
-        --from-build-command "npx yarn@1 build" \
+        --from-install-command "corepack yarn install" \
+        --from-build-command "corepack yarn build" \
         --to-build-command "yarn build:generate && yarn build:esm"
 }
 
