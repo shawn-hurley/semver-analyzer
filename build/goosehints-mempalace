@@ -1,0 +1,52 @@
+You have persistent memory via the mempalace MCP extension. Use it to build reusable migration knowledge across projects and track per-application migration progress.
+
+### How Memory is Organized
+
+There are two types of memory, stored in separate wings:
+
+**1. Migration path knowledge** — reusable across all applications.
+Wings are named by migration path: `wing_pf5-to-pf6`, `wing_react17-to-18`, `wing_node16-to-20`, etc.
+Rooms within each wing:
+- `pitfalls` — non-obvious problems discovered only after multiple failed attempts
+- `api-changes` — breaking API changes not caught by automated tooling
+- `fixes` — solutions to errors that required investigation beyond the obvious
+- `misc` — any other useful information
+
+**2. Application summary** — specific to one app's migration progress.
+Wings are named by application: `wing_console-plugin`, `wing_cost-management-ui`, etc.
+Each application wing has exactly one room: `summary`, containing a single drawer that tracks the current state of that app's migration.
+
+### Session Start
+
+1. Call `mempalace_status` to load the palace overview.
+2. Identify the application name from the workspace (e.g. `package.json` name field or repo directory name).
+3. Call `mempalace_search` scoped to `wing_<app-name>` room `summary` to load the application's prior migration state.
+
+### During Migration
+
+**Searching before acting:**
+- Before debugging any error, call `mempalace_search` with the error message or symptom. A past migration may have already solved the same issue.
+- Use `mempalace_kg_query` to look up entity relationships before making assumptions about API replacements.
+
+**Storing migration path knowledge (non-trivial only):**
+Migration path wings are for knowledge that was hard to discover and will save time on future migrations. Do NOT store routine errors or straightforward fixes here. A memory is worth storing only if:
+- It took multiple attempts to find the root cause
+- The solution contradicts or is absent from documentation
+- It reveals a hidden dependency or ordering constraint
+- Automated tooling fails silently or produces wrong output
+- It captures a behavioral difference not mentioned in changelogs
+- It documents a workaround for a known upstream bug
+
+Store in the migration path wing (e.g. `wing_pf5-to-pf6`) using the appropriate room (`pitfalls`, `api-changes`, `fixes`, `misc`). Call `mempalace_check_duplicate` before storing. Store content verbatim.
+
+### Session End
+
+**Update the application summary:**
+
+1. Call `mempalace_search` scoped to `wing_<app-name>` room `summary`.
+2. If a summary exists, call `mempalace_update_drawer` to replace it. Do not create a second summary.
+3. If none exists, call `mempalace_add_drawer` to create one.
+4. If you did end up using the memorized information, create a file memorized.md in your workspace and append brief (~1 line) to it detailing exactly which memory helped you. Append to existing file if one already exists.
+Unlike migration path knowledge, the summary should capture work done even if its non-trivial; however it should be brief and concise.
+
+Make sure you merge your new summary with existing — do not omit previous information. Compress without losing important details.

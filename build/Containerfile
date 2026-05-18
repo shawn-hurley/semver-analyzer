@@ -1,0 +1,508 @@
+# Stage 1: Go builder — kantra and kantra release assets
+FROM registry.access.redhat.com/ubi9/go-toolset AS go-builder
+
+ARG KANTRA_VERSION=v0.9.2-rc.1
+ARG KANTRA_REPO=https://github.com/konveyor/kantra.git
+ARG KANTRA_BRANCH=main
+ARG KANTRA_ARCH=amd64
+USER root
+RUN dnf install -y unzip && dnf clean all
+
+RUN curl -fSL -o /tmp/kantra.zip \
+    "https://github.com/konveyor/kantra/releases/download/${KANTRA_VERSION}/kantra.linux.${KANTRA_ARCH}.zip" \
+    && mkdir -p /kantra-assets && unzip /tmp/kantra.zip -d /kantra-assets/ \
+    && rm /tmp/kantra.zip
+
+RUN git clone --depth 1 --branch "$KANTRA_BRANCH" "$KANTRA_REPO" /src/kantra
+WORKDIR /src/kantra
+RUN CGO_ENABLED=0 go build -o /kantra-assets/kantra main.go
+
+RUN : > /kantra-assets/maven-index.txt \
+    && rm -rf /kantra-assets/rulesets /kantra-assets/jdtls /kantra-assets/fernflower.jar \
+    && mkdir -p /kantra-assets/rulesets
+
+
+# Stage 2: Rust builder — semver-analyzer, frontend-analyzer-provider, fix-engine-cli
+FROM registry.access.redhat.com/ubi9/ubi AS rust-builder
+
+ARG SEMVER_REPO=https://github.com/konveyor-ecosystem/semver-analyzer.git
+ARG SEMVER_BRANCH=main
+ARG KONVEYOR_CORE_REPO=https://github.com/konveyor-ecosystem/konveyor-core.git
+ARG KONVEYOR_CORE_BRANCH=main
+ARG FAP_REPO=https://github.com/konveyor-ecosystem/frontend-analyzer-provider.git
+ARG FAP_BRANCH=main
+ARG FIX_ENGINE_REPO=https://github.com/konveyor-ecosystem/fix-engine.git
+ARG FIX_ENGINE_BRANCH=main
+
+RUN dnf install -y gcc gcc-c++ make openssl-devel pkg-config git && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+RUN git clone --branch "$KONVEYOR_CORE_BRANCH" "$KONVEYOR_CORE_REPO" \
+    && git clone --branch "$SEMVER_BRANCH" "$SEMVER_REPO" \
+    && git clone --branch "$FAP_BRANCH" "$FAP_REPO" \
+    && git clone --branch "$FIX_ENGINE_BRANCH" "$FIX_ENGINE_REPO"
+
+WORKDIR /src/semver-analyzer
+RUN cargo build --release
+
+WORKDIR /src/frontend-analyzer-provider
+RUN cargo build --release
+
+WORKDIR /src/fix-engine
+RUN cargo build --release
+
+RUN strip \
+    /src/semver-analyzer/target/release/semver-analyzer \
+    /src/frontend-analyzer-provider/target/release/frontend-analyzer-provider \
+    /src/fix-engine/target/release/fix-engine-cli
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3a: PatternFly React rules
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi AS pf-rule-gen
+
+ARG PF_REACT_REPO=https://github.com/patternfly/patternfly-react.git
+ARG PF_CSS_REPO=https://github.com/patternfly/patternfly.git
+ARG PF_REACT_FROM=v5.3.3
+ARG PF_REACT_TO=v6.4.1
+ARG PF_DEP_FROM=v5.4.0
+ARG PF_DEP_TO=v6.4.0
+ARG PF_FROM_NODE_VERSION=18
+ARG PF_TO_NODE_VERSION=20
+ARG PF_FROM_INSTALL_CMD="corepack yarn install"
+ARG PF_FROM_BUILD_CMD="corepack yarn build"
+ARG PF_TO_BUILD_CMD="yarn build:generate && yarn build:esm"
+ARG PF_DEP_NODE_VERSION=18
+ARG PF_DEP_BUILD_CMD="export NODE_ENV=development && yarn install && npx gulp buildPatternfly"
+ARG TOKEN_MAPPINGS_URL=https://raw.githubusercontent.com/konveyor-ecosystem/semver-analyzer/refs/heads/main/hack/integration/patternfly-token-mappings.yaml
+
+RUN dnf install -y git make gcc gcc-c++ && dnf clean all
+
+SHELL ["/bin/bash", "-c"]
+ENV NVM_DIR=/root/.nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+    && source "$NVM_DIR/nvm.sh" \
+    && nvm install "$PF_FROM_NODE_VERSION" \
+    && nvm install "$PF_TO_NODE_VERSION" \
+    && nvm install "$PF_DEP_NODE_VERSION" \
+    && nvm alias default "$PF_TO_NODE_VERSION" \
+    && nvm use "$PF_FROM_NODE_VERSION" && corepack enable \
+    && nvm use "$PF_TO_NODE_VERSION" && corepack enable
+
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
+
+WORKDIR /src
+RUN git clone "$PF_REACT_REPO" && git clone "$PF_CSS_REPO"
+RUN curl -fSL -o /src/patternfly-token-mappings.yaml "$TOKEN_MAPPINGS_URL"
+
+ENV YARN_ENABLE_SCRIPTS=false
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+RUN source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
+    --repo /src/patternfly-react \
+    --from "$PF_REACT_FROM" --to "$PF_REACT_TO" \
+    --dep-repo /src/patternfly \
+    --dep-from "$PF_DEP_FROM" --dep-to "$PF_DEP_TO" \
+    --dep-build-command "$PF_DEP_BUILD_CMD" \
+    --from-dep-node-version "$PF_DEP_NODE_VERSION" \
+    --to-dep-node-version "$PF_DEP_NODE_VERSION" \
+    --from-node-version "$PF_FROM_NODE_VERSION" \
+    --to-node-version "$PF_TO_NODE_VERSION" \
+    --from-install-command "$PF_FROM_INSTALL_CMD" \
+    --from-build-command "$PF_FROM_BUILD_CMD" \
+    --to-build-command "$PF_TO_BUILD_CMD" \
+    --no-llm \
+    \
+    -o /src/semver_report.json
+
+RUN mkdir -p /rules/semver_rules \
+    && semver-analyzer konveyor typescript \
+    --from-report /src/semver_report.json \
+    --output-dir /rules/semver_rules \
+    --ruleset-name patternfly-breaking-changes \
+    --rename-patterns /src/patternfly-token-mappings.yaml
+
+SHELL ["/bin/sh", "-c"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3b: PatternFly React Topology rules
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi AS topology-rule-gen
+
+ARG TOPOLOGY_REPO=https://github.com/patternfly/react-topology.git
+ARG TOPOLOGY_FROM=v5.4.1
+ARG TOPOLOGY_TO=v6.4.0
+ARG TOPOLOGY_FROM_NODE_VERSION=20
+ARG TOPOLOGY_TO_NODE_VERSION=20
+ARG TOPOLOGY_FROM_INSTALL_CMD="yarn config set cache-folder /tmp/yarn-cache && rm -rf /tmp/yarn-cache && yarn install --frozen-lockfile --ignore-scripts --mutex file:/tmp/yarn-mutex --network-concurrency 1"
+ARG TOPOLOGY_TO_INSTALL_CMD="yarn config set cache-folder /tmp/yarn-cache && rm -rf /tmp/yarn-cache && yarn install --frozen-lockfile --ignore-scripts --mutex file:/tmp/yarn-mutex --network-concurrency 1"
+ARG TOPOLOGY_FROM_BUILD_CMD="yarn build"
+ARG TOPOLOGY_TO_BUILD_CMD="yarn build"
+
+RUN dnf install -y git make gcc gcc-c++ && dnf clean all
+
+SHELL ["/bin/bash", "-c"]
+ENV NVM_DIR=/root/.nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+    && source "$NVM_DIR/nvm.sh" \
+    && nvm install "$TOPOLOGY_FROM_NODE_VERSION" \
+    && nvm install "$TOPOLOGY_TO_NODE_VERSION" \
+    && nvm alias default "$TOPOLOGY_TO_NODE_VERSION" \
+    && npm install -g yarn@1.22.22
+
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
+
+WORKDIR /src
+RUN git clone "$TOPOLOGY_REPO"
+
+ENV YARN_ENABLE_SCRIPTS=false
+RUN source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
+    --repo /src/react-topology \
+    --from "$TOPOLOGY_FROM" --to "$TOPOLOGY_TO" \
+    --from-node-version "$TOPOLOGY_FROM_NODE_VERSION" \
+    --to-node-version "$TOPOLOGY_TO_NODE_VERSION" \
+    --from-install-command "$TOPOLOGY_FROM_INSTALL_CMD" \
+    --to-install-command "$TOPOLOGY_TO_INSTALL_CMD" \
+    --from-build-command "$TOPOLOGY_FROM_BUILD_CMD" \
+    --to-build-command "$TOPOLOGY_TO_BUILD_CMD" \
+    --no-llm \
+    \
+    -o /src/topology_report.json
+
+RUN mkdir -p /rules/semver_rules \
+    && semver-analyzer konveyor typescript \
+    --from-report /src/topology_report.json \
+    --output-dir /rules/semver_rules \
+    --ruleset-name topology-breaking-changes
+
+SHELL ["/bin/sh", "-c"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3c: PatternFly React Component Groups rules
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi AS rcg-rule-gen
+
+ARG RCG_REPO=https://github.com/patternfly/react-component-groups.git
+ARG RCG_FROM=v5.5.3
+ARG RCG_TO=v6.4.0
+ARG RCG_FROM_NODE_VERSION=20
+ARG RCG_TO_NODE_VERSION=20
+ARG RCG_FROM_INSTALL_CMD="npm ci --ignore-scripts"
+ARG RCG_TO_INSTALL_CMD="npm ci --ignore-scripts"
+ARG RCG_FROM_BUILD_CMD="npm run build"
+ARG RCG_TO_BUILD_CMD="npm run build"
+
+RUN dnf install -y git make gcc gcc-c++ && dnf clean all
+
+SHELL ["/bin/bash", "-c"]
+ENV NVM_DIR=/root/.nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+    && source "$NVM_DIR/nvm.sh" \
+    && nvm install "$RCG_FROM_NODE_VERSION" \
+    && nvm install "$RCG_TO_NODE_VERSION" \
+    && nvm alias default "$RCG_TO_NODE_VERSION"
+
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
+
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
+WORKDIR /src
+RUN git clone "$RCG_REPO"
+
+RUN source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
+    --repo /src/react-component-groups \
+    --from "$RCG_FROM" --to "$RCG_TO" \
+    --from-node-version "$RCG_FROM_NODE_VERSION" \
+    --to-node-version "$RCG_TO_NODE_VERSION" \
+    --from-install-command "$RCG_FROM_INSTALL_CMD" \
+    --to-install-command "$RCG_TO_INSTALL_CMD" \
+    --from-build-command "$RCG_FROM_BUILD_CMD" \
+    --to-build-command "$RCG_TO_BUILD_CMD" \
+    --no-llm \
+    \
+    -o /src/rcg_report.json
+
+RUN mkdir -p /rules/semver_rules \
+    && semver-analyzer konveyor typescript \
+    --from-report /src/rcg_report.json \
+    --output-dir /rules/semver_rules \
+    --ruleset-name react-component-groups-breaking-changes
+
+SHELL ["/bin/sh", "-c"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3d: Dynamic Plugin SDK rules
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi AS sdk-rule-gen
+
+ARG SDK_REPO=https://github.com/openshift/dynamic-plugin-sdk.git
+ARG SDK_FROM_DATE=2023-04-13
+ARG SDK_TO_DATE=2024-01-15
+ARG SDK_FROM_NODE_VERSION=20
+ARG SDK_TO_NODE_VERSION=20
+ARG SDK_FROM_BUILD_CMD="yarn install && yarn build"
+ARG SDK_TO_BUILD_CMD="yarn install && yarn build"
+
+RUN dnf install -y git make gcc gcc-c++ && dnf clean all
+
+SHELL ["/bin/bash", "-c"]
+ENV NVM_DIR=/root/.nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+    && source "$NVM_DIR/nvm.sh" \
+    && nvm install "$SDK_FROM_NODE_VERSION" \
+    && nvm install "$SDK_TO_NODE_VERSION" \
+    && nvm alias default "$SDK_TO_NODE_VERSION" \
+    && npm install -g corepack && corepack enable
+
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
+
+WORKDIR /src
+RUN git clone "$SDK_REPO"
+
+# Resolve commits from npm publish dates
+RUN SDK_FROM_COMMIT=$(cd /src/dynamic-plugin-sdk && \
+        git log --after="$(date -d "$SDK_FROM_DATE - 2 days" +%Y-%m-%d)" \
+                --before="$(date -d "$SDK_FROM_DATE + 2 days" +%Y-%m-%d)" \
+                --format="%H" -- packages/lib-core/package.json 2>/dev/null | head -1) \
+    && SDK_TO_COMMIT=$(cd /src/dynamic-plugin-sdk && \
+        git log --after="$(date -d "$SDK_TO_DATE - 2 days" +%Y-%m-%d)" \
+                --before="$(date -d "$SDK_TO_DATE + 2 days" +%Y-%m-%d)" \
+                --format="%H" -- packages/lib-core/package.json 2>/dev/null | head -1) \
+    && echo "SDK_FROM_COMMIT=$SDK_FROM_COMMIT" && echo "SDK_TO_COMMIT=$SDK_TO_COMMIT" \
+    && source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
+        --repo /src/dynamic-plugin-sdk \
+        --from "$SDK_FROM_COMMIT" --to "$SDK_TO_COMMIT" \
+        --from-build-command "$SDK_FROM_BUILD_CMD" \
+        --to-build-command "$SDK_TO_BUILD_CMD" \
+        --no-llm \
+        \
+        -o /src/sdk_report.json
+
+RUN mkdir -p /rules/semver_rules \
+    && semver-analyzer konveyor typescript \
+    --from-report /src/sdk_report.json \
+    --output-dir /rules/semver_rules \
+    --ruleset-name dynamic-plugin-sdk-breaking-changes
+
+SHELL ["/bin/sh", "-c"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3e: Console SDK rules (disabled — needs --package-name-map from updates branch)
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi-minimal AS console-rule-gen
+RUN mkdir -p /rules/semver_rules
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3f: React rules
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi AS react-rule-gen
+
+ARG REACT_REPO=https://github.com/facebook/react.git
+ARG REACT_FROM=v17.0.2
+ARG REACT_TO=v18.3.1
+ARG REACT_FROM_NODE_VERSION=18
+ARG REACT_TO_NODE_VERSION=18
+ARG REACT_FROM_BUILD_CMD="yarn build"
+ARG REACT_TO_BUILD_CMD="yarn build"
+
+RUN dnf install -y git make gcc gcc-c++ java-17-openjdk-headless && dnf clean all
+
+SHELL ["/bin/bash", "-c"]
+ENV NVM_DIR=/root/.nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+    && source "$NVM_DIR/nvm.sh" \
+    && nvm install "$REACT_FROM_NODE_VERSION" \
+    && nvm alias default "$REACT_FROM_NODE_VERSION" \
+    && npm install -g yarn@1.22.22
+
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
+
+ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
+
+WORKDIR /src
+RUN git clone --bare "$REACT_REPO" react/.git \
+    && cd react && git config core.bare false && git checkout "$REACT_TO"
+
+ARG REACT_FROM_INSTALL_CMD="yarn config set cache-folder /tmp/yarn-cache && rm -rf /tmp/yarn-cache && yarn install --ignore-scripts --ignore-optional --mutex file:/tmp/yarn-mutex --network-concurrency 1"
+ARG REACT_TO_INSTALL_CMD="yarn config set cache-folder /tmp/yarn-cache && rm -rf /tmp/yarn-cache && yarn install --ignore-scripts --ignore-optional --mutex file:/tmp/yarn-mutex --network-concurrency 1"
+
+RUN source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
+    --repo /src/react \
+    --from "$REACT_FROM" --to "$REACT_TO" \
+    --from-node-version "$REACT_FROM_NODE_VERSION" \
+    --to-node-version "$REACT_TO_NODE_VERSION" \
+    --from-install-command "$REACT_FROM_INSTALL_CMD" \
+    --to-install-command "$REACT_TO_INSTALL_CMD" \
+    --from-build-command "$REACT_FROM_BUILD_CMD" \
+    --to-build-command "$REACT_TO_BUILD_CMD" \
+    --no-llm \
+    \
+    -o /src/react_report.json
+
+RUN mkdir -p /rules/semver_rules \
+    && semver-analyzer konveyor typescript \
+    --from-report /src/react_report.json \
+    --output-dir /rules/semver_rules \
+    --ruleset-name react-breaking-changes
+
+SHELL ["/bin/sh", "-c"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3g: React Types rules (synthetic repo from DefinitelyTyped)
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi AS react-types-gen
+
+ARG DT_REPO=https://github.com/DefinitelyTyped/DefinitelyTyped.git
+ARG REACT_TYPES_FROM=v17
+ARG REACT_TYPES_TO=v18
+
+RUN dnf install -y git && dnf clean all \
+    && git config --global user.name "build" \
+    && git config --global user.email "build@localhost"
+
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
+
+WORKDIR /src
+
+# Sparse-clone DefinitelyTyped (only types/react and types/react-dom)
+RUN git clone --filter=blob:none --sparse "$DT_REPO" DefinitelyTyped \
+    && cd DefinitelyTyped && git sparse-checkout set types/react types/react-dom
+
+# Build synthetic repo with v17 and v18 tags
+RUN mkdir -p react-types && cd react-types && git init -q \
+    && mkdir -p packages/react packages/react-dom \
+    && cp -a /src/DefinitelyTyped/types/react/v17/* packages/react/ 2>/dev/null || true \
+    && rm -rf packages/react/test \
+    && cp -a /src/DefinitelyTyped/types/react-dom/v17/* packages/react-dom/ 2>/dev/null || true \
+    && rm -rf packages/react-dom/test \
+    && find packages -name package.json -exec sed -i 's/\([0-9]\+\)\.\([0-9]\+\)\.9999/\1.\2.0/g' {} + \
+    && git add -A && git commit -q -m "v17: @types/react v17" && git tag v17 \
+    && rm -rf packages/react/* packages/react-dom/* \
+    && cp -a /src/DefinitelyTyped/types/react/v18/* packages/react/ 2>/dev/null || true \
+    && rm -rf packages/react/test packages/react/ts5.0 \
+    && cp -a /src/DefinitelyTyped/types/react-dom/v18/* packages/react-dom/ 2>/dev/null || true \
+    && rm -rf packages/react-dom/test packages/react-dom/ts5.0 \
+    && find packages -name package.json -exec sed -i 's/\([0-9]\+\)\.\([0-9]\+\)\.9999/\1.\2.0/g' {} + \
+    && git add -A && git commit -q -m "v18: @types/react v18" && git tag v18
+
+RUN semver-analyzer analyze typescript \
+    --repo /src/react-types \
+    --from "$REACT_TYPES_FROM" --to "$REACT_TYPES_TO" \
+    --from-install-command "true" \
+    --to-install-command "true" \
+    --from-build-command "true" \
+    --to-build-command "true" \
+    --no-llm \
+    \
+    -o /src/react_types_report.json
+
+RUN mkdir -p /rules/semver_rules \
+    && semver-analyzer konveyor typescript \
+    --from-report /src/react_types_report.json \
+    --output-dir /rules/semver_rules \
+    --ruleset-name react-types-breaking-changes
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 4: Runtime image
+# ═══════════════════════════════════════════════════════════════════════════
+FROM registry.access.redhat.com/ubi9/ubi-minimal
+
+RUN microdnf install -y --nodocs \
+    bash \
+    python3 \
+    python3-pyyaml \
+    python3.11 \
+    python3.11-pip \
+    python3.11-setuptools \
+    git \
+    which \
+    procps-ng \
+    lsof \
+    bzip2 \
+    tar \
+    libgomp \
+    expect \
+    gcc \
+    make \
+    && curl -fsSL https://www.sqlite.org/2024/sqlite-autoconf-3450300.tar.gz \
+        | tar xz -C /tmp \
+    && cd /tmp/sqlite-autoconf-3450300 \
+    && ./configure --prefix=/usr/local && make -j$(nproc) && make install \
+    && echo /usr/local/lib > /etc/ld.so.conf.d/sqlite3.conf && ldconfig \
+    && rm -rf /tmp/sqlite-autoconf-3450300 \
+    && microdnf remove -y gcc make \
+    && microdnf clean all
+
+RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3.11 \
+    && ln -sf /usr/bin/pip3.11 /usr/local/bin/pip3.11
+
+RUN pip3.11 install --no-cache-dir --no-warn-script-location mempalace
+
+RUN curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - \
+    && microdnf install -y --nodocs nodejs \
+    && microdnf clean all \
+    && corepack enable
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
+
+ARG TARGETARCH=amd64
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${TARGETARCH}" \
+    -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+ENV CONFIGURE=false
+RUN curl -fsSL \
+    https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+ENV CONFIGURE=
+
+ENV KANTRA_DIR=/opt/patternfly-tools/.kantra
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN git config --system safe.directory '*' \
+    && git config --system user.name "PatternFly Migration" \
+    && git config --system user.email "pf-migration@localhost"
+
+WORKDIR /opt/patternfly-tools
+
+# Kantra assets
+COPY --from=go-builder /kantra-assets/ .kantra/
+
+# Rust binaries
+RUN mkdir -p bin
+COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer bin/
+COPY --from=rust-builder /src/frontend-analyzer-provider/target/release/frontend-analyzer-provider bin/
+COPY --from=rust-builder /src/fix-engine/target/release/fix-engine-cli bin/
+
+# Rules from all 7 stages — separate subdirectory per library
+COPY --from=pf-rule-gen /rules/ rules/patternfly/
+COPY --from=pf-rule-gen /src/patternfly-token-mappings.yaml .
+COPY --from=topology-rule-gen /rules/ rules/topology/
+COPY --from=rcg-rule-gen /rules/ rules/react-component-groups/
+COPY --from=sdk-rule-gen /rules/ rules/dynamic-plugin-sdk/
+COPY --from=console-rule-gen /rules/ rules/console-sdk/
+COPY --from=react-rule-gen /rules/ rules/react/
+COPY --from=react-types-gen /rules/ rules/react-types/
+
+
+# Default goose config
+RUN mkdir -p /root/.config/goose
+COPY goose-config.yaml /root/.config/goose/config.yaml
+RUN chmod 444 /root/.config/goose/config.yaml
+
+# run.sh and prompt
+COPY run.sh eval.sh prompt.md eval_prompt.md* ./
+RUN chmod +x run.sh eval.sh bin/* .kantra/kantra
+
+VOLUME ["/workspace"]
+
+ENTRYPOINT ["/opt/patternfly-tools/run.sh"]
+CMD ["--help"]
