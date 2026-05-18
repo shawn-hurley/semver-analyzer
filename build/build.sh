@@ -85,7 +85,7 @@ CONSOLE_BUILD_CMD="cd frontend && yarn build-plugin-sdk"
 REACT_REPO_URL="https://github.com/facebook/react.git"
 REACT_FROM="${REACT_FROM:-v17.0.2}"
 REACT_TO="${REACT_TO:-v18.3.1}"
-REACT_BUILD_CMD="npx yarn@1 build"
+REACT_BUILD_CMD="yarn build"
 
 # React Types (DefinitelyTyped)
 DT_REPO_URL="https://github.com/DefinitelyTyped/DefinitelyTyped.git"
@@ -675,13 +675,13 @@ generate_react_rules() {
     info "react: $REACT_FROM -> $REACT_TO"
     KONVEYOR_RENAME_PATTERNS="" KONVEYOR_PKG_NAME_MAP="" KONVEYOR_PKG_VERSION=""
 
-    local react_install_cmd="export ELECTRON_SKIP_BINARY_DOWNLOAD=1 && export NVM_DIR=\"\$HOME/.nvm\" && . \"\$NVM_DIR/nvm.sh\" && nvm exec 18 npx yarn@1 install --ignore-optional --ignore-scripts"
+    local react_install_cmd="export ELECTRON_SKIP_BINARY_DOWNLOAD=1 && yarn config set cache-folder /tmp/yarn-cache && rm -rf /tmp/yarn-cache && yarn install --ignore-scripts --ignore-optional --mutex file:/tmp/yarn-mutex --network-concurrency 1"
 
     (run_analyze_and_rules "react" "$BUILD_TMP/react-report.json" "react-breaking-changes" \
         --repo "$repo_src" \
         --from "$REACT_FROM" --to "$REACT_TO" \
-        --from-node-version 14 \
-        --to-node-version 14 \
+        --from-node-version 18 \
+        --to-node-version 18 \
         --from-install-command "$react_install_cmd" \
         --to-install-command "$react_install_cmd" \
         --from-build-command "$REACT_BUILD_CMD" \
@@ -916,7 +916,7 @@ main() {
     generate_topology_rules
     generate_rcg_rules
     generate_sdk_rules
-    generate_console_rules
+    # generate_console_rules  # disabled — needs --package-name-map from updates branch
     generate_react_rules
     generate_react_types_rules
     copy_prompt
