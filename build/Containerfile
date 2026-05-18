@@ -294,60 +294,10 @@ SHELL ["/bin/sh", "-c"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Stage 3e: Console SDK rules
+# Stage 3e: Console SDK rules (disabled — needs --package-name-map from updates branch)
 # ═══════════════════════════════════════════════════════════════════════════
-FROM registry.access.redhat.com/ubi9/ubi AS console-rule-gen
-
-ARG CONSOLE_REPO=https://github.com/openshift/console.git
-ARG CONSOLE_FROM=origin/release-4.17
-ARG CONSOLE_TO=origin/release-4.19
-ARG CONSOLE_FROM_NODE_VERSION=20
-ARG CONSOLE_TO_NODE_VERSION=20
-ARG CONSOLE_FROM_INSTALL_CMD="cd frontend && corepack enable && YARN_ENABLE_SCRIPTS=false yarn install"
-ARG CONSOLE_TO_INSTALL_CMD="cd frontend && corepack enable && YARN_ENABLE_SCRIPTS=false yarn install"
-ARG CONSOLE_FROM_BUILD_CMD="cd frontend && yarn build-plugin-sdk"
-ARG CONSOLE_TO_BUILD_CMD="cd frontend && yarn build-plugin-sdk"
-ARG CONSOLE_SDK_FROM_VERSION=1.4.0
-ARG CONSOLE_SDK_TO_VERSION=4.21.0
-
-RUN dnf install -y git make gcc gcc-c++ && dnf clean all
-
-SHELL ["/bin/bash", "-c"]
-ENV NVM_DIR=/root/.nvm
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
-    && source "$NVM_DIR/nvm.sh" \
-    && nvm install "$CONSOLE_FROM_NODE_VERSION" \
-    && nvm install "$CONSOLE_TO_NODE_VERSION" \
-    && nvm alias default "$CONSOLE_TO_NODE_VERSION" \
-    && npm install -g corepack && corepack enable
-
-COPY --from=rust-builder /src/semver-analyzer/target/release/semver-analyzer /usr/local/bin/
-
-WORKDIR /src
-RUN git clone "$CONSOLE_REPO"
-
-RUN source "$NVM_DIR/nvm.sh" && semver-analyzer analyze typescript \
-    --repo /src/console \
-    --from "$CONSOLE_FROM" --to "$CONSOLE_TO" \
-    --from-node-version "$CONSOLE_FROM_NODE_VERSION" \
-    --to-node-version "$CONSOLE_TO_NODE_VERSION" \
-    --from-install-command "$CONSOLE_FROM_INSTALL_CMD" \
-    --to-install-command "$CONSOLE_TO_INSTALL_CMD" \
-    --from-build-command "$CONSOLE_FROM_BUILD_CMD" \
-    --to-build-command "$CONSOLE_TO_BUILD_CMD" \
-    --no-llm \
-    \
-    -o /src/console_report.json
-
-RUN mkdir -p /rules/semver_rules \
-    && semver-analyzer konveyor typescript \
-    --from-report /src/console_report.json \
-    --output-dir /rules/semver_rules \
-    --ruleset-name console-sdk-breaking-changes \
-    --package-name-map "@console/dynamic-plugin-sdk=@openshift-console/dynamic-plugin-sdk" \
-    --package-version "@openshift-console/dynamic-plugin-sdk=${CONSOLE_SDK_FROM_VERSION}:${CONSOLE_SDK_TO_VERSION}"
-
-SHELL ["/bin/sh", "-c"]
+FROM registry.access.redhat.com/ubi9/ubi-minimal AS console-rule-gen
+RUN mkdir -p /rules/semver_rules
 
 
 # ═══════════════════════════════════════════════════════════════════════════
